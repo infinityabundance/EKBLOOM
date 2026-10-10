@@ -149,11 +149,31 @@ pub fn open_bytes(bytes: &[u8]) -> Result<EkbloomBody> {
             "machine id disagrees with the header",
         ));
     }
-    if *blake3::hash(&core).as_bytes() != manifest.core_hash {
+    // The machine consumes exactly one core byte per logical symbol, so a
+    // declared logical length greater than the visible core is unsatisfiable.
+    // Rejecting it here (rather than later, per read) also removes an
+    // untrusted-input allocation vector: a crafted header could otherwise
+    // declare a huge `logical_len` over a tiny core, and a forged-but-checksum-
+    // valid checkpoint would make `read` size a buffer from that declaration.
+    if scan.header.core_machine_id == crate::machine::MACHINE_NL2
+        && manifest.logical_len > core.len() as u64
+    {
+        return Err(corrupt(
+            selected.generation,
+            "logical length exceeds core length",
+        ));
+    }
+    // One digest over the authoritative core, cross-checked directly against
+    // every structure that carries a `core_hash`: the manifest, the history, and
+    // every bloom shell (and their certificates). Comparing each structure to the
+    // freshly recomputed digest — rather than only transitively via the manifest
+    // — makes any structure that disagrees with the core a rejection at `open`.
+    let core_digest = *blake3::hash(&core).as_bytes();
+    if core_digest != manifest.core_hash {
         return Err(corrupt(selected.generation, "core hash mismatch"));
     }
     if let Some(h) = &history {
-        if h.core_hash != manifest.core_hash || h.logical_len != manifest.logical_len {
+        if h.core_hash != core_digest || h.logical_len != manifest.logical_len {
             return Err(corrupt(
                 selected.generation,
                 "history core linkage mismatch",
@@ -161,12 +181,12 @@ pub fn open_bytes(bytes: &[u8]) -> Result<EkbloomBody> {
         }
     }
     for shell in &blooms {
-        if shell.core_hash != manifest.core_hash {
+        if shell.core_hash != core_digest {
             return Err(corrupt(selected.generation, "bloom core linkage mismatch"));
         }
     }
     for cert in &certificates {
-        if cert.core_hash != manifest.core_hash {
+        if cert.core_hash != core_digest {
             return Err(corrupt(
                 selected.generation,
                 "certificate core linkage mismatch",

@@ -23,8 +23,10 @@ where `S(v) = v ^ (v<<1) ^ (v<<3)` is a bijection on `u8`. Encoding produces
 ## P1. The machine is exactly invertible — **PROVED**
 
 **Claim.** `decode(encode(src)) == src` for every `src`, and `encode(decode(core))`
-reproduces `core` on its revealed prefix. Hence generation and execution are the
-same bijection.
+reproduces `core` on its revealed prefix. Equivalently, `decode ∘ encode = id` and
+`encode` is **injective** (a bijection `(u8)^n → (u8)^n` for each `n`); generation
+and execution are the same inverse pair. It is *not* a fact about the one-step
+symbol map `(x, r) -> (x', s)` — see the note below.
 
 **Proof.** `encode` and `decode` both start at `x_0 = 0` and, for the identical
 sequence `r_0, r_1, …`, apply the same update `x_{i+1} = (l_i<<8)|s_i` where
@@ -39,11 +41,26 @@ decode symbol = S[h_i] ^ l_i ^ r_i
 ```
 
 So the decoded symbol equals the symbol encoding started from, position by
-position. The converse is the same identity read left-to-right. ∎
+position. The converse is the same identity read left-to-right. Injectivity of
+`encode` on length-`n` inputs follows because the state after step `i` is a
+function of `s_0..s_{i-1}` alone, so the update `s_i -> r_i = s_i ^ (S[h_i]^l_i)`
+is invertible at every step. ∎
+
+**Note (accurate scope of "bijection").** The one-step map
+`T : (x, r) -> (x', s)` is **not** a bijection: since `x' = (l<<8)|s`, the low
+byte of `x'` already encodes `s`, so `T` has image size `2^16` and is **256-to-1**
+(domain `2^16 · 2^8 = 2^24`). Explicit collision:
+`T(0x0100, 11) = T(0x0200, 22) = (x' = 0, s = 0)`. What *is* bijective: for each
+fixed `r`, `x -> x'` permutes the 65,536 states; for each fixed `x`, `r -> s` is
+a bijection; and given `x` and the revealed `s`, `r = s ^ S[h] ^ l` is unique.
+This distinction is harmless: the machine relies only on injectivity / the
+roundtrip identity, never on invertibility of `T` alone.
 
 **Tested:** `src/machine.rs::roundtrip_various`,
 `tests/properties.rs::machine_roundtrip` (arbitrary `Vec<u8>`),
-`tests/correctness.rs` category tests.
+`tests/correctness.rs` category tests;
+`tests/math_review.rs::claim1_encode_decode_roundtrip_and_encode_bijection`,
+`claim1_transition_bijections_and_the_literal_collision`.
 
 ---
 
@@ -65,7 +82,8 @@ and the logical-position projection.
 
 **Tested:** `src/machine.rs::state_is_last_two_symbols`,
 `tests/history_checkpoint.rs::history_positions_and_decode_agree`,
-`tests/properties.rs::checkpoint_restore_matches_state_log`.
+`tests/properties.rs::checkpoint_restore_matches_state_log`;
+`tests/math_review.rs::claim2_state_log_is_last_two_symbols`.
 
 ---
 
@@ -85,14 +103,17 @@ This is the finite-model fact that `model_search::phi_from_context` computes by
 pure simulation and that the whole bloom family is keyed on.
 
 **Tested:** `tests/model_search.rs` (context outcomes match simulation),
-`tests/blooms_research.rs` (`phi_d` agrees with the machine at each position).
+`tests/blooms_research.rs` (`phi_d` agrees with the machine at each position);
+`tests/math_review.rs::claim3_outcome_depends_only_on_state_and_next_d_bytes`.
 
 ---
 
-## P4. The minimal sufficient context for depth `D` is exactly `D` bytes — **PROVED**, corroborated **EMPIRICALLY OBSERVED**
+## P4. The minimal sufficient context is exactly `D` bytes — **PROVED**, corroborated **EMPIRICALLY OBSERVED**
 
-**Claim.** For the key projection `k_j = (state, r_0..r_{j-1})`, a keyed table
-is exact iff `j ≥ D`; the smallest sufficient `j` is exactly `D`.
+**Claim.** The minimal sufficient context **size** is exactly `D` bytes: no key of
+fewer than `D` bytes is universally sufficient, and a `D`-byte sufficient key
+exists. For the prefix family `k_j = (state, r_0..r_{j-1})`, a keyed table is
+exact iff `j ≥ D`; the smallest sufficient `j` is exactly `D`.
 
 **Proof.**
 *Insufficiency of `j < D`.* Fix a state `x` and two contexts
@@ -120,9 +141,33 @@ give equal outcomes. ∎
 | conflicts | 64 | 256 | 1024 | 4096 | 0 |
 | status | rejected | rejected | rejected | rejected | **certified** |
 
+**Size vs shape (nuance).** The value `D` is a lower bound on the *number of
+bytes* of any sufficient key, not on a particular *shape*. For `D ≥ 2` the
+outcome map `(state, r_0..r_{D-1}) ↦ Phi_D` is surjective onto all `256^D` symbol
+tuples (`x_D = (s_{D-2}<<8)|s_{D-1}` is already determined by the symbols; the
+full domains were enumerated for `D = 2` at all `2^16` and `D = 3` at all `2^24`
+contexts, and the inverse `r_k = s_k ^ S[h_k] ^ l_k` is constructive for `D = 4`).
+Since sufficiency forces the key's fibers to refine the outcome fibers, any
+sufficient key needs `≥ 256^D` values, i.e. `≥ D` bytes — so **no key smaller
+than `D` bytes exists**, in any shape (prefix, arbitrary subset, hash, or
+aggregate). The size bound is tight but the shape is **not unique**: both
+`state ‖ (r_0..r_{D-1})` (`D + 2` bytes total) and the `D`-byte symbol key
+`(s_0..s_{D-1})` are sufficient; the symbol key is smaller in total, so the
+`state ‖ context` form is exact but not size-minimal. (`D = 1` is the boundary:
+the true minimum is 2 bytes; see P5.)
+
+**Caveat on finite-sample searches.** A brute-force sweep over a *restricted*
+domain can report a spurious small sufficient key because the sample does not
+exercise every degree of freedom -- e.g. on the toy sample `states ∈ {0..7}`,
+`bytes ∈ {0,1,2}` the 3-byte key `(r_3, s_1, s_2)` showed no conflict there even
+though it is not universally sufficient (it ignores `s_0`). Minimality is
+established by the counting argument above, not by any finite sample.
+
 **Tested:** `tests/model_search.rs::sweep_shows_minimal_sufficient_context_is_depth_bytes`,
 `tests/model_search.rs::state_only_key_is_insufficient_at_depth_four`,
-`tests/blooms_research.rs::contextual_exact_all_depths` (`minimal_context_bytes(D) == D`).
+`tests/blooms_research.rs::contextual_exact_all_depths` (`minimal_context_bytes(D) == D`),
+`tests/math_review.rs::claim4_minimal_key_size_is_exactly_depth_bytes`
+(size lower bound, different-shape keys, prefix-family exactness).
 
 ---
 
@@ -159,10 +204,28 @@ For the universal `T_D[x]` the projection is the 16-bit state alone (`pi = x`).
 
   (`evidence/counterexamples/bloom-key-0001.json`.)
 
+**Counterexample confirmation (independent recomputation).** The shipped witness
+is valid: reproducing `lcg(0x1234_5678_9ABC_DEF0, 4096)`, `core = encode(src)`,
+both `pos_a = 2106` and `pos_b = 3976` have `state & 0xFFFF = 175`, and the
+recomputed `Phi_4` at each position matches the recorded symbols and successor
+states exactly.
+
+**Information-theoretic nuance (any 16-bit key).** No 16-bit key of *any* shape
+(not merely the state) is universally sufficient for `D ≥ 3`: the outcome map is
+surjective onto `256^D` symbol tuples, and `256^D = 2^(8D) > 2^16` exactly when
+`D ≥ 3`, so a `2^16`-valued key must collide on distinct outcomes. For the stated
+`D = 4` this gives `2^32 ≫ 2^16`. The boundary is sharp: for `D = 2`,
+`256^2 = 2^16` exactly, and the 16-bit **symbol key** `(s_0, s_1)` *is*
+universally sufficient (`x_2 = (s_0<<8)|s_1`); `D = 1` likewise admits the 16-bit
+key `(l, s_0)`. So the impossibility of a small universal key is a `D ≥ 3`
+statement, not a property of the byte machine at all depths.
+
 **Tested:** `tests/blooms_research.rs::global_constant_certified_and_matches_machine`,
 `global_random_rejected_with_valid_counterexample`,
 `writes_deterministic_global_counterexample`,
-`global_physical_bytes_follow_depth`; `tests/bloom_path.rs::key_projection_and_sufficiency_primitive`.
+`global_physical_bytes_follow_depth`; `tests/bloom_path.rs::key_projection_and_sufficiency_primitive`;
+`tests/math_review.rs::claim5_global_condition_and_shipped_counterexample`,
+`claim5_no_16bit_key_is_universally_sufficient_for_d4`.
 
 ---
 
@@ -192,7 +255,8 @@ alternatives that are exact **by construction** are the contextual
 ordinal. ∎
 
 **Tested:** `tests/blooms_research.rs::global_random_rejected_with_valid_counterexample`,
-`tests/model_search.rs::canonical_state_only_counterexample_is_witness`.
+`tests/model_search.rs::canonical_state_only_counterexample_is_witness`;
+`tests/math_review.rs::claim6_canonical_state_only_counterexample_is_valid`.
 
 ---
 

@@ -23,7 +23,6 @@ use crate::error::{EkbloomError, Result};
 use crate::machine::{machine_by_id, state_log, OrMachine};
 use crate::manifest::EkbloomBody;
 use crate::state::Snapshot;
-use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 
 /// The outcome of a single named verification check.
@@ -291,14 +290,37 @@ fn check_global(
     let len = decoded.len();
     let windows = if len >= depth { len - depth + 1 } else { 0 };
     let mut expected: BTreeMap<u16, Outcome> = BTreeMap::new();
+    let mut conflict = false;
     for i in 0..windows {
         let key = (logs[i] & 0xFFFF) as u16;
-        if let Entry::Vacant(slot) = expected.entry(key) {
-            slot.insert(Outcome {
-                symbols: decoded[i..i + depth].to_vec(),
-                next_state: logs[i + depth],
-            });
+        let outcome = Outcome {
+            symbols: decoded[i..i + depth].to_vec(),
+            next_state: logs[i + depth],
+        };
+        match expected.get(&key) {
+            None => {
+                expected.insert(key, outcome);
+            }
+            Some(prev) if *prev != outcome => conflict = true,
+            Some(_) => {}
         }
+    }
+    // Re-derive the certification verdict from the object's own positions: the
+    // 16-bit state key is sufficient iff no key maps to two distinct `Phi_D`
+    // outcomes. Never trust the stored label alone (mirrors `check_regional`).
+    let recomputed = if conflict {
+        Certification::Rejected
+    } else {
+        Certification::Certified
+    };
+    if recomputed == Certification::Rejected && shell.status == Certification::Certified {
+        return check(
+            name,
+            false,
+            "global bloom claims Certified but its 16-bit state key is insufficient \
+             (a key maps to two distinct Phi_D outcomes)"
+                .to_string(),
+        );
     }
     for (slot, &present) in bloom.present.iter().enumerate() {
         let key = slot as u16;

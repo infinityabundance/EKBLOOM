@@ -212,6 +212,12 @@ impl GenesisHeader {
             });
         }
         let feature_flags = r.u64()?;
+        // The frozen contract defines feature_flags as always zero; a nonzero
+        // value advertises semantics this build does not implement. Refuse it
+        // rather than silently interpreting an unknown variant.
+        if feature_flags != 0 {
+            return Err(bad(format!("unsupported feature_flags {feature_flags:#x}")));
+        }
         let object_id = r.arr16()?;
         let logical_symbols = r.u64()?;
         let logical_bytes = r.u64()?;

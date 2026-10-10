@@ -204,12 +204,11 @@ pub fn read_random_1b(body: &EkbloomBody, offsets: &[u64], out: &mut Vec<u8>) ->
 /// and overflow behaviour match `reader::read`.
 pub fn read_ranges(body: &EkbloomBody, ranges: &[(u64, u64)], out: &mut Vec<u8>) -> Result<()> {
     if let Some(hot) = certified_path_hot(body) {
-        let total: u64 = ranges
-            .iter()
-            .fold(0u64, |acc, &(_, len)| acc.saturating_add(len));
-        if let Ok(extra) = usize::try_from(total) {
-            out.reserve(extra);
-        }
+        // Validate every range *before* reserving anything, so an adversarial
+        // `length` (e.g. `u64::MAX`) cannot drive `Vec::reserve` into a capacity
+        // overflow / abort before it is rejected. Only the true output size of
+        // the validated ranges is used as the allocation hint.
+        let mut total: u64 = 0;
         for &(offset, length) in ranges {
             let end = offset
                 .checked_add(length)
@@ -217,6 +216,15 @@ pub fn read_ranges(body: &EkbloomBody, ranges: &[(u64, u64)], out: &mut Vec<u8>)
             if end > body.logical_len {
                 return Err(oob(offset, length, body.logical_len));
             }
+            total = total.saturating_add(length);
+        }
+        if let Ok(extra) = usize::try_from(total) {
+            out.reserve(extra);
+        }
+        for &(offset, length) in ranges {
+            let end = offset
+                .checked_add(length)
+                .ok_or(EkbloomError::Overflow { what: "read range" })?;
             // end <= logical_len <= hot.len(), and hot.len() fits in usize, so the
             // conversions below cannot fail on any platform the slice fits on.
             let start =
