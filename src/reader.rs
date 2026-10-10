@@ -10,16 +10,23 @@
 //!
 //! Every path returns identical bytes; the module tests assert this agreement
 //! across all four paths.
+//!
+//! [`FileBody`] additionally provides a fully-safe, file-backed reader that keeps
+//! only parsed offsets in memory and reads exactly the byte ranges a request
+//! needs. No memory mapping and no `unsafe` are used anywhere in this crate.
 
-use crate::bloom::{BloomKind, BloomShell, Certificate, Certification};
+use crate::bloom::{supported_depth, BloomKind, BloomShell, Certificate, Certification};
 use crate::bloom_path::PathBloom;
 use crate::checkpoint::CheckpointSet;
 use crate::error::{EkbloomError, Result};
 use crate::format::{self, SectionKind};
 use crate::history::History;
 use crate::machine::machine_by_id;
-use crate::manifest::{EkbloomBody, ManifestationReport};
+use crate::manifest::{ComponentReport, EkbloomBody, ManifestationReport};
+use crate::state::Snapshot;
 use crate::ReadRequest;
+use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 /// Read the logical bytes `req.offset .. req.offset + req.length`.
@@ -346,6 +353,1141 @@ fn read_via_machine(body: &EkbloomBody, offset: u64, end: u64) -> Result<Vec<u8>
         pos += 1;
     }
     Ok(out)
+}
+
+/// Fixed byte size of a `BloomShell` wire header (mirrors `bloom::SHELL_HEADER_LEN`).
+const SHELL_HEADER_LEN: usize = 4 + 2 + 8 + 8 + 8 + 4 + 32 + 8;
+/// Fixed byte size of a path-bloom payload prefix (`depth`, `logical_len`, `nblocks`).
+const PATH_PAYLOAD_PREFIX_LEN: usize = 2 + 8 + 8;
+/// Fixed byte size of a history wire header (mirrors `history::HEADER_LEN`).
+const HISTORY_HEADER_LEN: usize = 8 + 8 + 8 + 32 + 8;
+/// Fixed byte size of a checkpoint-set wire header (`interval`, `count`).
+const CHECKPOINT_HEADER_LEN: usize = 4 + 8;
+/// Bounded streaming chunk for open-time checksums/hashes (64 KiB).
+const IO_CHUNK: usize = 64 * 1024;
+/// Number of checkpoint resume points validated per bounded read.
+const CHECKPOINT_VALIDATE_BATCH: u64 = 4096;
+
+/// Construct a [`EkbloomError::BadSection`].
+fn bad(reason: impl Into<String>) -> EkbloomError {
+    EkbloomError::BadSection {
+        reason: reason.into(),
+    }
+}
+
+/// Construct an [`EkbloomError::OutOfBounds`].
+#[inline]
+fn oob(offset: u64, length: u64, logical_len: u64) -> EkbloomError {
+    EkbloomError::OutOfBounds {
+        offset,
+        length,
+        logical_len,
+    }
+}
+
+/// Read a little-endian `u64` at `off` from a bounds-checked header buffer.
+fn le_u64(bytes: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes([
+        bytes[off],
+        bytes[off + 1],
+        bytes[off + 2],
+        bytes[off + 3],
+        bytes[off + 4],
+        bytes[off + 5],
+        bytes[off + 6],
+        bytes[off + 7],
+    ])
+}
+
+/// Read exactly `buf.len()` bytes at file offset `off`, after checking the
+/// extent against the known file length so failure is a clean [`EkbloomError`].
+fn read_exact_at_len(file: &File, buf: &mut [u8], off: u64, total: u64) -> Result<()> {
+    let end = off
+        .checked_add(buf.len() as u64)
+        .ok_or(EkbloomError::Overflow {
+            what: "file read extent",
+        })?;
+    if end > total {
+        return Err(EkbloomError::Truncated {
+            needed: end,
+            available: total,
+        });
+    }
+    file.read_exact_at(buf, off)?;
+    Ok(())
+}
+
+/// Read `len` bytes at `off` into a fresh buffer (bounds-checked).
+fn read_vec_at(file: &File, off: u64, len: u64, total: u64) -> Result<Vec<u8>> {
+    let n = usize::try_from(len).map_err(|_| EkbloomError::Overflow {
+        what: "file read length",
+    })?;
+    let mut buf = vec![0u8; n];
+    read_exact_at_len(file, &mut buf, off, total)?;
+    Ok(buf)
+}
+
+/// Stream a CRC-32 over `[off, off + len)` in bounded chunks.
+fn crc32_range(file: &File, off: u64, len: u64, total: u64) -> Result<u32> {
+    let end = off.checked_add(len).ok_or(EkbloomError::Overflow {
+        what: "checksum extent",
+    })?;
+    if end > total {
+        return Err(EkbloomError::Truncated {
+            needed: end,
+            available: total,
+        });
+    }
+    let mut hasher = crc32fast::Hasher::new();
+    let mut buf = vec![0u8; IO_CHUNK];
+    let mut at = off;
+    let mut remaining = len;
+    while remaining > 0 {
+        let n = remaining.min(buf.len() as u64) as usize;
+        file.read_exact_at(&mut buf[..n], at)?;
+        hasher.update(&buf[..n]);
+        at += n as u64;
+        remaining -= n as u64;
+    }
+    Ok(hasher.finalize())
+}
+
+/// Stream a BLAKE3 digest over `[off, off + len)` in bounded chunks.
+fn blake3_range(file: &File, off: u64, len: u64, total: u64) -> Result<[u8; 32]> {
+    let end = off.checked_add(len).ok_or(EkbloomError::Overflow {
+        what: "hash extent",
+    })?;
+    if end > total {
+        return Err(EkbloomError::Truncated {
+            needed: end,
+            available: total,
+        });
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; IO_CHUNK];
+    let mut at = off;
+    let mut remaining = len;
+    while remaining > 0 {
+        let n = remaining.min(buf.len() as u64) as usize;
+        file.read_exact_at(&mut buf[..n], at)?;
+        hasher.update(&buf[..n]);
+        at += n as u64;
+        remaining -= n as u64;
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+/// A bloom shell header plus the absolute file offset/length of its whole
+/// payload (shell header included). The payload is never loaded at once.
+#[derive(Clone, Copy, Debug)]
+struct FileBloom {
+    kind: BloomKind,
+    depth: u16,
+    logical_len: u64,
+    entries: u64,
+    status: Certification,
+    core_hash: [u8; 32],
+    payload_offset: u64,
+    payload_len: u64,
+}
+
+/// A checkpoint-set header plus the absolute range of its payload. Only the one
+/// resume point a request needs is ever read.
+#[derive(Clone, Copy, Debug)]
+struct FileCheckpoint {
+    interval: u32,
+    count: u64,
+    payload_offset: u64,
+}
+
+/// A full-history header plus the absolute range of its payload. Only the `u32`
+/// states a request needs are ever read.
+#[derive(Clone, Copy, Debug)]
+struct FileHistory {
+    logical_len: u64,
+    core_hash: [u8; 32],
+    payload_offset: u64,
+}
+
+/// A parsed certificate reduced to the fields `inspect` and linkage need.
+#[derive(Clone, Copy, Debug)]
+struct FileCertificate {
+    kind: BloomKind,
+    core_hash: [u8; 32],
+    bytes: u64,
+}
+
+/// A fully-safe, file-backed, streaming view of a validated `.ekb` file.
+///
+/// Unlike [`open`], which materialises the whole logical body (core, history,
+/// checkpoints and bloom payloads) into owned `Vec`s, `FileBody` opens the file
+/// and keeps only parsed offsets. A read then reads exactly the bytes it needs
+/// with `pread`-style `File::read_exact_at` calls:
+///
+/// * a certified **path bloom** read is a single contiguous read of the
+///   `hot[offset..end]` slice (no per-symbol decode),
+/// * a **checkpoint** read touches one 12-byte resume point plus the bounded core
+///   window `[j*K, end)`,
+/// * a **history** read touches the `u32` states for the requested positions plus
+///   the core window `[offset, end)`,
+/// * the **machine** fallback replays over the core window `[0, end)`.
+///
+/// At open time the file is validated by streaming its sections through a fixed
+/// 64 KiB buffer (checksums/hashes), so a large object is never fully resident.
+/// Every absolute offset is validated against the file length before it is read,
+/// so a corrupt or truncated file yields an [`EkbloomError`] — never a panic.
+/// For any valid file, [`FileBody::read`] returns bytes identical to [`read`].
+pub struct FileBody {
+    file: File,
+    logical_len: u64,
+    physical_len: u64,
+    machine_id: u32,
+    generation: u64,
+    core_offset: u64,
+    core_len: u64,
+    history: Option<FileHistory>,
+    checkpoints: Vec<FileCheckpoint>,
+    blooms: Vec<FileBloom>,
+    certificates: Vec<FileCertificate>,
+    profiles: Vec<String>,
+}
+
+impl FileBody {
+    /// Open `path`, validate the header, footer and every section, and keep only
+    /// parsed offsets. Core, history and bloom payloads are never held in RAM.
+    pub fn open(path: &Path) -> Result<FileBody> {
+        let file = File::open(path)?;
+        Self::parse(file)
+    }
+
+    /// The number of logical symbols (`n`) in the object.
+    #[inline]
+    pub fn logical_len(&self) -> u64 {
+        self.logical_len
+    }
+
+    /// The on-disk file length in bytes.
+    #[inline]
+    pub fn physical_len(&self) -> u64 {
+        self.physical_len
+    }
+
+    /// Read `req` by reading only the bytes it needs.
+    ///
+    /// Bounds and overflow semantics match [`read`]: an overflowing range yields
+    /// [`EkbloomError::Overflow`], a range past `logical_len` yields
+    /// [`EkbloomError::OutOfBounds`], and a zero-length read always succeeds.
+    pub fn read(&self, req: ReadRequest) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.read_into(req, &mut out)?;
+        Ok(out)
+    }
+
+    /// Like [`FileBody::read`], but appends into `out` instead of allocating.
+    /// `out` is not cleared.
+    pub fn read_into(&self, req: ReadRequest, out: &mut Vec<u8>) -> Result<()> {
+        let end = req
+            .offset
+            .checked_add(req.length)
+            .ok_or(EkbloomError::Overflow { what: "read range" })?;
+        if end > self.logical_len {
+            return Err(oob(req.offset, req.length, self.logical_len));
+        }
+        if req.length == 0 {
+            return Ok(());
+        }
+        if self.read_via_path(req.offset, end, out)? {
+            return Ok(());
+        }
+        if self.read_via_checkpoint(req.offset, req.length, end, out)? {
+            return Ok(());
+        }
+        if self.read_via_history(req.offset, end, out)? {
+            return Ok(());
+        }
+        self.read_via_machine(req.offset, end, out)
+    }
+
+    /// Byte-accounting report, equal to [`crate::manifest::inspect`] of the body
+    /// [`open`] would produce, but computed from parsed offsets only.
+    pub fn inspect(&self) -> Result<ManifestationReport> {
+        let mut components: Vec<ComponentReport> = Vec::new();
+        components.push(ComponentReport {
+            name: "core".to_string(),
+            kind: "core".to_string(),
+            bytes: self.core_len,
+        });
+        if let Some(h) = &self.history {
+            let states = h.logical_len.checked_add(1).ok_or(EkbloomError::Overflow {
+                what: "history count",
+            })?;
+            components.push(ComponentReport {
+                name: "history".to_string(),
+                kind: "history".to_string(),
+                bytes: states.saturating_mul(4),
+            });
+        }
+        for (i, cp) in self.checkpoints.iter().enumerate() {
+            components.push(ComponentReport {
+                name: format!("checkpoint[{i}] K={}", cp.interval),
+                kind: "checkpoint".to_string(),
+                bytes: cp.count.saturating_mul(Snapshot::PACKED_LEN as u64),
+            });
+        }
+        for (i, b) in self.blooms.iter().enumerate() {
+            components.push(ComponentReport {
+                name: format!("bloom[{i}] {}", b.kind.as_str()),
+                kind: "bloom".to_string(),
+                bytes: b.payload_len.saturating_sub(SHELL_HEADER_LEN as u64),
+            });
+        }
+        for (i, c) in self.certificates.iter().enumerate() {
+            components.push(ComponentReport {
+                name: format!("certificate[{i}] {}", c.kind.as_str()),
+                kind: "certificate".to_string(),
+                bytes: c.bytes,
+            });
+        }
+
+        let visible = self.core_len;
+        let physical = components
+            .iter()
+            .fold(0u64, |acc, c| acc.saturating_add(c.bytes));
+        let expansion_ratio = if visible == 0 {
+            0.0
+        } else {
+            physical as f64 / visible as f64
+        };
+        Ok(ManifestationReport {
+            logical_len: self.logical_len,
+            visible_bytes: visible,
+            physical_bytes: physical,
+            concealed_bytes: physical.saturating_sub(visible),
+            expansion_ratio,
+            generation: self.generation,
+            profiles: self.profiles.clone(),
+            components,
+        })
+    }
+
+    /// Validate a file by streaming, keeping only offsets and headers.
+    fn parse(file: File) -> Result<FileBody> {
+        let physical_len = file.metadata()?.len();
+        let (header, commits, torn_error) = scan_file(&file, physical_len)?;
+        let selected = match commits.last().cloned() {
+            Some(commit) => commit,
+            None => {
+                return Err(torn_error.unwrap_or_else(|| EkbloomError::RecoveryFailed {
+                    reason: "no valid committed generation".to_string(),
+                }))
+            }
+        };
+
+        let core_offset = format::CORE_OFFSET;
+        let core_len = header.core_len;
+
+        let mut history: Option<FileHistory> = None;
+        let mut checkpoints: Vec<FileCheckpoint> = Vec::new();
+        let mut blooms: Vec<FileBloom> = Vec::new();
+        let mut certificates: Vec<FileCertificate> = Vec::new();
+
+        for commit in &commits {
+            for section in &commit.sections {
+                let off = section.payload_offset;
+                let len = section.payload_len;
+                match section.kind {
+                    SectionKind::HistoryFull => {
+                        history = Some(parse_history(&file, off, len, physical_len)?)
+                    }
+                    SectionKind::Checkpoints => {
+                        checkpoints.push(parse_checkpoint(&file, off, len, physical_len)?)
+                    }
+                    SectionKind::BloomGlobal
+                    | SectionKind::BloomContext
+                    | SectionKind::BloomRegion
+                    | SectionKind::BloomPath => {
+                        let bloom = parse_bloom(&file, off, len, physical_len)?;
+                        if section_kind_of(bloom.kind) != section.kind {
+                            return Err(corrupt(
+                                commit.generation,
+                                "bloom kind disagrees with its section",
+                            ));
+                        }
+                        blooms.push(bloom);
+                    }
+                    SectionKind::Certificate => {
+                        certificates.push(parse_certificate(&file, off, len, physical_len)?)
+                    }
+                    SectionKind::Manifest => {}
+                    SectionKind::CoreMachine => {
+                        return Err(corrupt(commit.generation, "unexpected core section"))
+                    }
+                }
+            }
+        }
+
+        let manifest = manifest_record(&file, &selected, physical_len)?;
+
+        if manifest.generation != selected.generation {
+            return Err(corrupt(selected.generation, "manifest generation mismatch"));
+        }
+        if header.core_machine_id == crate::machine::MACHINE_NL2
+            && header.logical_bytes != header.logical_symbols
+        {
+            return Err(corrupt(
+                selected.generation,
+                "header logical_bytes disagrees with logical_symbols",
+            ));
+        }
+        if manifest.logical_len != header.logical_symbols {
+            return Err(corrupt(
+                selected.generation,
+                "logical length disagrees with the header",
+            ));
+        }
+        if manifest.object_id != header.object_id {
+            return Err(corrupt(
+                selected.generation,
+                "object id disagrees with the header",
+            ));
+        }
+        if manifest.machine_id != header.core_machine_id {
+            return Err(corrupt(
+                selected.generation,
+                "machine id disagrees with the header",
+            ));
+        }
+        if header.core_machine_id == crate::machine::MACHINE_NL2 && manifest.logical_len > core_len
+        {
+            return Err(corrupt(
+                selected.generation,
+                "logical length exceeds core length",
+            ));
+        }
+        let core_digest = blake3_range(&file, core_offset, core_len, physical_len)?;
+        if core_digest != manifest.core_hash {
+            return Err(corrupt(selected.generation, "core hash mismatch"));
+        }
+        if let Some(h) = &history {
+            if h.core_hash != core_digest || h.logical_len != manifest.logical_len {
+                return Err(corrupt(
+                    selected.generation,
+                    "history core linkage mismatch",
+                ));
+            }
+        }
+        for bloom in &blooms {
+            if bloom.core_hash != core_digest {
+                return Err(corrupt(selected.generation, "bloom core linkage mismatch"));
+            }
+        }
+        for cert in &certificates {
+            if cert.core_hash != core_digest {
+                return Err(corrupt(
+                    selected.generation,
+                    "certificate core linkage mismatch",
+                ));
+            }
+        }
+        let expected_components = 1
+            + usize::from(history.is_some())
+            + checkpoints.len()
+            + blooms.len()
+            + certificates.len();
+        if manifest.components.len() != expected_components {
+            return Err(corrupt(
+                selected.generation,
+                "component count disagrees with the manifest",
+            ));
+        }
+
+        Ok(FileBody {
+            file,
+            logical_len: manifest.logical_len,
+            physical_len,
+            machine_id: manifest.machine_id,
+            generation: selected.generation,
+            core_offset,
+            core_len,
+            history,
+            checkpoints,
+            blooms,
+            certificates,
+            profiles: manifest.profiles,
+        })
+    }
+
+    /// Read the core window `[from, to)` into a fresh buffer (bounds-checked).
+    fn read_core(&self, from: u64, to: u64) -> Result<Vec<u8>> {
+        if to < from {
+            return Err(bad("core window is reversed"));
+        }
+        if to > self.core_len {
+            return Err(EkbloomError::CoreTooShort {
+                needed: to,
+                available: self.core_len,
+            });
+        }
+        let off = self
+            .core_offset
+            .checked_add(from)
+            .ok_or(EkbloomError::Overflow {
+                what: "core window offset",
+            })?;
+        read_vec_at(&self.file, off, to - from, self.physical_len)
+    }
+
+    /// Path 1: read the certified path-bloom `hot` slice directly. Returns `true`
+    /// when it served the request.
+    fn read_via_path(&self, offset: u64, end: u64, out: &mut Vec<u8>) -> Result<bool> {
+        for bloom in &self.blooms {
+            if bloom.kind != BloomKind::Path
+                || bloom.status != Certification::Certified
+                || bloom.logical_len != self.logical_len
+            {
+                continue;
+            }
+            let Some(hot_off) = self.path_hot_offset(bloom)? else {
+                continue;
+            };
+            if bloom.logical_len < end {
+                continue;
+            }
+            let len = end - offset;
+            let n = usize::try_from(len).map_err(|_| oob(offset, len, self.logical_len))?;
+            let prev = out.len();
+            let new_len = prev.checked_add(n).ok_or(EkbloomError::Overflow {
+                what: "read buffer",
+            })?;
+            out.resize(new_len, 0);
+            let file_off = hot_off.checked_add(offset).ok_or(EkbloomError::Overflow {
+                what: "path hot offset",
+            })?;
+            read_exact_at_len(&self.file, &mut out[prev..], file_off, self.physical_len)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Absolute file offset of a path shell's `hot` array, applying exactly the
+    /// structural checks of [`crate::bloom_path::PathBloom::from_shell`] so the
+    /// same shell is selected as [`read`]. `None` means "not a usable path bloom".
+    fn path_hot_offset(&self, bloom: &FileBloom) -> Result<Option<u64>> {
+        if !supported_depth(bloom.depth) {
+            return Ok(None);
+        }
+        let Some(payload_len) = bloom.payload_len.checked_sub(SHELL_HEADER_LEN as u64) else {
+            return Ok(None);
+        };
+        if payload_len < PATH_PAYLOAD_PREFIX_LEN as u64 {
+            return Ok(None);
+        }
+        let prefix_off = bloom
+            .payload_offset
+            .checked_add(SHELL_HEADER_LEN as u64)
+            .ok_or(EkbloomError::Overflow {
+                what: "path payload offset",
+            })?;
+        let mut p = [0u8; PATH_PAYLOAD_PREFIX_LEN];
+        read_exact_at_len(&self.file, &mut p, prefix_off, self.physical_len)?;
+        let depth = u16::from_le_bytes([p[0], p[1]]);
+        if depth != bloom.depth {
+            return Ok(None);
+        }
+        let payload_logical = le_u64(&p, 2);
+        if payload_logical != bloom.logical_len {
+            return Ok(None);
+        }
+        let nblocks = le_u64(&p, 10);
+        if nblocks != bloom.logical_len.div_ceil(u64::from(depth)) {
+            return Ok(None);
+        }
+        if bloom.entries != nblocks {
+            return Ok(None);
+        }
+        let Some(cold_bytes) = nblocks.checked_mul(4) else {
+            return Ok(None);
+        };
+        let Some(need) = (PATH_PAYLOAD_PREFIX_LEN as u64)
+            .checked_add(bloom.logical_len)
+            .and_then(|n| n.checked_add(cold_bytes))
+        else {
+            return Ok(None);
+        };
+        if payload_len != need {
+            return Ok(None);
+        }
+        let hot_off = bloom
+            .payload_offset
+            .checked_add((SHELL_HEADER_LEN + PATH_PAYLOAD_PREFIX_LEN) as u64)
+            .ok_or(EkbloomError::Overflow {
+                what: "path hot offset",
+            })?;
+        Ok(Some(hot_off))
+    }
+
+    /// Path 2: the checkpoint set with the fewest replay steps. Only one resume
+    /// point and the bounded core window `[j*K, end)` are read.
+    fn read_via_checkpoint(
+        &self,
+        offset: u64,
+        length: u64,
+        end: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<bool> {
+        let mut best: Option<(u64, &FileCheckpoint)> = None;
+        for cp in &self.checkpoints {
+            if cp.interval == 0 {
+                continue;
+            }
+            let k = u64::from(cp.interval);
+            if offset / k >= cp.count {
+                continue;
+            }
+            let steps = offset % k;
+            let better = match best {
+                Some((best_steps, _)) => steps < best_steps,
+                None => true,
+            };
+            if better {
+                best = Some((steps, cp));
+            }
+        }
+        let Some((_, cp)) = best else {
+            return Ok(false);
+        };
+
+        let k = u64::from(cp.interval);
+        let j = offset / k;
+        let expected_cursor = j.checked_mul(k).ok_or(EkbloomError::Overflow {
+            what: "checkpoint cursor",
+        })?;
+
+        let rel = (CHECKPOINT_HEADER_LEN as u64)
+            .checked_add(j.checked_mul(Snapshot::PACKED_LEN as u64).ok_or(
+                EkbloomError::Overflow {
+                    what: "checkpoint entry",
+                },
+            )?)
+            .ok_or(EkbloomError::Overflow {
+                what: "checkpoint entry",
+            })?;
+        let entry_off = cp
+            .payload_offset
+            .checked_add(rel)
+            .ok_or(EkbloomError::Overflow {
+                what: "checkpoint entry",
+            })?;
+        let mut entry = [0u8; Snapshot::PACKED_LEN];
+        read_exact_at_len(&self.file, &mut entry, entry_off, self.physical_len)?;
+        let omega = Snapshot::unpack(&entry)?;
+        if omega.cursor != expected_cursor {
+            return Err(bad(format!(
+                "checkpoint cursor {} does not match implicit position {expected_cursor}",
+                omega.cursor
+            )));
+        }
+
+        // Replay from `j*K` to `offset`, then reveal `length` symbols. The core
+        // window starts at `j*K`; the local cursor is rebased to 0 so `reveal`
+        // indexes the window correctly.
+        let core = self.read_core(expected_cursor, end)?;
+        let steps =
+            usize::try_from(offset - expected_cursor).map_err(|_| EkbloomError::Overflow {
+                what: "checkpoint replay",
+            })?;
+        let machine = machine_by_id(self.machine_id).ok_or(EkbloomError::UnknownMachine {
+            id: self.machine_id,
+        })?;
+        let mut local = Snapshot::new(omega.state, 0);
+        for _ in 0..steps {
+            machine.reveal(&core, &mut local)?;
+        }
+        if let Ok(n) = usize::try_from(length) {
+            out.reserve(n);
+        }
+        for _ in 0..length {
+            out.push(machine.reveal(&core, &mut local)?);
+        }
+        Ok(true)
+    }
+
+    /// Path 3: the full history. Only the `u32` states for the requested
+    /// positions, plus the core window `[offset, end)`, are read.
+    fn read_via_history(&self, offset: u64, end: u64, out: &mut Vec<u8>) -> Result<bool> {
+        let Some(history) = &self.history else {
+            return Ok(false);
+        };
+        if history.logical_len != self.logical_len {
+            return Ok(false);
+        }
+        let count = history
+            .logical_len
+            .checked_add(1)
+            .ok_or(EkbloomError::Overflow {
+                what: "history count",
+            })?;
+        if end > count {
+            return Ok(false);
+        }
+        let machine = machine_by_id(self.machine_id).ok_or(EkbloomError::UnknownMachine {
+            id: self.machine_id,
+        })?;
+        let core = self.read_core(offset, end)?;
+
+        let span = end - offset;
+        let state_bytes = span.checked_mul(4).ok_or(EkbloomError::Overflow {
+            what: "history states",
+        })?;
+        let state_off = history
+            .payload_offset
+            .checked_add(HISTORY_HEADER_LEN as u64)
+            .and_then(|o| o.checked_add(offset.checked_mul(4)?))
+            .ok_or(EkbloomError::Overflow {
+                what: "history states",
+            })?;
+        let states = read_vec_at(&self.file, state_off, state_bytes, self.physical_len)?;
+
+        if let Ok(n) = usize::try_from(span) {
+            out.reserve(n);
+        }
+        for i in 0..span {
+            let s = usize::try_from(i).map_err(|_| EkbloomError::Overflow {
+                what: "history index",
+            })?;
+            let state = u32::from_le_bytes([
+                states[s * 4],
+                states[s * 4 + 1],
+                states[s * 4 + 2],
+                states[s * 4 + 3],
+            ]);
+            // Rebase the cursor onto the window starting at `offset`.
+            let mut omega = Snapshot::new(state, i);
+            out.push(machine.reveal(&core, &mut omega)?);
+        }
+        Ok(true)
+    }
+
+    /// Path 4: authoritative replay from `Omega_0` over the core window `[0, end)`.
+    fn read_via_machine(&self, offset: u64, end: u64, out: &mut Vec<u8>) -> Result<()> {
+        let machine = machine_by_id(self.machine_id).ok_or(EkbloomError::UnknownMachine {
+            id: self.machine_id,
+        })?;
+        if self.logical_len > self.core_len {
+            return Err(EkbloomError::CoreTooShort {
+                needed: self.logical_len,
+                available: self.core_len,
+            });
+        }
+        let core = self.read_core(0, end)?;
+        if let Ok(n) = usize::try_from(end - offset) {
+            out.reserve(n);
+        }
+        let mut omega = machine.init();
+        let mut pos = 0u64;
+        while pos < offset {
+            machine.reveal(&core, &mut omega)?;
+            pos += 1;
+        }
+        while pos < end {
+            out.push(machine.reveal(&core, &mut omega)?);
+            pos += 1;
+        }
+        Ok(())
+    }
+}
+
+/// Forward-scan a file by streaming: validate the header and every commit block,
+/// returning the valid prefix and any torn tail. Mirrors [`format::scan`] without
+/// loading the file into memory.
+fn scan_file(
+    file: &File,
+    total: u64,
+) -> Result<(
+    format::GenesisHeader,
+    Vec<format::ScannedCommit>,
+    Option<EkbloomError>,
+)> {
+    let mut header_buf = [0u8; format::HEADER_LEN];
+    read_exact_at_len(file, &mut header_buf, 0, total)?;
+    let header = format::GenesisHeader::decode(&header_buf)?;
+    let core_end =
+        format::CORE_OFFSET
+            .checked_add(header.core_len)
+            .ok_or(EkbloomError::Overflow {
+                what: "core extent",
+            })?;
+    if total < core_end {
+        return Err(EkbloomError::Truncated {
+            needed: core_end,
+            available: total,
+        });
+    }
+
+    let mut commits: Vec<format::ScannedCommit> = Vec::new();
+    let mut prev_generation = 0u64;
+    let mut torn_error = None;
+    let mut pos = format::align8(core_end);
+    while pos < total {
+        match scan_one_commit(file, total, pos, prev_generation) {
+            Ok(commit) => {
+                prev_generation = commit.generation;
+                pos = commit.end;
+                commits.push(commit);
+            }
+            Err(e) => {
+                torn_error = Some(e);
+                break;
+            }
+        }
+    }
+    Ok((header, commits, torn_error))
+}
+
+/// Parse and validate a single commit block starting at `start`, streaming every
+/// section payload through a bounded checksum buffer.
+fn scan_one_commit(
+    file: &File,
+    total: u64,
+    start: u64,
+    expected_prev: u64,
+) -> Result<format::ScannedCommit> {
+    let mut sections: Vec<format::ScannedSection> = Vec::new();
+    let mut cur = start;
+    let footer_start;
+
+    loop {
+        let header_end =
+            cur.checked_add(format::SECTION_HEADER_LEN as u64)
+                .ok_or(EkbloomError::Overflow {
+                    what: "section header extent",
+                })?;
+        if total < header_end {
+            return Err(EkbloomError::Truncated {
+                needed: header_end,
+                available: total,
+            });
+        }
+        let mut hbuf = [0u8; format::SECTION_HEADER_LEN];
+        file.read_exact_at(&mut hbuf, cur)?;
+        let header = format::SectionHeader::decode(&hbuf)?;
+        let expected_offset = header_end;
+        if header.offset != expected_offset {
+            return Err(bad(format!(
+                "section offset {} does not follow its header at {cur}",
+                header.offset
+            )));
+        }
+        let payload_end =
+            expected_offset
+                .checked_add(header.length)
+                .ok_or(EkbloomError::Overflow {
+                    what: "section payload extent",
+                })?;
+        if total < payload_end {
+            return Err(EkbloomError::Truncated {
+                needed: payload_end,
+                available: total,
+            });
+        }
+        let actual = crc32_range(file, expected_offset, header.length, total)?;
+        if actual != header.checksum {
+            return Err(EkbloomError::ChecksumMismatch {
+                section: header.kind.name(),
+            });
+        }
+        sections.push(format::ScannedSection {
+            kind: header.kind,
+            generation: header.generation,
+            header_offset: cur,
+            payload_offset: expected_offset,
+            payload_len: header.length,
+        });
+        cur = format::align8(payload_end);
+        if header.kind == SectionKind::Manifest {
+            footer_start = cur;
+            break;
+        }
+    }
+
+    let footer_end =
+        footer_start
+            .checked_add(format::FOOTER_LEN as u64)
+            .ok_or(EkbloomError::Overflow {
+                what: "footer extent",
+            })?;
+    if total < footer_end {
+        return Err(EkbloomError::Truncated {
+            needed: footer_end,
+            available: total,
+        });
+    }
+    let mut fbuf = [0u8; format::FOOTER_LEN];
+    file.read_exact_at(&mut fbuf, footer_start)?;
+    let footer = format::CommitFooter::decode(&fbuf)?;
+
+    let manifest = sections
+        .last()
+        .copied()
+        .ok_or_else(|| bad("empty commit"))?;
+    if manifest.kind != SectionKind::Manifest {
+        return Err(bad("commit does not end with a manifest section"));
+    }
+    if footer.manifest_offset != manifest.header_offset
+        || footer.manifest_len != manifest.payload_len
+    {
+        return Err(bad(format!(
+            "footer manifest pointer ({}, {}) disagrees with section ({}, {})",
+            footer.manifest_offset,
+            footer.manifest_len,
+            manifest.header_offset,
+            manifest.payload_len
+        )));
+    }
+    if footer.prev_generation != expected_prev {
+        return Err(bad(format!(
+            "footer prev_generation {} does not link to {expected_prev}",
+            footer.prev_generation
+        )));
+    }
+    let manifest_payload = read_vec_at(file, manifest.payload_offset, manifest.payload_len, total)?;
+    let actual_hash = *blake3::hash(&manifest_payload).as_bytes();
+    let mut expected_hash = [0u8; 16];
+    expected_hash.copy_from_slice(&actual_hash[..16]);
+    if footer.manifest_hash != expected_hash {
+        return Err(EkbloomError::ChecksumMismatch {
+            section: "manifest",
+        });
+    }
+    let record = format::ManifestRecord::decode(&manifest_payload)?;
+    if record.generation != footer.generation {
+        return Err(bad(format!(
+            "manifest generation {} disagrees with footer {}",
+            record.generation, footer.generation
+        )));
+    }
+
+    Ok(format::ScannedCommit {
+        generation: footer.generation,
+        prev_generation: footer.prev_generation,
+        manifest_offset: footer.manifest_offset,
+        manifest_len: footer.manifest_len,
+        manifest_hash: footer.manifest_hash,
+        start,
+        end: footer_end,
+        sections,
+    })
+}
+
+/// Decode the `MANIFEST` record of a scanned commit.
+fn manifest_record(
+    file: &File,
+    commit: &format::ScannedCommit,
+    total: u64,
+) -> Result<format::ManifestRecord> {
+    let section = commit
+        .sections
+        .iter()
+        .rev()
+        .find(|s| s.kind == SectionKind::Manifest)
+        .ok_or_else(|| bad("commit has no manifest section"))?;
+    let payload = read_vec_at(file, section.payload_offset, section.payload_len, total)?;
+    format::ManifestRecord::decode(&payload)
+}
+
+/// Parse a `BloomShell` header; the construction payload is never loaded.
+fn parse_bloom(
+    file: &File,
+    payload_offset: u64,
+    payload_len: u64,
+    total: u64,
+) -> Result<FileBloom> {
+    if payload_len < SHELL_HEADER_LEN as u64 {
+        return Err(EkbloomError::Truncated {
+            needed: SHELL_HEADER_LEN as u64,
+            available: payload_len,
+        });
+    }
+    let mut shell = [0u8; SHELL_HEADER_LEN];
+    read_exact_at_len(file, &mut shell, payload_offset, total)?;
+    let kind = BloomKind::from_u32(u32::from_le_bytes([shell[0], shell[1], shell[2], shell[3]]))
+        .ok_or_else(|| bad("unknown bloom shell kind"))?;
+    let depth = u16::from_le_bytes([shell[4], shell[5]]);
+    let logical_len = le_u64(&shell, 14);
+    let entries = le_u64(&shell, 22);
+    let status = Certification::from_u32(u32::from_le_bytes([
+        shell[30], shell[31], shell[32], shell[33],
+    ]))
+    .ok_or_else(|| bad("unknown bloom shell status"))?;
+    let mut core_hash = [0u8; 32];
+    core_hash.copy_from_slice(&shell[34..66]);
+    let declared_payload = le_u64(&shell, 66);
+    if declared_payload != payload_len - SHELL_HEADER_LEN as u64 {
+        return Err(bad(
+            "bloom shell payload length does not match available bytes",
+        ));
+    }
+    Ok(FileBloom {
+        kind,
+        depth,
+        logical_len,
+        entries,
+        status,
+        core_hash,
+        payload_offset,
+        payload_len,
+    })
+}
+
+/// Parse a checkpoint-set header and validate every resume point's cursor via
+/// bounded batch reads (never materialising the set).
+fn parse_checkpoint(
+    file: &File,
+    payload_offset: u64,
+    payload_len: u64,
+    total: u64,
+) -> Result<FileCheckpoint> {
+    if payload_len < CHECKPOINT_HEADER_LEN as u64 {
+        return Err(EkbloomError::Truncated {
+            needed: CHECKPOINT_HEADER_LEN as u64,
+            available: payload_len,
+        });
+    }
+    let mut h = [0u8; CHECKPOINT_HEADER_LEN];
+    read_exact_at_len(file, &mut h, payload_offset, total)?;
+    let interval = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
+    if !CheckpointSet::supported_interval(interval) {
+        return Err(EkbloomError::BadInterval { interval });
+    }
+    let count = le_u64(&h, 4);
+    if count == 0 {
+        return Err(bad("checkpoint set count is zero"));
+    }
+    let k = u64::from(interval);
+    (count - 1).checked_mul(k).ok_or(EkbloomError::Overflow {
+        what: "checkpoint span",
+    })?;
+    let need = count
+        .checked_mul(Snapshot::PACKED_LEN as u64)
+        .and_then(|n| n.checked_add(CHECKPOINT_HEADER_LEN as u64))
+        .ok_or(EkbloomError::Overflow {
+            what: "checkpoint byte length",
+        })?;
+    if payload_len < need {
+        return Err(EkbloomError::Truncated {
+            needed: need,
+            available: payload_len,
+        });
+    }
+    validate_checkpoint_entries(file, payload_offset, count, k, total)?;
+    Ok(FileCheckpoint {
+        interval,
+        count,
+        payload_offset,
+    })
+}
+
+/// Validate every resume point's implicit cursor using bounded batch reads.
+fn validate_checkpoint_entries(
+    file: &File,
+    payload_offset: u64,
+    count: u64,
+    k: u64,
+    total: u64,
+) -> Result<()> {
+    let batch = CHECKPOINT_VALIDATE_BATCH as usize;
+    let mut buf = vec![0u8; batch.saturating_mul(Snapshot::PACKED_LEN)];
+    let mut j = 0u64;
+    while j < count {
+        let n = (count - j).min(CHECKPOINT_VALIDATE_BATCH);
+        let bytes = (n as usize) * Snapshot::PACKED_LEN;
+        let off = payload_offset
+            .checked_add(CHECKPOINT_HEADER_LEN as u64)
+            .and_then(|o| o.checked_add(j.checked_mul(Snapshot::PACKED_LEN as u64)?))
+            .ok_or(EkbloomError::Overflow {
+                what: "checkpoint entry",
+            })?;
+        read_exact_at_len(file, &mut buf[..bytes], off, total)?;
+        for e in 0..n {
+            let lo = (e as usize) * Snapshot::PACKED_LEN;
+            let s = Snapshot::unpack(&buf[lo..lo + Snapshot::PACKED_LEN])?;
+            let expected = (j + e).checked_mul(k).ok_or(EkbloomError::Overflow {
+                what: "checkpoint cursor",
+            })?;
+            if s.cursor != expected {
+                return Err(bad(format!(
+                    "checkpoint {} cursor {} does not match implicit position {expected}",
+                    j + e,
+                    s.cursor
+                )));
+            }
+        }
+        j += n;
+    }
+    Ok(())
+}
+
+/// Parse a history header, validating its count and length without loading the
+/// state projection.
+fn parse_history(
+    file: &File,
+    payload_offset: u64,
+    payload_len: u64,
+    total: u64,
+) -> Result<FileHistory> {
+    if payload_len < HISTORY_HEADER_LEN as u64 {
+        return Err(EkbloomError::Truncated {
+            needed: HISTORY_HEADER_LEN as u64,
+            available: payload_len,
+        });
+    }
+    let mut h = [0u8; HISTORY_HEADER_LEN];
+    read_exact_at_len(file, &mut h, payload_offset, total)?;
+    let logical_len = le_u64(&h, 8);
+    let mut core_hash = [0u8; 32];
+    core_hash.copy_from_slice(&h[24..56]);
+    let count = le_u64(&h, 56);
+    let want_count = logical_len.checked_add(1).ok_or(EkbloomError::Overflow {
+        what: "history logical length",
+    })?;
+    if count != want_count {
+        return Err(bad(format!(
+            "history count {count} inconsistent with logical_len {logical_len}"
+        )));
+    }
+    let need = count
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(HISTORY_HEADER_LEN as u64))
+        .ok_or(EkbloomError::Overflow {
+            what: "history byte length",
+        })?;
+    if payload_len < need {
+        return Err(EkbloomError::Truncated {
+            needed: need,
+            available: payload_len,
+        });
+    }
+    Ok(FileHistory {
+        logical_len,
+        core_hash,
+        payload_offset,
+    })
+}
+
+/// Parse a certificate into the fields `inspect` and linkage need.
+fn parse_certificate(
+    file: &File,
+    payload_offset: u64,
+    payload_len: u64,
+    total: u64,
+) -> Result<FileCertificate> {
+    let payload = read_vec_at(file, payload_offset, payload_len, total)?;
+    let cert = Certificate::from_bytes(&payload)?;
+    Ok(FileCertificate {
+        kind: cert.kind,
+        core_hash: cert.core_hash,
+        bytes: payload_len,
+    })
 }
 
 #[cfg(test)]

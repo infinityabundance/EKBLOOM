@@ -15,10 +15,11 @@ use ekbloom::bloom_global::certify_global;
 use ekbloom::bloom_region::certify_regional;
 use ekbloom::manifest;
 use ekbloom::metrics::{now_ns, percentiles};
-use ekbloom::{reader, recovery, verify, writer};
 use ekbloom::{
-    Counterexample, EkbloomError, ManifestationProfile, ManifestationReport, ReadRequest,
+    read_random_1b, read_ranges, read_sequential, Counterexample, EkbloomError,
+    ManifestationProfile, ManifestationReport, ReadRequest,
 };
+use ekbloom::{reader, recovery, verify, writer};
 
 /// Top-level help text.
 const USAGE: &str = "\
@@ -602,7 +603,7 @@ fn hot_range(n: u64, rng: &mut u64) -> Option<(u64, u64)> {
 }
 
 /// Choose the source range for one iteration of `workload`.
-fn plan(workload: Workload, n: u64, rng: &mut u64) -> Option<(u64, u64)> {
+fn plan_op(workload: Workload, n: u64, rng: &mut u64) -> Option<(u64, u64)> {
     match workload {
         Workload::Seq => Some((0, n)),
         Workload::Random1b => random_range(n, 1, rng),
@@ -618,6 +619,163 @@ fn plan(workload: Workload, n: u64, rng: &mut u64) -> Option<(u64, u64)> {
     }
 }
 
+/// Build the fixed access sequence shared by both measurements.
+///
+/// Returns `None` when the empty object cannot serve the workload.
+fn build_plan(workload: Workload, n: u64, iterations: usize) -> Option<Vec<(u64, u64)>> {
+    let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut plan = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        plan.push(plan_op(workload, n, &mut rng)?);
+    }
+    Some(plan)
+}
+
+/// A per-measurement latency/throughput summary.
+struct BenchStats {
+    bytes: u64,
+    p50_ns: f64,
+    p95_ns: f64,
+    p99_ns: f64,
+    min_ns: f64,
+    max_ns: f64,
+    bytes_per_sec: f64,
+}
+
+/// Summarise an unsorted nanosecond sample and the bytes read.
+fn summarize(mut durations: Vec<u64>, bytes: u64) -> BenchStats {
+    let total_ns = durations.iter().fold(0u64, |acc, &d| acc.saturating_add(d));
+    durations.sort_unstable();
+    let stats = percentiles(&durations);
+    let seconds = total_ns as f64 / 1_000_000_000.0;
+    let bytes_per_sec = if seconds > 0.0 {
+        bytes as f64 / seconds
+    } else {
+        0.0
+    };
+    BenchStats {
+        bytes,
+        p50_ns: stats.p50,
+        p95_ns: stats.p95,
+        p99_ns: stats.p99,
+        min_ns: stats.min,
+        max_ns: stats.max,
+        bytes_per_sec,
+    }
+}
+
+/// Serve one planned access through the in-memory fast paths.
+fn fast_op(
+    body: &ekbloom::EkbloomBody,
+    workload: Workload,
+    offset: u64,
+    length: u64,
+    out: &mut Vec<u8>,
+) -> Result<(), EkbloomError> {
+    match workload {
+        Workload::Seq => read_sequential(body, out),
+        Workload::Random1b | Workload::HotSet => read_random_1b(body, &[offset], out),
+        Workload::Random4k | Workload::Range64k => read_ranges(body, &[(offset, length)], out),
+        Workload::Mixed => {
+            if length == 1 {
+                read_random_1b(body, &[offset], out)
+            } else {
+                read_ranges(body, &[(offset, length)], out)
+            }
+        }
+    }
+}
+
+/// Measure the plan against a cached in-memory body via the fast paths.
+fn measure_in_memory(
+    body: &ekbloom::EkbloomBody,
+    workload: Workload,
+    plan: &[(u64, u64)],
+) -> Result<BenchStats, CliError> {
+    let mut durations = Vec::with_capacity(plan.len());
+    let mut out: Vec<u8> = Vec::new();
+    let mut bytes = 0u64;
+    for &(offset, length) in plan {
+        out.clear();
+        let start = now_ns();
+        fast_op(body, workload, offset, length, &mut out)?;
+        durations.push(now_ns().saturating_sub(start));
+        bytes = bytes.saturating_add(out.len() as u64);
+    }
+    Ok(summarize(durations, bytes))
+}
+
+/// Measure the plan end-to-end through `reader::read_file` (re-open + validate).
+fn measure_file_backed(path: &Path, plan: &[(u64, u64)]) -> Result<BenchStats, CliError> {
+    let mut durations = Vec::with_capacity(plan.len());
+    let mut bytes = 0u64;
+    for &(offset, length) in plan {
+        let start = now_ns();
+        let data = reader::read_file(path, ReadRequest { offset, length })?;
+        durations.push(now_ns().saturating_sub(start));
+        bytes = bytes.saturating_add(data.len() as u64);
+    }
+    Ok(summarize(durations, bytes))
+}
+
+fn print_bench_human(
+    workload_name: &str,
+    iterations: usize,
+    in_memory: Option<&BenchStats>,
+    file_backed: Option<&BenchStats>,
+) {
+    println!("workload: {workload_name}");
+    println!("iterations: {iterations}");
+    print_bench_section("in-memory", in_memory);
+    print_bench_section("file-backed", file_backed);
+}
+
+fn print_bench_section(label: &str, stats: Option<&BenchStats>) {
+    match stats {
+        None => println!("{label}: cannot run (the object is empty)"),
+        Some(stats) => {
+            println!("{label}:");
+            println!("  bytes_read: {}", stats.bytes);
+            println!("  p50_us: {:.3}", stats.p50_ns / 1000.0);
+            println!("  p95_us: {:.3}", stats.p95_ns / 1000.0);
+            println!("  p99_us: {:.3}", stats.p99_ns / 1000.0);
+            println!("  min_us: {:.3}", stats.min_ns / 1000.0);
+            println!("  max_us: {:.3}", stats.max_ns / 1000.0);
+            println!("  logical_bytes_per_sec: {:.1}", stats.bytes_per_sec);
+        }
+    }
+}
+
+fn print_bench_json(
+    workload_name: &str,
+    iterations: usize,
+    in_memory: Option<&BenchStats>,
+    file_backed: Option<&BenchStats>,
+) {
+    println!("{{");
+    println!("  \"workload\": \"{}\",", json_escape(workload_name));
+    println!("  \"iterations\": {iterations},");
+    println!("  \"in-memory\": {},", stats_json(in_memory));
+    println!("  \"file-backed\": {}", stats_json(file_backed));
+    println!("}}");
+}
+
+fn stats_json(stats: Option<&BenchStats>) -> String {
+    match stats {
+        None => "null".to_string(),
+        Some(s) => format!(
+            "{{ \"bytes_read\": {}, \"p50_us\": {:.3}, \"p95_us\": {:.3}, \"p99_us\": {:.3}, \"min_us\": {:.3}, \"max_us\": {:.3}, \"logical_bytes_per_sec\": {:.1} }}",
+            s.bytes,
+            s.p50_ns / 1000.0,
+            s.p95_ns / 1000.0,
+            s.p99_ns / 1000.0,
+            s.min_ns / 1000.0,
+            s.max_ns / 1000.0,
+            s.bytes_per_sec
+        ),
+    }
+}
+
 fn cmd_bench(parsed: &Parsed) -> Result<i32, CliError> {
     let path = parsed.positional(0, "file.ekb")?;
     let workload_name = parsed.option("workload").ok_or_else(|| {
@@ -626,53 +784,43 @@ fn cmd_bench(parsed: &Parsed) -> Result<i32, CliError> {
         )
     })?;
     let workload = Workload::parse(workload_name).map_err(CliError::usage)?;
-    let iterations = parsed.parse_u64("iterations")?.unwrap_or(200);
-    if iterations == 0 {
+    let iterations_u64 = parsed.parse_u64("iterations")?.unwrap_or(200);
+    if iterations_u64 == 0 {
         return Err(CliError::usage("--iterations must be at least 1"));
     }
-    let iterations = usize::try_from(iterations)
+    let iterations = usize::try_from(iterations_u64)
         .map_err(|_| CliError::usage("--iterations is too large for this platform"))?;
 
-    let body = reader::open(Path::new(path))?;
+    let path = Path::new(path);
+    let body = reader::open(path)?;
     let n = body.logical_len;
 
-    let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut latencies: Vec<u64> = Vec::with_capacity(iterations);
-    let mut total_bytes: u64 = 0;
-    let mut total_ns: u64 = 0;
-
-    for _ in 0..iterations {
-        let Some((offset, length)) = plan(workload, n, &mut rng) else {
-            println!("workload {workload_name} cannot run: the object is empty");
-            return Ok(0);
-        };
-        let start = now_ns();
-        let bytes = reader::read(&body, ReadRequest { offset, length })?;
-        let elapsed = now_ns().saturating_sub(start);
-        latencies.push(elapsed);
-        total_ns = total_ns.saturating_add(elapsed);
-        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
-    }
-
-    latencies.sort_unstable();
-    let stats = percentiles(&latencies);
-    let seconds = total_ns as f64 / 1_000_000_000.0;
-    let bytes_per_sec = if seconds > 0.0 {
-        total_bytes as f64 / seconds
-    } else {
-        0.0
+    // Both measurements use the exact same access sequence, so the only
+    // difference is the path taken: cached fast paths vs re-open + validate.
+    let (in_memory, file_backed) = match build_plan(workload, n, iterations) {
+        None => (None, None),
+        Some(plan) => {
+            let in_memory = Some(measure_in_memory(&body, workload, &plan)?);
+            let file_backed = Some(measure_file_backed(path, &plan)?);
+            (in_memory, file_backed)
+        }
     };
 
-    println!("workload: {workload_name}");
-    println!("iterations: {iterations}");
-    println!("bytes_read: {total_bytes}");
-    println!("p50_us: {:.3}", stats.p50 / 1000.0);
-    println!("p95_us: {:.3}", stats.p95 / 1000.0);
-    println!("p99_us: {:.3}", stats.p99 / 1000.0);
-    println!("min_us: {:.3}", stats.min / 1000.0);
-    println!("max_us: {:.3}", stats.max / 1000.0);
-    println!("logical_bytes_per_sec: {bytes_per_sec:.1}");
-
+    if parsed.has_flag("json") {
+        print_bench_json(
+            workload_name,
+            iterations,
+            in_memory.as_ref(),
+            file_backed.as_ref(),
+        );
+    } else {
+        print_bench_human(
+            workload_name,
+            iterations,
+            in_memory.as_ref(),
+            file_backed.as_ref(),
+        );
+    }
     Ok(0)
 }
 

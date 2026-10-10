@@ -64,7 +64,7 @@ pub use metrics::{now_ns, percentiles, Percentiles};
 pub use model_search::{
     canonical_state_only_counterexample, sufficiency_sweep, AbstractCounterexample, SufficiencyRow,
 };
-pub use reader::{inspect_file, open, read, read_file};
+pub use reader::{inspect_file, open, read, read_file, FileBody};
 pub use recovery::{
     recover, scan_generations, truncate_to_valid, GenerationRecord, RecoveryReport,
 };

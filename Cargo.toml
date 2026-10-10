@@ -18,7 +18,6 @@ path = "src/main.rs"
 [dependencies]
 blake3 = "1.5"
 crc32fast = "1.4"
-memmap2 = "0.9"
 
 # Async I/O publication backend. Optional; a synchronous fallback is always built.
 io-uring = { version = "0.7", optional = true }

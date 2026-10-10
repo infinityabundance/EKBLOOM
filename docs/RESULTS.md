@@ -47,6 +47,20 @@ Detected CPU features for the sweep (`evidence/bench/cpu.json`): `sse2`, `avx2`,
 - **Bench entry points:** `benches/ekbloom.rs` (Divan) covers `root` vs `path4`
   vs `path8` for sequential, random-1b and 4 KiB ranges; `sh scripts/container-bench.sh`.
 
+### CLI `bench`: in-memory vs file-backed
+
+The `ekbloom bench` command reports two clearly-labelled measurements per
+workload. **`in-memory`** opens the object once (`reader::open`) and measures the
+optimised paths in `src/fastpath.rs` against the cached body, isolating pure read
+speed (sub-microsecond per operation with a certified path bloom — this is the
+same path the sweep below reports). **`file-backed`** measures the identical
+access sequence end-to-end through `reader::read_file`, which re-opens, validates
+and re-parses the `.ekb` on every call; it is therefore dominated by file open +
+validation + section parse rather than by symbol extraction, and is the honest
+cold per-call cost. Both numbers are real measurements of the same object and
+workload; they differ because a cached in-memory body keeps the manifested
+structures resident, whereas each file-backed call rebuilds them from disk.
+
 ---
 
 ## Speed frontier (`evidence/bench/sweep.json`)

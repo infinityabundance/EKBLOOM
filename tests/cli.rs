@@ -171,6 +171,74 @@ fn unknown_profile_is_rejected() {
 }
 
 #[test]
+fn bench_reports_in_memory_and_file_backed() {
+    let dir = temp_dir("bench");
+    let src: Vec<u8> = (0..4096u32)
+        .map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8)
+        .collect();
+    let input = dir.join("in.bin");
+    fs::write(&input, &src).unwrap();
+    let ekb = dir.join("o.ekb");
+    let out = run(&[
+        "create",
+        input.to_str().unwrap(),
+        "-o",
+        ekb.to_str().unwrap(),
+        "--profile",
+        "path",
+        "--depth",
+        "4",
+    ]);
+    assert!(out.status.success(), "create failed: {}", stderr(&out));
+
+    // Human output labels both the in-memory fast path and the file-backed path.
+    let out = run(&[
+        "bench",
+        ekb.to_str().unwrap(),
+        "--workload",
+        "random-1b",
+        "--iterations",
+        "100",
+    ]);
+    assert!(out.status.success(), "bench failed: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("in-memory"), "missing in-memory: {text}");
+    assert!(text.contains("file-backed"), "missing file-backed: {text}");
+    assert!(text.contains("p50_us"), "missing p50_us: {text}");
+
+    // JSON output carries both labelled objects.
+    let out = run(&[
+        "bench",
+        ekb.to_str().unwrap(),
+        "--workload",
+        "seq",
+        "--iterations",
+        "5",
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "bench --json failed: {}",
+        stderr(&out)
+    );
+    let json = stdout(&out);
+    assert!(
+        json.contains("\"in-memory\""),
+        "json missing in-memory: {json}"
+    );
+    assert!(
+        json.contains("\"in-memory\""),
+        "json missing in-memory: {json}"
+    );
+    assert!(
+        json.contains("\"file-backed\""),
+        "json missing file-backed: {json}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn missing_file_is_rejected() {
     let dir = temp_dir("missing");
     let missing = dir.join("nope.ekb");
