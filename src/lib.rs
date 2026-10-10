@@ -20,6 +20,7 @@
 //! The public entry points are [`create`], [`manifest`], [`read`], [`verify`],
 //! [`grow`] and [`inspect`].
 
+pub mod asyncpub;
 pub mod bloom;
 pub mod bloom_context;
 pub mod bloom_global;
@@ -39,8 +40,10 @@ pub mod reader;
 pub mod recovery;
 pub mod state;
 pub mod verify;
+pub mod worker;
 pub mod writer;
 
+pub use asyncpub::{append, detect_backend, publish, Backend};
 pub use bloom::{BloomKind, BloomShell, Certificate, Certification, Outcome};
 pub use bloom_context::ContextBloom;
 pub use bloom_global::{Counterexample, GlobalBloom, GlobalCertification};
@@ -64,6 +67,7 @@ pub use recovery::{
 };
 pub use state::Snapshot;
 pub use verify::{verify, verify_deep, CheckOutcome, VerificationReport};
+pub use worker::{available_parallelism, manifest_background, regional_parallel};
 pub use writer::{append_generation, write_body};
 
 /// Progressively expanded operational-body profiles.
