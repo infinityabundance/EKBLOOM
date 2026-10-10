@@ -1,0 +1,7 @@
+{
+  "key": 175,
+  "pos_a": 2106,
+  "pos_b": 3976,
+  "outcome_a": {"symbols":[211,47,53,193],"next_state":13761},
+  "outcome_b": {"symbols":[63,203,50,238],"next_state":13038}
+}

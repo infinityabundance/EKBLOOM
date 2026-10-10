@@ -1,0 +1,12 @@
+{
+  "kind": "model-search-sweep",
+  "depth": 4,
+  "contexts_cap": 4000000,
+  "rows": [
+    {"depth":4,"context_bytes":0,"keys":64,"conflicts":64,"status":"rejected","table_entries":65536,"physical_bytes":524288,"example":{"key":[0,0],"state":0,"r_a":[0,0,0,0],"r_b":[1,0,0,0],"outcome_a":{"symbols":[0,0,0,0],"next_state":0},"outcome_b":{"symbols":[1,1,10,1],"next_state":2561}}},
+    {"depth":4,"context_bytes":1,"keys":256,"conflicts":256,"status":"rejected","table_entries":16777216,"physical_bytes":134217728,"example":{"key":[0,0,0],"state":0,"r_a":[0,0,0,0],"r_b":[0,1,0,0],"outcome_a":{"symbols":[0,0,0,0],"next_state":0},"outcome_b":{"symbols":[0,1,1,10],"next_state":266}}},
+    {"depth":4,"context_bytes":2,"keys":1024,"conflicts":1024,"status":"rejected","table_entries":4294967296,"physical_bytes":34359738368,"example":{"key":[0,0,0,0],"state":0,"r_a":[0,0,0,0],"r_b":[0,0,1,0],"outcome_a":{"symbols":[0,0,0,0],"next_state":0},"outcome_b":{"symbols":[0,0,1,1],"next_state":257}}},
+    {"depth":4,"context_bytes":3,"keys":4096,"conflicts":4096,"status":"rejected","table_entries":1099511627776,"physical_bytes":8796093022208,"example":{"key":[0,0,0,0,0],"state":0,"r_a":[0,0,0,0],"r_b":[0,0,0,1],"outcome_a":{"symbols":[0,0,0,0],"next_state":0},"outcome_b":{"symbols":[0,0,0,1],"next_state":1}}},
+    {"depth":4,"context_bytes":4,"keys":16384,"conflicts":0,"status":"certified","table_entries":281474976710656,"physical_bytes":2251799813685248,"example":null}
+  ]
+}

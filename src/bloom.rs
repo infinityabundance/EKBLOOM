@@ -448,6 +448,20 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// A `D`-step manifested outcome: the `D` symbols and the successor machine state.
+///
+/// This is `Phi_D(Omega)` minus the cursor: for `OrANS-NL2` the revealed symbols and
+/// the successor state word are a deterministic function of the key projection (the
+/// 16-bit state plus, where required, the next `D` core bytes). The cursor is
+/// implicit (`p + D`) for machine 1 and is therefore not stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Outcome {
+    /// The `D` symbols revealed by the `D`-fold transition.
+    pub symbols: Vec<u8>,
+    /// The successor machine state word `x_D` (`u32` for machine generality).
+    pub next_state: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

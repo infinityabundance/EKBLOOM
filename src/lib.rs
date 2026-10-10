@@ -21,20 +21,30 @@
 //! [`grow`] and [`inspect`].
 
 pub mod bloom;
+pub mod bloom_context;
+pub mod bloom_global;
 pub mod bloom_key;
 pub mod bloom_path;
+pub mod bloom_region;
 pub mod checkpoint;
 pub mod error;
 pub mod history;
 pub mod machine;
+pub mod model_search;
 pub mod state;
 
-pub use bloom::{BloomKind, BloomShell, Certificate, Certification};
+pub use bloom::{BloomKind, BloomShell, Certificate, Certification, Outcome};
+pub use bloom_context::ContextBloom;
+pub use bloom_global::{Counterexample, GlobalBloom, GlobalCertification};
 pub use bloom_path::PathBloom;
+pub use bloom_region::{RegionCertification, RegionDescriptor};
 pub use checkpoint::CheckpointSet;
 pub use error::{EkbloomError, Result};
 pub use history::History;
 pub use machine::{machine_by_id, OrMachine, MACHINE_NL2, NL2};
+pub use model_search::{
+    canonical_state_only_counterexample, sufficiency_sweep, AbstractCounterexample, SufficiencyRow,
+};
 pub use state::Snapshot;
 
 /// Progressively expanded operational-body profiles.
