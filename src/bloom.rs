@@ -307,14 +307,21 @@ impl BloomShell {
         let status =
             Certification::from_u32(r.u32()?).ok_or_else(|| bad("unknown bloom shell status"))?;
         let core_hash = r.arr32()?;
-        let payload_len = r.u64()?;
-        let payload_len = usize::try_from(payload_len).map_err(|_| EkbloomError::Overflow {
+        let payload_len_u64 = r.u64()?;
+        let payload_len = usize::try_from(payload_len_u64).map_err(|_| EkbloomError::Overflow {
             what: "bloom shell payload length",
         })?;
         if r.remaining() < payload_len {
-            let consumed = (bytes.len() - r.remaining()) as u64;
+            // `r.off` is the number of header bytes consumed; adding the
+            // declared payload length must not overflow (untrusted input).
+            let needed =
+                (r.off as u64)
+                    .checked_add(payload_len_u64)
+                    .ok_or(EkbloomError::Overflow {
+                        what: "bloom shell payload length",
+                    })?;
             return Err(EkbloomError::Truncated {
-                needed: consumed + payload_len as u64,
+                needed,
                 available: bytes.len() as u64,
             });
         }
@@ -613,6 +620,81 @@ mod tests {
         assert!(matches!(
             Certificate::from_bytes(&t2),
             Err(EkbloomError::BadSection { .. })
+        ));
+    }
+
+    /// Build a `BloomShell` wire image with a chosen declared payload length and
+    /// trailing bytes; the fixed header fields are otherwise benign.
+    fn shell_with_payload_len(payload_len: u64, trailing: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&BloomKind::Path.to_u32().to_le_bytes());
+        b.extend_from_slice(&4u16.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes()); // generation
+        b.extend_from_slice(&0u64.to_le_bytes()); // logical_len
+        b.extend_from_slice(&0u64.to_le_bytes()); // entries
+        b.extend_from_slice(&Certification::Unverified.to_u32().to_le_bytes());
+        b.extend_from_slice(&[0u8; 32]); // core_hash
+        b.extend_from_slice(&payload_len.to_le_bytes());
+        b.extend_from_slice(trailing);
+        b
+    }
+
+    #[test]
+    fn crafted_lengths_return_errors_not_panics() {
+        // Exact reproducer from the fuzz_bloom campaign (base64
+        // `AQAAAHx8...Li6eAHx8fHw=`): a u64::MAX payload length plus a short
+        // payload. Previously this overflowed `consumed + payload_len`.
+        let mut repro: Vec<u8> = vec![1, 0, 0, 0, 124, 124];
+        repro.extend_from_slice(&[0u8; 60]);
+        repro.extend_from_slice(&[0xFFu8; 33]);
+        repro.extend_from_slice(&[46, 46, 158, 0, 124, 124, 124, 124]);
+        assert_eq!(repro.len(), 107);
+        assert!(matches!(
+            BloomShell::from_bytes(&repro),
+            Err(EkbloomError::Overflow {
+                what: "bloom shell payload length"
+            })
+        ));
+
+        // Header-only image declaring `u64::MAX` payload also overflows cleanly.
+        assert!(matches!(
+            BloomShell::from_bytes(&shell_with_payload_len(u64::MAX, &[])),
+            Err(EkbloomError::Overflow { .. })
+        ));
+
+        // A plausible length longer than the available bytes is truncated
+        // (no overflow): needed = 74 header + 8, available = 78.
+        let short = shell_with_payload_len(8, &[0u8; 4]);
+        assert!(matches!(
+            BloomShell::from_bytes(&short),
+            Err(EkbloomError::Truncated {
+                needed: 82,
+                available: 78
+            })
+        ));
+
+        // A payload length shorter than the trailing bytes is structural.
+        let trailing = shell_with_payload_len(0, &[0u8]);
+        assert!(matches!(
+            BloomShell::from_bytes(&trailing),
+            Err(EkbloomError::BadSection { .. })
+        ));
+    }
+
+    #[test]
+    fn certificate_bogus_string_length_is_overflow_not_panic() {
+        // kind, depth, machine_id, generation, status, then a `u64::MAX` string
+        // length with no string bytes: must be a clean error, never a panic.
+        let mut b = Vec::new();
+        b.extend_from_slice(&BloomKind::Path.to_u32().to_le_bytes());
+        b.extend_from_slice(&4u16.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&Certification::Unverified.to_u32().to_le_bytes());
+        b.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(matches!(
+            Certificate::from_bytes(&b),
+            Err(EkbloomError::Overflow { .. })
         ));
     }
 }
