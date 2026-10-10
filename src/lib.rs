@@ -29,6 +29,7 @@ pub mod bloom_path;
 pub mod bloom_region;
 pub mod checkpoint;
 pub mod error;
+pub mod fastpath;
 pub mod filesystem;
 pub mod format;
 pub mod history;
@@ -39,6 +40,7 @@ pub mod model_search;
 pub mod reader;
 pub mod recovery;
 pub mod state;
+pub mod sweep;
 pub mod verify;
 pub mod worker;
 pub mod writer;
@@ -51,6 +53,7 @@ pub use bloom_path::PathBloom;
 pub use bloom_region::{RegionCertification, RegionDescriptor};
 pub use checkpoint::CheckpointSet;
 pub use error::{EkbloomError, Result};
+pub use fastpath::{cpu_features, read_random_1b, read_ranges, read_sequential, CpuFeatures};
 pub use filesystem::{FileMeta, ObjectPhysical, OrFs, PhysicalReport};
 pub use history::History;
 pub use machine::{machine_by_id, OrMachine, MACHINE_NL2, NL2};
@@ -66,6 +69,9 @@ pub use recovery::{
     recover, scan_generations, truncate_to_valid, GenerationRecord, RecoveryReport,
 };
 pub use state::Snapshot;
+pub use sweep::{
+    manifestation_sweep, sweep_profiles, write_evidence_json, SweepConfig, SweepPoint, SweepReport,
+};
 pub use verify::{verify, verify_deep, CheckOutcome, VerificationReport};
 pub use worker::{available_parallelism, manifest_background, regional_parallel};
 pub use writer::{append_generation, write_body};

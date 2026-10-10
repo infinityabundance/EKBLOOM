@@ -1,0 +1,8 @@
+{
+  "cpu": { "sse2": true, "avx2": true, "avx512f": true },
+  "source_len": 2097152,
+  "source_seed": 16938038198979476557,
+  "iterations": 64,
+  "sweep_seed": 11400714819323198485,
+  "source_blake3": "382f0dab32599d61f12f40faedd9e3a222246fbb0302ccdf01c832747b139965"
+}

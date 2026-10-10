@@ -1,0 +1,123 @@
+{
+  "cpu": { "sse2": true, "avx2": true, "avx512f": true },
+  "source_len": 2097152,
+  "points": [
+    {
+      "profile": "root",
+      "physical_bytes": 2097152,
+      "visible_bytes": 2097152,
+      "expansion_ratio": 1,
+      "build_ns": 1716944,
+      "seq_bytes_per_s": 601919365.0828047,
+      "random_1b_ns_p50": 1570139,
+      "random_1b_ns_p99": 3310007,
+      "random_4k_ns_p50": 1690134,
+      "range_64k_bytes_per_s": 35907447.00204394,
+      "samples": 256
+    },
+    {
+      "profile": "sparse(K=1024)",
+      "physical_bytes": 2121740,
+      "visible_bytes": 2097152,
+      "expansion_ratio": 1.0117244720458984,
+      "build_ns": 4820355,
+      "seq_bytes_per_s": 604748274.3836316,
+      "random_1b_ns_p50": 882,
+      "random_1b_ns_p99": 1793,
+      "random_4k_ns_p50": 7354,
+      "range_64k_bytes_per_s": 605233956.3299218,
+      "samples": 256
+    },
+    {
+      "profile": "sparse(K=64)",
+      "physical_bytes": 2490380,
+      "visible_bytes": 2097152,
+      "expansion_ratio": 1.1875057220458984,
+      "build_ns": 4828950,
+      "seq_bytes_per_s": 604601330.0490429,
+      "random_1b_ns_p50": 211,
+      "random_1b_ns_p99": 400,
+      "random_4k_ns_p50": 6913,
+      "range_64k_bytes_per_s": 610200580.5359832,
+      "samples": 256
+    },
+    {
+      "profile": "full",
+      "physical_bytes": 10485764,
+      "visible_bytes": 2097152,
+      "expansion_ratio": 5.000001907348633,
+      "build_ns": 5686185,
+      "seq_bytes_per_s": 732696190.2046436,
+      "random_1b_ns_p50": 50,
+      "random_1b_ns_p99": 120,
+      "random_4k_ns_p50": 6352,
+      "range_64k_bytes_per_s": 647390121.8267797,
+      "samples": 256
+    },
+    {
+      "profile": "bloom(D=4)",
+      "physical_bytes": 2629852,
+      "visible_bytes": 2097152,
+      "expansion_ratio": 1.2540111541748047,
+      "build_ns": 10630672,
+      "seq_bytes_per_s": 605093159.2122672,
+      "random_1b_ns_p50": 1569869,
+      "random_1b_ns_p99": 3315387,
+      "random_4k_ns_p50": 1691075,
+      "range_64k_bytes_per_s": 35899254.102831565,
+      "samples": 256
+    },
+    {
+      "profile": "regional(D=4,R=4096)",
+      "physical_bytes": 22546752,
+      "visible_bytes": 2097152,
+      "expansion_ratio": 10.751129150390625,
+      "build_ns": 257852025,
+      "seq_bytes_per_s": 603538699.658132,
+      "random_1b_ns_p50": 1568737,
+      "random_1b_ns_p99": 3319074,
+      "random_4k_ns_p50": 1690004,
+      "range_64k_bytes_per_s": 35904793.689007685,
+      "samples": 256
+    },
+    {
+      "profile": "path(D=4)",
+      "physical_bytes": 6291691,
+      "visible_bytes": 2097152,
+      "expansion_ratio": 3.0001120567321777,
+      "build_ns": 9469237,
+      "seq_bytes_per_s": 66764891280.124794,
+      "random_1b_ns_p50": 30,
+      "random_1b_ns_p99": 41,
+      "random_4k_ns_p50": 70,
+      "range_64k_bytes_per_s": 34774314969.11661,
+      "samples": 256
+    },
+    {
+      "profile": "path(D=8)",
+      "physical_bytes": 5243115,
+      "visible_bytes": 2097152,
+      "expansion_ratio": 2.5001120567321777,
+      "build_ns": 8917744,
+      "seq_bytes_per_s": 66588342923.368034,
+      "random_1b_ns_p50": 30,
+      "random_1b_ns_p99": 40,
+      "random_4k_ns_p50": 70,
+      "range_64k_bytes_per_s": 35907370151.27259,
+      "samples": 256
+    },
+    {
+      "profile": "max-speed",
+      "physical_bytes": 14704891,
+      "visible_bytes": 2097152,
+      "expansion_ratio": 7.011838436126709,
+      "build_ns": 16290577,
+      "seq_bytes_per_s": 69757485985.37885,
+      "random_1b_ns_p50": 30,
+      "random_1b_ns_p99": 41,
+      "random_4k_ns_p50": 70,
+      "range_64k_bytes_per_s": 40324417866.82562,
+      "samples": 256
+    }
+  ]
+}
