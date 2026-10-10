@@ -132,7 +132,7 @@ alternative**, not a fabricated success:
 
 ```sh
 sh scripts/container-reproduce.sh    # clean build + full release test suite
-sh scripts/run-sweep.sh              # rewrite evidence/bench/{sweep,cpu}.json
+sh scripts/run-sweep.sh              # rewrite evidence/bench/{sweep,sweep-large,cpu}.json
 sh scripts/container-bench.sh        # Divan microbenchmarks (benches/ekbloom.rs)
 sh scripts/capture-environment.sh    # refresh evidence/environment.txt
 ```
@@ -141,3 +141,82 @@ The correctness of every measured path is enforced by
 `tests/fastpath.rs::fast_paths_are_byte_exact_for_every_profile` and
 `tests/sweep.rs`-adjacent module tests: optimised reads are byte-for-byte
 identical to the authoritative reader across the whole frontier.
+
+---
+
+## Curves and budget frontier (`evidence/bench/sweep-large.json`)
+
+The extended sweep (`sweep::large_sweep`, in `examples/sweep.rs`) runs on a
+deterministic **4 MiB** LCG corpus (`source_len = 4,194,304`, seed
+`0xEB10_0000_DEAD_BEEF`, BLAKE3
+`03dd6dac13582d76329849ae5456aa50b1d9a7d44a016b79feaae13b8368eebf`) with
+`sweep_seed = 0x9E37_79B9_7F4A_7C15` and `iterations = 32`, plus a
+**64 KiB** cache-resident corpus. CPU features: `sse2`, `avx2`, `avx512f` all
+true. All numbers below are read from `sweep-large.json`.
+
+**Selection rule.** For each target `M/N` ratio the harness *builds and measures*
+every candidate profile (`root`, all sparse intervals, `full`, `bloom(4)`,
+`regional(4,4096)`, every path depth, `max-speed`) and picks the fastest one whose
+`physical_bytes` fits `max(visible * ratio, 4096)`. “Fastest” is an octave-space
+score (`log2(seq) + log2(64k) − log2(1b p50) − log2(4k p50)`); speeds within a
+factor of two are treated as a **tie**, broken by the smaller physical footprint
+(and then the label). That tolerance makes the choice robust to benchmark noise
+and reproducible for a fixed seed.
+
+### Budget frontier (4 MiB)
+
+| target `M/N` | chosen profile | physical bytes | achieved `E_V` | seq MB/s | 1b p50 ns | 4k p50 ns |
+|---:|---|---:|---:|---:|---:|---:|
+| 0.5 | *(none fits)* | — | — | — | — | — |
+| 1 | `root` | 4,194,304 | 1.000 | 589.8 | 3,402,934 | 2,837,066 |
+| 2 | `sparse(K=256)` | 4,390,924 | 1.047 | 605.5 | 350 | 7,083 |
+| 4 | `path(D=32)` | 8,913,131 | 2.125 | 81,049 | 30 | 70 |
+| 8 | `path(D=32)` | 8,913,131 | 2.125 | 81,049 | 30 | 70 |
+| 16 | `path(D=32)` | 8,913,131 | 2.125 | 81,049 | 30 | 70 |
+| 32 | `path(D=32)` | 8,913,131 | 2.125 | 81,049 | 30 | 70 |
+| 64 | `path(D=32)` | 8,913,131 | 2.125 | 81,049 | 30 | 70 |
+
+### What the curves show
+
+- **The decisive step is the exact path bloom, not its size.** At `M/N = 4` the
+  frontier jumps from ~0.6 GB/s replay to **81 GB/s** (`path(D=32)`, 30 ns p50)
+  for 2.125× physical. Every budget from 4 to 64 selects the *same* point: the
+  path family all read the same `N`-byte `hot` array and land at 30 ns, so the
+  smallest-depth member (`D = 32`) wins the tie. **More manifestation stops
+  helping** past 2.125×; `full` (5×), `regional` (7–12×) and `max-speed` (7×)
+  add bytes for no gain in sequential or 1-byte/4 KiB latency.
+- **Cheapest positional win:** `sparse(K=256)` at 1.047× cuts 1-byte p50 from
+  3.4 ms (`root`) to 350 ns. At `M/N = 2`, `sparse(K=16)` (1.75×) is also eligible
+  and its median latency is ~2× lower, but the two are within the selection
+  tolerance, so the smaller footprint (`K=256`) is reported. This is the rule’s
+  behaviour, not a measurement error.
+- **Region-size curve** (`regional(D=4,R)`): every region is **rejected** on this
+  pseudorandom core, so reads fall back to replay (~3.3 ms p50). Smaller regions
+  cost *more*: `R = 256 → 11.9×`, `R = 65536 → 7.3×`, with the same (bad) speed.
+  Regional is strictly dominated here.
+- **Depth curve** (`path(D)`): physical falls monotonically with depth
+  (`D = 1 → 6.00×`, `D = 4 → 3.00×`, `D = 8 → 2.50×`, `D = 16 → 2.25×`,
+  `D = 32 → 2.125×`) while 1-byte p50 stays at 30 ns throughout. Deeper is
+  cheaper at identical speed — the opposite of “more manifestation must cost
+  more”. The 64 KiB-range column is noisy (43–72 GB/s) across depths.
+- **Checkpoint-interval curve** (`sparse(K)`): 1-byte p50 falls sharply then
+  plateaus — `K=65536 → 55,964 ns`, `K=4096 → 3,206`, `K=1024 → 1,302`,
+  `K=256 → 421`, `K=64 → 241`, `K=16 → 171`, `K=4 → 280`, `K=1 → 160`.
+  Below `K ≈ 64` the gain is within noise while the footprint keeps climbing
+  (`K=4 = 4.00×`, `K=1 = 13.00×`): a clear plateau.
+- **Cold start** (open + first 4 KiB read, one sample, ns): `root` 3,615,531;
+  `sparse(K=1024)` 10,444,018; `sparse(K=64)` 10,499,282; `full` 10,800,254;
+  `path(D=4)` 21,029,051; `path(D=32)` 18,602,901; `max-speed` 35,059,796.
+  Cold start is dominated by **building** the manifestation, not by the first
+  read; `max-speed` pays the most to open.
+- **Cache-resident throughput:** a 64 KiB corpus encoded with `path(D=32)` reads
+  sequentially at **122 GB/s** (122,268,656,716 B/s), versus ~49–81 GB/s for the
+  4 MiB object — the small object lives in private caches, the large one is
+  bound by memory bandwidth. This is the same path-bloom read; only the working
+  set differs.
+
+**Noise honesty.** The path-depth and 64 KiB-range columns vary run-to-run by up
+to ~1.6× on this host (e.g. `path(D=32)` measured 81 GB/s in the frontier pass
+and 49 GB/s in the depth-curve pass; all at 30 ns p50). The frontier is therefore
+built on 2× tolerance buckets, and the reported wins are the steps that survive
+that tolerance — not the last noisy percent.

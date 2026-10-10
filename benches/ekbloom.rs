@@ -4,7 +4,9 @@
 //!
 //! - `read_sequential`: `root` vs `path4` vs `path8`,
 //! - `read_random_1b`: `root` vs `full` vs `path4`,
-//! - `read_ranges` (4 KiB ranges): `root` vs `full` vs `path4`.
+//! - `read_ranges` (4 KiB ranges): `root` vs `full` vs `path4`,
+//! - `simd_gather_scalar` vs `simd_gather_avx2`: the §23 random single-byte
+//!   gather experiment (100k offsets over the 1 MiB `hot` array).
 //!
 //! Inputs are ~1 MiB and are built once (cached in `OnceLock`s) so the
 //! measured work is the read itself, not manifestation. Run with
@@ -15,6 +17,7 @@
 //! exact path bloom (`path4`/`path8`) under the same workload.
 
 use divan::black_box;
+use ekbloom::simd::{gather_bytes, gather_bytes_scalar};
 use ekbloom::{
     create, read_random_1b, read_ranges, read_sequential, EkbloomBody, ManifestationProfile,
 };
@@ -205,6 +208,38 @@ fn ranges_4k_path4(bencher: divan::Bencher) {
     bencher.bench_local(|| {
         out.clear();
         read_ranges(body, black_box(&ranges), &mut out).unwrap();
+        black_box(out.len())
+    });
+}
+
+// --- SIMD gather experiment: scalar vs AVX2 (§23) -------------------------------
+//
+// Directive §23 requires an honest test of whether wider SIMD actually wins. This
+// compares the scalar gather against `simd::gather_bytes` (AVX2 when the CPU
+// reports it, scalar otherwise) over the ~1 MiB `hot` array with 100k random
+// single-byte offsets. On a machine without AVX2 both benches run the same scalar
+// code and should match, which is itself a useful control.
+
+#[divan::bench]
+fn simd_gather_scalar(bencher: divan::Bencher) {
+    let hot = source();
+    let offs = offsets(100_000);
+    let mut out = Vec::with_capacity(offs.len());
+    bencher.bench_local(|| {
+        out.clear();
+        gather_bytes_scalar(hot, black_box(&offs), &mut out).unwrap();
+        black_box(out.len())
+    });
+}
+
+#[divan::bench]
+fn simd_gather_avx2(bencher: divan::Bencher) {
+    let hot = source();
+    let offs = offsets(100_000);
+    let mut out = Vec::with_capacity(offs.len());
+    bencher.bench_local(|| {
+        out.clear();
+        gather_bytes(hot, black_box(&offs), &mut out).unwrap();
         black_box(out.len())
     });
 }

@@ -26,12 +26,12 @@ const USAGE: &str = "\
 ekbloom — concealed-expansion codec CLI
 
 usage:
-  ekbloom create   <input> -o <out.ekb> [--profile <p>] [--depth D] [--interval K] [--region-bytes R]
-  ekbloom manifest <file.ekb> --profile <p> [--depth D] [--interval K] [--region-bytes R]
-  ekbloom grow     <file.ekb> --profile <p> [--depth D] [--interval K] [--region-bytes R]
-  ekbloom read     <file.ekb> --offset O --length L [-o <out.bin>]
-  ekbloom inspect  <file.ekb> [--json]
-  ekbloom verify   <file.ekb> [--deep]
+  ekbloom create   <input> -o <out.ekb> [--profile <p>] [--depth D] [--interval K] [--region-bytes R] [--key-hex H | --key-file F]
+  ekbloom manifest <file.ekb> --profile <p> [--depth D] [--interval K] [--region-bytes R] [--key-hex H | --key-file F]
+  ekbloom grow     <file.ekb> --profile <p> [--depth D] [--interval K] [--region-bytes R] [--key-hex H | --key-file F]
+  ekbloom read     <file.ekb> --offset O --length L [-o <out.bin>] [--key-hex H | --key-file F]
+  ekbloom inspect  <file.ekb> [--json] [--key-hex H | --key-file F]
+  ekbloom verify   <file.ekb> [--deep] [--key-hex H | --key-file F]
   ekbloom certify  <file.ekb> [--bloom universal|contextual|regional] [--depth D] [--region-bytes R]
   ekbloom recover  <file.ekb>
   ekbloom bench    <file.ekb> --workload <seq|random-1b|random-4k|range-64k|mixed|hot-set> [--iterations N]
@@ -40,6 +40,13 @@ profiles:
   root, sparse, dense, full, bloom4, bloom8, bloom16, bloom32, regional, path, max-speed
   (sparse/dense use --interval, default 1024; regional uses --depth/--region-bytes,
    default 4/4096; path uses --depth, default 4)
+
+keys:
+  --key-hex H  64 hex characters (32 raw bytes) of the authentication key
+  --key-file F a file holding the 32 raw key bytes, or 64 hex characters
+  When a key is given, create/manifest/grow write an authenticated object (keyed
+  BLAKE3 MAC) and read/inspect/verify require and check it. The key is never
+  printed. Without a key the default unkeyed behaviour is unchanged.
 
 notes:
   certify runs the requested certifications over the object's core and writes
@@ -151,6 +158,70 @@ impl Parsed {
     fn require_u64(&self, name: &str) -> Result<u64, CliError> {
         self.parse_u64(name)?
             .ok_or_else(|| CliError::usage(format!("missing required --{name}")))
+    }
+}
+
+/// Resolve the optional authentication key from `--key-hex`/`--key-file`.
+///
+/// Returns `None` when neither is supplied. The key value is never echoed in an
+/// error or log message.
+fn resolve_key(parsed: &Parsed) -> Result<Option<[u8; 32]>, CliError> {
+    let hex = parsed.option("key-hex");
+    let file = parsed.option("key-file");
+    if hex.is_some() && file.is_some() {
+        return Err(CliError::usage(
+            "--key-hex and --key-file are mutually exclusive",
+        ));
+    }
+    if let Some(h) = hex {
+        return parse_key_hex(h).map(Some);
+    }
+    if let Some(f) = file {
+        let bytes = fs::read(f)?;
+        if bytes.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            return Ok(Some(key));
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        return parse_key_hex(text.trim()).map(Some);
+    }
+    Ok(None)
+}
+
+/// Parse exactly 64 hex characters (optionally `0x`-prefixed) into a 32-byte key.
+fn parse_key_hex(s: &str) -> Result<[u8; 32], CliError> {
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    if s.len() != 64 {
+        return Err(CliError::usage(
+            "key must be exactly 64 hexadecimal characters (32 bytes)",
+        ));
+    }
+    let raw = s.as_bytes();
+    let mut key = [0u8; 32];
+    for (i, byte) in key.iter_mut().enumerate() {
+        match (hex_val(raw[2 * i]), hex_val(raw[2 * i + 1])) {
+            (Some(hi), Some(lo)) => *byte = (hi << 4) | lo,
+            _ => {
+                return Err(CliError::usage(
+                    "key must contain only hexadecimal characters",
+                ))
+            }
+        }
+    }
+    Ok(key)
+}
+
+/// Map one ASCII hex digit to its value.
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -289,13 +360,20 @@ fn cmd_create(parsed: &Parsed) -> Result<i32, CliError> {
         .option("o")
         .ok_or_else(|| CliError::usage("create requires -o <out.ekb>"))?;
     let profile = resolve_profile(parsed, false)?;
+    let key = resolve_key(parsed)?;
 
     let source = fs::read(input)?;
     let body = manifest::create(&source, profile)?;
-    writer::write_body(Path::new(out), &body)?;
+    match &key {
+        Some(key) => writer::write_body_authenticated(Path::new(out), &body, key)?,
+        None => writer::write_body(Path::new(out), &body)?,
+    }
 
     println!("created {out}");
     println!("profile: {}", profile.label());
+    if key.is_some() {
+        println!("auth: keyed-blake3");
+    }
     println!("visible_bytes: {}", body.visible_bytes());
     println!("physical_bytes: {}", body.physical_bytes());
     Ok(0)
@@ -304,15 +382,22 @@ fn cmd_create(parsed: &Parsed) -> Result<i32, CliError> {
 fn cmd_manifest(parsed: &Parsed, grow: bool) -> Result<i32, CliError> {
     let path = parsed.positional(0, "file.ekb")?;
     let profile = resolve_profile(parsed, true)?;
+    let key = resolve_key(parsed)?;
     let path = Path::new(path);
 
-    let mut body = reader::open(path)?;
+    let mut body = match &key {
+        Some(key) => reader::open_authenticated(path, key)?,
+        None => reader::open(path)?,
+    };
     if grow {
         manifest::grow(&mut body, profile)?;
     } else {
         manifest::manifest(&mut body, profile)?;
     }
-    let generation = writer::append_generation(path, &body)?;
+    let generation = match &key {
+        Some(key) => writer::append_generation_authenticated(path, &body, key)?,
+        None => writer::append_generation(path, &body)?,
+    };
 
     println!("generation: {generation}");
     println!("profile: {}", profile.label());
@@ -324,8 +409,16 @@ fn cmd_read(parsed: &Parsed) -> Result<i32, CliError> {
     let path = parsed.positional(0, "file.ekb")?;
     let offset = parsed.require_u64("offset")?;
     let length = parsed.require_u64("length")?;
+    let key = resolve_key(parsed)?;
 
-    let bytes = reader::read_file(Path::new(path), ReadRequest { offset, length })?;
+    let req = ReadRequest { offset, length };
+    let bytes = match &key {
+        Some(key) => {
+            let body = reader::open_authenticated(Path::new(path), key)?;
+            ekbloom::read(&body, req)?
+        }
+        None => reader::read_file(Path::new(path), req)?,
+    };
     match parsed.option("o") {
         Some(out) => {
             fs::write(out, &bytes)?;
@@ -343,7 +436,11 @@ fn cmd_read(parsed: &Parsed) -> Result<i32, CliError> {
 
 fn cmd_inspect(parsed: &Parsed) -> Result<i32, CliError> {
     let path = parsed.positional(0, "file.ekb")?;
-    let report = reader::inspect_file(Path::new(path))?;
+    let key = resolve_key(parsed)?;
+    let report = match &key {
+        Some(key) => manifest::inspect(&reader::open_authenticated(Path::new(path), key)?),
+        None => reader::inspect_file(Path::new(path))?,
+    };
     if parsed.has_flag("json") {
         print_inspect_json(&report);
     } else {
@@ -411,7 +508,11 @@ fn print_inspect_json(report: &ManifestationReport) {
 
 fn cmd_verify(parsed: &Parsed) -> Result<i32, CliError> {
     let path = parsed.positional(0, "file.ekb")?;
-    let body = reader::open(Path::new(path))?;
+    let key = resolve_key(parsed)?;
+    let body = match &key {
+        Some(key) => reader::open_authenticated(Path::new(path), key)?,
+        None => reader::open(Path::new(path))?,
+    };
     let report = if parsed.has_flag("deep") {
         verify::verify_deep(&body)?
     } else {

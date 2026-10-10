@@ -89,6 +89,9 @@ pub enum SectionKind {
     Certificate,
     /// The self-describing manifest record that closes a commit.
     Manifest,
+    /// Optional authentication tag (a 32-byte keyed BLAKE3 MAC) written
+    /// immediately before the commit footer. See `docs/SECURITY.md`.
+    Auth,
 }
 
 impl SectionKind {
@@ -104,6 +107,7 @@ impl SectionKind {
             SectionKind::BloomPath => 7,
             SectionKind::Certificate => 8,
             SectionKind::Manifest => 9,
+            SectionKind::Auth => 10,
         }
     }
 
@@ -119,6 +123,7 @@ impl SectionKind {
             7 => SectionKind::BloomPath,
             8 => SectionKind::Certificate,
             9 => SectionKind::Manifest,
+            10 => SectionKind::Auth,
             _ => return None,
         })
     }
@@ -135,8 +140,25 @@ impl SectionKind {
             SectionKind::BloomPath => "bloom-path",
             SectionKind::Certificate => "certificate",
             SectionKind::Manifest => "manifest",
+            SectionKind::Auth => "auth",
         }
     }
+}
+
+/// Payload length of an [`SectionKind::Auth`] section: a 32-byte keyed MAC.
+pub const AUTH_MAC_LEN: usize = 32;
+
+/// The AUTH tag over `covered`: `blake3::keyed_hash(key, blake3(covered))`.
+///
+/// The inner (unkeyed) hash is over the exact covered byte range; the outer
+/// keyed hash binds it to the secret `key`.
+pub fn auth_mac(key: &[u8; 32], covered: &[u8]) -> [u8; AUTH_MAC_LEN] {
+    auth_mac_from_hash(key, blake3::hash(covered).as_bytes())
+}
+
+/// The AUTH tag given the already-computed BLAKE3 hash of the covered range.
+pub fn auth_mac_from_hash(key: &[u8; 32], covered_hash: &[u8; 32]) -> [u8; AUTH_MAC_LEN] {
+    *blake3::keyed_hash(key, covered_hash).as_bytes()
 }
 
 /// The fixed 64-byte genesis header at offset 0.
@@ -808,6 +830,13 @@ fn parse_commit(bytes: &[u8], start: u64, expected_prev: u64) -> Result<ScannedC
         });
         cur = align8(payload_end);
         if header.kind == SectionKind::Manifest {
+            // An AUTH section, when present, is written after the manifest and
+            // immediately before the footer. Consume it if it is well-formed;
+            // otherwise the footer parser rejects the (now mis-anchored) tail.
+            if let Some((auth, next)) = scan_auth_opt(bytes, cur, total) {
+                sections.push(auth);
+                cur = next;
+            }
             footer_start = cur;
             break;
         }
@@ -826,13 +855,20 @@ fn parse_commit(bytes: &[u8], start: u64, expected_prev: u64) -> Result<ScannedC
     }
     let footer = CommitFooter::decode(&bytes[footer_start as usize..footer_end as usize])?;
 
-    let manifest = sections
-        .last()
-        .copied()
-        .ok_or_else(|| bad("empty commit"))?;
-    if manifest.kind != SectionKind::Manifest {
-        return Err(bad("commit does not end with a manifest section"));
+    let manifest_idx = sections
+        .iter()
+        .rposition(|s| s.kind == SectionKind::Manifest)
+        .ok_or_else(|| bad("commit has no manifest section"))?;
+    // Only the optional trailing AUTH section may follow the manifest.
+    if sections[manifest_idx + 1..]
+        .iter()
+        .any(|s| s.kind != SectionKind::Auth)
+    {
+        return Err(bad(
+            "commit does not end with its manifest (and optional AUTH)",
+        ));
     }
+    let manifest = sections[manifest_idx];
     if footer.manifest_offset != manifest.header_offset
         || footer.manifest_len != manifest.payload_len
     {
@@ -878,6 +914,41 @@ fn parse_commit(bytes: &[u8], start: u64, expected_prev: u64) -> Result<ScannedC
         end: footer_end,
         sections,
     })
+}
+
+/// If a well-formed [`SectionKind::Auth`] section begins at absolute `offset`,
+/// return its descriptor and the aligned offset just past it; otherwise `None`.
+///
+/// Never errors: a malformed candidate is left for the footer parser, which
+/// fails closed (the commit is rejected as a torn/corrupt tail).
+fn scan_auth_opt(bytes: &[u8], offset: u64, total: u64) -> Option<(ScannedSection, u64)> {
+    let header_end = offset.checked_add(SECTION_HEADER_LEN as u64)?;
+    if header_end > total {
+        return None;
+    }
+    let header = SectionHeader::decode(bytes.get(offset as usize..header_end as usize)?).ok()?;
+    if header.kind != SectionKind::Auth
+        || header.offset != header_end
+        || header.length != AUTH_MAC_LEN as u64
+    {
+        return None;
+    }
+    let payload_end = header_end.checked_add(header.length)?;
+    if payload_end > total {
+        return None;
+    }
+    let payload = bytes.get(header_end as usize..payload_end as usize)?;
+    if crc32fast::hash(payload) != header.checksum {
+        return None;
+    }
+    let section = ScannedSection {
+        kind: SectionKind::Auth,
+        generation: header.generation,
+        header_offset: offset,
+        payload_offset: header_end,
+        payload_len: header.length,
+    };
+    Some((section, align8(payload_end)))
 }
 
 /// Decode the `MANIFEST` record of a scanned commit.
@@ -927,12 +998,12 @@ mod tests {
 
     #[test]
     fn section_kind_codes_roundtrip() {
-        for code in 1..=9u32 {
+        for code in 1..=10u32 {
             let kind = SectionKind::from_u32(code).unwrap();
             assert_eq!(kind.to_u32(), code);
         }
         assert!(SectionKind::from_u32(0).is_none());
-        assert!(SectionKind::from_u32(10).is_none());
+        assert!(SectionKind::from_u32(11).is_none());
         assert!(SectionKind::from_u32(u32::MAX).is_none());
     }
 

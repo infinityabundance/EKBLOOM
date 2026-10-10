@@ -1,20 +1,24 @@
 # EKBLOOM — Performance / Format Review (locality & SIMD investigation)
 
 Reviewer: "Performance/Format engineer" subagent.
-Date: 2026-10-10.
+Date: 2026-10-10 (rev 1); **revision 2: 2026-10-11 adds an executed Divan AVX2-gather
+experiment.**
 Repo: `<repo-root>` (single crate `ekbloom`).
 Scope: directive §23 — investigate locality/SIMD on the certified path-bloom hot
 path, and record the findings honestly. Related deliverable: the fully-safe,
 file-backed, streaming [`FileBody`] reads (directive §14/§23) — bounded `pread`
-windows, **no memory mapping and no `unsafe` anywhere in the crate**.
+windows, **no memory mapping and no `unsafe` anywhere in the crate** (now: no
+`unsafe` outside the single, feature-detected block in `src/simd.rs`, added in
+revision 2 and described in §6).
 
 All project tooling ran **only** inside the pinned container
 (`sh scripts/container-verify.sh`, `sh scripts/container-test.sh`). No `cargo`
-invocation was made on the host. The Divan harness in `benches/ekbloom.rs` is not
-run by the verification gate, so **no new benchmark was executed for this
-review**; every performance number below is taken from the committed
-`evidence/bench/sweep.json` (source length `2,097,152` bytes = 2 MiB, captured on
-this machine class).
+invocation was made on the host. Revision 1's performance numbers are taken from
+the committed `evidence/bench/sweep.json` (source length `2,097,152` bytes = 2 MiB,
+captured on this machine class). **Revision 2 additionally executed the Divan
+harness** through `sh scripts/container-bench.sh --bench ekbloom -- simd`; its
+numbers are reported in §6. This directly supersedes rev 1's claim that no SIMD
+benchmark could be run.
 
 ---
 
@@ -132,34 +136,69 @@ the observed near-bandwidth throughput.
   `read_via_machine`) are inherently branchy/state-dependent and not vectorisable;
   they are left as scalar loops with bounded work (only their core window is read).
 
-## 6. SIMD verdict (honest)
+## 6. SIMD verdict (measured, honest)
 
-**No SIMD win was measured, and none is claimed.** Rationale:
+The contiguous sequential/range path (§2) is already lowered to `memcpy`, which
+dispatches to the libc/compiler-rt AVX2/AVX-512 kernels; it is memory-bandwidth-
+bound, so there is no headroom for manual vectorisation there. The one hot-path
+shape where SIMD could plausibly differ is the **random single-byte** read: many
+independent, data-dependent indexed loads, which scalar code issues as independent
+loads the out-of-order engine overlaps. That is exactly what an AVX2 gather
+(`vpgatherdd`) exists for, so it was implemented and **measured**.
 
-* the hot path is a length-known contiguous copy that LLVM already lowers to
-  `memcpy`, which uses the best available vector kernel (AVX2/AVX-512 here);
-* the copy is memory-bandwidth-bound, so wider registers cannot increase
-  throughput beyond the memory system;
-* hand-written AVX2/AVX-512 intrinsics would require `unsafe`, and this crate
-  contains **zero** `unsafe` (`grep -rn unsafe src/` is empty); adding it would
-  also bring codegen/perf-portability risk for no expected gain.
+Implementation (`src/simd.rs`, new module):
 
-Adding a Divan micro-benchmark that compares `extend_from_slice` against a manual
-AVX2/AVX-512 copy, and reporting real numbers, would be the only way to make a
-SIMD claim. That was not done here, because the available tooling
-(`container-verify.sh` / `container-test.sh`) does not run the Divan harness, and
-the directive requires measured numbers before any claim is made. The existing
-`benches/ekbloom.rs` remains the place such a comparison would live.
+* `gather_bytes_scalar` — checked indexed loads; the baseline.
+* `gather_bytes` — AVX2 `_mm256_i32gather_epi32` when
+  `is_x86_feature_detected!("avx2")` and `hot.len() <= i32::MAX`, else scalar.
+* The AVX2 path validates **every** offset before gathering, and only gathers an
+  eight-offset group when every index leaves four readable bytes
+  (`index + 4 <= hot.len()`), keeping each 4-byte gather inside the `hot`
+  allocation (the page-boundary reasoning). Boundary groups, the scalar tail, and
+  arrays shorter than four bytes use the scalar loop.
+* The required `unsafe` is **one** function with one block and a `// SAFETY:`
+  justification; `gather_bytes` is byte-for-byte equal to `gather_bytes_scalar`
+  (enforced by `tests/simd.rs`).
+
+Measurement — `sh scripts/container-bench.sh --bench ekbloom -- simd`, 1 MiB `hot`
+array, 100,000 random in-range offsets, 100 samples (two runs):
+
+| bench | median, packed compaction | median, first cut (per-lane push) |
+|---|---:|---:|
+| `simd_gather_scalar` | **156.5–157.3 µs** | 158.4 µs |
+| `simd_gather_avx2` | 167.3–168.8 µs | 190.2 µs |
+
+AVX2 gather is **~7% slower** than the scalar loop (≈150 ns per 100k offsets). The
+first cut was ~20% slower; replacing its per-lane scalar extraction with an
+in-register `packus` compaction (`_mm256_packus_epi32` → `_mm256_packus_epi16` →
+`_mm_unpacklo_epi32` → one 8-byte store) recovered most of the gap but did **not**
+overturn the result. The CPU reports `avx2: true` (§1), so the loss is not an
+artifact of missing ISA.
+
+**Verdict: SIMD DOES NOT WIN.** `vpgatherdd` is microcoded on this class of CPU
+and, for random single-byte reads, is slower than the out-of-order engine issuing
+eight independent scalar loads. Per directive §23 the scalar loop remains the
+default: `fastpath::read_random_1b` was wired to `simd::gather_bytes` during the
+experiment and then **reverted**, so the certified hot path is unchanged.
+`simd::gather_bytes` stays exported for callers who choose to opt in.
+
+**AVX-512 was not attempted.** `_mm512_i32gather_epi32` uses the same microcoded
+gather unit (typically 16 lanes, same or worse per-element cost), so an AVX-512
+gather is not expected to beat AVX2, and it would enlarge the `unsafe` surface for
+a path already measured slower — exactly the "wider is automatically better"
+assumption §23 warns against.
 
 ---
 
 ## Verdict
 
 The certified path-bloom hot path is a straight-line, contiguous, memory-bandwidth-
-bound copy that is already auto-vectorised by LLVM; manual SIMD intrinsics are not
-expected to beat it, and no measured SIMD win is claimed. Hot/cold separation and
-the resulting ≈111× sequential / ≈52,000× single-byte advantage over machine replay
-are supported by `evidence/bench/sweep.json`. The file-backed `FileBody` realises
-the same hot path through bounded, safe `pread` windows (no mapping, no `unsafe`).
-The one open measurement gap is the absence of an L1-resident control for the path
-hot path in the committed sweep.
+bound copy that is already auto-vectorised by LLVM. The random single-byte shape was
+tested directly with an executed AVX2 gather micro-benchmark: **it does not win
+(~7% slower), so the scalar loop remains the default** and `fastpath` is unchanged.
+Hot/cold separation and the resulting ≈111× sequential / ≈52,000× single-byte
+advantage over machine replay are supported by `evidence/bench/sweep.json`. The
+file-backed `FileBody` realises the same hot path through bounded, safe `pread`
+windows (no mapping, and no `unsafe` outside the isolated, feature-gated
+`src/simd.rs`). The one open measurement gap remains the absence of an L1-resident
+control for the path hot path in the committed sweep.

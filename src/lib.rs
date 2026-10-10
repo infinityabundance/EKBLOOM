@@ -32,6 +32,8 @@ pub mod error;
 pub mod fastpath;
 pub mod filesystem;
 pub mod format;
+#[cfg(feature = "fuse")]
+pub mod fuse;
 pub mod history;
 pub mod machine;
 pub mod manifest;
@@ -39,6 +41,7 @@ pub mod metrics;
 pub mod model_search;
 pub mod reader;
 pub mod recovery;
+pub mod simd;
 pub mod state;
 pub mod sweep;
 pub mod verify;
@@ -55,6 +58,8 @@ pub use checkpoint::CheckpointSet;
 pub use error::{EkbloomError, Result};
 pub use fastpath::{cpu_features, read_random_1b, read_ranges, read_sequential, CpuFeatures};
 pub use filesystem::{FileMeta, ObjectPhysical, OrFs, PhysicalReport};
+#[cfg(feature = "fuse")]
+pub use fuse::{mount, OrFsMount};
 pub use history::History;
 pub use machine::{machine_by_id, OrMachine, MACHINE_NL2, NL2};
 pub use manifest::{
@@ -64,17 +69,22 @@ pub use metrics::{now_ns, percentiles, Percentiles};
 pub use model_search::{
     canonical_state_only_counterexample, sufficiency_sweep, AbstractCounterexample, SufficiencyRow,
 };
-pub use reader::{inspect_file, open, read, read_file, FileBody};
+pub use reader::{
+    inspect_file, open, open_authenticated, open_bytes_authenticated, read, read_file, FileBody,
+};
 pub use recovery::{
     recover, scan_generations, truncate_to_valid, GenerationRecord, RecoveryReport,
 };
+pub use simd::{avx2_available, gather_bytes, gather_bytes_scalar};
 pub use state::Snapshot;
 pub use sweep::{
     manifestation_sweep, sweep_profiles, write_evidence_json, SweepConfig, SweepPoint, SweepReport,
 };
 pub use verify::{verify, verify_deep, CheckOutcome, VerificationReport};
 pub use worker::{available_parallelism, manifest_background, regional_parallel};
-pub use writer::{append_generation, write_body};
+pub use writer::{
+    append_generation, append_generation_authenticated, write_body, write_body_authenticated,
+};
 
 /// Progressively expanded operational-body profiles.
 ///

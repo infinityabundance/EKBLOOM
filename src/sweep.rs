@@ -19,11 +19,14 @@
 //! Runtime is bounded: a 1 MiB source completes in a few seconds with the
 //! default [`SweepConfig`]. Tests clamp `iterations` down further.
 
+use crate::bloom::SUPPORTED_DEPTHS;
+use crate::checkpoint::SUPPORTED_INTERVALS;
 use crate::error::Result;
 use crate::fastpath::{self, CpuFeatures};
 use crate::manifest::{create, EkbloomBody};
 use crate::metrics::{now_ns, percentiles};
-use crate::ManifestationProfile;
+use crate::reader;
+use crate::{ManifestationProfile, ReadRequest};
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -342,6 +345,549 @@ pub fn write_evidence_json(path: &Path, report: &SweepReport) -> Result<()> {
         });
     }
     s.push_str("  ]\n}\n");
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(path, s)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Curves, budget frontier, and the large evidence report.
+// ---------------------------------------------------------------------------
+
+/// Minimum physical-byte floor applied to a budget: `max(visible * ratio, floor)`.
+pub const BUDGET_MIN_FLOOR_BYTES: u64 = 4096;
+
+/// Target `physical/visible` ratios used by [`large_sweep`], least to most space.
+pub const DEFAULT_BUDGET_RATIOS: [f64; 8] = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0];
+
+/// Region sizes (logical positions) swept by [`region_size_curve`].
+pub const CURVE_REGION_SIZES: [u32; 5] = [256, 1024, 4096, 16384, 65536];
+
+/// One row of the budget frontier: for a target `M/N` ratio, the fastest valid
+/// profile whose physical footprint fits the budget, and its measured speed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BudgetPoint {
+    /// Requested target `physical/visible` ratio.
+    pub target_ratio: f64,
+    /// Label of the chosen profile (`""` when nothing fits the budget).
+    pub chosen_profile: String,
+    /// Physical bytes of the chosen profile (0 when nothing fits).
+    pub physical_bytes: u64,
+    /// Achieved `physical/visible` ratio (`0.0` when nothing fits).
+    pub achieved_ratio: f64,
+    /// Sequential read throughput of the chosen profile (bytes/s).
+    pub seq_bytes_per_s: f64,
+    /// Median single-byte random read latency (ns).
+    pub random_1b_ns_p50: f64,
+    /// Median 4 KiB random range read latency (ns).
+    pub random_4k_ns_p50: f64,
+}
+
+/// A labelled curve: one measured [`SweepPoint`] per axis label.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Curve {
+    /// Axis name (e.g. `"region-size"`).
+    pub axis: String,
+    /// One label per point, in `points` order.
+    pub labels: Vec<String>,
+    /// The measured points.
+    pub points: Vec<SweepPoint>,
+}
+
+/// The full evidence of a [`large_sweep`] run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LargeSweepReport {
+    /// Detected CPU features.
+    pub cpu: CpuFeatures,
+    /// Source length in bytes.
+    pub source_len: u64,
+    /// BLAKE3 hash of the exact source used.
+    pub source_hash: [u8; 32],
+    /// The budget frontier, one row per requested ratio.
+    pub budget_frontier: Vec<BudgetPoint>,
+    /// The measured curves (region size, depth, checkpoint interval).
+    pub curves: Vec<Curve>,
+    /// Cold-start (open + first 4 KiB read) nanoseconds per profile.
+    pub cold_start: Vec<(String, f64)>,
+    /// Cache-resident sequential throughput (bytes/s).
+    pub cache_resident_seq_bytes_per_s: f64,
+}
+
+/// Tolerance, in octaves (factors of two), within which two profiles are treated
+/// as tied for speed.
+///
+/// Profile selection must not depend on run-to-run timing noise. Measured speeds
+/// whose combined score is within `2^SPEED_TOLERANCE_OCTAVES` are therefore a tie,
+/// resolved by the (noise-free) smaller physical footprint and then the label. A
+/// one-octave (twofold) window is wide enough to absorb benchmark noise while
+/// still separating the frontier's real steps (which are many octaves apart).
+const SPEED_TOLERANCE_OCTAVES: f64 = 1.0;
+
+/// `log2` of a positive finite value, or a very low floor (so a missing metric
+/// neither dominates nor panics).
+fn lg(v: f64) -> f64 {
+    if v.is_finite() && v > 0.0 {
+        v.log2()
+    } else {
+        -60.0
+    }
+}
+
+/// A single speed score in octave space: throughput helps, latency hurts.
+fn speed_score(p: &SweepPoint) -> f64 {
+    lg(p.seq_bytes_per_s) + lg(p.range_64k_bytes_per_s)
+        - lg(p.random_1b_ns_p50)
+        - lg(p.random_4k_ns_p50)
+}
+
+/// Whether `a` is strictly preferred over `b`: clearly faster, otherwise smaller
+/// footprint, otherwise the lexicographically smaller profile label.
+fn faster(a: &SweepPoint, b: &SweepPoint) -> bool {
+    let sa = speed_score(a);
+    let sb = speed_score(b);
+    if sa - sb > SPEED_TOLERANCE_OCTAVES {
+        return true;
+    }
+    if sb - sa > SPEED_TOLERANCE_OCTAVES {
+        return false;
+    }
+    if a.physical_bytes != b.physical_bytes {
+        return a.physical_bytes < b.physical_bytes;
+    }
+    a.profile < b.profile
+}
+
+/// The candidate profiles considered when filling the budget frontier.
+fn budget_candidates() -> Vec<ManifestationProfile> {
+    let mut v = vec![ManifestationProfile::Root];
+    for interval in SUPPORTED_INTERVALS {
+        v.push(ManifestationProfile::Sparse { interval });
+    }
+    v.push(ManifestationProfile::Full);
+    v.push(ManifestationProfile::Bloom { depth: 4 });
+    v.push(ManifestationProfile::Regional {
+        depth: 4,
+        region_bytes: 4096,
+    });
+    for depth in SUPPORTED_DEPTHS {
+        v.push(ManifestationProfile::Path { depth });
+    }
+    v.push(ManifestationProfile::MaxSpeed);
+    v
+}
+
+/// The physical-byte budget for `visible` bytes at `ratio`:
+/// `max(visible * ratio, `[`BUDGET_MIN_FLOOR_BYTES`]`)`.
+fn budget_bytes(visible: u64, ratio: f64) -> u64 {
+    let r = if ratio.is_finite() && ratio > 0.0 {
+        ratio
+    } else {
+        0.0
+    };
+    let scaled = visible as f64 * r;
+    let cap = if scaled >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        scaled as u64
+    };
+    cap.max(BUDGET_MIN_FLOOR_BYTES)
+}
+
+/// For each target `M/N` ratio in `ratios`, build every candidate profile, measure
+/// it, and select the **fastest valid** profile whose `physical_bytes` fits the
+/// budget `max(visible * ratio, `[`BUDGET_MIN_FLOOR_BYTES`]`)`.
+///
+/// Selection is honest: every candidate is really built and measured, and only a
+/// profile whose physical footprint is within budget is eligible. When nothing
+/// fits, `chosen_profile` is `""` and the metrics are zero. Measured speeds within
+/// a factor of `2^SPEED_TOLERANCE_OCTAVES` are treated as a tie; ties go to the
+/// smaller physical footprint and then the profile label, so the result is
+/// deterministic for a fixed seed.
+pub fn budget_frontier(
+    source: &[u8],
+    ratios: &[f64],
+    cfg: &SweepConfig,
+) -> Result<Vec<BudgetPoint>> {
+    let visible = source.len() as u64;
+
+    let mut measured: Vec<SweepPoint> = Vec::new();
+    for profile in budget_candidates() {
+        measured.push(measure(source, profile, cfg)?);
+    }
+
+    let mut out = Vec::with_capacity(ratios.len());
+    for &target_ratio in ratios {
+        let budget = budget_bytes(visible, target_ratio);
+        let mut best: Option<&SweepPoint> = None;
+        for p in &measured {
+            if p.physical_bytes > budget {
+                continue;
+            }
+            match best {
+                None => best = Some(p),
+                Some(b) if faster(p, b) => best = Some(p),
+                Some(_) => {}
+            }
+        }
+        out.push(match best {
+            Some(p) => BudgetPoint {
+                target_ratio,
+                chosen_profile: p.profile.clone(),
+                physical_bytes: p.physical_bytes,
+                achieved_ratio: if visible == 0 {
+                    0.0
+                } else {
+                    finite(p.physical_bytes as f64 / visible as f64)
+                },
+                seq_bytes_per_s: finite(p.seq_bytes_per_s),
+                random_1b_ns_p50: finite(p.random_1b_ns_p50),
+                random_4k_ns_p50: finite(p.random_4k_ns_p50),
+            },
+            None => BudgetPoint {
+                target_ratio,
+                chosen_profile: String::new(),
+                physical_bytes: 0,
+                achieved_ratio: 0.0,
+                seq_bytes_per_s: 0.0,
+                random_1b_ns_p50: 0.0,
+                random_4k_ns_p50: 0.0,
+            },
+        });
+    }
+    Ok(out)
+}
+
+/// Sweep the regional `T_4^(reg)[x]` construction over `region_sizes` (logical
+/// positions per region); one [`SweepPoint`] per requested size.
+pub fn region_size_curve(source: &[u8], cfg: &SweepConfig, region_sizes: &[u32]) -> Result<Curve> {
+    let mut labels = Vec::with_capacity(region_sizes.len());
+    let mut points = Vec::with_capacity(region_sizes.len());
+    for &region_bytes in region_sizes {
+        labels.push(format!("R={region_bytes}"));
+        points.push(measure(
+            source,
+            ManifestationProfile::Regional {
+                depth: 4,
+                region_bytes,
+            },
+            cfg,
+        )?);
+    }
+    Ok(Curve {
+        axis: "region-size".to_string(),
+        labels,
+        points,
+    })
+}
+
+/// Sweep the exact path bloom `P_D[j]` over `depths`; one [`SweepPoint`] per depth.
+pub fn depth_curve(source: &[u8], cfg: &SweepConfig, depths: &[u16]) -> Result<Curve> {
+    let mut labels = Vec::with_capacity(depths.len());
+    let mut points = Vec::with_capacity(depths.len());
+    for &depth in depths {
+        labels.push(format!("D={depth}"));
+        points.push(measure(source, ManifestationProfile::Path { depth }, cfg)?);
+    }
+    Ok(Curve {
+        axis: "path-depth".to_string(),
+        labels,
+        points,
+    })
+}
+
+/// Sweep sparse checkpoints `C_K` over intervals `K`; one [`SweepPoint`] per
+/// interval (each must be a member of `SUPPORTED_INTERVALS`).
+pub fn checkpoint_interval_curve(
+    source: &[u8],
+    cfg: &SweepConfig,
+    intervals: &[u32],
+) -> Result<Curve> {
+    let mut labels = Vec::with_capacity(intervals.len());
+    let mut points = Vec::with_capacity(intervals.len());
+    for &interval in intervals {
+        labels.push(format!("K={interval}"));
+        points.push(measure(
+            source,
+            ManifestationProfile::Sparse { interval },
+            cfg,
+        )?);
+    }
+    Ok(Curve {
+        axis: "checkpoint-interval".to_string(),
+        labels,
+        points,
+    })
+}
+
+/// Cold-start nanoseconds: time to open the object (build/encode the manifested
+/// body) and perform the first 4 KiB read. A single cold sample; always `>= 0`.
+pub fn cold_start_ns(
+    source: &[u8],
+    profile: ManifestationProfile,
+    cfg: &SweepConfig,
+) -> Result<f64> {
+    // `cfg` is accepted for API symmetry; a cold start is a single measurement.
+    let _ = cfg;
+    let start = now_ns();
+    let body = create(source, profile)?;
+    let window = 4096u64.min(body.logical_len);
+    if window > 0 {
+        let _ = reader::read(
+            &body,
+            ReadRequest {
+                offset: 0,
+                length: window,
+            },
+        )?;
+    }
+    let end = now_ns();
+    Ok(end.saturating_sub(start) as f64)
+}
+
+/// A deterministic LCG byte corpus (useful to size-independent measurements).
+fn lcg_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut s = seed;
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        out.push((s >> 33) as u8);
+    }
+    out
+}
+
+/// Sequential throughput for a small, cache-resident corpus of `corpus_len`
+/// bytes. The corpus is encoded with an exact depth-32 path bloom, warmed once,
+/// then read sequentially many times.
+pub fn cache_resident_seq_bytes_per_s(corpus_len: usize, cfg: &SweepConfig) -> Result<f64> {
+    let source = lcg_bytes(cfg.seed ^ 0x00C0_FFEE_1234_5678, corpus_len);
+    let body = create(&source, ManifestationProfile::Path { depth: 32 })?;
+
+    let cap = usize::try_from(body.logical_len).unwrap_or(0);
+    let mut out: Vec<u8> = Vec::with_capacity(cap);
+    // Warm up so the first-touch page faults are not counted.
+    fastpath::read_sequential(&body, &mut out)?;
+    out.clear();
+
+    let reps = cfg.iterations.max(16).saturating_mul(8).min(100_000);
+    let mut bytes: u64 = 0;
+    let start = now_ns();
+    for _ in 0..reps {
+        out.clear();
+        fastpath::read_sequential(&body, &mut out)?;
+        bytes = bytes.saturating_add(out.len() as u64);
+    }
+    let elapsed = now_ns().saturating_sub(start).max(1);
+    Ok(finite(bytes as f64 * 1e9 / elapsed as f64))
+}
+
+/// Run the extended manifestation sweep: the budget frontier, the region-size /
+/// depth / checkpoint-interval curves, cold starts, and cache-resident throughput.
+pub fn large_sweep(source: &[u8], cfg: &SweepConfig) -> Result<LargeSweepReport> {
+    let cpu = fastpath::cpu_features();
+    let source_hash = *blake3::hash(source).as_bytes();
+
+    let frontier = budget_frontier(source, &DEFAULT_BUDGET_RATIOS, cfg)?;
+
+    let curves = vec![
+        region_size_curve(source, cfg, &CURVE_REGION_SIZES)?,
+        depth_curve(source, cfg, &SUPPORTED_DEPTHS)?,
+        checkpoint_interval_curve(source, cfg, &SUPPORTED_INTERVALS)?,
+    ];
+
+    let cold_profiles = [
+        ManifestationProfile::Root,
+        ManifestationProfile::Sparse { interval: 1024 },
+        ManifestationProfile::Sparse { interval: 64 },
+        ManifestationProfile::Full,
+        ManifestationProfile::Path { depth: 4 },
+        ManifestationProfile::Path { depth: 32 },
+        ManifestationProfile::MaxSpeed,
+    ];
+    let mut cold_start = Vec::with_capacity(cold_profiles.len());
+    for profile in cold_profiles {
+        let ns = cold_start_ns(source, profile, cfg)?;
+        cold_start.push((profile.label(), ns));
+    }
+
+    let cache = cache_resident_seq_bytes_per_s(64 * 1024, cfg)?;
+
+    Ok(LargeSweepReport {
+        cpu,
+        source_len: source.len() as u64,
+        source_hash,
+        budget_frontier: frontier,
+        curves,
+        cold_start,
+        cache_resident_seq_bytes_per_s: cache,
+    })
+}
+
+/// Lowercase hex of a 32-byte digest.
+fn hex32(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Serialize a [`SweepPoint`] as a JSON object (no trailing comma/newline).
+fn point_json(p: &SweepPoint, pad: &str) -> String {
+    let mut s = String::new();
+    let inner = format!("{pad}  ");
+    let _ = writeln!(s, "{pad}{{");
+    let _ = writeln!(s, "{inner}\"profile\": \"{}\",", json_escape(&p.profile));
+    let _ = writeln!(s, "{inner}\"physical_bytes\": {},", p.physical_bytes);
+    let _ = writeln!(s, "{inner}\"visible_bytes\": {},", p.visible_bytes);
+    let _ = writeln!(
+        s,
+        "{inner}\"expansion_ratio\": {},",
+        finite(p.expansion_ratio)
+    );
+    let _ = writeln!(s, "{inner}\"build_ns\": {},", p.build_ns);
+    let _ = writeln!(
+        s,
+        "{inner}\"seq_bytes_per_s\": {},",
+        finite(p.seq_bytes_per_s)
+    );
+    let _ = writeln!(
+        s,
+        "{inner}\"random_1b_ns_p50\": {},",
+        finite(p.random_1b_ns_p50)
+    );
+    let _ = writeln!(
+        s,
+        "{inner}\"random_1b_ns_p99\": {},",
+        finite(p.random_1b_ns_p99)
+    );
+    let _ = writeln!(
+        s,
+        "{inner}\"random_4k_ns_p50\": {},",
+        finite(p.random_4k_ns_p50)
+    );
+    let _ = writeln!(
+        s,
+        "{inner}\"range_64k_bytes_per_s\": {},",
+        finite(p.range_64k_bytes_per_s)
+    );
+    let _ = writeln!(s, "{inner}\"samples\": {}", p.samples);
+    let _ = write!(s, "{pad}}}");
+    s
+}
+
+/// Write a [`LargeSweepReport`] as pretty JSON to `path`, creating parent dirs.
+pub fn write_large_evidence_json(path: &Path, report: &LargeSweepReport) -> Result<()> {
+    let mut s = String::new();
+    s.push_str("{\n");
+    let _ = writeln!(
+        s,
+        "  \"cpu\": {{ \"sse2\": {}, \"avx2\": {}, \"avx512f\": {} }},",
+        report.cpu.sse2, report.cpu.avx2, report.cpu.avx512f
+    );
+    let _ = writeln!(s, "  \"source_len\": {},", report.source_len);
+    let _ = writeln!(s, "  \"source_hash\": \"{}\",", hex32(&report.source_hash));
+
+    s.push_str("  \"budget_frontier\": [\n");
+    for (i, bp) in report.budget_frontier.iter().enumerate() {
+        let comma = if i + 1 == report.budget_frontier.len() {
+            ""
+        } else {
+            ","
+        };
+        s.push_str("    {\n");
+        let _ = writeln!(s, "      \"target_ratio\": {},", bp.target_ratio);
+        let _ = writeln!(
+            s,
+            "      \"chosen_profile\": \"{}\",",
+            json_escape(&bp.chosen_profile)
+        );
+        let _ = writeln!(s, "      \"physical_bytes\": {},", bp.physical_bytes);
+        let _ = writeln!(
+            s,
+            "      \"achieved_ratio\": {},",
+            finite(bp.achieved_ratio)
+        );
+        let _ = writeln!(
+            s,
+            "      \"seq_bytes_per_s\": {},",
+            finite(bp.seq_bytes_per_s)
+        );
+        let _ = writeln!(
+            s,
+            "      \"random_1b_ns_p50\": {},",
+            finite(bp.random_1b_ns_p50)
+        );
+        let _ = writeln!(
+            s,
+            "      \"random_4k_ns_p50\": {}",
+            finite(bp.random_4k_ns_p50)
+        );
+        let _ = writeln!(s, "    }}{comma}");
+    }
+    s.push_str("  ],\n");
+
+    s.push_str("  \"curves\": [\n");
+    for (ci, curve) in report.curves.iter().enumerate() {
+        let comma = if ci + 1 == report.curves.len() {
+            ""
+        } else {
+            ","
+        };
+        s.push_str("    {\n");
+        let _ = writeln!(s, "      \"axis\": \"{}\",", json_escape(&curve.axis));
+        s.push_str("      \"labels\": [");
+        for (li, label) in curve.labels.iter().enumerate() {
+            if li > 0 {
+                s.push_str(", ");
+            }
+            let _ = write!(s, "\"{}\"", json_escape(label));
+        }
+        s.push_str("],\n");
+        s.push_str("      \"points\": [\n");
+        for (pi, p) in curve.points.iter().enumerate() {
+            let pcomma = if pi + 1 == curve.points.len() {
+                ""
+            } else {
+                ","
+            };
+            s.push_str(&point_json(p, "        "));
+            s.push_str(pcomma);
+            s.push('\n');
+        }
+        s.push_str("      ]\n");
+        let _ = writeln!(s, "    }}{comma}");
+    }
+    s.push_str("  ],\n");
+
+    s.push_str("  \"cold_start\": [\n");
+    for (i, (profile, ns)) in report.cold_start.iter().enumerate() {
+        let comma = if i + 1 == report.cold_start.len() {
+            ""
+        } else {
+            ","
+        };
+        let _ = writeln!(
+            s,
+            "    {{ \"profile\": \"{}\", \"ns\": {} }}{comma}",
+            json_escape(profile),
+            finite(*ns)
+        );
+    }
+    s.push_str("  ],\n");
+
+    let _ = writeln!(
+        s,
+        "  \"cache_resident_seq_bytes_per_s\": {}",
+        finite(report.cache_resident_seq_bytes_per_s)
+    );
+    s.push_str("}\n");
 
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {

@@ -1,0 +1,27 @@
+# Dedicated EKBLOOM FUSE smoke-test image.
+#
+# Base is the same pinned Rust digest as ./Dockerfile (kept in sync with
+# scripts/lib.sh) so the toolchain matches the verification image exactly.
+FROM rust:1.99.0-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa
+
+# Runtime FUSE bits only: `fuse3` provides the setuid `fusermount3` helper and
+# `libfuse3-3` its shared library. No libfuse headers/pkg-config are needed: the
+# `fuser` crate is built with default features off (no libfuse linkage).
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        fuse3 \
+        libfuse3-3 \
+    ; \
+    rm -rf /var/lib/apt/lists/*
+
+# Components the verification gate uses, so the same image can lint/format too.
+RUN rustup component add rustfmt clippy
+
+ENV CARGO_TERM_COLOR=never
+
+WORKDIR /work
+
+# Runs as root: mounting needs CAP_SYS_ADMIN and/or the setuid fusermount3 helper.
+CMD ["cargo", "test", "--features", "fuse", "--test", "fuse"]

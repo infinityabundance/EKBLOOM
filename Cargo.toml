@@ -22,9 +22,14 @@ crc32fast = "1.4"
 # Async I/O publication backend. Optional; a synchronous fallback is always built.
 io-uring = { version = "0.7", optional = true }
 
+# Read-only FUSE projection of the in-process OrFs namespace. Optional; off by
+# default. Built without the `libfuse` feature so no libfuse/pkg-config is needed.
+fuser = { version = "0.15", default-features = false, features = ["abi-7-31"], optional = true }
+
 [features]
 default = []
 io-uring = ["dep:io-uring"]
+fuse = ["dep:fuser"]
 
 [dev-dependencies]
 proptest = "1.5"

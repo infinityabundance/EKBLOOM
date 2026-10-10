@@ -30,6 +30,12 @@
 //!
 //! The implementation is entirely safe Rust: only checked arithmetic, safe
 //! slices and iterators are used.
+//!
+//! A runtime-detected AVX2 gather for the random single-byte path was implemented
+//! and measured (see [`crate::simd`] and `docs/reviews/performance.md`); it was
+//! **slower** than this scalar loop on the reference machine, so it is deliberately
+//! *not* wired into the default path. [`crate::simd::gather_bytes`] remains
+//! available for callers and benchmarking.
 
 use crate::bloom::{supported_depth, BloomKind, BloomShell, Certification};
 use crate::error::{EkbloomError, Result};

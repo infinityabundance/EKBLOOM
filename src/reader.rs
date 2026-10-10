@@ -90,13 +90,100 @@ pub fn open_bytes(bytes: &[u8]) -> Result<EkbloomBody> {
                 }));
         }
     };
+    let upto = scan.commits.len() - 1;
+    open_selected(bytes, &scan, selected, upto)
+}
 
+/// Open a `.ekb` file authenticated with `key`.
+///
+/// The file must carry an `AUTH` section (written by
+/// [`crate::writer::write_body_authenticated`] or
+/// [`crate::writer::append_generation_authenticated`]). The newest structurally
+/// valid committed generation whose MAC verifies is selected; a generation with
+/// a missing or mismatching `AUTH` is treated as invalid and skipped, exactly as
+/// recovery skips a torn generation. If no generation authenticates, this fails.
+pub fn open_authenticated(path: &Path, key: &[u8; 32]) -> Result<EkbloomBody> {
+    let bytes = std::fs::read(path)?;
+    open_bytes_authenticated(&bytes, key)
+}
+
+/// [`open_authenticated`] over an in-memory `.ekb` image.
+pub fn open_bytes_authenticated(bytes: &[u8], key: &[u8; 32]) -> Result<EkbloomBody> {
+    let scan = format::scan(bytes)?;
+    if scan.commits.is_empty() {
+        return Err(scan
+            .torn_error
+            .unwrap_or_else(|| EkbloomError::RecoveryFailed {
+                reason: "no authenticated committed generation".to_string(),
+            }));
+    }
+    let mut newest_error: Option<EkbloomError> = None;
+    for (idx, commit) in scan.commits.iter().enumerate().rev() {
+        match verify_commit_auth(bytes, commit, key) {
+            Ok(()) => return open_selected(bytes, &scan, commit.clone(), idx),
+            Err(e) => {
+                if newest_error.is_none() {
+                    newest_error = Some(e);
+                }
+            }
+        }
+    }
+    Err(newest_error.unwrap_or(EkbloomError::ChecksumMismatch { section: "auth" }))
+}
+
+/// Recompute and verify the keyed MAC of one scanned commit.
+///
+/// The commit must contain exactly one `AUTH` section, as its final section, whose
+/// 32-byte payload equals `blake3::keyed_hash(key, blake3(bytes[0 .. auth_offset]))`
+/// — i.e. the keyed MAC over the exact preceding bytes of the file.
+fn verify_commit_auth(bytes: &[u8], commit: &format::ScannedCommit, key: &[u8; 32]) -> Result<()> {
+    let auths: Vec<&format::ScannedSection> = commit
+        .sections
+        .iter()
+        .filter(|s| s.kind == SectionKind::Auth)
+        .collect();
+    if auths.is_empty() {
+        return Err(EkbloomError::CorruptGeneration {
+            generation: commit.generation,
+            reason: "authenticated open requires an AUTH section".to_string(),
+        });
+    }
+    if auths.len() != 1 || commit.sections.last().map(|s| s.kind) != Some(SectionKind::Auth) {
+        return Err(corrupt(
+            commit.generation,
+            "malformed AUTH section placement",
+        ));
+    }
+    let auth = auths[0];
+    let covered_end = usize::try_from(auth.header_offset).map_err(|_| EkbloomError::Overflow {
+        what: "auth covered range",
+    })?;
+    let covered = bytes.get(..covered_end).ok_or(EkbloomError::Truncated {
+        needed: auth.header_offset,
+        available: bytes.len() as u64,
+    })?;
+    let expected = format::auth_mac(key, covered);
+    let payload = format::section_payload(bytes, auth);
+    if payload != &expected[..] {
+        return Err(EkbloomError::ChecksumMismatch { section: "auth" });
+    }
+    Ok(())
+}
+
+/// Reconstruct a validated [`EkbloomBody`] from the commit at index `upto`,
+/// accumulating structures from `scan.commits[..=upto]` only.
+fn open_selected(
+    bytes: &[u8],
+    scan: &format::ScanOutcome,
+    selected: format::ScannedCommit,
+    upto: usize,
+) -> Result<EkbloomBody> {
     let mut history: Option<History> = None;
     let mut checkpoints: Vec<CheckpointSet> = Vec::new();
     let mut blooms: Vec<BloomShell> = Vec::new();
     let mut certificates: Vec<Certificate> = Vec::new();
 
-    for commit in &scan.commits {
+    for commit in &scan.commits[..=upto] {
         for section in &commit.sections {
             let payload = format::section_payload(bytes, section);
             match section.kind {
@@ -116,7 +203,7 @@ pub fn open_bytes(bytes: &[u8]) -> Result<EkbloomBody> {
                     blooms.push(shell);
                 }
                 SectionKind::Certificate => certificates.push(Certificate::from_bytes(payload)?),
-                SectionKind::Manifest => {}
+                SectionKind::Manifest | SectionKind::Auth => {}
                 SectionKind::CoreMachine => {
                     return Err(corrupt(commit.generation, "unexpected core section"))
                 }
@@ -718,7 +805,7 @@ impl FileBody {
                     SectionKind::Certificate => {
                         certificates.push(parse_certificate(&file, off, len, physical_len)?)
                     }
-                    SectionKind::Manifest => {}
+                    SectionKind::Manifest | SectionKind::Auth => {}
                     SectionKind::CoreMachine => {
                         return Err(corrupt(commit.generation, "unexpected core section"))
                     }
@@ -1205,6 +1292,11 @@ fn scan_one_commit(
         });
         cur = format::align8(payload_end);
         if header.kind == SectionKind::Manifest {
+            // Optional trailing AUTH section, immediately before the footer.
+            if let Some((auth, next)) = scan_auth_opt_file(file, cur, total)? {
+                sections.push(auth);
+                cur = next;
+            }
             footer_start = cur;
             break;
         }
@@ -1226,13 +1318,20 @@ fn scan_one_commit(
     file.read_exact_at(&mut fbuf, footer_start)?;
     let footer = format::CommitFooter::decode(&fbuf)?;
 
-    let manifest = sections
-        .last()
-        .copied()
-        .ok_or_else(|| bad("empty commit"))?;
-    if manifest.kind != SectionKind::Manifest {
-        return Err(bad("commit does not end with a manifest section"));
+    let manifest_idx = sections
+        .iter()
+        .rposition(|s| s.kind == SectionKind::Manifest)
+        .ok_or_else(|| bad("commit has no manifest section"))?;
+    // Only the optional trailing AUTH section may follow the manifest.
+    if sections[manifest_idx + 1..]
+        .iter()
+        .any(|s| s.kind != SectionKind::Auth)
+    {
+        return Err(bad(
+            "commit does not end with its manifest (and optional AUTH)",
+        ));
     }
+    let manifest = sections[manifest_idx];
     if footer.manifest_offset != manifest.header_offset
         || footer.manifest_len != manifest.payload_len
     {
@@ -1293,6 +1392,55 @@ fn manifest_record(
         .ok_or_else(|| bad("commit has no manifest section"))?;
     let payload = read_vec_at(file, section.payload_offset, section.payload_len, total)?;
     format::ManifestRecord::decode(&payload)
+}
+
+/// If a well-formed [`SectionKind::Auth`] section begins at absolute `offset` in
+/// `file`, return its descriptor and the aligned offset just past it; otherwise
+/// `Ok(None)`. Structural mismatches are not errors: a malformed candidate is
+/// left for the footer parser to reject (fail closed).
+fn scan_auth_opt_file(
+    file: &File,
+    offset: u64,
+    total: u64,
+) -> Result<Option<(format::ScannedSection, u64)>> {
+    let header_end = match offset.checked_add(format::SECTION_HEADER_LEN as u64) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if header_end > total {
+        return Ok(None);
+    }
+    let mut hbuf = [0u8; format::SECTION_HEADER_LEN];
+    if file.read_exact_at(&mut hbuf, offset).is_err() {
+        return Ok(None);
+    }
+    let header = match format::SectionHeader::decode(&hbuf) {
+        Ok(h) => h,
+        Err(_) => return Ok(None),
+    };
+    if header.kind != SectionKind::Auth
+        || header.offset != header_end
+        || header.length != format::AUTH_MAC_LEN as u64
+    {
+        return Ok(None);
+    }
+    let payload_end = match header_end.checked_add(header.length) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if payload_end > total
+        || crc32_range(file, header_end, header.length, total)? != header.checksum
+    {
+        return Ok(None);
+    }
+    let section = format::ScannedSection {
+        kind: SectionKind::Auth,
+        generation: header.generation,
+        header_offset: offset,
+        payload_offset: header_end,
+        payload_len: header.length,
+    };
+    Ok(Some((section, format::align8(payload_end))))
 }
 
 /// Parse a `BloomShell` header; the construction payload is never loaded.

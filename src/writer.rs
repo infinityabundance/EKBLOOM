@@ -40,6 +40,24 @@ use crate::manifest::{inspect, EkbloomBody};
 /// Any existing file at `path` is replaced atomically. The file's first commit
 /// uses `body.generation` and has `prev_generation = 0`.
 pub fn write_body(path: &Path, body: &EkbloomBody) -> Result<()> {
+    write_body_impl(path, body, None)
+}
+
+/// Create a fresh, committed `.ekb` file authenticated under `key`.
+///
+/// Identical to [`write_body`] except that an `AUTH` section is written after the
+/// manifest and immediately before the commit footer. Its 32-byte payload is the
+/// keyed MAC `blake3::keyed_hash(key, blake3(file[0 .. auth_header_offset]))`;
+/// that is, it authenticates and integrity-protects **every preceding byte** of
+/// the file (header, core, alignment padding, and every section including the
+/// manifest). [`crate::reader::open_authenticated`] recomputes and verifies it.
+/// The fixed 80-byte header and 64-byte footer sizes are unchanged. See
+/// `docs/SECURITY.md`.
+pub fn write_body_authenticated(path: &Path, body: &EkbloomBody, key: &[u8; 32]) -> Result<()> {
+    write_body_impl(path, body, Some(key))
+}
+
+fn write_body_impl(path: &Path, body: &EkbloomBody, key: Option<&[u8; 32]>) -> Result<()> {
     let header = crate::format::GenesisHeader {
         format_major: format::FORMAT_MAJOR,
         format_minor: format::FORMAT_MINOR,
@@ -50,17 +68,22 @@ pub fn write_body(path: &Path, body: &EkbloomBody) -> Result<()> {
         core_len: body.core.len() as u64,
         core_machine_id: body.machine_id,
     };
+    let header_bytes = header.encode();
 
     let sections = all_sections(body);
     let core_end = CORE_OFFSET + body.core.len() as u64;
     let base = align8(core_end);
-    let commit = build_commit(base, body.generation, 0, &sections)?;
+    let auth = key.map(|key| AuthSpec {
+        key,
+        prefix: prefix_hasher(&header_bytes, &body.core, base - core_end),
+    });
+    let commit = build_commit(base, body.generation, 0, &sections, auth)?;
 
     let tmp = tmp_path(path);
     let result = (|| -> Result<()> {
         let file = File::create(&tmp)?;
         let mut w = BufWriter::new(file);
-        w.write_all(&header.encode())?;
+        w.write_all(&header_bytes)?;
         w.write_all(&body.core)?;
         write_zeros(&mut w, base - core_end)?;
         w.write_all(&commit.bytes)?;
@@ -93,6 +116,24 @@ pub fn write_body(path: &Path, body: &EkbloomBody) -> Result<()> {
 /// valid commit before appending, so the new commit's `prev_generation` links to
 /// a complete predecessor.
 pub fn append_generation(path: &Path, body: &EkbloomBody) -> Result<u64> {
+    append_generation_impl(path, body, None)
+}
+
+/// Append a new committed generation authenticated under `key`.
+///
+/// Identical to [`append_generation`] except that the new commit carries an
+/// `AUTH` section. Its MAC covers **the whole file prefix** `[0, auth_offset)`
+/// — every earlier generation and every new section — so any prior tampering is
+/// also caught when the file is reopened with [`crate::reader::open_authenticated`].
+pub fn append_generation_authenticated(
+    path: &Path,
+    body: &EkbloomBody,
+    key: &[u8; 32],
+) -> Result<u64> {
+    append_generation_impl(path, body, Some(key))
+}
+
+fn append_generation_impl(path: &Path, body: &EkbloomBody, key: Option<&[u8; 32]>) -> Result<u64> {
     let bytes = std::fs::read(path)?;
     let scan = format::scan(&bytes)?;
     let last = scan
@@ -125,7 +166,19 @@ pub fn append_generation(path: &Path, body: &EkbloomBody) -> Result<u64> {
     drop(file);
 
     let base = align8(clean_len);
-    let commit = build_commit(base, body.generation, last.generation, &sections)?;
+    let auth = key.map(|key| AuthSpec {
+        key,
+        prefix: {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&bytes[..clean_len as usize]);
+            let pad = base - clean_len;
+            if pad > 0 {
+                hasher.update(&[0u8; 8][..pad as usize]);
+            }
+            hasher
+        },
+    });
+    let commit = build_commit(base, body.generation, last.generation, &sections, auth)?;
 
     let mut file = OpenOptions::new().append(true).open(path)?;
     if clean_len % 8 != 0 {
@@ -142,13 +195,37 @@ struct CommitPlan {
     bytes: Vec<u8>,
 }
 
+/// Authentication material for a commit: the MAC key plus a BLAKE3 hasher
+/// already fed with the exact bytes of `[0, base)` (everything before the
+/// commit block).
+struct AuthSpec<'a> {
+    key: &'a [u8; 32],
+    prefix: blake3::Hasher,
+}
+
+/// A BLAKE3 hasher fed with `header ++ core ++ pad` (the bytes of `[0, base)`).
+fn prefix_hasher(header: &[u8], core: &[u8], pad: u64) -> blake3::Hasher {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(header);
+    hasher.update(core);
+    if pad > 0 {
+        hasher.update(&[0u8; 8][..pad as usize]);
+    }
+    hasher
+}
+
 /// Serialize `sections` as an aligned commit block beginning at absolute offset
 /// `base` (which must be 8-aligned), closing with a `CommitFooter`.
+///
+/// When `auth` is `Some`, an `AUTH` section is emitted after every other section
+/// (including the manifest) and immediately before the footer, carrying the
+/// keyed MAC of the covered prefix `[0, auth_header_offset)`.
 fn build_commit(
     base: u64,
     generation: u64,
     prev_generation: u64,
     sections: &[(SectionKind, Vec<u8>)],
+    auth: Option<AuthSpec<'_>>,
 ) -> Result<CommitPlan> {
     let mut out: Vec<u8> = Vec::new();
     let mut off = base;
@@ -181,6 +258,28 @@ fn build_commit(
     }
 
     write_zeros(&mut out, align8(off) - off)?;
+    off = align8(off);
+
+    if let Some(AuthSpec { key, mut prefix }) = auth {
+        // `out` is exactly the bytes of `[base, off)`; folding it into the prefix
+        // hasher makes the covered range the whole `[0, off)` prefix.
+        prefix.update(&out);
+        let covered = *prefix.finalize().as_bytes();
+        let mac = format::auth_mac_from_hash(key, &covered);
+        let checksum = crc32fast::hash(&mac);
+        let header = SectionHeader {
+            kind: SectionKind::Auth,
+            flags: 0,
+            offset: off + SECTION_HEADER_LEN as u64,
+            length: mac.len() as u64,
+            generation,
+            checksum,
+        };
+        out.extend_from_slice(&header.encode());
+        out.extend_from_slice(&mac);
+        off = header.offset + mac.len() as u64;
+        write_zeros(&mut out, align8(off) - off)?;
+    }
 
     let (manifest_offset, manifest_len, manifest_hash) =
         manifest.ok_or_else(|| EkbloomError::BadSection {
@@ -239,7 +338,7 @@ fn accumulated_counts(commits: &[format::ScannedCommit]) -> CommittedCounts {
                 | SectionKind::BloomRegion
                 | SectionKind::BloomPath => counts.blooms += 1,
                 SectionKind::Certificate => counts.certificates += 1,
-                SectionKind::CoreMachine | SectionKind::Manifest => {}
+                SectionKind::CoreMachine | SectionKind::Manifest | SectionKind::Auth => {}
             }
         }
     }
