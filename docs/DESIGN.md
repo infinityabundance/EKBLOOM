@@ -156,10 +156,11 @@ Every section is bounds-checked and checksummed before use; untrusted bytes are 
 reinterpreted as native structs.
 
 ```text
-offset 0   GenesisHeader (fixed 64 bytes)
+offset 0   GenesisHeader (fixed 80 bytes)
              magic[8], format_major u16, format_minor u16, header_len u32,
              feature_flags u64, object_id[16], logical_symbols u64,
              logical_bytes u64, core_len u64, core_machine_id u32, reserved[12]
+             (8+2+2+4+8+16+8+8+8+4+12 = 80; header_len must equal 80)
            core bytes (core_len)
            [ sections... ]  each: SectionHeader{ kind u32, flags u32, offset u64,
                               length u64, generation u64, checksum u32 } ++ payload

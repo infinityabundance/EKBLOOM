@@ -28,10 +28,17 @@ pub mod bloom_path;
 pub mod bloom_region;
 pub mod checkpoint;
 pub mod error;
+pub mod format;
 pub mod history;
 pub mod machine;
+pub mod manifest;
+pub mod metrics;
 pub mod model_search;
+pub mod reader;
+pub mod recovery;
 pub mod state;
+pub mod verify;
+pub mod writer;
 
 pub use bloom::{BloomKind, BloomShell, Certificate, Certification, Outcome};
 pub use bloom_context::ContextBloom;
@@ -42,10 +49,20 @@ pub use checkpoint::CheckpointSet;
 pub use error::{EkbloomError, Result};
 pub use history::History;
 pub use machine::{machine_by_id, OrMachine, MACHINE_NL2, NL2};
+pub use manifest::{
+    create, grow, inspect, manifest, ComponentReport, EkbloomBody, ManifestationReport,
+};
+pub use metrics::{now_ns, percentiles, Percentiles};
 pub use model_search::{
     canonical_state_only_counterexample, sufficiency_sweep, AbstractCounterexample, SufficiencyRow,
 };
+pub use reader::{inspect_file, open, read, read_file};
+pub use recovery::{
+    recover, scan_generations, truncate_to_valid, GenerationRecord, RecoveryReport,
+};
 pub use state::Snapshot;
+pub use verify::{verify, verify_deep, CheckOutcome, VerificationReport};
+pub use writer::{append_generation, write_body};
 
 /// Progressively expanded operational-body profiles.
 ///
