@@ -1,0 +1,43 @@
+[package]
+name = "ekbloom"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.75"
+description = "EKBLOOM — concealed-expansion codec. Spend manifested space to maximise speed."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "ekbloom"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ekbloom"
+path = "src/main.rs"
+
+[dependencies]
+blake3 = "1.5"
+crc32fast = "1.4"
+memmap2 = "0.9"
+
+# Async I/O publication backend. Optional; a synchronous fallback is always built.
+io-uring = { version = "0.7", optional = true }
+
+[features]
+default = []
+io-uring = ["dep:io-uring"]
+
+[dev-dependencies]
+proptest = "1.5"
+divan = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

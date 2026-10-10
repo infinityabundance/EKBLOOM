@@ -1,0 +1,8 @@
+/target
+/.cargo-home
+/evidence/*.tmp
+*.ekb
+/extracted*.bin
+/research
+/fuzz/target
+/fuzz/Cargo.lock
