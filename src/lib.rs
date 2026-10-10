@@ -28,6 +28,7 @@ pub mod bloom_path;
 pub mod bloom_region;
 pub mod checkpoint;
 pub mod error;
+pub mod filesystem;
 pub mod format;
 pub mod history;
 pub mod machine;
@@ -47,6 +48,7 @@ pub use bloom_path::PathBloom;
 pub use bloom_region::{RegionCertification, RegionDescriptor};
 pub use checkpoint::CheckpointSet;
 pub use error::{EkbloomError, Result};
+pub use filesystem::{FileMeta, ObjectPhysical, OrFs, PhysicalReport};
 pub use history::History;
 pub use machine::{machine_by_id, OrMachine, MACHINE_NL2, NL2};
 pub use manifest::{
