@@ -34,8 +34,10 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
+use crate::blocks::BlockIndex;
 use crate::error::{EkbloomError, Result};
 use crate::fastpath;
+use crate::machine::machine_by_id;
 use crate::manifest::EkbloomBody;
 use crate::metrics::{now_ns, percentiles};
 use crate::{CpuFeatures, ReadRequest, SweepConfig};
@@ -703,6 +705,143 @@ impl Capabilities {
     pub fn is_empty(&self) -> bool {
         *self == Capabilities::none()
     }
+}
+
+/// Logical bytes of the hot prefix skipped by the cold-read selector (the same
+/// 256 KiB hot set the frontier harness uses).
+const COLD_SELECT_PREFIX: u64 = 256 * 1024;
+/// Cold-read length sampled by the selector (the common 4 KiB page).
+const COLD_SELECT_READ: u64 = 4096;
+/// Cold samples the selector takes per candidate.
+const COLD_SELECT_SAMPLES: usize = 64;
+
+/// A certified exact cold-read path: a representation machine plus an
+/// independently-restartable [`BlockIndex`] built to a chosen block size, with
+/// its real stored bytes and the sampled cold-read latency that selected it.
+#[derive(Clone, Debug)]
+pub struct ColdBlockSelection {
+    /// The encoding machine (`OrANS-NL2` / `OrANS-RANS0` / `OrANS-Store`).
+    pub machine_id: u32,
+    /// Block span in logical symbols the index restarts on.
+    pub block_bytes: u32,
+    /// The machine's visible core.
+    pub core: Vec<u8>,
+    /// The certified block-restart directory.
+    pub index: BlockIndex,
+    /// Real bytes retained: core `++` directory `++` restart records.
+    pub stored_bytes: u64,
+    /// Median sampled cold-read latency (ns) that selected this candidate.
+    pub sampled_ns_p50: f64,
+}
+
+impl ColdBlockSelection {
+    /// A byte-exact cold read through the selected certified block restart.
+    pub fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.index.read_range(&self.core, offset, len)
+    }
+
+    /// Independently re-certify the selected path against the authoritative
+    /// machine (fresh pass), so the returned path is proven exact.
+    pub fn certify(&self) -> Result<bool> {
+        self.index.verify_against(&self.core)
+    }
+}
+
+/// Deterministic 4 KiB-aligned cold offsets past [`COLD_SELECT_PREFIX`].
+fn cold_select_offsets(n: u64) -> Vec<u64> {
+    let span = n.saturating_sub(COLD_SELECT_PREFIX + COLD_SELECT_READ);
+    let slots = (span / COLD_SELECT_READ).max(1);
+    let mut out = Vec::with_capacity(COLD_SELECT_SAMPLES);
+    let mut s: u64 = 0x0C01_D5E1_0000_0001;
+    for _ in 0..COLD_SELECT_SAMPLES {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let j = if span >= COLD_SELECT_READ {
+            (s >> 33) % slots
+        } else {
+            0
+        };
+        out.push(COLD_SELECT_PREFIX + j.saturating_mul(COLD_SELECT_READ));
+    }
+    out
+}
+
+/// Select the **fastest certified exact** cold-read representation for `source`
+/// among `machines` and `block_sizes` whose real stored bytes fit `max_bytes`.
+///
+/// Each candidate is an authoritative machine encode plus an independently
+/// certified [`BlockIndex`]; the winner is chosen by the median latency of
+/// [`COLD_SELECT_SAMPLES`] deterministic cold reads past the hot prefix. If the
+/// source is shorter than the hot prefix the sample is the first aligned read.
+/// Returns [`EkbloomError::InvalidArgument`] when no candidate fits.
+pub fn select_cold_block(
+    source: &[u8],
+    machines: &[u32],
+    block_sizes: &[u32],
+    max_bytes: u64,
+) -> Result<ColdBlockSelection> {
+    let n = source.len() as u64;
+    let offsets = cold_select_offsets(n);
+    let mut best: Option<ColdBlockSelection> = None;
+    for &machine_id in machines {
+        let Some(machine) = machine_by_id(machine_id) else {
+            continue;
+        };
+        let core = machine.encode(source)?;
+        for &block_bytes in block_sizes {
+            if block_bytes == 0 {
+                continue;
+            }
+            let index = BlockIndex::build_machine(&core, n, block_bytes, machine_id)?;
+            let stored_bytes = (core.len() as u64)
+                .saturating_add(index.directory_bytes())
+                .saturating_add(index.restart_bytes());
+            if stored_bytes > max_bytes {
+                continue;
+            }
+            let mut samples = Vec::with_capacity(offsets.len());
+            for &offset in &offsets {
+                let len = COLD_SELECT_READ.min(n.saturating_sub(offset));
+                if len == 0 {
+                    samples.push(0u64);
+                    continue;
+                }
+                let t = now_ns();
+                let bytes = index.read_range(&core, offset, len)?;
+                let elapsed = now_ns().saturating_sub(t);
+                if bytes != source[offset as usize..(offset + len) as usize] {
+                    return Err(EkbloomError::BadSection {
+                        reason: "cold selection produced non-exact bytes".to_string(),
+                    });
+                }
+                samples.push(elapsed);
+            }
+            samples.sort_unstable();
+            let p50 = percentiles(&samples).p50;
+            let candidate = ColdBlockSelection {
+                machine_id,
+                block_bytes,
+                core: core.clone(),
+                index,
+                stored_bytes,
+                sampled_ns_p50: p50,
+            };
+            let better = match &best {
+                None => true,
+                Some(b) => {
+                    p50 < b.sampled_ns_p50
+                        || (p50 == b.sampled_ns_p50 && stored_bytes < b.stored_bytes)
+                }
+            };
+            if better {
+                best = Some(candidate);
+            }
+        }
+    }
+    best.ok_or(EkbloomError::InvalidArgument {
+        what: format!("no certified cold representation fits the {max_bytes}-byte cap"),
+    })
 }
 
 /// One measured row: a baseline or an EKBLOOM profile under one workload.

@@ -14,9 +14,9 @@
 
 use ekbloom::adapt::{Workload, WorkloadKind};
 use ekbloom::{
-    create_auto, now_ns, percentiles, spread_offsets, AccessTrace, BlockIndex, DirectoryKind,
-    Engine, HotBlockCache, ManifestationBudget, ManifestationProfile, Percentiles, ReadRequest,
-    TileSet, MACHINE_STORE,
+    create_auto, machine_by_id, now_ns, percentiles, spread_offsets, AccessTrace, BlockIndex,
+    DirectoryKind, Engine, HotBlockCache, ManifestationBudget, ManifestationProfile, Percentiles,
+    ReadRequest, TileSet, MACHINE_STORE,
 };
 use std::path::Path;
 
@@ -26,6 +26,11 @@ const N: usize = 4 * 1024 * 1024;
 const HOT_BYTES: u64 = 256 * 1024;
 /// Exact read length (bytes).
 const READ: u64 = 4096;
+/// Cold-read lengths for the head-to-head: the 4 KiB page and a 64 KiB extent.
+const COLD4K: u64 = 4096;
+const COLD64K: u64 = 64 * 1024;
+/// Cold samples per latency point.
+const COLD_SAMPLES: usize = 256;
 /// Random samples per latency point.
 const SAMPLES: usize = 512;
 /// Samples and best-of-N passes for the hot-index micro-measurement.
@@ -547,6 +552,367 @@ fn zstd_read_cached(
     out
 }
 
+// ---------------------------------------------------------------------------
+// COLD (uncached) read head-to-head at one footprint per contender.
+//
+// The bottleneck is decode throughput, so this compares EKBLOOM's block-restart
+// decode across its three machines and three block sizes against a **fair**
+// block-indexed LZ4 (a real per-block offset table, so a 4 KiB cold read
+// decompresses only the covering block, never the whole object) and chunked
+// Zstandard. Every contender is byte-exact before timing.
+// ---------------------------------------------------------------------------
+
+/// Deterministic cold offsets (`COLD_SAMPLES` of them) past the 256 KiB hot set,
+/// aligned to `len`.
+fn cold_offsets(n: u64, len: u64, salt: u64) -> Vec<u64> {
+    let start = HOT_BYTES;
+    let span = n.saturating_sub(start + len);
+    let slots = (span / len).max(1);
+    (0..COLD_SAMPLES as u64)
+        .map(|i| {
+            let j = if span >= len {
+                i.wrapping_mul(2654435761)
+                    .wrapping_add(salt)
+                    .wrapping_mul(0x9E37_79B9)
+                    % slots
+            } else {
+                0
+            };
+            start + j * len
+        })
+        .collect()
+}
+
+/// Block-indexed LZ4 read: decompress only the blocks covering the request (the
+/// `block`-byte grid is the real, offset-addressed index).
+fn lz4_read_blocked(blocks: &[Vec<u8>], block: usize, n: usize, offset: u64, len: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len as usize);
+    let mut pos = offset as usize;
+    let end = pos + len as usize;
+    while pos < end {
+        let b = pos / block;
+        let start = b * block;
+        let seg_end = end.min(start + block);
+        let full = (n - start).min(block);
+        let decoded = lz4_flex::decompress(&blocks[b], full).expect("lz4 block");
+        out.extend_from_slice(&decoded[pos - start..seg_end - start]);
+        pos = seg_end;
+    }
+    out
+}
+
+/// [`lz4_read_blocked`] through a byte-budgeted hot-block cache.
+fn lz4_read_blocked_cached(
+    cache: &mut HotBlockCache,
+    blocks: &[Vec<u8>],
+    block: usize,
+    n: usize,
+    offset: u64,
+    len: u64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len as usize);
+    let mut pos = offset as usize;
+    let end = pos + len as usize;
+    while pos < end {
+        let b = pos / block;
+        let start = b * block;
+        let seg_end = end.min(start + block);
+        let full = (n - start).min(block);
+        let decoded = cache
+            .get_or_load(b as u64, || {
+                Some(lz4_flex::decompress(&blocks[b], full).expect("lz4 block"))
+            })
+            .expect("cached lz4 block");
+        out.extend_from_slice(&decoded[pos - start..seg_end - start]);
+        pos = seg_end;
+    }
+    out
+}
+
+/// Chunked Zstandard read of an arbitrary `(offset, len)` extent.
+fn zstd_read_at(frames: &[Vec<u8>], chunk: usize, offset: u64, len: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len as usize);
+    let mut pos = offset as usize;
+    let end = pos + len as usize;
+    while pos < end {
+        let c = pos / chunk;
+        let start = c * chunk;
+        let seg_end = end.min(start + chunk);
+        let decoded = zstd::stream::decode_all(&frames[c][..]).expect("zstd frame");
+        out.extend_from_slice(&decoded[pos - start..seg_end - start]);
+        pos = seg_end;
+    }
+    out
+}
+
+/// [`zstd_read_at`] through a byte-budgeted hot-block cache.
+fn zstd_read_at_cached(
+    cache: &mut HotBlockCache,
+    frames: &[Vec<u8>],
+    chunk: usize,
+    offset: u64,
+    len: u64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len as usize);
+    let mut pos = offset as usize;
+    let end = pos + len as usize;
+    while pos < end {
+        let c = pos / chunk;
+        let start = c * chunk;
+        let seg_end = end.min(start + chunk);
+        let decoded = cache
+            .get_or_load(c as u64, || {
+                Some(zstd::stream::decode_all(&frames[c][..]).expect("zstd frame"))
+            })
+            .expect("cached zstd frame");
+        out.extend_from_slice(&decoded[pos - start..seg_end - start]);
+        pos = seg_end;
+    }
+    out
+}
+
+/// One cold-read contender row.
+struct ColdRow {
+    name: String,
+    class: String,
+    stored_bytes: u64,
+    index_bytes: u64,
+    build_ns: u64,
+    r4k_p50: f64,
+    r4k_p99: f64,
+    r64k_p50: f64,
+    r64k_p99: f64,
+    note: String,
+}
+
+impl ColdRow {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        name: String,
+        class: &str,
+        stored_bytes: u64,
+        index_bytes: u64,
+        build_ns: u64,
+        r4k: &Percentiles,
+        r64k: &Percentiles,
+        note: String,
+    ) -> ColdRow {
+        ColdRow {
+            name,
+            class: class.to_string(),
+            stored_bytes,
+            index_bytes,
+            build_ns,
+            r4k_p50: r4k.p50,
+            r4k_p99: r4k.p99,
+            r64k_p50: r64k.p50,
+            r64k_p99: r64k.p99,
+            note,
+        }
+    }
+}
+
+/// The cold head-to-head for one corpus.
+struct ColdReport {
+    name: String,
+    source_len: u64,
+    hot_bytes: u64,
+    rows: Vec<ColdRow>,
+}
+
+/// Measure the cold 4 KiB / 64 KiB head-to-head for one corpus.
+fn measure_cold(name: &str, source: &[u8]) -> ekbloom::Result<ColdReport> {
+    let n = source.len() as u64;
+    let offs4 = cold_offsets(n, COLD4K, 0xC01D);
+    let offs64 = cold_offsets(n, COLD64K, 0xC064);
+    let mut rows: Vec<ColdRow> = Vec::new();
+
+    // ---- EKBLOOM: every machine x block size, each an authoritative encode plus
+    // a certified BlockIndex, read through the bounded block decoder.
+    for &machine in &[1u32, 2, 3] {
+        let m = machine_by_id(machine).expect("known machine");
+        let t_enc = now_ns();
+        let core = m.encode(source)?;
+        let encode_ns = now_ns().saturating_sub(t_enc);
+        for &block in &[256u32, 1024, 4096] {
+            let t = now_ns();
+            let index = BlockIndex::build_machine(&core, n, block, machine)?;
+            let build_ns = now_ns().saturating_sub(t).saturating_add(encode_ns);
+            let index_bytes = index
+                .directory_bytes()
+                .saturating_add(index.restart_bytes());
+            let stored = (core.len() as u64).saturating_add(index_bytes);
+            for &off in offs4.iter().take(8) {
+                assert_eq!(
+                    index.read_range(&core, off, COLD4K)?,
+                    &source[off as usize..(off + COLD4K) as usize],
+                    "ekbloom m{machine} b{block} cold exact"
+                );
+            }
+            let r4k = time_reads(&offs4, |off| index.read_range(&core, off, COLD4K).unwrap());
+            let r64k = time_reads(&offs64, |off| {
+                index.read_range(&core, off, COLD64K).unwrap()
+            });
+            rows.push(ColdRow::new(
+                format!("ekbloom-m{machine}-b{block}"),
+                "ekbloom",
+                stored,
+                index_bytes,
+                build_ns,
+                &r4k,
+                &r64k,
+                format!("machine {machine}, {block} B block restart"),
+            ));
+        }
+    }
+
+    // ---- Block-indexed LZ4 (explicit u32 offset table) and a cached variant.
+    let budget = n + n / 8;
+    for &block in &[1024usize, 4096, 16384] {
+        let t = now_ns();
+        let blocks: Vec<Vec<u8>> = source.chunks(block).map(lz4_flex::compress).collect();
+        let build_ns = now_ns().saturating_sub(t);
+        let compressed: u64 = blocks.iter().map(|b| b.len() as u64).sum();
+        let index_bytes = blocks.len() as u64 * 4;
+        let stored = compressed.saturating_add(index_bytes);
+        for &off in offs4.iter().take(8) {
+            assert_eq!(
+                lz4_read_blocked(&blocks, block, source.len(), off, COLD4K),
+                &source[off as usize..(off + COLD4K) as usize],
+                "lz4 b{block} cold exact"
+            );
+        }
+        let r4k = time_reads(&offs4, |off| {
+            lz4_read_blocked(&blocks, block, source.len(), off, COLD4K)
+        });
+        let r64k = time_reads(&offs64, |off| {
+            lz4_read_blocked(&blocks, block, source.len(), off, COLD64K)
+        });
+        rows.push(ColdRow::new(
+            format!("lz4-block-{block}"),
+            "lz4",
+            stored,
+            index_bytes,
+            build_ns,
+            &r4k,
+            &r64k,
+            format!(
+                "{block} B block grid + {index_bytes} B offset table, one decompress per block"
+            ),
+        ));
+        if block == 4096 {
+            let cache_budget = budget.saturating_sub(stored);
+            let mut cache = HotBlockCache::new(block as u64, cache_budget);
+            for _ in 0..2 {
+                for &off in &offs4 {
+                    let _ = lz4_read_blocked_cached(
+                        &mut cache,
+                        &blocks,
+                        block,
+                        source.len(),
+                        off,
+                        COLD4K,
+                    );
+                }
+            }
+            let r4k = time_reads(&offs4, |off| {
+                lz4_read_blocked_cached(&mut cache, &blocks, block, source.len(), off, COLD4K)
+            });
+            let r64k = time_reads(&offs64, |off| {
+                lz4_read_blocked_cached(&mut cache, &blocks, block, source.len(), off, COLD64K)
+            });
+            rows.push(ColdRow::new(
+                "lz4-block-4096+cache".to_string(),
+                "lz4",
+                stored.saturating_add(cache_budget),
+                index_bytes,
+                build_ns,
+                &r4k,
+                &r64k,
+                format!("same storage + {cache_budget} B LRU cache"),
+            ));
+        }
+    }
+
+    // ---- Chunked Zstandard and a cached variant.
+    {
+        let t = now_ns();
+        let frames: Vec<Vec<u8>> = source
+            .chunks(ZSTD_CHUNK)
+            .map(|c| zstd::stream::encode_all(c, 0).unwrap())
+            .collect();
+        let build_ns = now_ns().saturating_sub(t);
+        let compressed: u64 = frames.iter().map(|f| f.len() as u64).sum();
+        let index_bytes = frames.len() as u64 * 4;
+        let stored = compressed.saturating_add(index_bytes);
+        let r4k = time_reads(&offs4, |off| zstd_read_at(&frames, ZSTD_CHUNK, off, COLD4K));
+        let r64k = time_reads(&offs64, |off| {
+            zstd_read_at(&frames, ZSTD_CHUNK, off, COLD64K)
+        });
+        rows.push(ColdRow::new(
+            "zstd-chunk".to_string(),
+            "zstd",
+            stored,
+            index_bytes,
+            build_ns,
+            &r4k,
+            &r64k,
+            format!("{ZSTD_CHUNK} B seekable chunk, one frame per chunk"),
+        ));
+        let cache_budget = budget.saturating_sub(stored);
+        let mut cache = HotBlockCache::new(ZSTD_CHUNK as u64, cache_budget);
+        for _ in 0..2 {
+            for &off in &offs4 {
+                let _ = zstd_read_at_cached(&mut cache, &frames, ZSTD_CHUNK, off, COLD4K);
+            }
+        }
+        let r4k = time_reads(&offs4, |off| {
+            zstd_read_at_cached(&mut cache, &frames, ZSTD_CHUNK, off, COLD4K)
+        });
+        let r64k = time_reads(&offs64, |off| {
+            zstd_read_at_cached(&mut cache, &frames, ZSTD_CHUNK, off, COLD64K)
+        });
+        rows.push(ColdRow::new(
+            "zstd-chunk+cache".to_string(),
+            "zstd",
+            stored.saturating_add(cache_budget),
+            index_bytes,
+            build_ns,
+            &r4k,
+            &r64k,
+            format!("same storage + {cache_budget} B LRU cache"),
+        ));
+    }
+
+    // ---- raw-vec reference (a memcpy, the cold floor).
+    {
+        let raw = source.to_vec();
+        let r4k = time_reads(&offs4, |off| {
+            raw[off as usize..(off + COLD4K) as usize].to_vec()
+        });
+        let r64k = time_reads(&offs64, |off| {
+            raw[off as usize..(off + COLD64K) as usize].to_vec()
+        });
+        rows.push(ColdRow::new(
+            "raw-vec".to_string(),
+            "raw",
+            n,
+            0,
+            0,
+            &r4k,
+            &r64k,
+            "positional memcpy".to_string(),
+        ));
+    }
+
+    Ok(ColdReport {
+        name: name.to_string(),
+        source_len: n,
+        hot_bytes: HOT_BYTES,
+        rows,
+    })
+}
+
 /// One measured contender.
 #[derive(Clone)]
 struct Row {
@@ -695,11 +1061,15 @@ fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
         rows.push(row);
     }
 
-    // ---- Block-indexed LZ4 (with and without a hot-block cache).
+    // ---- Block-indexed LZ4 (with and without a hot-block cache). The compressed
+    // blocks are a fixed-size grid but their sizes vary, so a real direct-access
+    // reader needs a per-block offset table; `u32` offsets (one per block) are
+    // counted in the footprint so the LZ4 competitor is not made artificially slim.
     let t = now_ns();
     let lz4_blocks: Vec<Vec<u8>> = source.chunks(LZ4_BLOCK).map(lz4_flex::compress).collect();
     let lz4_build_ns = now_ns().saturating_sub(t);
-    let lz4_storage = lz4_blocks.iter().map(|b| b.len() as u64).sum::<u64>();
+    let lz4_index_bytes = lz4_blocks.len() as u64 * 4;
+    let lz4_storage = lz4_blocks.iter().map(|b| b.len() as u64).sum::<u64>() + lz4_index_bytes;
     for &off in hot_offsets.iter().chain(cold_offsets.iter()).take(16) {
         assert_eq!(
             lz4_read(&lz4_blocks, source.len(), off, READ),
@@ -941,6 +1311,7 @@ fn render_json(
     hot: &HotIndex,
     residency: &[Residency],
     rep: &Representation,
+    cold: &[ColdReport],
 ) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
@@ -1072,6 +1443,42 @@ fn render_json(
     );
     let _ = writeln!(s, "    \"skewed_ratio\": {:.4}", finite(rep.skewed_ratio));
     s.push_str("  },\n");
+    s.push_str("  \"cold_reads\": [\n");
+    for (ci, c) in cold.iter().enumerate() {
+        s.push_str("    {\n");
+        let _ = writeln!(s, "      \"name\": \"{}\",", json_escape(&c.name));
+        let _ = writeln!(s, "      \"source_len\": {},", c.source_len);
+        let _ = writeln!(s, "      \"hot_bytes\": {},", c.hot_bytes);
+        let _ = writeln!(s, "      \"cold4k_bytes\": {COLD4K},");
+        let _ = writeln!(s, "      \"cold64k_bytes\": {COLD64K},");
+        let _ = writeln!(s, "      \"samples\": {COLD_SAMPLES},");
+        s.push_str("      \"rows\": [\n");
+        for (ri, r) in c.rows.iter().enumerate() {
+            s.push_str("        {\n");
+            let _ = writeln!(s, "          \"name\": \"{}\",", json_escape(&r.name));
+            let _ = writeln!(s, "          \"class\": \"{}\",", r.class);
+            let _ = writeln!(s, "          \"stored_bytes\": {},", r.stored_bytes);
+            let _ = writeln!(s, "          \"index_bytes\": {},", r.index_bytes);
+            let _ = writeln!(s, "          \"build_ns\": {},", r.build_ns);
+            let _ = writeln!(s, "          \"r4k_p50_ns\": {:.1},", finite(r.r4k_p50));
+            let _ = writeln!(s, "          \"r4k_p99_ns\": {:.1},", finite(r.r4k_p99));
+            let _ = writeln!(s, "          \"r64k_p50_ns\": {:.1},", finite(r.r64k_p50));
+            let _ = writeln!(s, "          \"r64k_p99_ns\": {:.1},", finite(r.r64k_p99));
+            let _ = writeln!(s, "          \"note\": \"{}\"", json_escape(&r.note));
+            let _ = write!(s, "        }}");
+            if ri + 1 < c.rows.len() {
+                s.push(',');
+            }
+            s.push('\n');
+        }
+        s.push_str("      ]\n");
+        let _ = write!(s, "    }}");
+        if ci + 1 < cold.len() {
+            s.push(',');
+        }
+        s.push('\n');
+    }
+    s.push_str("  ],\n");
     s.push_str("  \"corpora\": [\n");
     for (ci, c) in corpora.iter().enumerate() {
         s.push_str("    {\n");
@@ -1195,16 +1602,56 @@ fn print_table(corpora: &[CorpusReport]) {
     }
 }
 
+fn print_cold_table(cold: &[ColdReport]) {
+    for c in cold {
+        println!(
+            "\n== COLD reads: corpus {} ==  source {} B, hot prefix {} B",
+            c.name, c.source_len, c.hot_bytes
+        );
+        println!(
+            "{:<22} {:<8} {:>11} {:>9} {:>10} {:>10} {:>11} {:>11}",
+            "contender",
+            "class",
+            "stored",
+            "build_ns",
+            "r4k p50",
+            "r4k p99",
+            "r64k p50",
+            "r64k p99"
+        );
+        for r in &c.rows {
+            println!(
+                "{:<22} {:<8} {:>11} {:>9} {:>10.0} {:>10.0} {:>11.0} {:>11.0}",
+                r.name,
+                r.class,
+                r.stored_bytes,
+                r.build_ns,
+                r.r4k_p50,
+                r.r4k_p99,
+                r.r64k_p50,
+                r.r64k_p99
+            );
+        }
+    }
+}
+
 fn main() -> ekbloom::Result<()> {
     let hot_index = measure_hot_index(&skewed(0xE7B0_0000_00CC_0001, N))?;
     let residency = vec![measure_residency(RES_1M)?, measure_residency(RES_256M)?];
     let representation = measure_representation()?;
-    let corpora: Vec<CorpusReport> = corpora()
-        .into_iter()
-        .map(|(name, source)| measure_corpus(name, &source))
+    let corpus_list = corpora();
+    let cold: Vec<ColdReport> = corpus_list
+        .iter()
+        .filter(|(name, _)| *name == "skewed" || *name == "mixed")
+        .map(|(name, source)| measure_cold(name, source))
+        .collect::<ekbloom::Result<Vec<_>>>()?;
+    let corpora: Vec<CorpusReport> = corpus_list
+        .iter()
+        .map(|(name, source)| measure_corpus(name, source))
         .collect::<ekbloom::Result<Vec<_>>>()?;
 
     print_table(&corpora);
+    print_cold_table(&cold);
 
     println!("\n== hot index (fully resident, allocation-parity) ==");
     println!(
@@ -1273,7 +1720,7 @@ fn main() -> ekbloom::Result<()> {
     println!("  reproducible advantage over indexed codecs: {advantage_win}");
     println!("  HOLDS: {holds}");
 
-    let json = render_json(&corpora, &hot_index, &residency, &representation);
+    let json = render_json(&corpora, &hot_index, &residency, &representation, &cold);
     let out = Path::new("evidence/bench/frontier.json");
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;

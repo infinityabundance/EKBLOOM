@@ -167,10 +167,16 @@ impl Model {
 /// The context is a pure function of the core header; it holds no cursor and is
 /// immutable, so it may be shared across threads (it is `Send + Sync`).
 pub struct RansContext {
-    freq: [u16; SYMBOLS],
-    cum: [u32; SYMBOLS],
-    /// `table[slot]` is the unique symbol `s` with `cum[s] <= slot < cum[s] + freq[s]`.
-    table: Vec<u8>,
+    /// The fused per-slot decode table. `entries[slot]` packs everything one
+    /// decoder step needs, so the step is a **single** dependent load instead of
+    /// the old two-level `table[slot] -> s -> freq[s]/cum[s]` chain:
+    ///
+    /// ```text
+    /// bits  0..12  freq[s]      (<= 3841, fits 12 bits: 256 symbols each >= 1)
+    /// bits 12..24  cum[s]       (<= 4095, fits 12 bits)
+    /// bits 24..32  s            (the revealed symbol byte)
+    /// ```
+    entries: Vec<u32>,
 }
 
 impl RansContext {
@@ -180,44 +186,48 @@ impl RansContext {
     /// that do not sum to `M`, or a zero frequency.
     pub fn from_core(core: &[u8]) -> Result<RansContext> {
         let model = Model::from_header(core)?;
-        let mut table = vec![0u8; M as usize];
+        let mut entries = vec![0u32; M as usize];
         for s in 0..SYMBOLS {
-            let start = model.cum[s] as usize;
+            let f = u32::from(model.freq[s]);
+            let c = model.cum[s];
+            let packed = f | (c << SCALE_BITS) | ((s as u32) << 24);
+            let start = c as usize;
             let end = start + usize::from(model.freq[s]);
-            table[start..end].fill(s as u8);
+            entries[start..end].fill(packed);
         }
-        Ok(RansContext {
-            freq: model.freq,
-            cum: model.cum,
-            table,
-        })
+        Ok(RansContext { entries })
     }
 
-    /// One decoder step: resolve the symbol owning `x & 4095` from the table and
-    /// advance the state, consuming zero or more renormalisation bytes.
+    /// One decoder step: resolve the symbol owning `x & 4095` from the fused table
+    /// and advance the state, consuming zero or more renormalisation bytes.
+    ///
+    /// The whole step is 32-bit: the coder state is provably `< 2^31 + 2^12`
+    /// (the encoder's `x_max = 2^19 * f` bounds it), so `(x >> 12) * f + slot - c`
+    /// cannot overflow a `u32` and the renormalisation shift only ever runs while
+    /// `nx < RANS_L = 2^23`, keeping `nx << 8 < 2^31`.
     #[inline]
     fn step(&self, core: &[u8], omega: &mut Snapshot) -> Result<u8> {
         let x = omega.state;
         let slot = x & (M - 1);
-        let s = self.table[slot as usize];
-        let f = u64::from(self.freq[s as usize]);
-        let c = u64::from(self.cum[s as usize]);
-        let mut nx = f * u64::from(x >> SCALE_BITS) + u64::from(slot) - c;
+        let e = self.entries[slot as usize];
+        let mut nx = (x >> SCALE_BITS) * (e & 0x0FFF) + slot - ((e >> SCALE_BITS) & 0x0FFF);
         let mut p = omega.cursor;
-        while nx < u64::from(RANS_L) {
-            let idx = usize::try_from(p).map_err(|_| EkbloomError::Overflow {
-                what: "rans cursor",
-            })?;
-            let byte = *core.get(idx).ok_or(EkbloomError::CoreTooShort {
-                needed: p + 1,
-                available: core.len() as u64,
-            })?;
-            nx = (nx << 8) | u64::from(byte);
+        while nx < RANS_L {
+            let byte = match core.get(p as usize) {
+                Some(&b) => b,
+                None => {
+                    return Err(EkbloomError::CoreTooShort {
+                        needed: p + 1,
+                        available: core.len() as u64,
+                    })
+                }
+            };
+            nx = (nx << 8) | u32::from(byte);
             p += 1;
         }
-        omega.state = nx as u32;
+        omega.state = nx;
         omega.cursor = p;
-        Ok(s)
+        Ok((e >> 24) as u8)
     }
 
     /// Reveal one symbol against this prepared context.
@@ -236,16 +246,80 @@ impl RansContext {
     /// Advance `omega` by exactly `n` decoder steps, discarding the symbols.
     ///
     /// This is the prepared block-decoder skip used to reach a block's read
-    /// offset (bounded by the block size) without re-parsing the model.
+    /// offset (bounded by the block size) without re-parsing the model. It keeps
+    /// the state and cursor in locals across the whole loop.
     pub fn skip(&self, core: &[u8], omega: &mut Snapshot, n: u64) -> Result<()> {
+        let mut x = omega.state;
+        let mut p = omega.cursor;
         for _ in 0..n {
-            self.step(core, omega)?;
+            let slot = x & (M - 1);
+            let e = self.entries[slot as usize];
+            let mut nx = (x >> SCALE_BITS) * (e & 0x0FFF) + slot - ((e >> SCALE_BITS) & 0x0FFF);
+            while nx < RANS_L {
+                let byte = match core.get(p as usize) {
+                    Some(&b) => b,
+                    None => {
+                        return Err(EkbloomError::CoreTooShort {
+                            needed: p + 1,
+                            available: core.len() as u64,
+                        })
+                    }
+                };
+                nx = (nx << 8) | u32::from(byte);
+                p += 1;
+            }
+            x = nx;
         }
+        omega.state = x;
+        omega.cursor = p;
+        Ok(())
+    }
+
+    /// Decode exactly `out.len()` symbols from `omega` into `out` — the tight
+    /// prepared block decoder: local state/cursor, one fused-table load per symbol,
+    /// a `u32` state update, and a slice store with no per-symbol capacity check.
+    pub fn decode_into_slice(
+        &self,
+        core: &[u8],
+        omega: &mut Snapshot,
+        out: &mut [u8],
+    ) -> Result<()> {
+        let mut x = omega.state;
+        let mut p = omega.cursor;
+        for byte in out.iter_mut() {
+            let slot = x & (M - 1);
+            let e = self.entries[slot as usize];
+            let mut nx = (x >> SCALE_BITS) * (e & 0x0FFF) + slot - ((e >> SCALE_BITS) & 0x0FFF);
+            if nx < RANS_L {
+                loop {
+                    let b = match core.get(p as usize) {
+                        Some(&b) => b,
+                        None => {
+                            return Err(EkbloomError::CoreTooShort {
+                                needed: p + 1,
+                                available: core.len() as u64,
+                            })
+                        }
+                    };
+                    nx = (nx << 8) | u32::from(b);
+                    p += 1;
+                    if nx >= RANS_L {
+                        break;
+                    }
+                }
+            }
+            x = nx;
+            *byte = (e >> 24) as u8;
+        }
+        omega.state = x;
+        omega.cursor = p;
         Ok(())
     }
 
     /// Reveal `n` symbols from `omega`, appending them to `out` using the prepared
-    /// table (the prepared block decoder).
+    /// table (the prepared block decoder). The destination is resized once and the
+    /// tight [`RansContext::decode_into_slice`] fills it, so the per-symbol
+    /// capacity check of a `push` loop is gone.
     pub fn decode_into(
         &self,
         core: &[u8],
@@ -253,13 +327,15 @@ impl RansContext {
         n: u64,
         out: &mut Vec<u8>,
     ) -> Result<()> {
-        if let Ok(cap) = usize::try_from(n) {
-            out.reserve(cap);
-        }
-        for _ in 0..n {
-            out.push(self.step(core, omega)?);
-        }
-        Ok(())
+        let n = usize::try_from(n).map_err(|_| EkbloomError::Overflow {
+            what: "rans decode length",
+        })?;
+        let start = out.len();
+        let end = start.checked_add(n).ok_or(EkbloomError::Overflow {
+            what: "rans decode buffer",
+        })?;
+        out.resize(end, 0);
+        self.decode_into_slice(core, omega, &mut out[start..end])
     }
 }
 

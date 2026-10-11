@@ -24,7 +24,8 @@
 //! tampered restart is rejected rather than published.
 
 use crate::error::{EkbloomError, Result};
-use crate::machine::{machine_by_id, prepare, MACHINE_NL2};
+use crate::machine::{machine_by_id, prepare, MACHINE_NL2, MACHINE_RANS0, MACHINE_STORE, SBOX};
+use crate::machine_rans::RansContext;
 use crate::state::Snapshot;
 
 /// Wire magic of a serialized [`BlockIndex`].
@@ -290,6 +291,11 @@ impl BlockIndex {
 
     /// [`BlockIndex::read_range`] reporting the exact number of machine steps
     /// performed (skip to `offset` plus `len` reveals), so the bound is testable.
+    ///
+    /// The step loop is machine-specific and tight: machine 2 uses the fused-table
+    /// prepared decoder (one context build per read, **no** per-symbol header
+    /// parse), machine 1 uses the NL2 XOR step directly, and machine 3 is a
+    /// verbatim slice copy (`cursor == position`).
     pub fn read_range_counted(&self, core: &[u8], offset: u64, len: u64) -> Result<(Vec<u8>, u64)> {
         let end = offset.checked_add(len).ok_or(EkbloomError::Overflow {
             what: "block read range",
@@ -311,23 +317,92 @@ impl BlockIndex {
             .entries
             .get(idx)
             .ok_or_else(|| bad("block restart index out of range"))?;
-        let machine = machine_by_id(self.machine_id).ok_or(EkbloomError::UnknownMachine {
-            id: self.machine_id,
-        })?;
-        let ctx = prepare(machine, core)?;
-        let mut omega = Snapshot::new(state, cursor);
-        let mut steps = 0u64;
-        while steps < offset - start {
-            ctx.reveal(core, &mut omega)?;
-            steps += 1;
-        }
+        let skip = offset - start;
         let cap = usize::try_from(len).map_err(|_| EkbloomError::Overflow {
             what: "block read length",
         })?;
-        let mut out = Vec::with_capacity(cap);
-        ctx.decode_into(core, &mut omega, len, &mut out)?;
-        steps = steps.saturating_add(len);
-        Ok((out, steps))
+        let mut out = vec![0u8; cap];
+        match self.machine_id {
+            MACHINE_STORE => {
+                // `cursor == position`: a verbatim read is a direct slice copy.
+                let a = usize::try_from(offset).map_err(|_| EkbloomError::Overflow {
+                    what: "block read offset",
+                })?;
+                let b = a.checked_add(cap).ok_or(EkbloomError::Overflow {
+                    what: "block read offset",
+                })?;
+                let src = core.get(a..b).ok_or(EkbloomError::CoreTooShort {
+                    needed: end,
+                    available: core.len() as u64,
+                })?;
+                out.copy_from_slice(src);
+            }
+            MACHINE_NL2 => {
+                // `cursor == position`: skip then reveal, all against `core[i]`.
+                decode_nl2_into(core, state, start as usize, skip, &mut out)?;
+            }
+            MACHINE_RANS0 => {
+                let ctx = RansContext::from_core(core)?;
+                let mut omega = Snapshot::new(state, cursor);
+                ctx.skip(core, &mut omega, skip)?;
+                ctx.decode_into_slice(core, &mut omega, &mut out)?;
+            }
+            _ => {
+                let machine =
+                    machine_by_id(self.machine_id).ok_or(EkbloomError::UnknownMachine {
+                        id: self.machine_id,
+                    })?;
+                let ctx = prepare(machine, core)?;
+                let mut omega = Snapshot::new(state, cursor);
+                ctx.skip(core, &mut omega, skip)?;
+                ctx.decode_into(core, &mut omega, len, &mut out)?;
+            }
+        }
+        Ok((out, skip.saturating_add(len)))
+    }
+
+    /// [`BlockIndex::read_range_counted`] for a machine-2 index that reuses a
+    /// prepared [`RansContext`] built once by the caller, so the per-read header
+    /// parse and 4096-entry table build are paid once for many cold reads.
+    pub fn read_range_counted_rans(
+        &self,
+        core: &[u8],
+        ctx: &RansContext,
+        offset: u64,
+        len: u64,
+    ) -> Result<(Vec<u8>, u64)> {
+        if self.machine_id != MACHINE_RANS0 {
+            return Err(bad("prepared rANS read requires a machine-2 block index"));
+        }
+        let end = offset.checked_add(len).ok_or(EkbloomError::Overflow {
+            what: "block read range",
+        })?;
+        if end > self.logical_len {
+            return Err(EkbloomError::OutOfBounds {
+                offset,
+                length: len,
+                logical_len: self.logical_len,
+            });
+        }
+        if len == 0 {
+            return Ok((Vec::new(), 0));
+        }
+        let (start, idx) = self
+            .block_of(offset)
+            .ok_or_else(|| bad(format!("no block restart covers offset {offset}")))?;
+        let (state, cursor) = *self
+            .entries
+            .get(idx)
+            .ok_or_else(|| bad("block restart index out of range"))?;
+        let skip = offset - start;
+        let cap = usize::try_from(len).map_err(|_| EkbloomError::Overflow {
+            what: "block read length",
+        })?;
+        let mut out = vec![0u8; cap];
+        let mut omega = Snapshot::new(state, cursor);
+        ctx.skip(core, &mut omega, skip)?;
+        ctx.decode_into_slice(core, &mut omega, &mut out)?;
+        Ok((out, skip.saturating_add(len)))
     }
 
     /// Recompute the content digest over the geometry and restart records.
@@ -520,6 +595,44 @@ fn bad(reason: impl Into<String>) -> EkbloomError {
     EkbloomError::BadSection {
         reason: reason.into(),
     }
+}
+
+/// Decode `out.len()` NL2 symbols from the block restart `(state, core_pos)`,
+/// skipping `skip` symbols first. Machine 1's cursor equals the logical position,
+/// so `core[i]` is the backing byte for logical position `i`.
+fn decode_nl2_into(
+    core: &[u8],
+    state: u32,
+    core_pos: usize,
+    skip: u64,
+    out: &mut [u8],
+) -> Result<()> {
+    let mut x = state & 0xFFFF;
+    let mut pos = core_pos;
+    for _ in 0..skip {
+        let r = *core.get(pos).ok_or(EkbloomError::CoreTooShort {
+            needed: pos as u64 + 1,
+            available: core.len() as u64,
+        })?;
+        let h = (x >> 8) as u8;
+        let l = (x & 0xFF) as u8;
+        let s = SBOX[h as usize] ^ l ^ r;
+        x = (u32::from(l) << 8) | u32::from(s);
+        pos += 1;
+    }
+    for byte in out.iter_mut() {
+        let r = *core.get(pos).ok_or(EkbloomError::CoreTooShort {
+            needed: pos as u64 + 1,
+            available: core.len() as u64,
+        })?;
+        let h = (x >> 8) as u8;
+        let l = (x & 0xFF) as u8;
+        let s = SBOX[h as usize] ^ l ^ r;
+        x = (u32::from(l) << 8) | u32::from(s);
+        *byte = s;
+        pos += 1;
+    }
+    Ok(())
 }
 
 /// Read a little-endian `u64` at `off` (the caller has bounds-checked `off + 8`).
