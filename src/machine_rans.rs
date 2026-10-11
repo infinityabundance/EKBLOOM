@@ -33,22 +33,22 @@ use crate::machine::{OrMachine, MACHINE_RANS0};
 use crate::state::Snapshot;
 
 /// Lower bound of the ANS state.
-const RANS_L: u32 = 1 << 23;
+pub(crate) const RANS_L: u32 = 1 << 23;
 /// Model scale: frequencies sum to `1 << SCALE_BITS`.
-const SCALE_BITS: u32 = 12;
+pub(crate) const SCALE_BITS: u32 = 12;
 /// Model total.
-const M: u32 = 1 << SCALE_BITS;
+pub(crate) const M: u32 = 1 << SCALE_BITS;
 /// Number of byte symbols.
-const SYMBOLS: usize = 256;
+pub(crate) const SYMBOLS: usize = 256;
 /// Model header size: 256 little-endian `u16` frequencies.
-const MODEL_BYTES: usize = SYMBOLS * 2;
+pub(crate) const MODEL_BYTES: usize = SYMBOLS * 2;
 /// Header size: model ++ initial state `u32`.
-const HEADER_BYTES: usize = MODEL_BYTES + 4;
+pub(crate) const HEADER_BYTES: usize = MODEL_BYTES + 4;
 /// Upper bound on decode steps per core byte. A genuine order-0 stream consumes
 /// at most ~86 steps per byte (the entropy floor for the maximally skewed
 /// supported model); this guards against crafted streams that renormalise too
 /// rarely and would otherwise spin.
-const MAX_STEPS_PER_BYTE: u64 = 4096;
+pub(crate) const MAX_STEPS_PER_BYTE: u64 = 4096;
 
 /// The `OrANS-RANS0` machine.
 #[derive(Clone, Copy, Debug, Default)]
@@ -58,9 +58,9 @@ pub struct Rans0;
 pub static RANS0: Rans0 = Rans0;
 
 /// A derived order-0 model: scaled frequencies and prefix sums.
-struct Model {
-    freq: [u16; SYMBOLS],
-    cum: [u32; SYMBOLS],
+pub(crate) struct Model {
+    pub(crate) freq: [u16; SYMBOLS],
+    pub(crate) cum: [u32; SYMBOLS],
 }
 
 impl Model {
@@ -70,7 +70,7 @@ impl Model {
     /// `M - SYMBOLS` mass is distributed proportionally to the clamped counts,
     /// with any rounding remainder handed to the largest fractional parts. The
     /// result always has `freq[s] >= 1` and sums to exactly `M`.
-    fn from_source(source: &[u8]) -> Model {
+    pub(crate) fn from_source(source: &[u8]) -> Model {
         let mut count = [0u64; SYMBOLS];
         for &b in source {
             count[b as usize] += 1;
@@ -111,7 +111,7 @@ impl Model {
     }
 
     /// Parse and validate the model stored in `core`'s header.
-    fn from_header(core: &[u8]) -> Result<Model> {
+    pub(crate) fn from_header(core: &[u8]) -> Result<Model> {
         if core.len() < HEADER_BYTES {
             return Err(EkbloomError::Truncated {
                 needed: HEADER_BYTES as u64,
@@ -196,6 +196,14 @@ impl RansContext {
             entries[start..end].fill(packed);
         }
         Ok(RansContext { entries })
+    }
+
+    /// The fused per-slot decode table (see the field documentation). The
+    /// interleaved machine reuses it so its per-lane step is the same **single**
+    /// dependent load as machine 2's step.
+    #[inline]
+    pub(crate) fn table(&self) -> &[u32] {
+        &self.entries
     }
 
     /// One decoder step: resolve the symbol owning `x & 4095` from the fused table

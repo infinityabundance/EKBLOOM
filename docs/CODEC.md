@@ -1,13 +1,16 @@
-# EKBLOOM — `OrANS-RANS0` (machine 2) and `OrANS-Store` (machine 3)
+# EKBLOOM — `OrANS-RANS0` (machine 2), `OrANS-Store` (machine 3) and `OrANS-RANS0I` (machine 4)
 
 The visible-representation machines. Where the authoritative machine `OrANS-NL2`
 (`machine_id = 1`) is expansion-only (`V = N`), machine 2 **compresses** skewed
-sources (`V < N`) and machine 3 is the **identity** codec (`V = N`, no model
-header, never larger than raw). Machine 1 is unchanged in every respect (its
-semantics, wire behaviour and tests are bit-identical).
+sources (`V < N`), machine 3 is the **identity** codec (`V = N`, no model
+header, never larger than raw), and machine 4 is the **interleaved** order-0 rANS —
+the same `V < N` compression as machine 2 but with `K` independent lane states, so
+the decode rate escapes machine 2's inherently serial state chain. Machine 1 is
+unchanged in every respect (its semantics, wire behaviour and tests are
+bit-identical).
 
-Machine 2's contract is the first half of this document; machine 3 and the `auto`
-representation policy that chooses between them are the second.
+Machine 2's contract is the first half of this document; machine 3, machine 4 and
+the `auto` representation policy that chooses between them are the rest.
 
 This document freezes the machine-2 contract. The implementation lives in
 `src/machine_rans.rs`; the codec is exercised by `tests/machine_rans.rs`.
@@ -175,6 +178,70 @@ advancing; `check_core` requires `logical_len <= core.len()`. Implementation:
 implements `OrMachine` fully and works with the state log, history, checkpoints
 (power-of-two intervals pack to 2 bytes/entry because `cursor == j*K`), packed
 restarts, path blooms, tiles, blocks, regions and the bounded engine.
+
+## Machine 4 — `OrANS-RANS0I` (`machine_id = 4`): interleaved order-0 rANS
+
+Machine 2's decode is an irreducible serial dependent chain (`x -> slot -> fused
+table load -> multiply -> x'`); a byte cannot be decoded before its predecessor.
+Machine 4 **breaks that chain**: it keeps `K` independent 32-bit rANS states and
+codes symbol `i` in lane `i % K`, so the `K` steps of one group are independent and
+the CPU overlaps their table loads, multiplies and adds. The model is byte-for-byte
+machine 2's (same largest-remainder scaling, `M = 1 << 12`, `RANS_L = 1 << 23`), and
+the same 512-byte frequency table is reused; only the trailer and the interleaved
+renorm-byte order differ. Implementation:
+[`src/machine_rans_i.rs`](../src/machine_rans_i.rs); tests:
+[`tests/machine_rans_i.rs`](../tests/machine_rans_i.rs).
+
+**Core layout (`core = encode(source)`).**
+
+```text
+[freq: 256 * u16 LE = 512 B][K: u32 LE][K initial states: K * u32 LE][interleaved renorm bytes ...]
+```
+
+`K ∈ [1, 8]` (default `4`) is stored explicitly, so a core is self-describing and
+any `K` round-trips; the `K` initial states are the encoder's final per-lane states.
+The renorm bytes are the encoder's whole emission sequence **in reverse** (exactly
+machine 2's convention), so the decoder reads them forward — and because the encoder
+emitted them lane-tagged in descending symbol order, that forward read is precisely
+the per-lane order the decoder needs.
+
+**Semantics.** The complete resumable state is
+`Omega = (lane_states: [u32; K], cursor: u64, lane: u8)`. Genesis is
+`(initial_states, header_len, lane 0)`; one `reveal` decodes one symbol on `lane`,
+renormalising from the shared core cursor, then advances `lane` cyclically. The
+complete state lives in a [`Snapshot`](../src/state.rs) (which now carries the lane
+array), so `state_log`, checkpoints, blocks, tiles, path blooms and the engine all
+work through the machine-general paths. A cursor-divergent multi-word machine stores
+restarts in a **wide** form (complete `Snapshot`, `45 B`/entry) in the `BlockIndex`
+and in a versioned wide checkpoint container; machines 1/2/3 keep their `2`/`12`-byte
+wire forms bit-identically.
+
+**Decoder (prepared bulk path, `Prepared::decode_into`).** A full group of `K`
+consecutive symbols visits every lane once, so the group's `K` table lookups and
+state updates are `K` **independent scalar chains** — the ILP that escapes machine
+2's serial dependency. Only the shared renormalising cursor is ordered, and on
+skewed sources renormalisation is rare. This is safe scalar ILP; no new `unsafe` or
+SIMD was added (the sanctioned `unsafe` modules are unchanged).
+
+**Measured** (4 MiB skewed corpus, `examples/frontier.rs`, best of 3, byte-exact
+asserted before timing):
+
+| config | machine | K | ns/byte | GB/s | vs machine 2 |
+|---|---|---:|---:|---:|---:|
+| `rans0-m2` | 2 | 1 | 3.447 | 0.290 | 1.00× |
+| `rans0i-k4` | 4 | 4 | 2.364 | 0.423 | **1.46×** |
+| `rans0i-k8` | 4 | 8 | 2.167 | 0.461 | **1.59×** |
+
+**Honest bound.** Interleaving narrows but does **not** close the cold gap vs LZ4:
+at a comparable stored footprint (machine 4 `b4096` 876,155 B vs machine 2 `b1024`
+879,179 B) the 4 KiB cold read falls `14,447 -> 10,019 ns` and the 64 KiB read
+`223,026 -> 151,082 ns` (≈1.44–1.48× faster), yet LZ4's block decompress is still
+`2,825 ns` / `33,002 ns`, so EKBLOOM stays ≈**3.5× (4 KiB) to ≈4.6× (64 KiB)**
+slower cold (machine 2 was ≈5.1–6.8×). The residual is the serial renormalising
+cursor plus the per-symbol table gather that LZ4 avoids entirely. The `auto` policy
+does **not** select machine 4 (its core is machine 2's plus `4 + 4K` header bytes),
+so existing representation numbers are unchanged; machine 4 is an explicit,
+measured option.
 
 ## The `auto` representation policy
 

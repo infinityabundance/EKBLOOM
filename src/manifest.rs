@@ -253,7 +253,12 @@ pub fn create_machine(
 /// The policy tries machine 2 (`OrANS-RANS0`); when its encoded core is **not**
 /// smaller than the source (`core_len >= source_len`) it falls back to machine 3
 /// (`OrANS-Store`, verbatim), so the base representation is **never larger than
-/// raw**: `V <= N` for every source. Explicit `machine_id = 1|2|3` overrides this.
+/// raw**: `V <= N` for every source. Explicit `machine_id = 1|2|3|4` overrides
+/// this. The interleaved machine 4 (`OrANS-RANS0I`) is deliberately *not* selected
+/// by `auto`: its core is machine 2's plus a `4 + 4K` header, so it is never
+/// smaller, and it trades those few bytes for a faster cold decode rather than a
+/// smaller representation. It is available explicitly via [`create_machine`] and
+/// measured in `examples/frontier.rs`.
 pub fn select_machine(source: &[u8]) -> Result<u32> {
     let machine =
         machine_by_id(MACHINE_RANS0).ok_or(EkbloomError::UnknownMachine { id: MACHINE_RANS0 })?;

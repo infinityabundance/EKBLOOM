@@ -546,19 +546,19 @@ fn lying_block_restarts_are_rejected_by_certification_not_served() {
 
     // A wrong state and a wrong cursor are each caught by certification.
     let mut wrong_state = idx.clone();
-    wrong_state.entries[2].0 ^= 0xFFFF;
+    wrong_state.entries[2].state ^= 0xFFFF;
     assert!(!wrong_state.certify(&core).unwrap());
     assert!(!wrong_state.verify_against(&core).unwrap());
 
     let mut wrong_cursor = idx.clone();
-    wrong_cursor.entries[3].1 = wrong_cursor.entries[3].1.wrapping_add(1);
+    wrong_cursor.entries[3].cursor = wrong_cursor.entries[3].cursor.wrapping_add(1);
     assert!(!wrong_cursor.certify(&core).unwrap());
     assert!(!wrong_cursor.verify_against(&core).unwrap());
 
     // A body carrying a lying restart: `verify` rejects it (authoritative)...
     let mut forged = create_machine(&src, ManifestationProfile::Root, MACHINE_RANS0).unwrap();
     let mut lie = BlockIndex::build_machine(&forged.core, n, 256, MACHINE_RANS0).unwrap();
-    lie.entries[0].0 ^= 0xFFFF;
+    lie.entries[0].state ^= 0xFFFF;
     forged.blocks.push(lie);
     assert!(
         !verify(&forged).unwrap().ok,

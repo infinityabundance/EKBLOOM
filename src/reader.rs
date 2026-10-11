@@ -22,7 +22,7 @@ use crate::checkpoint::{parse_checkpoint_layout, CheckpointSet, CKPT_HEADER_MAX}
 use crate::error::{EkbloomError, Result};
 use crate::format::{self, SectionKind};
 use crate::history::History;
-use crate::machine::{machine_by_id, prepare, MACHINE_NL2, MACHINE_STORE};
+use crate::machine::{machine_by_id, prepare, MACHINE_NL2, MACHINE_RANS0I, MACHINE_STORE};
 use crate::manifest::{ComponentReport, EkbloomBody, ManifestationReport};
 use crate::state::Snapshot;
 use crate::tiles::{
@@ -916,6 +916,9 @@ struct FileBlocks {
     machine_id: u32,
     count: u64,
     packed: bool,
+    /// Complete wide resume records (`Snapshot::WIDE_LEN`) for the interleaved
+    /// machine 4 (multi-word state), versus the 12-byte single-state records.
+    wide: bool,
     core_hash: [u8; 32],
     /// Absolute file offset of the first restart record.
     data_offset: u64,
@@ -926,6 +929,8 @@ impl FileBlocks {
     fn entry_bytes(&self) -> u64 {
         if self.packed {
             2
+        } else if self.wide {
+            Snapshot::WIDE_LEN as u64
         } else {
             12
         }
@@ -947,10 +952,10 @@ impl FileBlocks {
     /// restart records), matching the in-memory `BlockIndex::physical_bytes`.
     #[inline]
     fn physical_bytes(&self) -> u64 {
-        let model = if self.machine_id == MACHINE_NL2 {
-            0
-        } else {
-            crate::blocks::RANS_MODEL_HEADER_BYTES
+        let model = match self.machine_id {
+            MACHINE_NL2 => 0,
+            MACHINE_RANS0I => crate::blocks::RANS_I_MODEL_HEADER_BYTES,
+            _ => crate::blocks::RANS_MODEL_HEADER_BYTES,
         };
         model
             .saturating_add(self.directory_bytes())
@@ -996,7 +1001,7 @@ impl FileBlocks {
             .ok_or(EkbloomError::Overflow {
                 what: "block restart entry",
             })?;
-        let (state, cursor) = if self.packed {
+        let (state, cursor, wide_omega) = if self.packed {
             let mut e = [0u8; 2];
             read_exact_at_len(file, &mut e, rel, total)?;
             (
@@ -1009,7 +1014,16 @@ impl FileBlocks {
                     .ok_or(EkbloomError::Overflow {
                         what: "block cursor",
                     })?,
+                None,
             )
+        } else if self.wide {
+            let mut e = [0u8; Snapshot::WIDE_LEN];
+            read_exact_at_len(file, &mut e, rel, total)?;
+            let s = Snapshot::unpack_wide(&e)?;
+            if s.cursor > core_len {
+                return Err(bad("block restart cursor exceeds the core length"));
+            }
+            (s.state, s.cursor, Some(s))
         } else {
             let mut e = [0u8; Snapshot::PACKED_LEN];
             read_exact_at_len(file, &mut e, rel, total)?;
@@ -1017,7 +1031,7 @@ impl FileBlocks {
             if s.cursor > core_len {
                 return Err(bad("block restart cursor exceeds the core length"));
             }
-            (s.state, s.cursor)
+            (s.state, s.cursor, None)
         };
         let machine = machine_by_id(self.machine_id).ok_or(EkbloomError::UnknownMachine {
             id: self.machine_id,
@@ -1031,7 +1045,11 @@ impl FileBlocks {
         let (win_from, win_to, mut omega) = if self.machine_id == MACHINE_NL2 {
             (start, end.min(core_len), Snapshot::new(state, 0))
         } else {
-            (0, core_len, Snapshot::new(state, cursor))
+            (
+                0,
+                core_len,
+                wide_omega.unwrap_or_else(|| Snapshot::new(state, cursor)),
+            )
         };
         let core = read_vec_at(
             file,
@@ -1084,7 +1102,13 @@ fn parse_blocks(
     }
     let need = prefix
         .count
-        .checked_mul(if prefix.packed { 2 } else { 12 })
+        .checked_mul(if prefix.packed {
+            2
+        } else if prefix.machine_id == MACHINE_RANS0I {
+            Snapshot::WIDE_LEN as u64
+        } else {
+            12
+        })
         .and_then(|payload| payload.checked_add(BLOCK_INDEX_PREFIX_LEN as u64))
         .ok_or(EkbloomError::Overflow {
             what: "block index byte length",
@@ -1106,6 +1130,7 @@ fn parse_blocks(
         machine_id: prefix.machine_id,
         count: prefix.count,
         packed: prefix.packed,
+        wide: prefix.machine_id == MACHINE_RANS0I,
         core_hash: prefix.core_hash,
         data_offset,
     })
@@ -1184,6 +1209,7 @@ struct FileCheckpoint {
     header_len: u64,
     entry_len: u64,
     packed: bool,
+    wide: bool,
     payload_offset: u64,
 }
 
@@ -2056,6 +2082,10 @@ impl FileBody {
             let mut e = [0u8; 2];
             read_exact_at_len(&self.file, &mut e, entry_off, self.physical_len)?;
             Snapshot::new(u32::from(u16::from_le_bytes(e)), expected_cursor)
+        } else if cp.wide {
+            let mut entry = [0u8; Snapshot::WIDE_LEN];
+            read_exact_at_len(&self.file, &mut entry, entry_off, self.physical_len)?;
+            Snapshot::unpack_wide(&entry)?
         } else {
             let mut entry = [0u8; Snapshot::PACKED_LEN];
             read_exact_at_len(&self.file, &mut entry, entry_off, self.physical_len)?;
@@ -2524,6 +2554,7 @@ fn parse_checkpoint(
         header_len: layout.header_len as u64,
         entry_len: layout.entry_len as u64,
         packed: layout.packed,
+        wide: layout.wide,
         payload_offset,
     })
 }
@@ -2546,22 +2577,27 @@ fn validate_checkpoint_entries(
     let enforce_cursor = machine.machine_id() == MACHINE_NL2;
     let count = layout.count;
     let k = u64::from(layout.interval);
+    let entry_len = layout.entry_len;
     let batch = CHECKPOINT_VALIDATE_BATCH as usize;
-    let mut buf = vec![0u8; batch.saturating_mul(Snapshot::PACKED_LEN)];
+    let mut buf = vec![0u8; batch.saturating_mul(entry_len)];
     let mut j = 0u64;
     while j < count {
         let n = (count - j).min(CHECKPOINT_VALIDATE_BATCH);
-        let bytes = (n as usize) * Snapshot::PACKED_LEN;
+        let bytes = (n as usize) * entry_len;
         let off = payload_offset
             .checked_add(layout.header_len as u64)
-            .and_then(|o| o.checked_add(j.checked_mul(Snapshot::PACKED_LEN as u64)?))
+            .and_then(|o| o.checked_add(j.checked_mul(entry_len as u64)?))
             .ok_or(EkbloomError::Overflow {
                 what: "checkpoint entry",
             })?;
         read_exact_at_len(file, &mut buf[..bytes], off, total)?;
         for e in 0..n {
-            let lo = (e as usize) * Snapshot::PACKED_LEN;
-            let s = Snapshot::unpack(&buf[lo..lo + Snapshot::PACKED_LEN])?;
+            let lo = (e as usize) * entry_len;
+            let s = if layout.wide {
+                Snapshot::unpack_wide(&buf[lo..lo + entry_len])?
+            } else {
+                Snapshot::unpack(&buf[lo..lo + entry_len])?
+            };
             if enforce_cursor {
                 let expected = (j + e).checked_mul(k).ok_or(EkbloomError::Overflow {
                     what: "checkpoint cursor",

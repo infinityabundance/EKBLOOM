@@ -1,6 +1,6 @@
 //! The authoritative byte machines.
 //!
-//! EKBLOOM 0.3 ships three concrete machines. `OrANS-NL2` (`machine_id = 1`) is a
+//! EKBLOOM 0.3 ships four concrete machines. `OrANS-NL2` (`machine_id = 1`) is a
 //! deterministic, exactly invertible state-*expansion* machine (`V = N`); see
 //! `docs/DESIGN.md` §1 for the frozen contract. `OrANS-RANS0` (`machine_id = 2`)
 //! additionally *compresses* skewed sources (`V < N`); see `docs/CODEC.md` and
@@ -9,9 +9,14 @@
 //! at `V = N` with no model header; the `auto` representation policy falls back
 //! to it whenever order-0 rANS cannot shrink the source, so the base
 //! representation is never larger than raw. See [`crate::machine_store`].
+//! `OrANS-RANS0I` (`machine_id = 4`) is the **interleaved** order-0 rANS: the same
+//! model and `V < N` as machine 2, but `K` independent lane states whose per-group
+//! steps are independent, so decode throughput escapes machine 2's serial chain.
+//! See [`crate::machine_rans_i`].
 
 use crate::error::{EkbloomError, Result};
 use crate::machine_rans::{RansContext, RANS0};
+use crate::machine_rans_i::{RansIContext, RANS0I};
 use crate::machine_store::STORE;
 use crate::state::Snapshot;
 
@@ -23,6 +28,9 @@ pub const MACHINE_RANS0: u32 = 2;
 
 /// Machine identifier for `OrANS-Store` (the identity / verbatim codec).
 pub const MACHINE_STORE: u32 = 3;
+
+/// Machine identifier for `OrANS-RANS0I` (interleaved order-0 rANS).
+pub const MACHINE_RANS0I: u32 = 4;
 
 const fn build_sbox() -> [u8; 256] {
     let mut s = [0u8; 256];
@@ -194,6 +202,8 @@ pub enum Prepared<'a> {
     Delegated(&'a dyn OrMachine),
     /// A prepared `OrANS-RANS0` decoder context (machine 2).
     Rans(Box<RansContext>),
+    /// A prepared `OrANS-RANS0I` interleaved decoder context (machine 4).
+    RansI(Box<RansIContext>),
 }
 
 impl Prepared<'_> {
@@ -203,6 +213,7 @@ impl Prepared<'_> {
         match self {
             Prepared::Delegated(machine) => machine.reveal(core, omega),
             Prepared::Rans(ctx) => ctx.reveal(core, omega),
+            Prepared::RansI(ctx) => ctx.reveal(core, omega),
         }
     }
 
@@ -212,15 +223,21 @@ impl Prepared<'_> {
         match self {
             Prepared::Delegated(machine) => machine.peek(core, omega),
             Prepared::Rans(ctx) => ctx.peek(core, omega),
+            Prepared::RansI(ctx) => ctx.peek(core, omega),
         }
     }
 
     /// Advance `omega` by exactly `n` reveal steps, discarding the symbols.
     pub fn skip(&self, core: &[u8], omega: &mut Snapshot, n: u64) -> Result<()> {
-        for _ in 0..n {
-            self.reveal(core, omega)?;
+        match self {
+            Prepared::RansI(ctx) => ctx.skip(core, omega, n),
+            _ => {
+                for _ in 0..n {
+                    self.reveal(core, omega)?;
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     /// Reveal `n` symbols from `omega`, appending them to `out`.
@@ -231,6 +248,9 @@ impl Prepared<'_> {
         n: u64,
         out: &mut Vec<u8>,
     ) -> Result<()> {
+        if let Prepared::RansI(ctx) = self {
+            return ctx.decode_into(core, omega, n, out);
+        }
         if let Ok(cap) = usize::try_from(n) {
             out.reserve(cap);
         }
@@ -249,6 +269,7 @@ impl Prepared<'_> {
 pub fn prepare<'a>(machine: &'a dyn OrMachine, core: &[u8]) -> Result<Prepared<'a>> {
     match machine.machine_id() {
         MACHINE_RANS0 => Ok(Prepared::Rans(Box::new(RansContext::from_core(core)?))),
+        MACHINE_RANS0I => Ok(Prepared::RansI(Box::new(RansIContext::from_core(core)?))),
         _ => Ok(Prepared::Delegated(machine)),
     }
 }
@@ -259,6 +280,7 @@ pub fn machine_by_id(id: u32) -> Option<&'static dyn OrMachine> {
         MACHINE_NL2 => Some(&NL2),
         MACHINE_RANS0 => Some(&RANS0),
         MACHINE_STORE => Some(&STORE),
+        MACHINE_RANS0I => Some(&RANS0I),
         _ => None,
     }
 }
@@ -281,7 +303,7 @@ pub fn block_restarts_with(
     core: &[u8],
     logical_len: u64,
     block_bytes: u32,
-) -> Result<Vec<(u32, u64)>> {
+) -> Result<Vec<Snapshot>> {
     if block_bytes == 0 {
         return Err(EkbloomError::InvalidArgument {
             what: "block size must be non-zero".to_string(),
@@ -299,15 +321,15 @@ pub fn block_restarts_with(
     let capacity = usize::try_from(count).map_err(|_| EkbloomError::Overflow {
         what: "block restart count",
     })?;
-    let mut entries: Vec<(u32, u64)> = Vec::with_capacity(capacity);
+    let mut entries: Vec<Snapshot> = Vec::with_capacity(capacity);
     let mut omega = machine.init(core)?;
-    entries.push((omega.state, omega.cursor));
+    entries.push(omega);
     let mut i: u64 = 0;
     while i < logical_len {
         ctx.reveal(core, &mut omega)?;
         i += 1;
         if i.is_multiple_of(b) {
-            entries.push((omega.state, omega.cursor));
+            entries.push(omega);
         }
     }
     Ok(entries)

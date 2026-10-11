@@ -290,7 +290,9 @@ fn machine_one_is_unaffected() {
         assert_eq!(machine_by_id(MACHINE_NL2).unwrap().machine_id(), 1);
     }
     assert!(machine_by_id(MACHINE_STORE).is_some());
-    assert!(machine_by_id(4).is_none());
+    // Machine 4 (interleaved rANS) is now registered; 5 is still unknown.
+    assert_eq!(machine_by_id(4).unwrap().machine_id(), 4);
+    assert!(machine_by_id(5).is_none());
     assert_eq!(MACHINE_NL2, 1);
     assert_eq!(MACHINE_RANS0, 2);
     assert_eq!(MACHINE_STORE, 3);

@@ -179,13 +179,13 @@ fn restart_certification_detects_tamper() {
 
     // A tampered restart state breaks both certification paths.
     let mut tampered = index.clone();
-    tampered.entries[2].0 ^= 0xFFFF;
+    tampered.entries[2].state ^= 0xFFFF;
     assert!(!tampered.certify(&core).unwrap());
     assert!(!tampered.verify_against(&core).unwrap());
 
     // A tampered cursor is likewise rejected.
     let mut tampered = index.clone();
-    tampered.entries[3].1 = tampered.entries[3].1.wrapping_add(1);
+    tampered.entries[3].cursor = tampered.entries[3].cursor.wrapping_add(1);
     assert!(!tampered.certify(&core).unwrap());
 
     // Against a different core the linkage fails closed.

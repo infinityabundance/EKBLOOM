@@ -47,6 +47,7 @@ pub mod history_store;
 pub mod kernels;
 pub mod machine;
 pub mod machine_rans;
+pub mod machine_rans_i;
 pub mod machine_store;
 pub mod manifest;
 pub mod mapped;
@@ -113,9 +114,13 @@ pub use kernels::{
     kernel_a_table, kernel_a_unrolled, kernel_b_simd, kernel_b_threads, window_start_states,
 };
 pub use machine::{
-    machine_by_id, state_log_with, OrMachine, MACHINE_NL2, MACHINE_RANS0, MACHINE_STORE, NL2,
+    machine_by_id, prepare, state_log_with, OrMachine, Prepared, MACHINE_NL2, MACHINE_RANS0,
+    MACHINE_RANS0I, MACHINE_STORE, NL2,
 };
 pub use machine_rans::{Rans0, RANS0};
+pub use machine_rans_i::{
+    encode_with_k, Rans0I, RansIContext, DEFAULT_K as RANS_I_DEFAULT_K, RANS0I,
+};
 pub use machine_store::{Store, STORE};
 pub use manifest::{
     create, create_auto, create_auto_within_budget, create_machine, create_machine_within_budget,

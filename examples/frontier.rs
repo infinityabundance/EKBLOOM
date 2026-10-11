@@ -14,9 +14,9 @@
 
 use ekbloom::adapt::{Workload, WorkloadKind};
 use ekbloom::{
-    create_auto, machine_by_id, now_ns, percentiles, spread_offsets, AccessTrace, BlockIndex,
-    DirectoryKind, Engine, HotBlockCache, ManifestationBudget, ManifestationProfile, Percentiles,
-    ReadRequest, TileSet, MACHINE_STORE,
+    create_auto, encode_with_k, machine_by_id, now_ns, percentiles, prepare, spread_offsets,
+    AccessTrace, BlockIndex, DirectoryKind, Engine, HotBlockCache, ManifestationBudget,
+    ManifestationProfile, OrMachine, Percentiles, ReadRequest, TileSet, MACHINE_STORE, RANS0,
 };
 use std::path::Path;
 
@@ -729,7 +729,7 @@ fn measure_cold(name: &str, source: &[u8]) -> ekbloom::Result<ColdReport> {
 
     // ---- EKBLOOM: every machine x block size, each an authoritative encode plus
     // a certified BlockIndex, read through the bounded block decoder.
-    for &machine in &[1u32, 2, 3] {
+    for &machine in &[1u32, 2, 3, 4] {
         let m = machine_by_id(machine).expect("known machine");
         let t_enc = now_ns();
         let core = m.encode(source)?;
@@ -911,6 +911,60 @@ fn measure_cold(name: &str, source: &[u8]) -> ekbloom::Result<ColdReport> {
         hot_bytes: HOT_BYTES,
         rows,
     })
+}
+
+/// One bulk-decode-throughput contender (the prepared fast path).
+struct DecodeRate {
+    name: String,
+    machine: u32,
+    k: usize,
+    core_bytes: u64,
+    source_bytes: u64,
+    best_ns: f64,
+    ns_per_byte: f64,
+    gb_per_s: f64,
+    exact: bool,
+}
+
+/// Measure bulk decode throughput (`ns/byte`, GB/s) of machine 2 versus the
+/// interleaved machine 4 at `K = 4` and `K = 8`, all through the prepared bulk
+/// decoder (`prepare` + `Prepared::decode_into`), best of 3, byte-exact checked.
+fn measure_decode(source: &[u8]) -> ekbloom::Result<Vec<DecodeRate>> {
+    let n = source.len() as u64;
+    let reps = 3usize;
+    let configs: [(&str, u32, usize, Vec<u8>); 3] = [
+        ("rans0-m2", 2, 1, RANS0.encode(source)?),
+        ("rans0i-k4", 4, 4, encode_with_k(source, 4)?),
+        ("rans0i-k8", 4, 8, encode_with_k(source, 8)?),
+    ];
+    let mut rows = Vec::new();
+    for (name, machine_id, k, core) in &configs {
+        let machine = machine_by_id(*machine_id).expect("known machine");
+        let mut best = u64::MAX;
+        let mut exact = true;
+        for _ in 0..reps {
+            let ctx = prepare(machine, core)?;
+            let mut omega = machine.init(core)?;
+            let mut out: Vec<u8> = Vec::with_capacity(source.len());
+            let t = now_ns();
+            ctx.decode_into(core, &mut omega, n, &mut out)?;
+            best = best.min(now_ns().saturating_sub(t));
+            exact &= out == source;
+        }
+        let ns = best as f64;
+        rows.push(DecodeRate {
+            name: name.to_string(),
+            machine: *machine_id,
+            k: *k,
+            core_bytes: core.len() as u64,
+            source_bytes: n,
+            best_ns: ns,
+            ns_per_byte: ns / n as f64,
+            gb_per_s: if ns > 0.0 { n as f64 / ns } else { 0.0 },
+            exact,
+        });
+    }
+    Ok(rows)
 }
 
 /// One measured contender.
@@ -1312,6 +1366,7 @@ fn render_json(
     residency: &[Residency],
     rep: &Representation,
     cold: &[ColdReport],
+    decode: &[DecodeRate],
 ) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
@@ -1479,6 +1534,25 @@ fn render_json(
         s.push('\n');
     }
     s.push_str("  ],\n");
+    s.push_str("  \"decode_rate\": [\n");
+    for (i, d) in decode.iter().enumerate() {
+        s.push_str("    {\n");
+        let _ = writeln!(s, "      \"name\": \"{}\",", json_escape(&d.name));
+        let _ = writeln!(s, "      \"machine\": {},", d.machine);
+        let _ = writeln!(s, "      \"k\": {},", d.k);
+        let _ = writeln!(s, "      \"core_bytes\": {},", d.core_bytes);
+        let _ = writeln!(s, "      \"source_bytes\": {},", d.source_bytes);
+        let _ = writeln!(s, "      \"best_ns\": {:.0},", finite(d.best_ns));
+        let _ = writeln!(s, "      \"ns_per_byte\": {:.4},", finite(d.ns_per_byte));
+        let _ = writeln!(s, "      \"gb_per_s\": {:.3},", finite(d.gb_per_s));
+        let _ = writeln!(s, "      \"exact\": {}", d.exact);
+        let _ = write!(s, "    }}");
+        if i + 1 < decode.len() {
+            s.push(',');
+        }
+        s.push('\n');
+    }
+    s.push_str("  ],\n");
     s.push_str("  \"corpora\": [\n");
     for (ci, c) in corpora.iter().enumerate() {
         s.push_str("    {\n");
@@ -1635,8 +1709,23 @@ fn print_cold_table(cold: &[ColdReport]) {
     }
 }
 
+fn print_decode_table(decode: &[DecodeRate]) {
+    println!("\n== bulk decode throughput (skewed corpus, best of 3) ==");
+    println!(
+        "{:<12} {:>8} {:>3} {:>11} {:>10} {:>10} {:>9} {:>6}",
+        "config", "machine", "K", "core_B", "ns", "ns/byte", "GB/s", "exact"
+    );
+    for d in decode {
+        println!(
+            "{:<12} {:>8} {:>3} {:>11} {:>10.0} {:>10.4} {:>9.3} {:>6}",
+            d.name, d.machine, d.k, d.core_bytes, d.best_ns, d.ns_per_byte, d.gb_per_s, d.exact
+        );
+    }
+}
+
 fn main() -> ekbloom::Result<()> {
-    let hot_index = measure_hot_index(&skewed(0xE7B0_0000_00CC_0001, N))?;
+    let skew_src = skewed(0xE7B0_0000_00CC_0001, N);
+    let hot_index = measure_hot_index(&skew_src)?;
     let residency = vec![measure_residency(RES_1M)?, measure_residency(RES_256M)?];
     let representation = measure_representation()?;
     let corpus_list = corpora();
@@ -1649,9 +1738,11 @@ fn main() -> ekbloom::Result<()> {
         .iter()
         .map(|(name, source)| measure_corpus(name, source))
         .collect::<ekbloom::Result<Vec<_>>>()?;
+    let decode = measure_decode(&skew_src)?;
 
     print_table(&corpora);
     print_cold_table(&cold);
+    print_decode_table(&decode);
 
     println!("\n== hot index (fully resident, allocation-parity) ==");
     println!(
@@ -1720,7 +1811,14 @@ fn main() -> ekbloom::Result<()> {
     println!("  reproducible advantage over indexed codecs: {advantage_win}");
     println!("  HOLDS: {holds}");
 
-    let json = render_json(&corpora, &hot_index, &residency, &representation, &cold);
+    let json = render_json(
+        &corpora,
+        &hot_index,
+        &residency,
+        &representation,
+        &cold,
+        &decode,
+    );
     let out = Path::new("evidence/bench/frontier.json");
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;

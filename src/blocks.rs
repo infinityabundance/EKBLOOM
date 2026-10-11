@@ -24,9 +24,12 @@
 //! tampered restart is rejected rather than published.
 
 use crate::error::{EkbloomError, Result};
-use crate::machine::{machine_by_id, prepare, MACHINE_NL2, MACHINE_RANS0, MACHINE_STORE, SBOX};
+use crate::machine::{
+    machine_by_id, prepare, MACHINE_NL2, MACHINE_RANS0, MACHINE_RANS0I, MACHINE_STORE, SBOX,
+};
 use crate::machine_rans::RansContext;
-use crate::state::Snapshot;
+use crate::machine_rans_i::RansIContext;
+use crate::state::{Snapshot, MAX_LANES};
 
 /// Wire magic of a serialized [`BlockIndex`].
 pub const BLOCK_INDEX_MAGIC: [u8; 8] = *b"EKBKBLKS";
@@ -37,11 +40,18 @@ pub const BLOCK_INDEX_VERSION: u8 = 1;
 pub const BLOCK_INDEX_PREFIX_LEN: usize = 104;
 /// Machine-2 model header size (`256 * u16` frequencies `++` `u32` initial state).
 pub const RANS_MODEL_HEADER_BYTES: u64 = 516;
+/// Machine-4 header size upper bound (`256 * u16` frequencies `++` `u32 K` `++`
+/// up to `MAX_LANES` `u32` lane states); the true header is embedded in the core
+/// and shrinks with `K`.
+pub const RANS_I_MODEL_HEADER_BYTES: u64 = 512 + 4 + 4 * MAX_LANES as u64;
 
 /// Wire format code: 2-byte packed states, cursor derived (machine 1).
 const FORMAT_PACKED: u8 = 1;
-/// Wire format code: `u32` state `++` `u64` cursor per block (machine 2).
+/// Wire format code: `u32` state `++` `u64` cursor per block (machines 2, 3).
 const FORMAT_FULL: u8 = 2;
+/// Wire format code: complete wide resume (`Snapshot::WIDE_LEN`) per block, for a
+/// cursor-divergent interleaved machine with a multi-word state (machine 4).
+const FORMAT_WIDE: u8 = 3;
 /// Greatest accepted block size (`1 << 30` symbols).
 const MAX_BLOCK_BYTES: u32 = 1 << 30;
 
@@ -56,8 +66,12 @@ const MAX_BLOCK_BYTES: u32 = 1 << 30;
 pub struct BlockIndex {
     /// Block span in logical symbols (`==` core bytes for machine 1).
     pub block_bytes: u32,
-    /// `entries[k] = (state, cursor)` at logical position `k * block_bytes`.
-    pub entries: Vec<(u32, u64)>,
+    /// `entries[k] = Omega` (complete resumable state) at logical position
+    /// `k * block_bytes`. For machine 1 the cursor is `k * block_bytes`; for the
+    /// cursor-divergent machines it is the true core offset, and for the
+    /// interleaved machine the entry additionally carries the `[u32; K]` lane
+    /// states and the active lane.
+    pub entries: Vec<Snapshot>,
     machine_id: u32,
     logical_len: u64,
     core_len: u64,
@@ -102,11 +116,13 @@ pub fn parse_block_index_prefix(bytes: &[u8]) -> Result<BlockIndexPrefix> {
     if bytes[8] != BLOCK_INDEX_VERSION {
         return Err(bad(format!("unsupported block index version {}", bytes[8])));
     }
-    let packed = match bytes[9] {
-        FORMAT_PACKED => true,
+    let wide = match bytes[9] {
+        FORMAT_PACKED => false,
         FORMAT_FULL => false,
+        FORMAT_WIDE => true,
         other => return Err(bad(format!("unknown block index format {other}"))),
     };
+    let packed = bytes[9] == FORMAT_PACKED;
     let machine_id = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
     let block_bytes = u32::from_le_bytes([bytes[14], bytes[15], bytes[16], bytes[17]]);
     if block_bytes == 0 || block_bytes > MAX_BLOCK_BYTES {
@@ -114,6 +130,9 @@ pub fn parse_block_index_prefix(bytes: &[u8]) -> Result<BlockIndexPrefix> {
     }
     if packed && machine_id != MACHINE_NL2 {
         return Err(bad("packed block index is machine-1 only"));
+    }
+    if wide && machine_id != MACHINE_RANS0I {
+        return Err(bad("wide block index is machine-4 only"));
     }
     if bytes[98..BLOCK_INDEX_PREFIX_LEN].iter().any(|&b| b != 0) {
         return Err(bad("block index reserved bytes are non-zero"));
@@ -214,11 +233,14 @@ impl BlockIndex {
         self.core_hash
     }
 
-    /// Bytes per restart record: 2 for a packed (machine-1) index, 12 otherwise.
+    /// Bytes per restart record: 2 for a packed (machine-1) index, `Snapshot::WIDE_LEN`
+    /// for the interleaved machine (complete lane state), 12 otherwise.
     #[inline]
     pub fn entry_bytes(&self) -> u64 {
         if self.packed() {
             2
+        } else if self.machine_id == MACHINE_RANS0I {
+            Snapshot::WIDE_LEN as u64
         } else {
             12
         }
@@ -247,10 +269,10 @@ impl BlockIndex {
     /// restart records.
     #[inline]
     pub fn physical_bytes(&self) -> u64 {
-        let model = if self.machine_id == MACHINE_NL2 {
-            0
-        } else {
-            RANS_MODEL_HEADER_BYTES
+        let model = match self.machine_id {
+            MACHINE_NL2 => 0,
+            MACHINE_RANS0I => RANS_I_MODEL_HEADER_BYTES,
+            _ => RANS_MODEL_HEADER_BYTES,
         };
         model
             .saturating_add(self.directory_bytes())
@@ -313,10 +335,11 @@ impl BlockIndex {
         let (start, idx) = self
             .block_of(offset)
             .ok_or_else(|| bad(format!("no block restart covers offset {offset}")))?;
-        let (state, cursor) = *self
+        let entry = *self
             .entries
             .get(idx)
             .ok_or_else(|| bad("block restart index out of range"))?;
+        let state = entry.state;
         let skip = offset - start;
         let cap = usize::try_from(len).map_err(|_| EkbloomError::Overflow {
             what: "block read length",
@@ -343,7 +366,13 @@ impl BlockIndex {
             }
             MACHINE_RANS0 => {
                 let ctx = RansContext::from_core(core)?;
-                let mut omega = Snapshot::new(state, cursor);
+                let mut omega = entry;
+                ctx.skip(core, &mut omega, skip)?;
+                ctx.decode_into_slice(core, &mut omega, &mut out)?;
+            }
+            MACHINE_RANS0I => {
+                let ctx = RansIContext::from_core(core)?;
+                let mut omega = entry;
                 ctx.skip(core, &mut omega, skip)?;
                 ctx.decode_into_slice(core, &mut omega, &mut out)?;
             }
@@ -353,7 +382,7 @@ impl BlockIndex {
                         id: self.machine_id,
                     })?;
                 let ctx = prepare(machine, core)?;
-                let mut omega = Snapshot::new(state, cursor);
+                let mut omega = entry;
                 ctx.skip(core, &mut omega, skip)?;
                 ctx.decode_into(core, &mut omega, len, &mut out)?;
             }
@@ -390,7 +419,7 @@ impl BlockIndex {
         let (start, idx) = self
             .block_of(offset)
             .ok_or_else(|| bad(format!("no block restart covers offset {offset}")))?;
-        let (state, cursor) = *self
+        let entry = *self
             .entries
             .get(idx)
             .ok_or_else(|| bad("block restart index out of range"))?;
@@ -399,7 +428,7 @@ impl BlockIndex {
             what: "block read length",
         })?;
         let mut out = vec![0u8; cap];
-        let mut omega = Snapshot::new(state, cursor);
+        let mut omega = entry;
         ctx.skip(core, &mut omega, skip)?;
         ctx.decode_into_slice(core, &mut omega, &mut out)?;
         Ok((out, skip.saturating_add(len)))
@@ -416,9 +445,15 @@ impl BlockIndex {
         hasher.update(&self.core_len.to_le_bytes());
         hasher.update(&self.core_hash);
         hasher.update(&(self.entries.len() as u64).to_le_bytes());
-        for &(state, cursor) in &self.entries {
-            hasher.update(&state.to_le_bytes());
-            hasher.update(&cursor.to_le_bytes());
+        for s in &self.entries {
+            hasher.update(&s.state.to_le_bytes());
+            hasher.update(&s.cursor.to_le_bytes());
+            if self.machine_id == MACHINE_RANS0I {
+                hasher.update(&[s.lane]);
+                for &x in &s.lanes {
+                    hasher.update(&x.to_le_bytes());
+                }
+            }
         }
         *hasher.finalize().as_bytes()
     }
@@ -427,6 +462,8 @@ impl BlockIndex {
     fn format_code(&self) -> u8 {
         if self.packed() {
             FORMAT_PACKED
+        } else if self.machine_id == MACHINE_RANS0I {
+            FORMAT_WIDE
         } else {
             FORMAT_FULL
         }
@@ -468,12 +505,12 @@ impl BlockIndex {
         let Some(&first) = self.entries.first() else {
             return Ok(false);
         };
-        if first != (genesis.state, genesis.cursor) {
+        if first != genesis {
             return Ok(false);
         }
         let b = u64::from(self.block_bytes);
         for j in 0..self.entries.len().saturating_sub(1) {
-            let (state, cursor) = self.entries[j];
+            let mut omega = self.entries[j];
             let target = (j as u64 + 1)
                 .checked_mul(b)
                 .ok_or(EkbloomError::Overflow {
@@ -482,11 +519,10 @@ impl BlockIndex {
             if target > self.logical_len {
                 break;
             }
-            let mut omega = Snapshot::new(state, cursor);
             for _ in 0..b {
                 ctx.reveal(core, &mut omega)?;
             }
-            if (omega.state, omega.cursor) != self.entries[j + 1] {
+            if omega != self.entries[j + 1] {
                 return Ok(false);
             }
         }
@@ -511,13 +547,17 @@ impl BlockIndex {
         out.extend_from_slice(&[0u8; BLOCK_INDEX_PREFIX_LEN - 98]);
         debug_assert_eq!(out.len(), BLOCK_INDEX_PREFIX_LEN);
         if self.packed() {
-            for &(state, _) in &self.entries {
-                out.extend_from_slice(&(state as u16).to_le_bytes());
+            for s in &self.entries {
+                out.extend_from_slice(&(s.state as u16).to_le_bytes());
+            }
+        } else if self.machine_id == MACHINE_RANS0I {
+            for s in &self.entries {
+                out.extend_from_slice(&s.pack_wide());
             }
         } else {
-            for &(state, cursor) in &self.entries {
-                out.extend_from_slice(&state.to_le_bytes());
-                out.extend_from_slice(&cursor.to_le_bytes());
+            for s in &self.entries {
+                out.extend_from_slice(&s.state.to_le_bytes());
+                out.extend_from_slice(&s.cursor.to_le_bytes());
             }
         }
         out
@@ -527,7 +567,13 @@ impl BlockIndex {
     /// structural inconsistency, truncation, trailing bytes or digest mismatch.
     pub fn from_bytes(bytes: &[u8]) -> Result<BlockIndex> {
         let prefix = parse_block_index_prefix(bytes)?;
-        let entry_bytes: usize = if prefix.packed { 2 } else { 12 };
+        let entry_bytes: usize = if prefix.packed {
+            2
+        } else if prefix.machine_id == MACHINE_RANS0I {
+            Snapshot::WIDE_LEN
+        } else {
+            12
+        };
         let count_usize = usize::try_from(prefix.count).map_err(|_| EkbloomError::Overflow {
             what: "block index count",
         })?;
@@ -555,8 +601,17 @@ impl BlockIndex {
                 let cursor = j.checked_mul(b).ok_or(EkbloomError::Overflow {
                     what: "block index cursor",
                 })?;
-                entries.push((state, cursor));
+                entries.push(Snapshot::new(state, cursor));
                 off += 2;
+            }
+        } else if prefix.machine_id == MACHINE_RANS0I {
+            for _ in 0..prefix.count {
+                let s = Snapshot::unpack_wide(&bytes[off..])?;
+                if s.cursor > prefix.core_len {
+                    return Err(bad("block restart cursor exceeds the core length"));
+                }
+                entries.push(s);
+                off += Snapshot::WIDE_LEN;
             }
         } else {
             for _ in 0..prefix.count {
@@ -570,7 +625,7 @@ impl BlockIndex {
                 if cursor > prefix.core_len {
                     return Err(bad("block restart cursor exceeds the core length"));
                 }
-                entries.push((state, cursor));
+                entries.push(Snapshot::new(state, cursor));
                 off += 12;
             }
         }
@@ -750,7 +805,7 @@ mod tests {
 
         // A tampered restart state is rejected by `verify_against` and `certify`.
         let mut tampered = idx.clone();
-        tampered.entries[1].0 ^= 0xFFFF;
+        tampered.entries[1].state ^= 0xFFFF;
         assert!(!tampered.certify(&core).unwrap());
         assert!(!tampered.verify_against(&core).unwrap());
     }

@@ -15,7 +15,7 @@
 
 use crate::error::{EkbloomError, Result};
 use crate::machine::{OrMachine, MACHINE_NL2, NL2};
-use crate::state::Snapshot;
+use crate::state::{Snapshot, MAX_LANES};
 
 /// Checkpoint intervals supported by the frozen contract, densest last.
 pub const SUPPORTED_INTERVALS: [u32; 8] = [65536, 4096, 1024, 256, 64, 16, 4, 1];
@@ -38,6 +38,9 @@ pub const CKPT_HEADER_MAX: usize = CKPT_FIXED_LEN;
 const CKPT_FORMAT_PACKED: u8 = 1;
 /// Compact format code: 12-byte complete `(state, cursor)` restarts.
 const CKPT_FORMAT_FULL: u8 = 2;
+/// Compact format code: complete wide `Snapshot::WIDE_LEN` restarts (interleaved
+/// machine 4 with a multi-word lane state).
+const CKPT_FORMAT_WIDE: u8 = 3;
 
 /// Decoded wire layout of a checkpoint payload header, for the bounded file
 /// reader (which must not materialise the whole set).
@@ -49,10 +52,12 @@ pub struct CheckpointLayout {
     pub count: u64,
     /// Header length in bytes (`12` legacy, [`CKPT_FIXED_LEN`] compact).
     pub header_len: usize,
-    /// Bytes per restart record (2 packed, else 12).
+    /// Bytes per restart record (2 packed, else 12, or `Snapshot::WIDE_LEN`).
     pub entry_len: usize,
     /// Whether restart records are 2-byte packed states.
     pub packed: bool,
+    /// Whether restart records are complete wide (`Snapshot::WIDE_LEN`) states.
+    pub wide: bool,
 }
 
 impl CheckpointLayout {
@@ -84,9 +89,10 @@ pub fn parse_checkpoint_layout(bytes: &[u8]) -> Result<CheckpointLayout> {
                 reason: format!("unsupported checkpoint version {}", bytes[8]),
             });
         }
-        let packed = match bytes[9] {
-            CKPT_FORMAT_PACKED => true,
-            CKPT_FORMAT_FULL => false,
+        let (packed, wide) = match bytes[9] {
+            CKPT_FORMAT_PACKED => (true, false),
+            CKPT_FORMAT_FULL => (false, false),
+            CKPT_FORMAT_WIDE => (false, true),
             other => {
                 return Err(EkbloomError::BadSection {
                     reason: format!("unknown checkpoint format {other}"),
@@ -113,8 +119,15 @@ pub fn parse_checkpoint_layout(bytes: &[u8]) -> Result<CheckpointLayout> {
             interval,
             count,
             header_len: CKPT_FIXED_LEN,
-            entry_len: if packed { 2 } else { 12 },
+            entry_len: if packed {
+                2
+            } else if wide {
+                Snapshot::WIDE_LEN
+            } else {
+                12
+            },
             packed,
+            wide,
         })
     } else {
         if bytes.len() < HEADER_LEN {
@@ -145,6 +158,7 @@ pub fn parse_checkpoint_layout(bytes: &[u8]) -> Result<CheckpointLayout> {
             header_len: HEADER_LEN,
             entry_len: 12,
             packed: false,
+            wide: false,
         })
     }
 }
@@ -280,18 +294,30 @@ impl CheckpointSet {
         self.interval.is_power_of_two()
             && self.resume.iter().enumerate().all(|(j, s)| {
                 s.state <= u32::from(u16::MAX)
+                    && s.lane == 0
+                    && s.lanes == [0u32; MAX_LANES]
                     && (j as u64)
                         .checked_mul(u64::from(self.interval))
                         .is_some_and(|pos| s.cursor == pos)
             })
     }
 
+    /// Whether the set carries any multi-word (interleaved) resume state and must
+    /// therefore be stored in the wide container.
+    pub fn wide(&self) -> bool {
+        self.resume
+            .iter()
+            .any(|s| s.lane != 0 || s.lanes.iter().any(|&x| x != 0))
+    }
+
     /// Bytes per restart record in the compact container: `2` when [`Self::packed`],
-    /// otherwise `12`.
+    /// `Snapshot::WIDE_LEN` when [`Self::wide`], otherwise `12`.
     #[inline]
     pub fn entry_bytes(&self) -> u64 {
         if self.packed() {
             2
+        } else if self.wide() {
+            Snapshot::WIDE_LEN as u64
         } else {
             12
         }
@@ -316,13 +342,22 @@ impl CheckpointSet {
     pub fn to_bytes(&self) -> Vec<u8> {
         let count = self.resume.len() as u64;
         let packed = self.packed();
-        let entry_len = if packed { 2 } else { 12 };
+        let wide = !packed && self.wide();
+        let entry_len = if packed {
+            2
+        } else if wide {
+            Snapshot::WIDE_LEN
+        } else {
+            12
+        };
         let capacity = CKPT_FIXED_LEN.saturating_add(self.resume.len().saturating_mul(entry_len));
         let mut out = Vec::with_capacity(capacity);
         out.extend_from_slice(&CKPT_MAGIC);
         out.push(CKPT_VERSION);
         out.push(if packed {
             CKPT_FORMAT_PACKED
+        } else if wide {
+            CKPT_FORMAT_WIDE
         } else {
             CKPT_FORMAT_FULL
         });
@@ -331,6 +366,10 @@ impl CheckpointSet {
         if packed {
             for s in &self.resume {
                 out.extend_from_slice(&(s.state as u16).to_le_bytes());
+            }
+        } else if wide {
+            for s in &self.resume {
+                out.extend_from_slice(&s.pack_wide());
             }
         } else {
             for s in &self.resume {
@@ -385,6 +424,10 @@ impl CheckpointSet {
                 })?;
                 resume.push(Snapshot::new(state, cursor));
                 off += 2;
+            } else if layout.wide {
+                let s = Snapshot::unpack_wide(&bytes[off..off + Snapshot::WIDE_LEN])?;
+                resume.push(s);
+                off += Snapshot::WIDE_LEN;
             } else {
                 let s = Snapshot::unpack(&bytes[off..off + Snapshot::PACKED_LEN])?;
                 if enforce_cursor {
