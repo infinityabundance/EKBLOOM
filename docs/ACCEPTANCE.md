@@ -22,21 +22,27 @@ Environment for every run: [`../evidence/environment.txt`](../evidence/environme
 
 Complete machine, correct for arbitrary byte input.
 
-- **Implements:** `src/machine.rs` (`Nl2`, `OrMachine`, `MACHINE_NL2`).
+- **Implements:** `src/machine.rs` (`Nl2`, `OrMachine`, `MACHINE_NL2`),
+  `src/machine_rans.rs` (`Rans0`, `MACHINE_RANS0`, machine 2).
 - **Artifact:** machine unit tests in `src/machine.rs`; `tests/properties.rs`
-  (`machine_roundtrip`); `tests/correctness.rs` (`category_*`).
+  (`machine_roundtrip`); `tests/correctness.rs` (`category_*`);
+  `tests/machine_rans.rs` (machine 2 roundtrip, compression, header validation).
 - **Proves:**
   - unit tests in `src/machine.rs`: `sbox_is_bijective`, `roundtrip_various`,
     `genesis_matches_log0_zero`, `state_is_last_two_symbols`, `peek_matches_reveal`;
   - `tests/properties.rs::machine_roundtrip` (arbitrary `Vec<u8>`);
   - `tests/correctness.rs` categories (`category_every_byte_value`,
-    `category_empty_input`, `category_single_symbol`, `category_lcg_pseudorandom`).
+    `category_empty_input`, `category_single_symbol`, `category_lcg_pseudorandom`);
+  - `tests/machine_rans.rs::roundtrip_exact_for_every_shape`,
+    `skewed_source_compresses`, `random_source_is_not_compressed`,
+    `invalid_model_headers_error_cleanly`, `machine_one_is_unaffected`.
 - **Reproduce:**
 
   ```sh
   sh scripts/container-test.sh --release machine::
   sh scripts/container-test.sh --release --test properties machine_roundtrip
   sh scripts/container-test.sh --release --test correctness
+  sh scripts/container-test.sh --release --test machine_rans
   ```
 
 ---
@@ -64,6 +70,7 @@ Committed history retained without overwriting earlier states.
   sh scripts/container-test.sh --release --test history_checkpoint
   sh scripts/container-test.sh --release --test manifest_read_verify additive_growth
   sh scripts/container-test.sh --release --test format_roundtrip append_generation
+  sh scripts/run-large-history.sh
   ```
 
 ---
@@ -154,26 +161,33 @@ or a precise counterexample and a justified alternative.
 
 ## Gate 6 — Expanded manifestations
 
-Regional, contextual and path blooms implemented and evaluated.
+Regional, contextual and path blooms implemented and evaluated; region-scoped
+adaptation added.
 
 - **Implements:** `src/bloom_region.rs` (`T_D^(reg)[x]`), `src/bloom_context.rs`,
-  `src/bloom_path.rs`; profiles `Regional`, `Path`, `Bloom` in `src/manifest.rs`.
+  `src/bloom_path.rs`; profiles `Regional`, `Path`, `Bloom` in `src/manifest.rs`;
+  region-scoped adaptation in `src/region_adapt.rs`.
 - **Proves:**
   - `tests/blooms_research.rs::contextual_exact_all_depths`,
     `regional_constant_all_certified_with_exact_lookups`,
     `regional_random_reports_counts_consistently`;
   - `tests/bloom_path.rs`;
   - `tests/async_build.rs::regional_parallel_equals_sequential_byte_for_byte`;
+  - `tests/region_adapt.rs` (7 tests: additivity, budget enforcement,
+    traced/cold-region byte-exactness, LRU byte-exactness/eviction, determinism);
   - the frontier measures `bloom(D=4)`, `regional(D=4,R=4096)`, `path(D=4)`,
     `path(D=8)` (see Gate 9).
-- **Evidence:** [`../evidence/bench/sweep.json`](../evidence/bench/sweep.json).
+- **Evidence:** [`../evidence/bench/sweep.json`](../evidence/bench/sweep.json),
+  [`../evidence/bench/competitive.json`](../evidence/bench/competitive.json).
 - **Reproduce:**
 
   ```sh
   sh scripts/container-test.sh --release --test blooms_research
   sh scripts/container-test.sh --release --test bloom_path
+  sh scripts/container-test.sh --release --test region_adapt
   sh scripts/container-test.sh --release --test async_build
   sh scripts/run-sweep.sh
+  sh scripts/run-competitive.sh
   ```
 
 ---
@@ -209,21 +223,25 @@ Interrupted publication cannot invalidate earlier committed generations under
 the documented durability model.
 
 - **Implements:** `src/recovery.rs` (`recover`, `scan_generations`,
-  `truncate_to_valid`), `src/writer.rs` (footer-after-payload order).
+  `truncate_to_valid`), `src/writer.rs` (footer-after-payload order),
+  `src/async_io.rs` (`io_uring` ordering, when enabled).
 - **Artifact:** `tests/crash_recovery.rs`, `tests/correctness.rs`,
-  `tests/segmented_hardening.rs`, `tests/adversarial.rs`.
+  `tests/segmented_hardening.rs`, `tests/adversarial.rs`, `tests/async_io.rs`.
 - **Proves:**
   - `tests/crash_recovery.rs::truncate_mid_footer_keeps_previous_generation`,
     `corrupt_newest_section_payload_keeps_previous_generation`,
     `trailing_garbage_keeps_newest_generation_and_truncates`,
     `fully_corrupt_commit_is_rejected_not_ignored`;
   - `tests/correctness.rs::category_interrupted_publication_torn_file`,
-    `category_corrupted_file_rejected`.
+    `category_corrupted_file_rejected`;
+  - `tests/async_io.rs::failed_append_never_corrupts_the_previous_generation`,
+    `failed_publish_leaves_the_existing_committed_file_intact`.
 - **Reproduce:**
 
   ```sh
   sh scripts/container-test.sh --release --test crash_recovery
   sh scripts/container-test.sh --release --test correctness
+  sh scripts/container-async-io.sh
   ```
 
 ---
@@ -234,24 +252,29 @@ A real speed-versus-manifested-space frontier exists.
 
 - **Implements:** `src/sweep.rs` (`manifestation_sweep`, `write_evidence_json`),
   `src/fastpath.rs` (optimised paths), `src/metrics.rs` (timing/percentiles);
-  driver `examples/sweep.rs`; harness `benches/ekbloom.rs`.
+  drivers `examples/sweep.rs`, `examples/baselines.rs`, `examples/competitive.rs`,
+  `examples/perf_target.rs`; harness `benches/ekbloom.rs`.
 - **Proves:** `tests/fastpath.rs::fast_paths_are_byte_exact_for_every_profile`
   (optimised paths are byte-identical to `read`), and the generated frontier.
 - **Artifact:** `tests/fastpath.rs`, `tests/sweep_curves.rs`, `tests/layout.rs`,
-  `tests/simd.rs`; benchmark driver `examples/sweep.rs` and
-  `examples/perf_target.rs`.
+  `tests/simd.rs`, `tests/baselines.rs`.
 - **Evidence:** [`../evidence/bench/sweep.json`](../evidence/bench/sweep.json),
   [`../evidence/bench/cpu.json`](../evidence/bench/cpu.json),
   [`../evidence/bench/sweep-large.json`](../evidence/bench/sweep-large.json),
   [`../evidence/bench/depth-metrics.json`](../evidence/bench/depth-metrics.json),
   [`../evidence/bench/memory-tiers.json`](../evidence/bench/memory-tiers.json),
   [`../evidence/bench/adaptive.json`](../evidence/bench/adaptive.json),
-  [`../evidence/bench/perf.json`](../evidence/bench/perf.json).
+  [`../evidence/bench/perf.json`](../evidence/bench/perf.json),
+  [`../evidence/bench/baselines.json`](../evidence/bench/baselines.json),
+  [`../evidence/bench/competitive.json`](../evidence/bench/competitive.json).
 - **Reproduce:**
 
   ```sh
   sh scripts/container-test.sh --release --test fastpath
+  sh scripts/container-test.sh --release --test baselines
   sh scripts/run-sweep.sh
+  sh scripts/run-baselines.sh
+  sh scripts/run-competitive.sh
   sh scripts/container-bench.sh
   sh scripts/container-perf.sh
   ```
@@ -279,6 +302,8 @@ benchmarks.
   sh scripts/container-reproduce.sh    # clean build + tests from scratch
   sh scripts/run-sweep.sh              # representative benchmarks
   sh scripts/capture-environment.sh    # refresh evidence/environment.txt
+  sh scripts/container-verify.sh       # fmt + clippy -D warnings + tests
+  sh scripts/container-loom.sh         # Loom model checking
   ```
 
 ---
@@ -296,6 +321,9 @@ fabricated; each is regenerated by the command shown and by nothing else.
 | [`../evidence/bench/memory-tiers.json`](../evidence/bench/memory-tiers.json) | O9 L1/L2/LLC/DRAM tier curve: throughput 139 → 71 → 57 → 18 GB/s at constant `E_V = 2.13×` | `sh scripts/run-sweep.sh` |
 | [`../evidence/bench/adaptive.json`](../evidence/bench/adaptive.json) | O7 adaptive shell: appending an exact `P_32[j]` as generation 2 takes 52,727 → 6.96 ns/read (≈7,570×) for +1,179,883 bytes | `sh scripts/run-sweep.sh` |
 | [`../evidence/bench/sweep-large.json`](../evidence/bench/sweep-large.json) | 4 MiB budget frontier + region/depth/checkpoint curves, cold starts, cache-resident throughput | `sh scripts/run-sweep.sh` |
+| [`../evidence/bench/baselines.json`](../evidence/bench/baselines.json) | Conventional baselines vs `Root`/`Path{D=4}`/`Full`: no read-speed win over `raw-vec`; machine 2 `V/N = 0.511×` on skewed data | `sh scripts/run-baselines.sh` |
+| [`../evidence/bench/competitive.json`](../evidence/bench/competitive.json) | Region-scoped manifestation vs an LRU cache vs raw under one corpus/trace/budget: LRU wins hot (60 vs 871 ns), EKBLOOM wins cold (240 vs 281 ns) | `sh scripts/run-competitive.sh` |
+| [`../evidence/bench/io-uring.json`](../evidence/bench/io-uring.json) | Genuine completion-driven `io_uring` publication, byte-identical and durability-ordered, but ≈2.2–2.3× slower than sync for ~1 MiB | `sh scripts/container-async-io.sh` |
 | [`../evidence/environment.txt`](../evidence/environment.txt) | Pinned image/digest, toolchain, kernel, CPU, `Cargo.lock` sha256, git HEAD | `sh scripts/capture-environment.sh` |
 
 Loom model checking is reproducible with `sh scripts/container-loom.sh`
@@ -303,6 +331,10 @@ Loom model checking is reproducible with `sh scripts/container-loom.sh`
 with `sh scripts/container-fuse.sh` ([`FUSE.md`](FUSE.md)).
 
 Supporting documents added alongside these artifacts:
+[`CODEC.md`](CODEC.md) (machine 2),
+[`BASELINES.md`](BASELINES.md) (conventional baselines),
+[`COMPETITIVE.md`](COMPETITIVE.md) (vs an LRU cache),
+[`ASYNC.md`](ASYNC.md) (io_uring),
 [`LAYOUT.md`](LAYOUT.md) (layout/SIMD keep-or-reject decisions),
 [`ADAPTIVE.md`](ADAPTIVE.md) (O7/O8/O9),
 [`SECURITY.md`](SECURITY.md) (opt-in `AUTH`),

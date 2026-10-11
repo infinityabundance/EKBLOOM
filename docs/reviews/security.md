@@ -5,10 +5,12 @@ Scope: untrusted-input handling on the `.ekb` read path — `format`, `reader`,
 `filesystem` index parsing, and publication races. Adversarial method:
 read the parsers, then craft concrete byte images and feed them to
 `open_bytes`/`from_bytes`/`verify`, asserting a clean `Err` (never panic, never
-OOM). The crate contains exactly **one** `unsafe` block, in `src/simd.rs`
-(feature-gated AVX2 gather); it is independently reviewed in the
-"Unsafe review (src/simd.rs)" section below. All other `unsafe` mentions in the
-tree are prose. All tooling ran via `scripts/container-verify.sh` (8 GiB cap).
+OOM). The crate's `unsafe` is confined to exactly **two** sanctioned modules —
+`src/simd.rs` (the feature-gated AVX2/AVX-512 gathers) and `src/async_io.rs`
+(the `io-uring` submission-queue pushes); each is independently reviewed below.
+Every `unsafe` block carries a `// SAFETY:` justification; other `unsafe`
+mentions in the tree are prose. All tooling ran via
+`scripts/container-verify.sh` (8 GiB cap).
 
 ## Findings
 
@@ -84,7 +86,9 @@ Adversarial authenticity requires a **keyed MAC** over the committed bytes
 
 ## Unsafe review (`src/simd.rs`) — verdict **SAFE**
 
-The crate's only `unsafe`: `gather_bytes_avx2` (`unsafe fn`, one block) plus its
+This module's `unsafe` (one of the crate's **two** sanctioned `unsafe` modules;
+the other, `src/async_io.rs`, is reviewed at the end of this document):
+`gather_bytes_avx2` (`unsafe fn`, one block) plus its
 one call site in `gather_bytes`. It implements a `_mm256_i32gather_epi32` gather
 of many single bytes from a path-bloom `hot` array. Reviewed independently, not
 wired into `fastpath` (the scalar loop remains the default; see
@@ -120,8 +124,10 @@ Boundary groups, the tail, and `len < 4` use the validated scalar loads.
   (lane-0/1 analysis in the module docs is exact).
 
 **Other-unsafe confirmation:** `grep -E 'unsafe\s*(fn|\{|impl|extern|trait)'`
-across `src/` matches **only** `src/simd.rs` (the block and call site). Zero
-other `unsafe`.
+across `src/` matches exactly two modules — `src/simd.rs` (the AVX2/AVX-512/
+prefetch gather blocks and their call sites) and `src/async_io.rs` (the two
+`SubmissionQueue::push` calls, reviewed below). These are the crate's **two**
+sanctioned `unsafe` modules. Zero other `unsafe` is present.
 
 **Miri:** `scripts/container-miri.sh` runs `cargo miri test --lib -- machine::`,
 so `simd::tests::*` is **excluded**; Miri never interprets the AVX2 intrinsics
@@ -151,8 +157,9 @@ review; as shipped it is opt-in and not on the critical path.
 
 ## What I could not attack / residual risk
 - No reachable `panic`/`unwrap` from parsed bytes found by inspection or
-  mutation (`mutated_and_truncated_images_never_panic`); the one `unsafe`
-  (`src/simd.rs`) is reviewed above and is not on the read path.
+  mutation (`mutated_and_truncated_images_never_panic`); the `unsafe` in
+  `src/simd.rs` is reviewed above and is not on the read path, and the `unsafe`
+  in `src/async_io.rs` is reviewed below and is likewise not on the read path.
 - Not exhaustively fuzzed here; a dedicated campaign (`fuzz/fuzz_targets`) plus
   Miri/sanitizers would be stronger evidence. `memmap2` is a declared dependency
   but unused in `src` (no mmap of untrusted offsets). Finding C is now mitigated
@@ -268,4 +275,100 @@ fuzz_history_store`); see the process note below.
   passes in debug and in isolation. Not caused by this revision.
 - **Regression suite:** new adversarial tests live in
   `tests/segmented_hardening.rs` (12 tests); the full debug suite is 300 passed / 0
-  failed and the release suite is 299 / 0 with the flaky determinism test skipped. 
+  failed and the release suite is 299 / 0 with the flaky determinism test skipped.
+
+---
+
+## Unsafe review (`src/async_io.rs`) — verdict **SAFE**
+
+First independent review of the crate's *second* `unsafe` module (the first is
+`src/simd.rs`). The module is compiled only under `#[cfg(feature = "io-uring")]`
+and is the real completion-driven publication backend for `.ekb` generations.
+
+### Exact `unsafe` inventory (grep)
+
+`grep -rn unsafe src/` finds `unsafe` *code* in exactly two modules:
+`src/simd.rs` (`gather_bytes_avx2`, `gather_bytes_prefetch_sse`,
+`gather_bytes_avx512_impl` + their three gated call sites) and `src/async_io.rs`
+(two `SubmissionQueue::push` calls: one write SQE, one `Fsync` SQE). Every one
+carries a `// SAFETY:` comment. The string `unsafe` also appears in doc comments
+in `src/fastpath.rs` / `src/reader.rs` (asserting they contain *no* `unsafe`),
+and in `tests/unsafe_review.rs` (the `simd` review), but no other `unsafe` blocks
+exist. No `unsafe` in tests, benches, examples, or fuzz targets.
+
+### SAFETY argument
+
+* **Buffer lifetime.** `write_all` takes `data: &[u8]`; each SQE's pointer is
+  `data[idx..].as_ptr()`. `write_all` reaps every submitted batch via
+  `submit_and_wait(planned.len())` before returning or re-borrowing, and the caller
+  (`publish`: owned `image` Vec; `append`: owned `image` Vec; `probe`: `&'static`
+  literal) keeps the buffer alive across the call. Declaration order also puts the
+  owned buffer *before* the `IoUring`, so on any early return the ring (and its fd)
+  is dropped before the buffer. The kernel only reads until the matching CQE.
+* **SQE/CQE indexing and `user_data`.** `user_data` is the payload-relative
+  start offset, strictly increasing within and across batches; the CQE is matched
+  back with that key, and an unmatched `user_data` is a hard error
+  (`"completion with unknown user_data"`). No aliasing is possible.
+* **Counts.** `planned.len()` is bounded by `sq.capacity()` and only counts
+  successful `push`es; `submit_and_wait(planned.len())` then guarantees that many
+  completions, and the CQ is fully drained each batch, so `done` advances by exactly
+  the bytes acknowledged. `reaped == 0` is an error.
+* **Bounds/offsets.** `base_offset + idx` and `len` are derived from an in-memory
+  image; `len <= WRITE_CHUNK` fits the `u32` `Write::len`. `append` truncates the
+  torn tail to `last.end` *before* writing at that offset, so the new block never
+  overlaps a committed one.
+* **Error propagation — no silent partial writes.** A negative CQE result becomes
+  `io::Error::from_raw_os_error(-res)`; a positive-but-short result is a
+  `WriteZero` "short write" error; a submission failure is a clean error. `publish`
+  removes its `*.tmp` and returns `Err`, and `asyncpub` then falls back to the
+  synchronous writer.
+* **Durability ordering.** `publish`: write whole image to `*.tmp` -> fsync ->
+  rename -> dir fsync. `append`: (truncate torn tail) -> write complete commit
+  block -> fsync. Readers validate the footer, so a torn *tail* is ignored and an
+  earlier commit is never invalidated.
+
+### Adversarial attempts (executable)
+
+Added to `tests/async_io.rs` (run under `io-uring`):
+
+* `failed_append_never_corrupts_the_previous_generation` — publish gen 1, grow the
+  body, `chmod 0444` the destination, call `append(..., Backend::IoUring)` => the
+  async path and the sync fallback both fail; the file is **byte-for-byte the
+  previous image**, `recover().newest_valid == Some(gen_before)`,
+  `torn_tail_bytes == 0`, no `*.tmp` sibling, and `open`/`verify`/`read` still see
+  only the previous committed generation. (On a privileged uid that bypasses the
+  mode bit the test instead asserts the non-withdrawal prefix property.)
+* `failed_publish_leaves_the_existing_committed_file_intact` — block the `*.tmp`
+  path with a *directory* (`File::create` -> `EISDIR` for every uid); `publish`
+  fails and the destination is unchanged and still verifies.
+* Existing `publishing_never_exposes_a_partial_shell` covers the torn-tail crash:
+  a truncated tail recovers to the previous generation and still reads the
+  original bytes.
+
+No attempt produced a corrupt or partially-published generation readable by
+`open`/`recover`.
+
+### Observations (not defects)
+
+* `fsync_fd` does not assert `cqe.user_data() == FSYNC_TAG`; harmless because
+  `write_all` fully drains the CQ first, but a defensive check would be cheaper to
+  audit. On an `fsync` *failure* after a fully written commit block, the fallback
+  `writer::append_generation` re-scans the file and can reject the (already
+  present) generation with `InvalidArgument` — the file stays consistent either
+  way, so this is an error-reporting nuance, not a durability gap.
+* A `rename`/dir-fsync failure in `publish` can leave the `*.tmp` sibling behind
+  (the removal is inside the earlier closure); the synchronous writer shares this
+  exact shape, so it is not a regression.
+* The module doc-comment in `sweep.rs` (`budget_frontier` is a pure function of
+  its inputs) remains false; see F5 in `adversarial.md` (now handled at the test
+  level, not in production).
+
+### Result
+
+`sh scripts/container-async-io.sh`: probe works end-to-end under
+`--security-opt seccomp=unconfined` (byte-identical, `durability_ordered: true`,
+6/6 tests pass in both stage 0 fallback and stage 1). `sh scripts/container-fuzz.sh`:
+all four targets PASS (`fuzz_machine`, `fuzz_open`, `fuzz_bloom`,
+`fuzz_history_store` @100k runs, cov 1121). **Verdict: SAFE — no memory-safety or
+durability defect found.**
+ 

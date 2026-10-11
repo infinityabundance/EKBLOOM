@@ -100,7 +100,10 @@ any `ManifestationProfile`, so exposure is currently nil.
   the core digest and its own CRC valid is out of scope (F2 assumes a
   self-consistent file, which the writer makes easy).
 * `io-uring` backend, `filesystem`/`OrFs`, async publication, and the CLI were
-  not adversarially exercised here.
+  not adversarially exercised by *this* pass. The async `io_uring` backend and its
+  `unsafe` were subsequently reviewed SAFE and exercised in
+  `docs/reviews/security.md` ("Unsafe review (`src/async_io.rs`)") and
+  `sh scripts/container-async-io.sh`.
 * `Certificate.status` vs bloom `status` agreement is unchecked (subsumed by F3).
 * Contextual/regional certification status semantics for multi-region objects
   were only spot-checked for one region size.
@@ -177,6 +180,24 @@ noise, not the machine or the reader. Reported rather than fixed: `src/sweep.rs`
 and this test are outside the modules under review, and the honest fix (a
 coarser/derived tolerance or removing timing from the tie-break) is a design
 choice. No core correctness impact.
+
+**Update (deflaked at the test level).** Reproduced on this host at 11/30
+`--release` runs (`sweep_curves` file, parallel test threads), with the flake now
+observed between sparse intervals (`sparse(K=64)` vs `sparse(K=1024)` vs
+`sparse(K=256)`), not only path depths. The production selection was *not*
+changed: making it fully timing-independent would replace the documented
+"fastest measured profile" rule with a static ranking, i.e. change production
+behaviour, which is out of scope. Instead the unit tests were rewritten to assert
+only deterministic, non-timing properties:
+`tests/sweep_curves.rs::budget_frontier_scaffolding_is_seed_deterministic` pins
+the row count, the echoed ratios and the forced `root` choice at ratio 1.0; the
+`"improved"` / ns-per-read / throughput claims were removed from
+`tests/adaptive.rs` (`adapt_preserves_earlier_generations`,
+`adapt_to_hot_set_is_additive_and_linked`). The measured instability and the
+"shell is measurably faster" evidence now live in `examples/sweep.rs` ->
+`evidence/bench/budget-frontier-determinism.json` and `adaptive.json`. 15
+consecutive full `--release` suite runs (325 tests x 36 binaries each) finished
+with 0 failures.
 
 ### Fuzz target added
 

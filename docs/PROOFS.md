@@ -350,6 +350,67 @@ existing checkpoint set was untouched and the adapted body still passes
 
 ---
 
+## P10. Machine 2 (`OrANS-RANS0`) is exactly invertible, compresses skewed sources, and validates its model header — **PROVED** (invertibility, validation), **EMPIRICALLY OBSERVED** (ratios)
+
+**Claim.** For the additive machine 2 (`machine_id = 2`, `src/machine_rans.rs`):
+
+1. `decode(encode(source)) == source` for **every** source (exact invertibility);
+2. on skewed sources the visible core is genuinely smaller than the object
+   (`V < N`), while on uniform random bytes it is larger only by the fixed
+   `HEADER_BYTES = 516` model header (`V/N → 1`);
+3. `init`/`check_core` reject a malformed header (too short, `Σ freq ≠ M`, any
+   `freq = 0`) with a clean error, and reject a crafted non-renormalising stream
+   with `EkbloomError::NonTermination` instead of spinning;
+4. machine 1 is unaffected (bit-identical semantics and wire behaviour).
+
+**Proof (1 — exact invertibility).** Machine 2 is a static order-0 range-ANS
+coder. `encode` walks the symbols in reverse, maintaining a state
+`x ≥ RANS_L` and applying, for symbol `s`, the map
+`x ↦ (x / f[s]) · M + (x mod f[s]) + cum[s]` after emitting the low bytes needed
+to keep `x < x_max`; `decode` applies its exact inverse
+`slot = x & (M-1)`, `s = symbol_table[slot]`,
+`x ↦ f[s] · (x >> 12) + slot − cum[s]`, then renormalises by pulling bytes. The
+encoder is a bijection on the (state, symbol) pair, and it stores the
+renormalisation bytes in **reverse emission order**, so the decoder reads forward
+exactly the bytes the encoder emitted; the header stores `freq` and the final
+coder state (`= Omega_0`). Because every `freq[s] ≥ 1`, the cumulative partition
+is strictly increasing, so `slot ↦ s` is unique and inverts the encoder's
+`slot = cum[s] + (x mod f[s])`. By induction over the reverse/forward passes the
+recovered symbol at each step is the encoded one and the final state matches, hence
+`decode ∘ encode = id`. ∎
+
+**Proof (3 — header validation).** `Model::from_header` checks
+`core.len() ≥ HEADER_BYTES`, `Σ freq = M = 4096`, and `freq[s] ≥ 1` for all `s`,
+returning `Truncated`/`BadSection` otherwise; `Model::from_source` guarantees the
+same invariants for any source (including the empty one). `check_core`/`decode`
+bound the decode loop by `MAX_STEPS_PER_BYTE · |core| + slack`, so a crafted
+stream that fails to renormalise is cut off with `NonTermination`. ∎
+
+**Corroboration (2 — ratios, EMPIRICALLY OBSERVED).** `tests/machine_rans.rs` on
+the English-like 18-symbol skewed generator and on LCG bytes:
+
+| source | `V` (core bytes) | `N` (source bytes) | `V/N` |
+|---|---:|---:|---:|
+| skewed (weighted alphabet) | 8,371 | 16,384 | **0.511** |
+| uniform random (LCG) | 33,261 | 32,768 | 1.015 |
+
+Order-0 modelling cannot compress uniform bytes, so the random case pays only the
+fixed `516/32,768 ≈ 1.6%` header, decaying toward `1.0` as `N` grows. This is
+stated honestly: **order-0 only compresses skewed data**, and the win is a
+*storage* win whose reads are decode-based unless the raw output array is also
+manifested (see `docs/BASELINES.md`). `tests/machine_rans.rs` additionally proves
+the state log, history, checkpoint sets and path blooms are byte-exact against the
+machine for machine 2, and that `machine_one_is_unaffected`.
+
+**Tested:** `tests/machine_rans.rs::roundtrip_exact_for_every_shape`,
+`empty_source_has_only_the_model_header`, `skewed_source_compresses`,
+`random_source_is_not_compressed`, `history_checkpoint_and_path_bloom_are_byte_exact`,
+`invalid_model_headers_error_cleanly`, `end_to_end_manifest_verify_and_read`,
+`machine_one_is_unaffected`; reproduced by
+`sh scripts/container-test.sh --release --test machine_rans`.
+
+---
+
 ## Unresolved limitations (honest)
 
 1. **No certified universal 65,536-entry `T_4[x]` for the byte machine.** By P6
@@ -372,10 +433,22 @@ existing checkpoint set was untouched and the adapted body still passes
    CPU-capped container, with 256 samples per point; it is evidence, not a
    multi-platform study. CPU features are detected at runtime
    (`evidence/bench/cpu.json`).
-6. **Backends.** `io-uring` is optional and not exercised by the default build
-   or the benchmark evidence; the synchronous fallback is what was measured.
-   OrFS is in-process; its read-only FUSE projection is opt-in and separate.
-7. **Manifested structure bytes are unauthenticated unless `AUTH` is used.**
+6. **Machine 2 has decode-read semantics and a divergent cursor.** Its core
+   compresses skewed sources (`V < N`) but the cursor is a byte offset that
+   diverges from the logical position, so the state-only projection is not
+   resumable: only the complete resumable states (checkpoint sets) restart, and
+   the file reader falls back to authoritative replay for machine 2. Compressed
+   storage therefore costs O(offset) machine work per read unless a path bloom
+   (the raw output array) is also manifested.
+7. **Backends.** `io-uring` is an optional, *genuine* completion-driven backend
+   (not a probe). It is runtime-verified here under `--security-opt
+   seccomp=unconfined` and is byte-identical and durability-ordered, but it is
+   **slower than the synchronous writer for small single-file writes**
+   (≈2.2× on the medians, ≈2.45× on minima; ~1 MiB body; `docs/ASYNC.md`,
+   `evidence/bench/io-uring.json`). The
+   synchronous writer is the default and remains the fastest measured path. OrFS
+   is in-process; its read-only FUSE projection is opt-in and separate.
+8. **Manifested structure bytes are unauthenticated unless `AUTH` is used.**
    CRC-32/BLAKE3 detect accidental corruption, not forgery: a writer with file
    access can recompute them consistently. In particular **segmented history
    states are unauthenticated** — `open`/`verify` check the

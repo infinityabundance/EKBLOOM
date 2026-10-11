@@ -21,7 +21,7 @@ Captured by `scripts/capture-environment.sh` into
 - **toolchain** `rustc 1.99.0 (b940084d7 2026-09-28)`, `cargo 1.99.0`,
   host `x86_64-unknown-linux-gnu`;
 - **host** AMD Ryzen 7 9800X3D, `nproc 16`, kernel `7.2.9-2-cachyos`;
-- **source** `Cargo.lock` sha256 `64b1b4f1…`, git HEAD `88313a9b…`;
+- **source** `Cargo.lock` sha256 `64b1b4f1…`, git HEAD `e624b98d…`;
 - **nightly harness image** `rustlang/rust:nightly-bookworm-slim@sha256:2fe113dd…`.
 
 Detected CPU features for the sweep (`evidence/bench/cpu.json`): `sse2`, `avx2`,
@@ -227,20 +227,127 @@ shell choice is a per-consumer, coordination-free decision.
 
 ---
 
-## Reproduce
+## Machine 2 (`OrANS-RANS0`) — the space win
 
-```sh
-sh scripts/container-reproduce.sh    # clean build + full release test suite
-sh scripts/run-sweep.sh              # rewrite evidence/bench/{sweep,sweep-large,depth-metrics,memory-tiers,adaptive,cpu}.json
-sh scripts/container-bench.sh        # Divan microbenchmarks (benches/ekbloom.rs)
-sh scripts/capture-environment.sh    # refresh evidence/environment.txt
-```
+Machine 1 is expansion-only (`V = N`). The additive machine 2 (`docs/CODEC.md`)
+compresses *skewed* sources. Measured by `tests/machine_rans.rs`:
+
+| source | core bytes `V` | source bytes `N` | `V/N` |
+|---|---:|---:|---:|
+| skewed (English-like 18-symbol alphabet) | 8,371 | 16,384 | **0.511** |
+| uniform random (LCG bytes) | 33,261 | 32,768 | 1.015 |
+
+This is the first EKBLOOM row to beat a raw array on **bytes**. It is an honest
+storage win with stated semantics: order-0 modelling cannot compress uniform
+bytes (only the fixed 516-byte model header is paid), and at equal O(1)-slice
+read semantics the win is consumed by the raw output array (see
+[`docs/BASELINES.md`](BASELINES.md)). Machine 1 is bit-identical
+(`tests/machine_rans.rs::machine_one_is_unaffected`); `docs/PROOFS.md` P10 records
+the encode∘decode identity, the ratios, and model-header validation.
+
+---
+
+## Conventional baselines (`evidence/bench/baselines.json`)
+
+EKBLOOM is normally compared to its own replay fallback; `examples/baselines.rs`
+(via `sh scripts/run-baselines.sh`) compares it to conventional direct-access
+baselines under one 1 MiB corpus and identical workloads. `E_V = physical/N`;
+`seq` MB/s; `1b p50`/`4k p50` ns.
+
+| structure | class | physical bytes | `E_V` | build (ns) | seq MB/s | 1b p50 | 4k p50 | caps |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| `raw-vec` | baseline | 1,048,576 | 1.000 | 128,260 | 67,963.0 | 30 | 60 | `-----` |
+| `raw-file` | baseline | 1,048,576 | 1.000 | 150,851 | 41,984.1 | 120 | 181 | `-----` |
+| `predecoded` | baseline | 1,048,576 | 1.000 | 29,385 | 64,787.3 | 30 | 60 | `-----` |
+| `indexed-array` | baseline | 1,050,624 | 1.002 | 83,176 | 66,788.5 | 30 | 60 | `-----` |
+| `ekbloom Root` | ekbloom | 1,048,576 | 1.000 | 964,190 | 594.9 | 948,400 | 927,371 | `h----` |
+| `ekbloom Path{D=4}` | ekbloom | 3,145,963 | 3.000 | 6,002,304 | 72,528.4 | 30 | 60 | `h--sx` |
+| `ekbloom Full` | ekbloom | 5,242,884 | 5.000 | 2,954,806 | 634.5 | 50 | 5,581 | `h-psx` |
+
+**Honest verdict.** No read-speed win over the strongest baseline: `Path{D=4}`
+ties `raw-vec` on random-1b p50 (**30 ns**) and within noise on sequential
+(**72.5 vs 68.0 GB/s**), because the path `hot` array *is* the raw output array.
+`Root` loses badly (594.9 MB/s, 948,400 ns) because it retains the *encoded core*;
+`Full` restores random-1b to 50 ns but range extraction stays per-byte (5,581 ns).
+Space is 3.0×/5.0× for `Path`/`Full` vs 1.0× for `RawVec`. The value is the
+**capability combination** (verifiable history, exact restart, per-position state,
+adaptive shells, concealment) that no baseline retains. Full discussion:
+[`docs/BASELINES.md`](BASELINES.md).
+
+---
+
+## Competitive experiment: region-scoped manifestation vs an ordinary LRU cache (`evidence/bench/competitive.json`)
+
+`examples/competitive.rs` (via `sh scripts/run-competitive.sh`) runs **one corpus**
+(deterministic 4 MiB LCG), **one trace** (512 hot regions × 64 B = a 32 KiB hot
+working set) and **one byte budget** (`1,224,924 B`) across three contenders:
+EKBLOOM region-scoped manifestation (504/512 hot regions certified, cold served by
+`K=64` checkpoint restart), an ordinary byte-budgeted LRU cache over the raw bytes,
+and raw/no-cache (`pread`). All latencies in nanoseconds:
+
+| metric | EKBLOOM region-adapt | LRU cache | raw/no-cache |
+|---|---:|---:|---:|
+| acceleration bytes | 1,224,924 | 1,224,924 | 0 |
+| **hot p50** (warm) | 871 | **60** | 181 |
+| **hot p99** | 1663 | **80** | 221 |
+| **cold p50** (1 B) | **240** | 662 | 281 |
+| post-thrash, 1st hot read | 3467 | 1062 | 711 |
+| **post-thrash hot p50** | 942 | 150 | 180 |
+| reopen, 1st hot read | 1593 | 752 | 181 |
+| **reopen warm hot p50** | 852 | **60** | 181 |
+
+**Honest verdict.** EKBLOOM's region-scoped manifestation gives **no read-speed
+advantage** over a well-sized cache of the raw bytes: at the same budget the LRU is
+≈14× faster on warm hot reads (**60 vs 871 ns**) and also beats raw (181 ns).
+EKBLOOM beats raw/no-cache only on **cold single-byte access** (**240 vs 281 ns**).
+Its manifested regions are **non-eviction** (unchanged across a thrashing scan:
+871 → 942 ns, vs the LRU's 60 → 150 ns) and **persistent** (survive reopen; the LRU
+resets), every materialised region is independently certified, and the body still
+passes `verify_deep` — real properties, but not a read-speed win. The structural
+reason is `V = N`. Full discussion: [`docs/COMPETITIVE.md`](COMPETITIVE.md).
+
+---
+
+## Asynchronous publication (`evidence/bench/io-uring.json`)
+
+The optional `io-uring` backend is a **genuine completion-driven** publication path
+(real ring, owned-buffer write SQEs, completion reaping, `fsync` through the ring),
+and its output is byte-for-byte identical to the synchronous writer. It was **run**
+here, not merely probed: `sh scripts/container-async-io.sh` uses
+`--security-opt seccomp=unconfined` with no capability and no `--privileged`, and
+the evidence records `io_uring_usable: true`, `async_and_sync_byte_identical: true`,
+`durability_ordered: true`. On one ~1 MiB manifested body (`body_bytes = 1,052,072`),
+median of 15 publications:
+
+| path | median wall-clock |
+|---|---:|
+| `io_uring` async | 416,158 ns |
+| synchronous | 189,884 ns |
+
+**Honest negative on speed:** the async path is ≈2.2× *slower* here, because it
+creates a fresh ring per publication and pays submit/completion round-trips the
+plain `write`+`fsync` path does not. `docs/ASYNC.md` reports these exact committed
+medians. The backend's value is the genuine completion-driven API, owned-buffer
+handling, and transparent fallback — not throughput for small single-file writes.
+
+---
+
+## Concurrency and `unsafe` (Loom)
+
+`sh scripts/container-loom.sh` exhaustively model-checks the crate's one genuine
+shared-mutable structure (`OrFs`'s index mutex): **330** schedules at
+preemptions = 2 and **1,416** at preemptions = 3, all pass. Publication ordering
+is a filesystem property covered by `tests/crash_recovery.rs`, not Loom. The
+crate's `unsafe` is confined to **two** sanctioned modules (`src/simd.rs`,
+`src/async_io.rs`), each independently reviewed SAFE. See
+[`docs/reviews/concurrency.md`](reviews/concurrency.md) and
+[`docs/reviews/security.md`](reviews/security.md).
 
 The correctness of every measured path is enforced by
 `tests/fastpath.rs::fast_paths_are_byte_exact_for_every_profile`,
-`tests/adaptive.rs` (`read_shell` vs `reader::read`, parallel shells), and
-`tests/sweep_curves.rs`: optimised reads are byte-for-byte identical to the
-authoritative reader across the whole frontier.
+`tests/adaptive.rs` (`read_shell` vs `reader::read`, parallel shells),
+`tests/region_adapt.rs`, and `tests/sweep_curves.rs`: optimised reads are
+byte-for-byte identical to the authoritative reader across the whole frontier.
 
 ---
 
@@ -400,3 +507,23 @@ using the measured ordering documented above — `max-speed` > `path` (tie broke
 the smaller/deeper bloom) > `full` > `sparse` (smaller interval = faster) >
 `root`/`bloom`/`regional` — so a path bloom wins whenever it fits, matching
 "path blooms are the speed ceiling".
+
+---
+
+## Reproduce
+
+All tooling runs **only** inside the pinned container (`scripts/lib.sh`).
+
+```sh
+sh scripts/container-reproduce.sh    # clean build + full release test suite
+sh scripts/container-verify.sh       # fmt + clippy -D warnings + tests
+sh scripts/run-sweep.sh              # rewrite evidence/bench/{sweep,sweep-large,depth-metrics,memory-tiers,adaptive,cpu}.json
+sh scripts/run-large-history.sh      # history-2p30.json (2^30 streaming build)
+sh scripts/run-baselines.sh          # baselines.json
+sh scripts/run-competitive.sh        # competitive.json
+sh scripts/container-perf.sh         # perf.json (hardware counters)
+sh scripts/container-async-io.sh     # io-uring.json (seccomp=unconfined)
+sh scripts/container-loom.sh         # Loom model checking
+sh scripts/container-bench.sh        # Divan microbenchmarks (benches/ekbloom.rs)
+sh scripts/capture-environment.sh    # refresh evidence/environment.txt
+```

@@ -133,14 +133,19 @@ writes `evidence/bench/io-uring.json`.
 - The async-published file was byte-identical to the synchronous one, and it
   passed `reader::open` + `verify` + `read`.
 
-Measured on one ~1 MiB manifested body (`body_bytes = 1052072`), median of 15
-publications (see [`../evidence/bench/io-uring.json`](../evidence/bench/io-uring.json));
-the exact median varies run to run:
+Measured on one ~1 MiB manifested body (`body_bytes = 1,052,072`), median of
+`iterations = 15` publications, from the committed
+[`../evidence/bench/io-uring.json`](../evidence/bench/io-uring.json):
 
-| Path | median wall-clock (last run) |
-|---|---|
-| `io_uring` async | ≈ 254 µs |
-| synchronous | ≈ 111 µs |
+| Path | median wall-clock | fastest (min) |
+|---|---:|---:|
+| `io_uring` async | 416,158 ns (≈ 416.2 µs) | 401,440 ns (≈ 401.4 µs) |
+| synchronous | 189,884 ns (≈ 189.9 µs) | 163,836 ns (≈ 163.8 µs) |
+
+The async path is **≈ 2.19× slower** than the synchronous writer on the medians
+(≈ 2.45× on the minima). These are the exact committed values; the evidence file
+records only the median/min aggregates for the 15 iterations, not a per-run
+breakdown.
 
 This is an **honest negative** on speed: for a single ~1 MiB publication the async
 path is *slower* here. It creates a fresh ring per publication and adds

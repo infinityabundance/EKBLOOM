@@ -124,7 +124,7 @@ fn memory_tiers_are_finite_and_sized() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn adapt_to_hot_set_is_additive_and_improves() {
+fn adapt_to_hot_set_is_additive_and_linked() {
     let src = lcg(0x0ADD_5000_0001, 256 * 1024);
     let mut body = create(&src, ManifestationProfile::Root).unwrap();
     let before_gen = body.generation;
@@ -150,14 +150,12 @@ fn adapt_to_hot_set_is_additive_and_improves() {
         .starts_with(&before_profiles[..before_profiles.len()]));
     assert_eq!(body.profiles.last().unwrap(), "path(D=32)");
 
-    // Measurable improvement for the observed hot-set workload.
-    assert!(
-        report.improved,
-        "adaptive shell did not improve the hot-set workload: before {:.1} ns/read, after {:.1} ns/read",
-        report.before_ns_per_read, report.after_ns_per_read
-    );
-    assert!(report.after_ns_per_read < report.before_ns_per_read);
-    assert!(report.after_bytes_per_s > report.before_bytes_per_s);
+    // NOTE: the "the shell is measurably faster" claim is intentionally *not*
+    // asserted here. `AdaptReport::improved` (and the before/after ns-per-read and
+    // throughput fields) are wall-clock measurements that are not stable under
+    // parallel test execution. The improvement evidence lives in
+    // `examples/sweep.rs` -> `evidence/bench/adaptive.json`, outside the unit
+    // suite. The unit test pins only the deterministic, structural contract.
 
     // The adapted body is still fully verifiable (new bloom + certificate linked).
     let v = verify_deep(&body).unwrap();
@@ -211,7 +209,11 @@ fn adapt_preserves_earlier_generations() {
 
     let report =
         adapt_to_workload(&mut body, &hot_set_workload(16 * 1024, 64), &small_cfg()).unwrap();
-    assert!(report.improved);
+    // Structural, timing-free assertions only: `report.improved` is a wall-clock
+    // comparison and must not be asserted in a unit test (it flakes under parallel
+    // execution). The additive/non-withdrawal contract is what matters here.
+    assert_eq!(report.shell, Some(ShellChoice::Path));
+    assert!(report.added_physical_bytes > 0);
     assert_eq!(body.generation, gen_before + 1);
     // Earlier structures remain (non-withdrawal).
     assert_eq!(body.checkpoints.len(), checkpoints_before);

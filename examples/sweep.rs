@@ -11,14 +11,19 @@
 //! - `evidence/bench/memory-tiers.json` — the L1/L2/LLC/DRAM memory-tier curve
 //!   (O9),
 //! - `evidence/bench/adaptive.json` — the adaptive-shell demonstration (O7),
+//! - `evidence/bench/budget-frontier-determinism.json` — whether two
+//!   back-to-back budget-frontier runs picked the same profiles (F5 evidence;
+//!   `budget_frontier` selects on wall-clock measurements, so this is recorded,
+//!   never asserted),
 //! - `evidence/bench/cpu.json` — the detected CPU features and a content hash of
 //!   the exact source used, so the numbers are attributable.
 //!
 //! Run it in the pinned container with `sh scripts/run-sweep.sh`.
 
 use ekbloom::sweep::{
-    depth_metrics, large_sweep, memory_tiers, write_depth_metrics_json, write_large_evidence_json,
-    write_memory_tiers_json, DEFAULT_MEMORY_TIERS,
+    budget_frontier, depth_metrics, large_sweep, memory_tiers, write_depth_metrics_json,
+    write_large_evidence_json, write_memory_tiers_json, BudgetPoint, DEFAULT_BUDGET_RATIOS,
+    DEFAULT_MEMORY_TIERS,
 };
 use ekbloom::{
     adapt_to_workload, cpu_features, create, manifestation_sweep, write_evidence_json,
@@ -58,6 +63,15 @@ fn lcg_bytes(seed: u64, len: usize) -> Vec<u8> {
         out.push((s >> 33) as u8);
     }
     out
+}
+
+/// Render a slice of ASCII profile labels as a JSON string array.
+fn labels_json(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn main() -> ekbloom::Result<()> {
@@ -134,6 +148,39 @@ fn main() -> ekbloom::Result<()> {
         "cache-resident seq ({} KiB): {:.1} MB/s",
         CACHE_SRC_LEN / 1024,
         large.cache_resident_seq_bytes_per_s / 1e6
+    );
+
+    // --- budget-frontier run-to-run stability (F5 evidence) -------------------
+    // `budget_frontier` picks the fastest *measured* eligible profile, so two runs
+    // under CPU load can legitimately choose different equal-speed shapes (e.g.
+    // `sparse(K=64)` vs `sparse(K=1024)`). That instability is recorded here as
+    // evidence and is deliberately never asserted by a unit test.
+    let frontier_a = budget_frontier(&large_source, &DEFAULT_BUDGET_RATIOS, &large_cfg)?;
+    let frontier_b = budget_frontier(&large_source, &DEFAULT_BUDGET_RATIOS, &large_cfg)?;
+    let selection_stable = frontier_a == frontier_b;
+    let labels_of = |rows: &[BudgetPoint]| -> Vec<String> {
+        rows.iter().map(|p| p.chosen_profile.clone()).collect()
+    };
+    let mut dj = String::new();
+    dj.push_str("{\n");
+    let _ = writeln!(dj, "  \"source_len\": {},", large_source.len());
+    let _ = writeln!(dj, "  \"iterations\": {},", large_cfg.iterations);
+    let _ = writeln!(dj, "  \"seed\": {},", large_cfg.seed);
+    let _ = writeln!(dj, "  \"selection_stable\": {},", selection_stable);
+    let _ = writeln!(
+        dj,
+        "  \"run_a\": [{}],",
+        labels_json(&labels_of(&frontier_a))
+    );
+    let _ = writeln!(
+        dj,
+        "  \"run_b\": [{}]",
+        labels_json(&labels_of(&frontier_b))
+    );
+    dj.push_str("}\n");
+    std::fs::write(dir.join("budget-frontier-determinism.json"), dj)?;
+    println!(
+        "budget-frontier determinism: selection_stable={selection_stable} (F5; recorded, not asserted)"
     );
 
     // --- per-depth metrics (§10) ----------------------------------------------

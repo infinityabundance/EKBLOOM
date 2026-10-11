@@ -8,9 +8,9 @@ Repo: `<repo-root>` (single crate `ekbloom`).
 Scope: directive §23 — investigate locality/SIMD on the certified path-bloom hot
 path, and record the findings honestly. Related deliverable: the fully-safe,
 file-backed, streaming [`FileBody`] reads (directive §14/§23) — bounded `pread`
-windows, **no memory mapping and no `unsafe` anywhere in the crate** (now: no
-`unsafe` outside the single, feature-detected block in `src/simd.rs`, added in
-revision 2 and described in §6).
+windows, **no memory mapping**; the crate's `unsafe` is confined to exactly two
+sanctioned, feature-gated modules — the SIMD gathers in `src/simd.rs` (§6) and
+the `io-uring` submission-queue pushes in `src/async_io.rs`.
 
 All project tooling ran **only** inside the pinned container
 (`sh scripts/container-verify.sh`, `sh scripts/container-test.sh`). No `cargo`
@@ -200,8 +200,9 @@ tested directly with an executed AVX2 gather micro-benchmark: **it does not win
 Hot/cold separation and the resulting ≈111× sequential / ≈52,000× single-byte
 advantage over machine replay are supported by `evidence/bench/sweep.json`. The
 The file-backed `FileBody` realises the same hot path through bounded, safe `pread`
-windows (no mapping, and no `unsafe` outside the isolated, feature-gated
-`src/simd.rs`). The one open measurement gap remains the absence of an L1-resident
+windows (no mapping, and `unsafe` confined to the isolated, feature-gated
+`src/simd.rs` and `src/async_io.rs` modules). The one open measurement gap remains
+the absence of an L1-resident
 control for the path hot path in the committed sweep.
 
 ---

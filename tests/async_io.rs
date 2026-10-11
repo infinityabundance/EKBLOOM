@@ -156,6 +156,105 @@ fn publishing_never_exposes_a_partial_shell() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Adversarial: force the append to fail on an unwritable destination and prove
+/// the previously committed generation is left byte-for-byte intact, with no torn
+/// tail and no stray temp sibling. `async_io::append` opens the path for write
+/// only *after* scanning and committing the plan, so the failure happens before
+/// any mutation.
+#[test]
+fn failed_append_never_corrupts_the_previous_generation() {
+    let dir = temp_dir("append-fail");
+    let path = dir.join("obj.ekb");
+    let src = lcg(0xD00D_0001, 4096);
+    let mut body = create(&src, ManifestationProfile::Root).unwrap();
+    publish(&path, &body, Backend::Sync).unwrap();
+    let committed = std::fs::read(&path).unwrap();
+    let gen_before = open(&path).unwrap().generation;
+
+    grow(&mut body, ManifestationProfile::Sparse { interval: 256 }).unwrap();
+
+    // Make the destination unwritable (0444).
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&path, perms).unwrap();
+
+    let attempt = append(&path, &body, Backend::IoUring);
+
+    // Restore permissions so the file can be reopened for inspection/cleanup.
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&path, perms).unwrap();
+
+    let after = std::fs::read(&path).unwrap();
+    if attempt.is_err() {
+        // Clean failure: the file is the exact previous committed image.
+        assert_eq!(after, committed, "a failed append mutated the file");
+    } else {
+        // Privileged process bypassed the read-only bit (e.g. root): the append
+        // succeeded, but it must still be prefix-preserving (non-withdrawal).
+        assert!(
+            after.starts_with(&committed),
+            "append did not preserve the previous generation"
+        );
+    }
+
+    // Either way, `open`/`recover` must see only complete, verifiable commits.
+    let opened = open(&path).unwrap();
+    assert!(
+        verify(&opened).unwrap().ok,
+        "file does not verify after append attempt"
+    );
+    let report = ekbloom::recovery::recover(&path).unwrap();
+    assert_eq!(report.torn_tail_bytes, 0, "append attempt left a torn tail");
+    if attempt.is_err() {
+        assert_eq!(opened.generation, gen_before);
+        assert_eq!(report.newest_valid, Some(gen_before));
+    }
+    assert_round_trip(&path, &src);
+    assert!(!temp_sibling_exists(&path));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Adversarial: block the private temp path with a *directory* (so `File::create`
+/// returns `EISDIR` for every uid) and prove a failed `publish` never touches the
+/// existing destination.
+#[test]
+fn failed_publish_leaves_the_existing_committed_file_intact() {
+    let dir = temp_dir("publish-fail");
+    let path = dir.join("obj.ekb");
+    let src = lcg(0xD00D_0002, 2048);
+    let body = create(&src, ManifestationProfile::Root).unwrap();
+    publish(&path, &body, Backend::Sync).unwrap();
+    let committed = std::fs::read(&path).unwrap();
+    let gen_before = open(&path).unwrap().generation;
+
+    let tmp = {
+        let mut os = path.as_os_str().to_os_string();
+        os.push(".tmp");
+        PathBuf::from(os)
+    };
+    std::fs::create_dir(&tmp).unwrap();
+
+    let result = publish(&path, &body, Backend::IoUring);
+    assert!(
+        result.is_err(),
+        "publish unexpectedly succeeded with the temp path blocked"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        committed,
+        "a failed publish mutated the destination"
+    );
+    let opened = open(&path).unwrap();
+    assert_eq!(opened.generation, gen_before);
+    assert!(verify(&opened).unwrap().ok);
+    assert_round_trip(&path, &src);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn async_backend_matches_sync_byte_for_byte_when_available() {
     let dir = temp_dir("parity");
