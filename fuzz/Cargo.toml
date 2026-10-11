@@ -56,3 +56,10 @@ path = "fuzz_targets/fuzz_tiles.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_blocks"
+path = "fuzz_targets/fuzz_blocks.rs"
+test = false
+doc = false
+bench = false

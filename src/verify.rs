@@ -20,8 +20,9 @@ use crate::bloom_path::PathBloom;
 use crate::bloom_region::RegionTable;
 use crate::checkpoint::CheckpointSet;
 use crate::error::{EkbloomError, Result};
-use crate::machine::{machine_by_id, state_log_with, OrMachine};
+use crate::machine::{machine_by_id, state_log_with, OrMachine, MACHINE_NL2};
 use crate::manifest::EkbloomBody;
+use crate::region_adapt::{cursor_log_with, region_stored_cursors};
 use crate::state::Snapshot;
 use std::collections::BTreeMap;
 
@@ -112,6 +113,21 @@ fn run(body: &EkbloomBody, deep: bool) -> Result<VerificationReport> {
     // State log, used by checkpoint and bloom checks.
     let logs = state_log_with(machine, &body.core, body.logical_len).ok();
 
+    // A cursor-divergent machine stores a successor cursor in each regional
+    // record, so `check_regional` must re-derive it from the authoritative pass.
+    // A cursor==position machine derives the cursor from the position and stores
+    // none, so no extra pass is needed.
+    let cursors = if body.machine_id != MACHINE_NL2
+        && body
+            .blooms
+            .iter()
+            .any(|shell| shell.kind == BloomKind::Regional)
+    {
+        cursor_log_with(machine, &body.core, body.logical_len).ok()
+    } else {
+        None
+    };
+
     // History.
     if let Some(history) = &body.history {
         let passed = history.logical_len == body.logical_len
@@ -134,7 +150,14 @@ fn run(body: &EkbloomBody, deep: bool) -> Result<VerificationReport> {
 
     // Blooms.
     for (idx, shell) in body.blooms.iter().enumerate() {
-        checks.push(check_bloom(body, shell, idx, decoded, logs.as_deref()));
+        checks.push(check_bloom(
+            body,
+            shell,
+            idx,
+            decoded,
+            logs.as_deref(),
+            cursors.as_deref(),
+        ));
     }
 
     // Certificates.
@@ -223,6 +246,7 @@ fn check_bloom(
     idx: usize,
     decoded: Option<&Vec<u8>>,
     logs: Option<&[u32]>,
+    cursors: Option<&[u64]>,
 ) -> CheckOutcome {
     let name = format!("bloom[{idx}]:{}", shell.kind.as_str());
     if shell.core_hash != body.core_hash {
@@ -231,7 +255,7 @@ fn check_bloom(
     match shell.kind {
         BloomKind::Path => check_path(body, shell, name, decoded, logs),
         BloomKind::Universal => check_global(shell, name, decoded, logs),
-        BloomKind::Regional => check_regional(body, shell, name, decoded, logs),
+        BloomKind::Regional => check_regional(body, shell, name, decoded, logs, cursors),
         BloomKind::Contextual => check_contextual(body, shell, name),
     }
 }
@@ -371,6 +395,7 @@ fn check_regional(
     name: String,
     decoded: Option<&Vec<u8>>,
     logs: Option<&[u32]>,
+    cursors: Option<&[u64]>,
 ) -> CheckOutcome {
     let table = match RegionTable::from_shell(shell) {
         Ok(table) => table,
@@ -419,7 +444,35 @@ fn check_regional(
     if table.entries != expected_pairs {
         return check(name, false, "regional entries do not reproduce Phi_D");
     }
-    let expected_status = if conflict {
+
+    // A cursor-divergent table also stores the successor cursor per record.
+    // `RegionTable::from_shell` drops it, so re-derive it from the authoritative
+    // machine pass and require the stored cursor to match: a self-consistent but
+    // forged cursor would otherwise pass while `read_region_scoped` returned bytes
+    // disagreeing with `reader::read`. It is a conflict, so it also forces the
+    // recomputed status to `Rejected`.
+    let mut cursor_conflict = false;
+    let mut expected_cursors: BTreeMap<u16, u64> = BTreeMap::new();
+    if table.cursor_bytes != 0 {
+        let Some(cursors) = cursors else {
+            return check(name, false, "authoritative cursor log unavailable");
+        };
+        for w in 0..windows {
+            let key = (logs[base + w] & 0xFFFF) as u16;
+            let Some(&cursor) = cursors.get(base + w + depth) else {
+                return check(name, false, "authoritative cursor log too short");
+            };
+            match expected_cursors.get(&key) {
+                None => {
+                    expected_cursors.insert(key, cursor);
+                }
+                Some(prev) if *prev != cursor => cursor_conflict = true,
+                Some(_) => {}
+            }
+        }
+    }
+
+    let expected_status = if conflict || cursor_conflict {
         Certification::Rejected
     } else {
         Certification::Certified
@@ -431,6 +484,21 @@ fn check_regional(
             "regional status disagrees with reproduced conflicts",
         );
     }
+
+    if table.cursor_bytes != 0 {
+        let Some(stored) = region_stored_cursors(shell, table.depth, table.cursor_bytes) else {
+            return check(name, false, "regional cursor records malformed");
+        };
+        let expected_records: Vec<(u16, u64)> = expected_cursors.into_iter().collect();
+        if stored != expected_records {
+            return check(
+                name,
+                false,
+                "regional successor cursors do not reproduce Phi_D",
+            );
+        }
+    }
+
     check(
         name,
         true,
@@ -685,8 +753,9 @@ fn check_deep_symbols(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{create, grow};
-    use crate::ManifestationProfile;
+    use crate::manifest::{create, create_machine, grow};
+    use crate::region_adapt::{manifest_hot_regions, AccessTrace};
+    use crate::{ManifestationBudget, ManifestationProfile, MACHINE_RANS0};
 
     fn lcg(seed: u64, len: usize) -> Vec<u8> {
         let mut s = seed;
@@ -788,5 +857,77 @@ mod tests {
             .checks
             .iter()
             .any(|c| !c.passed && c.name == "core_hash"));
+    }
+
+    #[test]
+    fn machine1_regional_identity_cursor_verifies() {
+        // Machine 1's cursor is the logical position (the identity), so its
+        // regional tables store no cursor and re-derive `i + D`. Honest machine-1
+        // regions must still verify unchanged.
+        let src = lcg(0x51D, 512);
+        let body = create(
+            &src,
+            ManifestationProfile::Regional {
+                depth: 4,
+                region_bytes: 128,
+            },
+        )
+        .unwrap();
+        let report = verify_deep(&body).unwrap();
+        assert!(report.ok, "{:?}", report.checks);
+    }
+
+    #[test]
+    fn forged_regional_cursor_is_detected() {
+        use crate::bloom_region::RegionTable;
+        use crate::SweepConfig;
+
+        // A cursor-divergent (machine 2) hot region: the adaptive builder stores
+        // the complete successor cursor in each record. Flipping a stored cursor
+        // must fail verification even though the (symbols, successor state) part
+        // is untouched and self-consistent. A region of exactly depth `D` has a
+        // single window, so it always certifies and is materialised.
+        let src = lcg(0x9E3, 4096);
+        let mut body = create_machine(&src, ManifestationProfile::Root, MACHINE_RANS0).unwrap();
+        let trace = AccessTrace {
+            regions: vec![(0, 4)],
+            counts: vec![16],
+        };
+        let budget = ManifestationBudget {
+            maximum_physical_bytes: u64::MAX,
+        };
+        let cfg = SweepConfig {
+            iterations: 1,
+            seed: 1,
+        };
+        manifest_hot_regions(&mut body, &trace, &budget, &cfg).unwrap();
+
+        // Honest regions still pass.
+        let honest = verify(&body).unwrap();
+        assert!(honest.ok, "honest body must verify: {:?}", honest.checks);
+
+        let idx = body
+            .blooms
+            .iter()
+            .position(|shell| {
+                RegionTable::from_shell(shell)
+                    .map(|table| table.cursor_bytes != 0)
+                    .unwrap_or(false)
+            })
+            .expect("adaptive builder must materialise a cursor-carrying region");
+
+        // The successor cursor is the final 8 bytes of the payload; flip one.
+        let last = body.blooms[idx].payload.len() - 1;
+        body.blooms[idx].payload[last] ^= 0xFF;
+
+        let report = verify(&body).unwrap();
+        assert!(!report.ok);
+        assert!(
+            report.checks.iter().any(|c| {
+                !c.passed && c.name.starts_with("bloom[") && c.name.ends_with(":regional")
+            }),
+            "regional check must fail: {:?}",
+            report.checks
+        );
     }
 }

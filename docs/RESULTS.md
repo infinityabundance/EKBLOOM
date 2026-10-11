@@ -21,7 +21,7 @@ Captured by `scripts/capture-environment.sh` into
 - **toolchain** `rustc 1.99.0 (b940084d7 2026-09-28)`, `cargo 1.99.0`,
   host `x86_64-unknown-linux-gnu`;
 - **host** AMD Ryzen 7 9800X3D, `nproc 16`, kernel `7.2.9-2-cachyos`;
-- **source** `Cargo.lock` sha256 `8f4b41d4…`, git HEAD `2e9950d9…`;
+- **source** `Cargo.lock` sha256 `f1cbc54f…`, git HEAD `4263f9e1…`;
 - **nightly harness image** `rustlang/rust:nightly-bookworm-slim@sha256:2fe113dd…`.
 
 Detected CPU features for the sweep (`evidence/bench/cpu.json`): `sse2`, `avx2`,
@@ -336,8 +336,9 @@ handling, and transparent fallback — not throughput for small single-file writ
 
 Seven later artifacts measure the round-3 modules. Each is read from its committed
 `evidence/bench/*.json` and detailed in its own doc; the numbers below are the
-headline rows, not a substitute for those docs. (The table also adds the three
-final phases: SIMD kernels, the background planner, and the mapped surface.)
+headline rows, not a substitute for those docs. The table also adds the final
+rounds: SIMD kernels, the background planner, the mapped surface, and the
+rounds-R1–R4 artifacts (machine-2 context, blocks, unified engine).
 
 | Phase | Headline measured result | Doc | Evidence |
 |---|---|---|---|
@@ -352,6 +353,9 @@ final phases: SIMD kernels, the background planner, and the mapped surface.)
 | Workload-directed background planner | moving 8-region hot window adapted, cold p50 **301 → 130 ns** (~2.3×), hot-fraction **0% → 100%**; additive, committed history untouched; 44 shared locks / 12,288 reads (lock-free read path) | [`PLANNER.md`](PLANNER.md) §4 | `planner-bg.json` |
 | Mapped surface + huge pages | `mmap` rand-1b p50 **130 → 30 ns** (4.3×, 1–64 MiB), faster than `pread` sequentially; resident `Vec` equal-or-better (20 vs 30 ns); huge pages **REJECTED** (`MADV_HUGEPAGE` 1.00× — mapping already file-THP backed) | [`MMAP.md`](MMAP.md) | `mmap.json` |
 | FUSE read path | measured FUSE overhead vs a direct read, and the passthrough / FUSE-over-io_uring **non-result** | [`FUSE.md`](FUSE.md) | `fuse-perf.json` |
+| Machine-2 prepared decode context | one validated `RansContext` reused for a bulk decode **165×** the per-symbol rebuild (skewed; byte-exact) | [`CODEC.md`](CODEC.md) | `rans.json` |
+| Machine-2 restartable blocks | 4 KiB read **18.3 µs (256 B) … 158.3 µs (64 KiB)** vs **6,095,739 ns** from genesis (**38–330×**) at a **141×** footprint span; packed checkpoint (**1/6**, backward-compatible) | [`BLOCKS.md`](BLOCKS.md) | `blocks.json` |
+| Unified bounded-access engine + frontier | hot 4 KiB **1.00–1.14×** raw; footprint **0.27×/0.79×** raw on skewed/mixed (uniform 1.07×); non-eviction thrash p99 **542–591 ns** vs caches degrading **4.9–6.4×**; cold p99 loses to bare LZ4 | [`ENGINE.md`](ENGINE.md), [`FRONTIER.md`](FRONTIER.md) | `frontier.json` |
 
 **Honest reading.** These phases add *capabilities* and one exact space win
 (packing), not a new hot-read speed ceiling: the court restates that `raw-vec` wins
@@ -360,9 +364,54 @@ remains the only bytes win (see the baseline and machine-2 sections above). The
 prefix decode win is genuine but construction-bound (P11); tiles trade cold access
 for hot (P13); the io_uring win is batched-cold-only ([`IOURING.md`](IOURING.md)).
 The kernels win only across windows/blocks (P15), the background planner is a
-certified-dispatch adapter (P16), and mmap is a `pread` replacement, not a heap
-replacement (P17). Their proved/observed properties are P11–P17 in
+is a certified-dispatch adapter (P16), and mmap is a `pread` replacement, not a heap
+replacement (P17). Their proved/observed properties are P11–P23 in
 [`PROOFS.md`](PROOFS.md).
+
+### Rounds R1–R4 (`evidence/bench/rans.json`, `blocks.json`, `frontier.json`)
+
+The final round closes four gaps; every number below is read from the named
+artifact.
+
+- **R1 — machine-general regional + complete successor cursor + shared tile
+  parser + evidence validation.** The regional table is now built over the
+  machine adapter and stores the **complete successor cursor** for a
+  cursor-divergent machine; `tiles::parse_tile_set_prefix` is the single guard
+  shared by the in-memory and file-backed readers. `sh scripts/validate-evidence.sh`
+  validates every `evidence/**/*.json` and reports **27** files `OK` (up from 24).
+- **R2 — machine-2 prepared context, encode-first budgets, bounded cold
+  reconstruction, cache single-flight.** A validated `RansContext` reused for the
+  whole decode is **165×** the per-symbol rebuild on skewed data
+  (`evidence/bench/rans.json`: `2,379,740 ns` vs `392,550,970 ns`, byte-exact;
+  uniform **115×**). Machine-2 budgets **encode first**, so the compressed core
+  length is known before the hard-cap check and a budget is never over-rejected.
+  A tile set that seeds from the nearest checkpoint cuts cold 1-byte p50 from
+  **6,402,245 ns (genesis) to 1,223 ns (5,235×)** for 49,164 restart bytes; the
+  object cache is **single-flight** (per-path builder lock).
+- **R3a — machine-2 restartable blocks + compact checkpoints.** On a 4 MiB skewed
+  machine-2 object (core `2,000,493 B`, `V/N = 0.477`, source `4,194,304 B`) a
+  4 KiB read from genesis costs **6,095,739 ns p50**; block restarts serve it in
+  **18.3 µs (256 B), 19.7 µs (1 KiB), 26.5 µs (4 KiB), 53.5 µs (16 KiB), 158.3 µs
+  (64 KiB)** — **38–330×** faster — with a restart footprint of
+  **197,240 / 49,784 / 12,920 / 3,704 / 1,400 B** (**141×** span). The packed
+  `K=64` machine-1 checkpoint drops **196,632 → 32,792 bytes (1/6)**, still
+  reading the legacy magic-less layout. (`docs/BLOCKS.md`, `blocks.json`.)
+- **R3b — unified engine + competitive frontier.** The engine's `worst_case_steps`
+  bounds any request's positioning (it rejects a body with no certified bounded
+  path instead of replaying from genesis). A fully resident **4 KiB** read is
+  **1.00–1.14×** a raw `Vec`; a 1-byte read is **~1.5×**. Against block-indexed
+  LZ4 and chunked Zstandard (± a hot cache) and raw under one equal budget the
+  engine retains **0.27× raw on skewed** (1,142,159 vs 4,194,304 B) and **0.79× on
+  mixed** (3,299,237 vs 4,194,304 B), and its post-scan hot p99 is essentially
+  unchanged (**591→542→541 ns**) while the cache contenders degrade
+  (**lz4-block+cache** 200→4,929 ns, **zstd-chunk+cache** 13,044 ns) —
+  non-withdrawal. It **fails** honestly where it should: on `uniform` it retains
+  **1.07× raw** (no space win without skew) and its cold p99 loses to a bare LZ4
+  4 KiB decompress. (`docs/ENGINE.md`, `docs/FRONTIER.md`, `frontier.json`.)
+- **R4 — verifier completeness.** `verify`/`verify_deep` now **re-derive the
+  regional successor cursor** from the authoritative machine pass and reject a
+  forged cursor (`src/verify.rs::forged_regional_cursor_is_detected`), and the
+  region bounds use a checked `start + len` (`tests/adversarial_r4.rs`).
 
 ---
 
@@ -557,6 +606,10 @@ sh scripts/run-baselines.sh          # baselines.json
 sh scripts/run-competitive.sh        # competitive.json
 sh scripts/container-perf.sh         # perf.json (hardware counters)
 sh scripts/container-async-io.sh     # io-uring.json (seccomp=unconfined)
+sh scripts/run-rans.sh               # rans.json (machine-2 prepared decode context)
+sh scripts/run-blocks.sh             # blocks.json (machine-2 blocks + packed checkpoints)
+sh scripts/run-frontier.sh           # frontier.json (engine vs indexed codecs)
+sh scripts/validate-evidence.sh      # validate every evidence/**/*.json (27 files)
 sh scripts/container-loom.sh         # Loom model checking
 sh scripts/container-bench.sh        # Divan microbenchmarks (benches/ekbloom.rs)
 sh scripts/capture-environment.sh    # refresh evidence/environment.txt

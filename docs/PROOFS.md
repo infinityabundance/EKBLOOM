@@ -689,6 +689,186 @@ unlink; 4 readers × 64 generations never torn;
 
 ---
 
+## P18. The round-3/round-4 constructions are machine-general — **PROVED** (by construction), **EMPIRICALLY OBSERVED** (both machines)
+
+**Claim.** The regional transition table, the selective `TileSet`, and the
+independently restartable `BlockIndex` are all built over the **machine adapter**
+(`machine_by_id`), not hard-wired to `OrANS-NL2`; a machine-2
+(`OrANS-RANS0`) body obtains the same byte-exact structures, and the
+`tile_shift`/magic/version guard is checked in exactly **one** place
+(`tiles::parse_tile_set_prefix`) shared by the in-memory `TileSet::from_bytes`
+and the file-backed reader.
+
+**Proof.** Each builder takes the machine/core and replays the authoritative
+machine step (`state_log_with`, `OrMachine::reveal`); the regional builder stores
+`(symbols, successor state)` and — for a **cursor-divergent** machine — the
+complete successor cursor, and treats a cursor divergence as a key conflict, so
+honest output is authoritative on both machines. The shared prefix parser makes
+the untrusted-input validation identical on both read paths, so a crafted
+`tile_shift` is rejected before any table is indexed. ∎
+
+**Corroboration.** Machine-1 regional tables store no cursor
+(`table_len == entries·(D+6)`) and are byte-identical before and after reopen;
+machine-2 regional tables store the authoritative `cursors[i+D]` and read
+exactly across every regional boundary, the partial final region, region-edge
+single bytes, and after reopen. Machine-2 state log, history, checkpoint sets and
+path blooms are byte-exact against the machine (`tests/machine_rans.rs`).
+
+**Tested:** `tests/blooms_research.rs` (regional, both machines),
+`tests/blocks.rs`, `tests/region_adapt.rs`, `src/tiles.rs`
+(`crafted_tile_shift_is_rejected_without_panicking`), `tests/adversarial_r4.rs`.
+
+---
+
+## P19. The regional successor cursor is stored completely and re-derived by the verifier — **PROVED** (builder), **EMPIRICALLY OBSERVED** (forgery rejected)
+
+**Claim.** For a cursor-divergent machine the regional record carries the
+**complete successor cursor** (`cursors[i+D]`), and `verify`/`verify_deep`
+**re-derives** it from the authoritative machine pass and requires the stored
+records to match, so a self-consistent forged cursor is `Rejected` rather than
+certified.
+
+**Proof.** `region_adapt::build_region_shell` records
+`(symbols, next_state, next_cursor)` per window key and marks any window pair that
+agrees on `(symbols, next_state)` but differs on the cursor as a conflict, so the
+builder never emits a non-authoritative cursor. `verify::check_regional` now
+re-derives `cursors[base + w + depth]` for every window from the same machine
+`run` that produces the state log and compares the whole
+`(key, cursor)` record list to `region_stored_cursors`; a mismatch forces the
+recomputed status to `Rejected` (the class of Finding F3/E). The region-bounds
+computation uses a checked `start + len`. ∎
+
+**Corroboration.** `src/verify.rs::forged_regional_cursor_is_detected` flips one
+byte of a machine-2 regional record's successor cursor and asserts `verify`
+fails, while `machine1_regional_identity_cursor_verifies` confirms honest
+machine-1 regions still verify unchanged at no extra cost (no cursor is stored).
+
+**Tested:** `src/verify.rs` unit tests; `tests/adversarial_r4.rs`
+(`verify_accepts_a_wrong_machine2_region_cursor_used_by_read` is the reproducer
+that the fix now rejects).
+
+---
+
+## P20. Machine-2 restartable blocks bound positional reconstruction — **PROVED** (step bound, certification), **EMPIRICALLY OBSERVED** (latency / footprint)
+
+**Claim.** A `BlockIndex` stores one complete `(state, cursor)` restart at each
+block boundary; `read_range(offset, len)` starts at
+`floor(offset / B)·B` and advances at most `B−1` symbols, so the exact machine
+step count is `offset % B + len ≤ B − 1 + len`, independent of the offset; the
+index is certified block-by-block before publication and rejected by `verify` on
+any state **or** cursor mismatch.
+
+**Proof.** For a cursor-divergent machine a resumable state is the pair
+`(x, p)`; the stored restart at the covering boundary is authoritative, so
+advancing `offset − block_start ≤ B − 1` steps reaches `offset` exactly
+(`docs/BLOCKS.md`). `certify` replays the index from genesis block-by-block and
+requires entry 0 to be genesis and each block to land on the next stored restart;
+`verify_against` re-runs the authoritative pass, so a wrong state **or** cursor is
+caught. ∎
+
+**Corroboration.** On a 4 MiB skewed machine-2 object (core `2,000,493 B`,
+`V/N = 0.477`) a 4 KiB read from genesis costs `6,095,739 ns p50`; block restarts
+serve it in `18,274 ns` (256 B) … `158,316 ns` (64 KiB) — **38–330×** faster — at
+a footprint spanning `197,240 B → 1,400 B` (**141×**), all `exact: true`. Evidence
+`evidence/bench/blocks.json`.
+
+**Tested:** `tests/blocks.rs` (extremes, truncation, wrong state/cursor,
+boundary/partial/zero-length reads, reopen, exact step count); fuzzed by
+`fuzz/fuzz_targets/fuzz_blocks.rs`; reviewed in `docs/reviews/adversarial.md`
+(Revision 4).
+
+---
+
+## P21. The packed restart/checkpoint wire format is exact and backward-compatible — **PROVED** (byte round-trip), **EMPIRICALLY OBSERVED** (1/6 bytes)
+
+**Claim.** `CheckpointSet::to_bytes` emits the versioned `EKBCKPT` container;
+the packed `format = 1` encoding is used exactly when the set is
+cursor==position and every state fits in `u16` (a machine-1 set), else the
+complete `(u32 state, u64 cursor)` `format = 2` is emitted. `from_bytes_with`
+first tests for the magic and otherwise parses the **legacy** magic-less layout,
+so old files still read; a wrong/unknown version or format is a clean `Err`.
+
+**Proof.** `physical_bytes()`/`entry_bytes()` agree with the emitted record
+width (2 B machine-1, 12 B machine-2), so the round-trip is byte-exact and a
+packed write reproduces the same set as the legacy write. `PackedHistory`/
+`PackedRestarts` reject `stride_shift > 63`, non-zero reserved bytes, truncation
+and trailing bytes; an unknown version is rejected, never silently mis-read. ∎
+
+**Corroboration.** A machine-1 `K=64` checkpoint over 1 MiB at `196,632` legacy
+bytes becomes `32,792` compact bytes (**1/6**, +10 B header) at equal coverage,
+with `legacy_backward_compatible: true` and `packed_roundtrip: true`. Evidence
+`evidence/bench/blocks.json` (`checkpoint_format`).
+
+**Tested:** `tests/history_checkpoint.rs`, `tests/adversarial_r4.rs`
+(legacy + compact parse, bad version/format/interval/zero-count/truncation);
+fuzzed by `fuzz/fuzz_targets/fuzz_packed.rs`.
+
+---
+
+## P22. The unified engine bounds positioning with `worst_case_steps` and rejects unbounded bodies — **PROVED** (bound + dispatch), **EMPIRICALLY OBSERVED** (hot index / frontier)
+
+**Claim.** `Engine::plan` admits only certified bounded structures under a strict
+physical budget or **fails** (never an `O(prefix)` genesis replay);
+`Engine::read` performs an O(1), search-free dispatch and is byte-exact to
+`reader::read` on both machines; and `Engine::worst_case_steps()` bounds the
+positioning work of **any** request independently of its length.
+
+**Proof.** Every admitted path carries a structure-parameter bound (`K−1` for a
+checkpoint, `B−1` for a block, `0` for a tile / O(1) state load), so a cold read
+at any offset costs at most `worst_case_steps` positioning steps plus its own
+reveals — never `O(prefix)`. Planning is transactional: it returns an in-budget
+plan or an error, so no partial/over-budget plan exists. Each branch re-implements
+the identical primitive `reader::read` would choose, and a request spanning
+regions is split at boundaries and concatenated. ∎
+
+**Corroboration (hot index).** With the whole output materialised
+(`worst_case_steps = 0`) a fully resident **4 KiB** read is **1.00–1.14×** a raw
+`Vec`; a 1-byte read is **~1.5×** (a fixed ~10 ns dispatch on a ~20 ns op).
+`tests/engine.rs::worst_case_steps_holds_for_adversarial_offsets` sweeps offsets
+at `base + {0, 1, K−2, K−1}` and asserts `steps − length ≤ worst_case_steps`.
+**Corroboration (frontier).** Against block-indexed LZ4 and chunked Zstandard
+(± a hot-block cache) and raw under one equal budget, the engine retains
+**0.27× raw on skewed** and **0.79× on mixed** (uniform **1.07×**, no space win)
+and its post-scan (*thrash*) hot p99 stays at **542–591 ns** while the cache
+contenders degrade **4.9–6.4×** (non-withdrawal). It honestly **loses** to a bare
+LZ4 4 KiB block decompress on cold p99 (`0.99–5.04 µs`). Evidence
+`evidence/bench/frontier.json`; full verdict in `docs/FRONTIER.md` §2/§5.
+
+**Tested:** `tests/engine.rs` (9 tests: byte-exactness on both machines,
+transactional budget, `worst_case_steps` on adversarial offsets, certified-only
+selection, rejection of an unbounded body, determinism); reviewed in
+`docs/reviews/adversarial.md` (Revision 4).
+
+---
+
+## P23. The machine-2 prepared decode context is byte-exact and reuses validated state — **PROVED** (equality), **EMPIRICALLY OBSERVED** (speedup)
+
+**Claim.** A validated `RansContext` (the 256 frequencies, derived prefix sums,
+and a direct 4096-entry slot→symbol table) built once per bulk decode reproduces
+the per-symbol path's revealed **symbol and state sequence** exactly for every
+corpus, and `machine::prepare` hands the same context to every sequential/block
+decoder, history/state-log builder, tile reconstruction and bloom builder.
+
+**Proof.** The context is a pure function of the core header
+(`RansContext::from_core` validates `Σ freq = M` and every `freq ≥ 1`), and the
+decoder step is unchanged (`slot = x & 4095`, `s = table[slot]`,
+`x = f[s]·(x>>12) + slot − cum[s]`, renormalise) — the table only removes the
+repeated search/parse, so the state/cursor sequence is identical by construction. ∎
+
+**Corroboration.** On a 512 KiB skewed corpus the prepared decode is
+**2,379,740 ns** vs **392,550,970 ns** for the per-symbol rebuild — **165×**
+(`prepared_exact: true`); uniform is **115×**. The reported ratio is an **upper
+bound** because the per-symbol column rebuilds the full context while the pre-fix
+code parsed only the header; the direction is unchanged. Evidence
+`evidence/bench/rans.json`.
+
+**Tested:** `tests/machine_rans.rs`; `tests/adversarial_r4.rs` (byte- and
+state-exact across empty/all-`0xFF`/constant/skewed/uniform corpora; invalid
+headers are clean `Err`s; independent contexts for different cores do not
+interfere).
+
+---
+
 ## Unresolved limitations (honest)
 
 1. **No certified universal 65,536-entry `T_4[x]` for the byte machine.** By P6
@@ -760,3 +940,19 @@ unlink; 4 readers × 64 generations never torn;
     must never be pointed at an untrusted or concurrently-truncated file (a
     truncation of an unfaulted page is a `SIGBUS`), and it is a *source-from-file*
     mode, not a faster heap (P17).
+12. **The unified engine has no space win on uniform data and a fixed per-read
+    dispatch cost.** On incompressible (`uniform`) data the engine retains
+    **1.07× raw** — *larger* than raw — and its cold p99 **loses** to a bare LZ4
+    4 KiB block decompress (0.99–5.04 µs); the non-eviction advantage over a
+    conventional cache is the one reproducible win there. The **4 KiB** hot-read
+    target (within 15% of a raw `Vec`) is met only for reads at least a region
+    long (`1.00–1.14×`); a **1-byte** read is **~1.5×** because a fixed ~10 ns
+    dispatch dominates a ~20 ns allocation-bound copy. No further safe branch can
+    be removed without weakening the certified-bound guarantee
+    (`docs/FRONTIER.md` §2/§5, P22).
+13. **The regional successor-cursor check is a verifier-completeness property,
+    not an authenticity boundary.** `verify`/`verify_deep` now re-derive the
+    machine-2 regional cursor (P19), but as everywhere a forger who recomputes
+    the section CRC and re-seals the linked certificate and `core_hash` authors a
+    different valid object; only the opt-in keyed-MAC `AUTH` mode is an
+    authenticity boundary (limitation 8).

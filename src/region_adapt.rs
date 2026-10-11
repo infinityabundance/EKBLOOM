@@ -372,6 +372,66 @@ fn authoritative_pass(
     Ok((decoded, states, cursors))
 }
 
+/// The authoritative backing cursor before each logical position for `machine`
+/// over `core`: `cursors[i]` is `Omega_i.cursor` (the cursor *before* revealing
+/// symbol `i`), so a region window starting at `i` stores `cursors[i + D]`.
+///
+/// This is the cursor projection `verify::check_regional` re-derives for a
+/// cursor-divergent regional table, so a forged successor cursor cannot pass.
+/// A cursor==position machine (`MACHINE_NL2`) stores no cursor and needs no pass.
+pub(crate) fn cursor_log_with(
+    machine: &dyn OrMachine,
+    core: &[u8],
+    logical_len: u64,
+) -> Result<Vec<u64>> {
+    machine.check_core(core, logical_len)?;
+    let n = usize::try_from(logical_len).map_err(|_| EkbloomError::Overflow {
+        what: "cursor log length",
+    })?;
+    let ctx = crate::machine::prepare(machine, core)?;
+    let mut omega = machine.init(core)?;
+    let mut cursors: Vec<u64> = Vec::with_capacity(n.saturating_add(1));
+    cursors.push(omega.cursor);
+    for _ in 0..logical_len {
+        ctx.reveal(core, &mut omega)?;
+        cursors.push(omega.cursor);
+    }
+    Ok(cursors)
+}
+
+/// The stored `(16-bit key, successor cursor)` records of a regional shell that
+/// carries a per-record successor cursor, in stored key order. `None` when the
+/// shell stores no cursor bytes or its payload is structurally short.
+///
+/// `verify::check_regional` uses this to compare the stored cursor against the
+/// one re-derived from the authoritative machine pass: `RegionTable::from_shell`
+/// discards the cursor, so a self-consistent but forged cursor would otherwise
+/// survive verification while `read_region_scoped` returned divergent bytes. The
+/// caller has already validated the shell with `RegionTable::from_shell`.
+pub(crate) fn region_stored_cursors(
+    shell: &BloomShell,
+    depth: u16,
+    cursor_bytes: usize,
+) -> Option<Vec<(u16, u64)>> {
+    if cursor_bytes == 0 {
+        return None;
+    }
+    let entries = usize::try_from(shell.entries).ok()?;
+    let record = region_record_len(depth, cursor_bytes);
+    let cursor_off = 2 + usize::from(depth) + 4;
+    let mut off = REGION_PREFIX_LEN;
+    let mut out = Vec::with_capacity(entries);
+    for _ in 0..entries {
+        let end = off.checked_add(record)?;
+        let rec = shell.payload.get(off..end)?;
+        let key = u16::from_le_bytes(rec.get(0..2)?.try_into().ok()?);
+        let cursor = u64::from_le_bytes(rec.get(cursor_off..cursor_off + 8)?.try_into().ok()?);
+        out.push((key, cursor));
+        off = end;
+    }
+    Some(out)
+}
+
 /// Materialise acceleration structures **only for the hot regions named by
 /// `trace`**, each independently certified, appended additively as a new
 /// generation, and bounded by `budget` (the [`ManifestationBudget`] hard cap).
@@ -732,8 +792,15 @@ impl<'a> RegionView<'a> {
     }
 
     /// Whether logical position `pos` begins a full window inside this region.
+    ///
+    /// The region end is computed with `checked_add`: a forged shell whose
+    /// `start + len` overflows `u64` is never covered (rather than panicking in a
+    /// debug build), so the read path cleanly falls back to bounded restart.
     fn covers(&self, pos: u64) -> bool {
-        pos >= self.start && pos.saturating_add(self.depth) <= self.start + self.len
+        let Some(end) = self.start.checked_add(self.len) else {
+            return false;
+        };
+        pos >= self.start && pos.saturating_add(self.depth) <= end
     }
 
     /// The `(D symbols, successor state, successor cursor)` outcome recorded for
@@ -1001,5 +1068,42 @@ mod tests {
             assert_eq!(next, logs[i + 4]);
             assert!(cursor.is_none(), "machine 1 stores no cursor");
         }
+    }
+
+    #[test]
+    fn covers_rejects_overflowing_forged_region() {
+        // A forged region whose `start + len` wraps past `u64::MAX` must never be
+        // reported as covering a position; the unchecked sum would panic in a
+        // debug build. Fields are crafted directly into a `Regional` shell.
+        let depth: u16 = 4;
+        let entries: u64 = 1;
+        let start = u64::MAX;
+        let len: u64 = 16;
+        let table_len = entries * region_record_len(depth, 0) as u64;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&depth.to_le_bytes());
+        payload.extend_from_slice(&start.to_le_bytes());
+        payload.extend_from_slice(&len.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&entries.to_le_bytes());
+        payload.extend_from_slice(&Certification::Certified.to_u32().to_le_bytes());
+        payload.extend_from_slice(&table_len.to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 4]);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let shell = BloomShell {
+            kind: BloomKind::Regional,
+            depth,
+            generation: 1,
+            logical_len: len,
+            entries,
+            payload,
+            status: Certification::Certified,
+            core_hash: [0u8; 32],
+        };
+        let view = RegionView::parse(&shell, false).expect("structurally valid forged shell");
+        assert!(!view.covers(u64::MAX));
+        assert!(!view.covers(start));
+        assert!(!view.covers(start - 1));
     }
 }

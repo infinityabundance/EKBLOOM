@@ -83,9 +83,19 @@ original specification lives in `research/`.
     hot-fraction 0% → 100%, additively and without touching committed history
     (`docs/PLANNER.md` §4).
 14. **A read-only `mmap` surface is kept; huge pages are rejected.** mmap drops
-    random-1-byte p50 from **130 → 30 ns** (4.3×) at 1–64 MiB and beats `pread`
-    sequentially, but `MADV_HUGEPAGE` is a no-op because this kernel already backs
-    the file mapping with PMDs (`docs/MMAP.md`).
+   random-1-byte p50 from **130 → 30 ns** (4.3×) at 1–64 MiB and beats `pread`
+   sequentially, but `MADV_HUGEPAGE` is a no-op because this kernel already backs
+   the file mapping with PMDs (`docs/MMAP.md`).
+15. **Machine-2 blocks bound reconstruction; the unified engine is the milestone.**
+   Independently restartable machine-2 blocks reconstruct any range in at most
+   `B−1` positioning steps — **38–330×** faster than replay-from-genesis at a
+   **141×** restart-footprint span — and the versioned, compact checkpoint wire
+   format cuts machine-1 restart bytes to **1/6** with **backward-compatible**
+   reads. The unified bounded-access engine ([`docs/ENGINE.md`](docs/ENGINE.md))
+   serves every read through a certified bounded path under an explicit
+   `worst_case_steps`, retaining **0.27×–0.79× raw** on skewed/mixed data with a
+   non-eviction advantage over indexed codecs, while honestly failing on uniform
+   data (1.07×) and cold-vs-bare-LZ4 ([`docs/FRONTIER.md`](docs/FRONTIER.md)).
 
 ---
 
@@ -572,6 +582,55 @@ plain mapping faults in only 125 minor faults), so `MADV_HUGEPAGE` is a **1.00×
 no-op. Invariants: immutable-for-lifetime, rename-then-retain publication, explicit
 `munmap` on drop, and never wired into the untrusted `.ekb` parser.
 
+### Machine-2 blocks, packed checkpoints, and the unified engine (rounds R1–R4)
+
+The final rounds fold four long-standing gaps into the certified body:
+
+- **R1 — machine-general constructions and evidence validation.** The regional
+transition table is built machine-generally and now stores the **complete
+successor cursor** for a cursor-divergent machine (machine 2); the tile-set
+affix parser (`tiles::parse_tile_set_prefix`, including the `tile_shift` guard)
+is shared by the in-memory and file-backed readers, so parsing happens in exactly
+one place. `sh scripts/validate-evidence.sh`
+(`examples/validate_evidence.rs`, dependency-free) validates every
+`evidence/**/*.json`: **27** files `OK` (up from 24).
+- **R2 — machine-2 prepared decode context, encode-first budgets, bounded cold
+reconstruction, cache single-flight.** A validated `RansContext` (frequencies,
+prefix sums, 4096-entry slot table) is built **once** per bulk decode instead of
+per symbol: **165×** on skewed data (`evidence/bench/rans.json`), byte-exact
+against the per-symbol path. Machine-2 budgets **encode first** (the compressed
+core length is only known after encoding), so a budget is never over-rejected. A
+tile set that seeds absent fragments from the nearest checkpoint removes the
+genesis replay: cold 1-byte p50 **6,402,245 ns → 1,223 ns (5,235×)** for 49,164
+restart bytes. The object cache is **single-flight** (concurrent misses for one
+path serialise on a per-path builder lock) — see [`docs/HANDLES.md`](docs/HANDLES.md).
+- **R3a — machine-2 restartable blocks and compact checkpoints.** A `BlockIndex`
+stores one complete `(state, cursor)` restart per fixed-size block and
+reconstructs any range in bounded steps. On a 4 MiB skewed machine-2 object
+(core 2,000,493 B, `V/N = 0.477`) a 4 KiB read replaying from genesis costs
+**6,095,739 ns p50**; block restarts serve it in **18.3 µs (256 B) … 158.3 µs
+(64 KiB)** — **38–330× faster** — at a footprint spanning **197,240 B → 1,400 B**
+(a **141×** span). The versioned packed checkpoint container (`EKBCKPT`) emits
+2-byte machine-1 restarts, cutting a `K=64` checkpoint from 196,632 to **32,792
+bytes (1/6)** while **still reading the legacy magic-less layout**
+([`docs/BLOCKS.md`](docs/BLOCKS.md), `evidence/bench/blocks.json`).
+- **R3b — unified bounded-access engine and competitive frontier.** `src/engine.rs`
+is the single certified read planner over every manifested structure, with an
+explicit `worst_case_steps` bound; it **rejects** a body with no certified bounded
+path rather than falling back to an O(prefix) genesis replay. A fully resident
+**4 KiB** read is **1.00–1.14×** a raw `Vec`; a 1-byte read is ~1.5× (fixed
+dispatch). Against block-indexed LZ4 and chunked Zstandard (± a hot-block cache)
+and raw under one equal budget, the engine retains **0.27× raw on skewed** and
+**0.79× on mixed** (uniform 1.07×) and its post-scan (*thrash*) hot p99 stays at
+**542–591 ns** while the cache contenders degrade **4.9–6.4×** — non-withdrawal.
+It honestly loses to bare LZ4 on cold 4 KiB decompress
+([`docs/ENGINE.md`](docs/ENGINE.md), [`docs/FRONTIER.md`](docs/FRONTIER.md),
+`evidence/bench/frontier.json`).
+- **R4 — verifier completeness.** `verify`/`verify_deep` now **re-derive the
+regional successor cursor** from the authoritative machine pass and compare it
+to the stored records (a forged cursor is now `Rejected`, closing the earlier
+verifier gap), and the region-bounds computation uses a checked `start + len` add.
+
 ---
 
 ## Layout / SIMD experiments and concurrency
@@ -639,7 +698,11 @@ sh scripts/run-court.sh             # evidence/bench/{court,planner}.json (court
 sh scripts/run-kernels.sh           # evidence/bench/kernels.json (SIMD reconstruction kernels)
 sh scripts/run-planner-bg.sh        # evidence/bench/planner-bg.json (background planner)
 sh scripts/run-mmap.sh              # evidence/bench/mmap.json (mmap + huge pages)
+sh scripts/run-rans.sh              # evidence/bench/rans.json (machine-2 prepared decode context)
+sh scripts/run-blocks.sh            # evidence/bench/blocks.json (machine-2 blocks + packed checkpoints)
+sh scripts/run-frontier.sh          # evidence/bench/frontier.json (engine vs indexed codecs)
 sh scripts/run-fuse-perf.sh         # evidence/bench/fuse-perf.json (requires /dev/fuse)
+sh scripts/validate-evidence.sh     # validate every evidence/**/*.json
 sh scripts/container-loom.sh        # Loom model checking (tests/loom.rs)
 sh scripts/container-reproduce.sh   # clean build + tests from scratch
 sh scripts/capture-environment.sh   # write evidence/environment.txt
@@ -648,8 +711,9 @@ sh scripts/capture-environment.sh   # write evidence/environment.txt
 Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 (libFuzzer — runs **every** target declared in `fuzz/Cargo.toml`:
 `fuzz_machine`, `fuzz_open`, `fuzz_bloom`, `fuzz_history_store`, `fuzz_packed`,
-`fuzz_tiles`), `scripts/container-miri.sh` (UB), `scripts/container-sanitize.sh`
-(AddressSanitizer), and `scripts/container-fuse.sh` (read-only FUSE mount).
+`fuzz_tiles`, `fuzz_blocks`), `scripts/container-miri.sh` (UB),
+`scripts/container-sanitize.sh` (AddressSanitizer), and `scripts/container-fuse.sh`
+(read-only FUSE mount).
 
 ### Verified tooling
 
@@ -739,6 +803,9 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 - `evidence/bench/kernels.json` — SIMD reconstruction kernels (A/B) with keep/reject ratios.
 - `evidence/bench/planner-bg.json` — the workload-directed background planner's moving hot window.
 - `evidence/bench/mmap.json` — mapped read surfaces vs `pread`/resident and the huge-page non-result.
+- `evidence/bench/rans.json` — machine-2 prepared decode context (**165×** on skewed, byte-exact).
+- `evidence/bench/blocks.json` — machine-2 restartable blocks (**38–330×** vs genesis) + packed checkpoint format (**1/6**).
+- `evidence/bench/frontier.json` — the unified engine vs indexed codecs (LZ4/Zstd ± cache) and raw.
 - `evidence/bench/fuse-perf.json` — measured FUSE read-path cost and the passthrough non-result.
 - `evidence/counterexamples/` — rejected state-keyed blooms.
 - `evidence/model-search/` — finite-model sufficiency sweep.
@@ -750,7 +817,7 @@ Documentation map:
 | [`docs/INDEX.md`](docs/INDEX.md) | One-page index of all docs and evidence. |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Frozen internal engineering contract. |
 | [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | The 10 hard gates mapped to tests and commands. |
-| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties P1–P17 (machine 1 + machine 2 + the round-3/round-4 modules) and honest limitations. |
+| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties P1–P23 (machine 1 + machine 2 + the round-3/round-4 modules) and honest limitations. |
 | [`docs/RESULTS.md`](docs/RESULTS.md) | Measured results and the 65,536 research outcome. |
 | [`docs/CODEC.md`](docs/CODEC.md) | Machine 2 (`OrANS-RANS0`) compressing codec contract. |
 | [`docs/BASELINES.md`](docs/BASELINES.md) | Conventional baseline comparison (`RawVec`/`RawFile`/…). |
@@ -769,6 +836,9 @@ Documentation map:
 | [`docs/PLANNER.md`](docs/PLANNER.md) | The certified, search-free access planner + workload-directed background planner. |
 | [`docs/KERNELS.md`](docs/KERNELS.md) | SIMD reconstruction kernels (§6): keep/reject per measured kernel. |
 | [`docs/MMAP.md`](docs/MMAP.md) | Read-only `mmap` surface + huge-page investigation (keep/reject). |
+| [`docs/BLOCKS.md`](docs/BLOCKS.md) | Machine-2 independently restartable blocks + compact (packed) checkpoints. |
+| [`docs/ENGINE.md`](docs/ENGINE.md) | The unified bounded-access engine (`worst_case_steps`, certified dispatch). |
+| [`docs/FRONTIER.md`](docs/FRONTIER.md) | The engine vs indexed codecs (LZ4/Zstd ± cache) and raw, under one budget. |
 | [`docs/reviews/adversarial.md`](docs/reviews/adversarial.md) | Adversarial correctness review. |
 | [`docs/reviews/concurrency.md`](docs/reviews/concurrency.md) | Concurrency audit + Loom model checking. |
 | [`docs/reviews/mathematics.md`](docs/reviews/mathematics.md) | Independent re-derivation of the proofs. |

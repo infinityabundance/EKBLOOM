@@ -538,4 +538,102 @@ Docker's **default** seccomp profile (`--cap-drop=ALL
 --security-opt=no-new-privileges`; no relaxation, no capability), writes
 `evidence/bench/mmap.json`. **Verdict: SAFE — no memory-safety, lifetime, or
 use-after-unmap defect found.**
+
+## Revision 4 — `blocks`, `engine`, `region_adapt`, `machine_rans`, `checkpoint`/`packed` (verdict **TWO DEFECTS, BOTH FIXED**)
+
+Independent adversarial pass over the newest round, executable in
+`tests/adversarial_r4.rs` (12 tests) with a new fuzz target `fuzz_blocks`
+(`fuzz/Cargo.toml` + the `scripts/container-fuzz.sh` target list). Method: mutate
+a real body / writer output in memory, re-seal any linked certificate whose
+`bloom_hash`/receipt must follow the mutation, and compare every result against
+the authoritative machine or `reader::read`.
+
+### Finding E (**Medium**, FIXED) — `verify` did not check the machine-2 successor cursor
+
+| # | Severity | Location | Concrete input | Status |
+|---|---|---|---|---|
+| E | **Medium** | `src/verify.rs:check_regional` (+ `src/bloom_region.rs:RegionTable::from_shell`, which discarded `next_cursor`) | A `Certified` machine-2 `Regional` shell whose per-record successor cursor is altered, with its linked certificate re-sealed | **Fixed** |
+
+Originally `check_regional` re-derived each region window's `(symbols, next_state)`
+and compared it to the stored entries, but never compared the stored successor
+`u64` cursor to the authoritative `cursors[i+D]`. For a cursor-divergent machine
+(`OrANS-RANS0`) the cursor — not the state — is what makes the table resumable, and
+`region_adapt::RegionReader::read` uses it verbatim on every leap. A self-consistent
+forged body therefore **passed `verify_deep` (`ok == true`) while
+`read_region_scoped` returned bytes that disagreed with `reader::read`** — a
+verifier-completeness gap of the same class as Finding F3.
+
+**Resolution.** `check_regional` now consumes the authoritative cursor log
+(`region_adapt::cursor_log_with`, built in `run` only for a divergent machine) and
+re-derives the per-key successor cursor, comparing it against the stored records
+(`region_adapt::region_stored_cursors`); a mismatch — or a key whose windows
+diverge on the cursor — fails the check and forces the recomputed status to
+`Rejected`. A forged cursor now **fails** `verify`. Regression tests:
+`verify::forged_regional_cursor_is_detected` (a flipped stored cursor fails
+`verify` though `(symbols, next_state)` is untouched) and
+`verify::machine1_regional_identity_cursor_verifies`; my end-to-end
+`tests/adversarial_r4.rs::verify_rejects_a_wrong_machine2_region_cursor_used_by_read`
+was flipped from the old gap reproducer to a rejection assertion. The builder was
+already sound, so honest output was exact
+(`machine2_region_successor_cursor_is_stored_and_authoritative`,
+`machine2_region_reads_are_exact_across_boundaries_and_after_reopen`).
+
+### Finding F (**Low**, FIXED) — `RegionView::covers` overflowed on a forged region
+
+`src/region_adapt.rs::RegionView::covers` computed `self.start + self.len` with an
+unchecked add, so a forged regional shell whose `len == shell.logical_len` is near
+`u64::MAX` (accepted structurally by `open` and `RegionView::parse`, which check
+only length *equality*) could overflow that add — a debug-build panic reachable
+from `open_bytes` + `read_region_scoped`. Not memory-unsafe; not reachable through
+the honest writer.
+
+**Resolution.** `covers` now uses `self.start.checked_add(self.len)` and returns
+`false` on overflow, so a position is never covered and the read cleanly falls back
+to bounded restart. Regression test:
+`region_adapt::tests::covers_rejects_overflowing_forged_region`.
+
+### Attacks that held (Revision 4)
+
+* **Region cursor (machine 2).** Stored successor cursors equal the authoritative
+  `cursors[i+D]` for every window key; reads are byte-exact across every regional
+  boundary, the final partial region, region-edge single bytes, and after
+  serialize+reopen.
+* **Machine-1 regional byte-identity.** No cursor bytes are stored
+  (`table_len == entries*(D+6)`); reads are identical before and after reopen.
+* **`blocks`.** `block_bytes` ∈ {0, 1, 3, 1<<30, (1<<30)+1}: `0` and `>1<<30` are
+  rejected, the rest exact (a `1<<30` block is one restart); every truncation,
+  bad magic/version/size/trailing byte → clean `Err`; a wrong state **or** cursor
+  is rejected by `certify` **and** `verify_against`; `read_range` is byte-exact for
+  both machines on boundary/partial/zero-length probes and after reopen; the step
+  count is exactly `offset % B + len ≤ B-1+len`. A lying restart is caught by
+  `verify`; the engine would serve it on in-file geometry alone (F2 boundary).
+* **`checkpoint`/`packed`.** Legacy (12-byte) and compact (`EKBCKPT`) both parse;
+  bad version/format/interval/zero-count/truncation/trailing → clean `Err`; no
+  ambiguous parse (the magic-spelling legacy interval is simply invalid);
+  `PackedHistory`/`PackedRestarts` reject `stride_shift > 63`, non-zero reserved
+  bytes, truncation and trailing bytes.
+* **`engine`.** `read` equals `reader::read` on both machines for aligned,
+  unaligned, whole-object, zero-length, past-end and `u64::MAX` requests;
+  only certified paths are selected; a body with no bounded structure is rejected
+  (never an `O(prefix)` genesis replay); the transactional budget holds.
+* **`machine_rans` prepared context.** `RansContext` is byte- and state-exact vs
+  the per-symbol path across all categories; invalid headers (truncated, bad sum,
+  zero frequency) are clean `Err`s; independent contexts for different cores do
+  not interfere.
+
+### Fuzz + evidence (Revision 4)
+
+`sh scripts/container-fuzz.sh` now runs **all seven** targets clean (the existing
+six plus `fuzz_blocks`, 20,000 runs, no crash). `sh scripts/container-reproduce.sh`
+completed: clean `--locked` `--release` build, full suite **445 passed / 0 failed /
+0 ignored**, and `sh scripts/validate-evidence.sh` reports **27** evidence JSON
+files `OK`.
+
+### Residual risk (Revision 4)
+
+* Findings E and F are **RESOLVED** (see above); no open defect remains from this
+  pass.
+* Integrity is not authenticity, as throughout: a forger who recomputes the
+  section CRC and the core linkage authors a different valid object; only opt-in
+  `AUTH` is an authenticity boundary.
  
