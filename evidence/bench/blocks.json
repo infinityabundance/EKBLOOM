@@ -1,0 +1,29 @@
+{
+  "generated_by": "examples/blocks.rs (sh scripts/run-blocks.sh)",
+  "machine": "OrANS-RANS0 (machine_id=2)",
+  "source_len": 4194304,
+  "core_len": 2000493,
+  "v_over_n": 0.4770,
+  "read_len": 4096,
+  "samples": 512,
+  "genesis_replay_4k_p50_ns": 6095739.0,
+  "peak_rss_bytes": 17760256,
+  "blocks": [
+    { "block_bytes": 256, "restarts": 16385, "model_bytes": 516, "directory_bytes": 104, "restart_bytes": 196620, "physical_bytes": 197240, "construction_ns": 71046210, "construction_ns_per_symbol": 16.938736, "read_4k_p50_ns": 18274.0, "read_4k_p99_ns": 19416.0, "max_steps_bound": 4351, "exact": true },
+    { "block_bytes": 1024, "restarts": 4097, "model_bytes": 516, "directory_bytes": 104, "restart_bytes": 49164, "physical_bytes": 49784, "construction_ns": 70475686, "construction_ns_per_symbol": 16.802713, "read_4k_p50_ns": 19747.0, "read_4k_p99_ns": 23263.0, "max_steps_bound": 5119, "exact": true },
+    { "block_bytes": 4096, "restarts": 1025, "model_bytes": 516, "directory_bytes": 104, "restart_bytes": 12300, "physical_bytes": 12920, "construction_ns": 73418789, "construction_ns_per_symbol": 17.504403, "read_4k_p50_ns": 26539.0, "read_4k_p99_ns": 35466.0, "max_steps_bound": 8184, "exact": true },
+    { "block_bytes": 16384, "restarts": 257, "model_bytes": 516, "directory_bytes": 104, "restart_bytes": 3084, "physical_bytes": 3704, "construction_ns": 71371628, "construction_ns_per_symbol": 17.016322, "read_4k_p50_ns": 53460.0, "read_4k_p99_ns": 85540.0, "max_steps_bound": 20451, "exact": true },
+    { "block_bytes": 65536, "restarts": 65, "model_bytes": 516, "directory_bytes": 104, "restart_bytes": 780, "physical_bytes": 1400, "construction_ns": 71189427, "construction_ns_per_symbol": 16.972882, "read_4k_p50_ns": 158316.0, "read_4k_p99_ns": 287456.0, "max_steps_bound": 69601, "exact": true }
+  ],
+  "checkpoint_format": {
+    "machine": "OrANS-NL2 (machine_id=1)",
+    "interval": 64,
+    "count": 16385,
+    "legacy_bytes": 196632,
+    "packed_bytes": 32792,
+    "packed_over_legacy": 0.166768,
+    "legacy_backward_compatible": true,
+    "packed_roundtrip": true
+  },
+  "verdict": "smaller blocks tighten the bounded positional replay but grow the restart directory linearly; the packed checkpoint format cuts machine-1 restart bytes 6x with backward-compatible reads"
+}

@@ -25,6 +25,7 @@ pub mod adapt;
 pub mod async_io;
 pub mod asyncpub;
 pub mod baseline;
+pub mod blocks;
 pub mod bloom;
 pub mod bloom_context;
 pub mod bloom_global;
@@ -71,6 +72,10 @@ pub use asyncpub::{append, detect_backend, publish, Backend};
 pub use baseline::{
     measure_baseline, measure_body, write_baselines_json, Baseline, BaselineKind, BaselinePoint,
     BaselineReport, Capabilities, DEFAULT_INDEX_BLOCK, DEFAULT_LRU_BLOCK,
+};
+pub use blocks::{
+    parse_block_index_prefix, BlockIndex, BlockIndexPrefix, BLOCK_INDEX_MAGIC,
+    BLOCK_INDEX_PREFIX_LEN, BLOCK_INDEX_VERSION,
 };
 pub use bloom::{Bloom4Resume, BloomKind, BloomShell, Certificate, Certification, Outcome};
 pub use bloom_context::ContextBloom;

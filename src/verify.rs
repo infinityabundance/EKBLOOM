@@ -146,6 +146,12 @@ fn run(body: &EkbloomBody, deep: bool) -> Result<VerificationReport> {
         checks.push(check_tiles(body, tile_set, idx, decoded));
     }
 
+    // Persisted block indexes: geometry/digest, core linkage, and every restart
+    // against a fresh authoritative pass.
+    for (idx, block) in body.blocks.iter().enumerate() {
+        checks.push(check_blocks(body, block, idx));
+    }
+
     if deep {
         checks.push(check_deep_symbols(body, decoded, machine));
     }
@@ -512,6 +518,35 @@ fn check_tiles(
             name,
             false,
             "a materialised tile disagrees with the authoritative decode",
+        ),
+        Err(e) => check(name, false, e.to_string()),
+    }
+}
+
+/// Verify one persisted block index: core linkage, content digest, and every
+/// restart against a fresh authoritative pass over the core.
+fn check_blocks(body: &EkbloomBody, block: &crate::blocks::BlockIndex, idx: usize) -> CheckOutcome {
+    let name = format!("blocks[{idx}] size={}", block.block_bytes);
+    if block.core_hash() != body.core_hash {
+        return check(name, false, "block index core hash does not match the body");
+    }
+    if !block.verify() {
+        return check(name, false, "block index content digest mismatch");
+    }
+    match block.verify_against(&body.core) {
+        Ok(true) => check(
+            name,
+            true,
+            format!(
+                "{}/{} restart(s) certify against the machine",
+                block.block_count(),
+                block.block_count()
+            ),
+        ),
+        Ok(false) => check(
+            name,
+            false,
+            "a block restart disagrees with the authoritative machine",
         ),
         Err(e) => check(name, false, e.to_string()),
     }

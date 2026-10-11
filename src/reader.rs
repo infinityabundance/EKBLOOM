@@ -15,9 +15,10 @@
 //! only parsed offsets in memory and reads exactly the byte ranges a request
 //! needs. No memory mapping and no `unsafe` are used anywhere in this crate.
 
+use crate::blocks::{parse_block_index_prefix, BlockIndex, BLOCK_INDEX_PREFIX_LEN};
 use crate::bloom::{supported_depth, BloomKind, BloomShell, Certificate, Certification};
 use crate::bloom_path::PathBloom;
-use crate::checkpoint::CheckpointSet;
+use crate::checkpoint::{parse_checkpoint_layout, CheckpointSet, CKPT_HEADER_MAX};
 use crate::error::{EkbloomError, Result};
 use crate::format::{self, SectionKind};
 use crate::history::History;
@@ -186,6 +187,7 @@ fn open_selected(
     let mut blooms: Vec<BloomShell> = Vec::new();
     let mut certificates: Vec<Certificate> = Vec::new();
     let mut tiles: Vec<crate::tiles::TileSet> = Vec::new();
+    let mut blocks: Vec<BlockIndex> = Vec::new();
     let mut segmented_count = 0usize;
     let mut segmented_link: Option<([u8; 32], u64)> = None;
 
@@ -217,6 +219,7 @@ fn open_selected(
                 }
                 SectionKind::Certificate => certificates.push(Certificate::from_bytes(payload)?),
                 SectionKind::Tiles => tiles.push(crate::tiles::TileSet::from_bytes(payload)?),
+                SectionKind::Blocks => blocks.push(BlockIndex::from_bytes(payload)?),
                 SectionKind::HistorySegmented => {
                     // The in-memory `EkbloomBody` has no field for a segmented
                     // projection, so the section is validated for linkage and
@@ -326,12 +329,21 @@ fn open_selected(
             ));
         }
     }
+    for block in &blocks {
+        if block.core_hash() != core_digest || block.logical_len() != manifest.logical_len {
+            return Err(corrupt(
+                selected.generation,
+                "block index core linkage mismatch",
+            ));
+        }
+    }
     let expected_components = 1
         + usize::from(history.is_some())
         + checkpoints.len()
         + blooms.len()
         + certificates.len()
         + tiles.len()
+        + blocks.len()
         + segmented_count;
     if manifest.components.len() != expected_components {
         return Err(corrupt(
@@ -351,6 +363,7 @@ fn open_selected(
         blooms,
         certificates,
         tiles,
+        blocks,
         generation: selected.generation,
         profiles: manifest.profiles,
     })
@@ -492,8 +505,6 @@ const SHELL_HEADER_LEN: usize = 4 + 2 + 8 + 8 + 8 + 4 + 32 + 8;
 const PATH_PAYLOAD_PREFIX_LEN: usize = 2 + 8 + 8;
 /// Fixed byte size of a history wire header (mirrors `history::HEADER_LEN`).
 const HISTORY_HEADER_LEN: usize = 8 + 8 + 8 + 32 + 8;
-/// Fixed byte size of a checkpoint-set wire header (`interval`, `count`).
-const CHECKPOINT_HEADER_LEN: usize = 4 + 8;
 /// Bounded streaming chunk for open-time checksums/hashes (64 KiB).
 const IO_CHUNK: usize = 64 * 1024;
 /// Number of checkpoint resume points validated per bounded read.
@@ -895,6 +906,210 @@ fn parse_tiles(
     Ok(tile_set)
 }
 
+/// A parsed [`crate::blocks::BlockIndex`] section: geometry plus the absolute
+/// range of its restart records. Only the one record a request needs is read.
+#[derive(Clone, Copy, Debug)]
+struct FileBlocks {
+    block_bytes: u32,
+    logical_len: u64,
+    machine_id: u32,
+    count: u64,
+    packed: bool,
+    core_hash: [u8; 32],
+    /// Absolute file offset of the first restart record.
+    data_offset: u64,
+}
+
+impl FileBlocks {
+    #[inline]
+    fn entry_bytes(&self) -> u64 {
+        if self.packed {
+            2
+        } else {
+            12
+        }
+    }
+
+    /// Directory (fixed-prefix) bytes.
+    #[inline]
+    fn directory_bytes(&self) -> u64 {
+        BLOCK_INDEX_PREFIX_LEN as u64
+    }
+
+    /// Restart-record bytes.
+    #[inline]
+    fn restart_bytes(&self) -> u64 {
+        self.count.saturating_mul(self.entry_bytes())
+    }
+
+    /// Total manifested footprint (model header for machine 2, directory, and
+    /// restart records), matching the in-memory `BlockIndex::physical_bytes`.
+    #[inline]
+    fn physical_bytes(&self) -> u64 {
+        let model = if self.machine_id == MACHINE_NL2 {
+            0
+        } else {
+            crate::blocks::RANS_MODEL_HEADER_BYTES
+        };
+        model
+            .saturating_add(self.directory_bytes())
+            .saturating_add(self.restart_bytes())
+    }
+
+    /// Whether the index covers `[offset, end)`.
+    #[inline]
+    fn covers(&self, offset: u64, end: u64) -> bool {
+        end <= self.logical_len && offset <= end
+    }
+
+    /// Read `[offset, offset+length)` from the covering block restart plus a
+    /// bounded machine replay. Only one restart record and the needed core window
+    /// are read.
+    #[allow(clippy::too_many_arguments)]
+    fn read_range(
+        &self,
+        file: &File,
+        core_offset: u64,
+        core_len: u64,
+        total: u64,
+        offset: u64,
+        length: u64,
+        end: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        let b = u64::from(self.block_bytes);
+        let (start, idx) = block_of(self.logical_len, b, offset)
+            .ok_or_else(|| bad(format!("no block restart covers offset {offset}")))?;
+        let rel = self
+            .data_offset
+            .checked_add(
+                u64::try_from(idx)
+                    .map_err(|_| EkbloomError::Overflow {
+                        what: "block restart entry",
+                    })?
+                    .checked_mul(self.entry_bytes())
+                    .ok_or(EkbloomError::Overflow {
+                        what: "block restart entry",
+                    })?,
+            )
+            .ok_or(EkbloomError::Overflow {
+                what: "block restart entry",
+            })?;
+        let (state, cursor) = if self.packed {
+            let mut e = [0u8; 2];
+            read_exact_at_len(file, &mut e, rel, total)?;
+            (
+                u32::from(u16::from_le_bytes(e)),
+                u64::try_from(idx)
+                    .map_err(|_| EkbloomError::Overflow {
+                        what: "block cursor",
+                    })?
+                    .checked_mul(b)
+                    .ok_or(EkbloomError::Overflow {
+                        what: "block cursor",
+                    })?,
+            )
+        } else {
+            let mut e = [0u8; Snapshot::PACKED_LEN];
+            read_exact_at_len(file, &mut e, rel, total)?;
+            let s = Snapshot::unpack(&e)?;
+            if s.cursor > core_len {
+                return Err(bad("block restart cursor exceeds the core length"));
+            }
+            (s.state, s.cursor)
+        };
+        let machine = machine_by_id(self.machine_id).ok_or(EkbloomError::UnknownMachine {
+            id: self.machine_id,
+        })?;
+
+        // For machine 1 the cursor equals the logical boundary, so the core window
+        // `[start, end)` suffices (rebased to 0); a cursor-divergent machine needs
+        // the full core from byte 0 so its prepared model header is available, with
+        // the stored cursor indexing it directly — the same bounded-by-file tradeoff
+        // as the machine-2 checkpoint path.
+        let (win_from, win_to, mut omega) = if self.machine_id == MACHINE_NL2 {
+            (start, end.min(core_len), Snapshot::new(state, 0))
+        } else {
+            (0, core_len, Snapshot::new(state, cursor))
+        };
+        let core = read_vec_at(
+            file,
+            core_offset
+                .checked_add(win_from)
+                .ok_or(EkbloomError::Overflow {
+                    what: "block core window",
+                })?,
+            win_to.saturating_sub(win_from),
+            total,
+        )?;
+        let ctx = prepare(machine, &core)?;
+        let steps = offset.saturating_sub(start);
+        ctx.skip(&core, &mut omega, steps)?;
+        ctx.decode_into(&core, &mut omega, length, out)?;
+        Ok(())
+    }
+}
+
+/// The covering block for logical position `i`: `(block_start, index)`.
+fn block_of(logical_len: u64, block_bytes: u64, i: u64) -> Option<(u64, usize)> {
+    if block_bytes == 0 || i > logical_len {
+        return None;
+    }
+    let idx = i / block_bytes;
+    Some((idx.checked_mul(block_bytes)?, usize::try_from(idx).ok()?))
+}
+
+/// Parse a [`SectionKind::Blocks`] section: structurally validate the fixed
+/// prefix, locate the restart records and bind the index to the object.
+fn parse_blocks(
+    file: &File,
+    payload_offset: u64,
+    payload_len: u64,
+    total: u64,
+    machine_id: u32,
+    logical_len: u64,
+) -> Result<FileBlocks> {
+    if payload_len < BLOCK_INDEX_PREFIX_LEN as u64 {
+        return Err(EkbloomError::Truncated {
+            needed: BLOCK_INDEX_PREFIX_LEN as u64,
+            available: payload_len,
+        });
+    }
+    let mut prefix_buf = [0u8; BLOCK_INDEX_PREFIX_LEN];
+    read_exact_at_len(file, &mut prefix_buf, payload_offset, total)?;
+    let prefix = parse_block_index_prefix(&prefix_buf)?;
+    if prefix.machine_id != machine_id || prefix.logical_len != logical_len {
+        return Err(bad("block index disagrees with the object header"));
+    }
+    let need = prefix
+        .count
+        .checked_mul(if prefix.packed { 2 } else { 12 })
+        .and_then(|payload| payload.checked_add(BLOCK_INDEX_PREFIX_LEN as u64))
+        .ok_or(EkbloomError::Overflow {
+            what: "block index byte length",
+        })?;
+    if payload_len < need {
+        return Err(EkbloomError::Truncated {
+            needed: need,
+            available: payload_len,
+        });
+    }
+    let data_offset = payload_offset
+        .checked_add(BLOCK_INDEX_PREFIX_LEN as u64)
+        .ok_or(EkbloomError::Overflow {
+            what: "block index record offset",
+        })?;
+    Ok(FileBlocks {
+        block_bytes: prefix.block_bytes,
+        logical_len: prefix.logical_len,
+        machine_id: prefix.machine_id,
+        count: prefix.count,
+        packed: prefix.packed,
+        core_hash: prefix.core_hash,
+        data_offset,
+    })
+}
+
 /// Stream a CRC-32 over `[off, off + len)` in bounded chunks.
 fn crc32_range(file: &File, off: u64, len: u64, total: u64) -> Result<u32> {
     let end = off.checked_add(len).ok_or(EkbloomError::Overflow {
@@ -965,6 +1180,9 @@ struct FileBloom {
 struct FileCheckpoint {
     interval: u32,
     count: u64,
+    header_len: u64,
+    entry_len: u64,
+    packed: bool,
     payload_offset: u64,
 }
 
@@ -1227,6 +1445,7 @@ pub struct FileBody {
     blooms: Vec<FileBloom>,
     certificates: Vec<FileCertificate>,
     tiles: Vec<FileTiles>,
+    blocks: Vec<FileBlocks>,
     segmented: Option<FileSegmentedHistory>,
     profiles: Vec<String>,
 }
@@ -1318,6 +1537,9 @@ impl FileBody {
         if self.read_via_path(req.offset, end, out)? {
             return Ok(());
         }
+        if self.read_via_blocks(req.offset, req.length, end, out)? {
+            return Ok(());
+        }
         if self.read_via_checkpoint(req.offset, req.length, end, out)? {
             return Ok(());
         }
@@ -1350,7 +1572,7 @@ impl FileBody {
             components.push(ComponentReport {
                 name: format!("checkpoint[{i}] K={}", cp.interval),
                 kind: "checkpoint".to_string(),
-                bytes: cp.count.saturating_mul(Snapshot::PACKED_LEN as u64),
+                bytes: cp.count.saturating_mul(cp.entry_len),
             });
         }
         for (i, b) in self.blooms.iter().enumerate() {
@@ -1372,6 +1594,13 @@ impl FileBody {
                 name: format!("tiles[{i}] shift={}", t.tile_shift),
                 kind: "tiles".to_string(),
                 bytes: t.physical_bytes(),
+            });
+        }
+        for (i, b) in self.blocks.iter().enumerate() {
+            components.push(ComponentReport {
+                name: format!("blocks[{i}] size={}", b.block_bytes),
+                kind: "blocks".to_string(),
+                bytes: b.physical_bytes(),
             });
         }
         if let Some(seg) = &self.segmented {
@@ -1428,6 +1657,7 @@ impl FileBody {
         let mut blooms: Vec<FileBloom> = Vec::new();
         let mut certificates: Vec<FileCertificate> = Vec::new();
         let mut tiles: Vec<FileTiles> = Vec::new();
+        let mut blocks: Vec<FileBlocks> = Vec::new();
         let mut segmented: Option<FileSegmentedHistory> = None;
 
         for commit in &commits {
@@ -1458,6 +1688,14 @@ impl FileBody {
                         certificates.push(parse_certificate(&file, off, len, physical_len)?)
                     }
                     SectionKind::Tiles => tiles.push(parse_tiles(
+                        &file,
+                        off,
+                        len,
+                        physical_len,
+                        header.core_machine_id,
+                        header.logical_symbols,
+                    )?),
+                    SectionKind::Blocks => blocks.push(parse_blocks(
                         &file,
                         off,
                         len,
@@ -1556,12 +1794,21 @@ impl FileBody {
                 ));
             }
         }
+        for block in &blocks {
+            if block.core_hash != core_digest || block.logical_len != manifest.logical_len {
+                return Err(corrupt(
+                    selected.generation,
+                    "block index core linkage mismatch",
+                ));
+            }
+        }
         let expected_components = 1
             + usize::from(history.is_some())
             + checkpoints.len()
             + blooms.len()
             + certificates.len()
             + tiles.len()
+            + blocks.len()
             + usize::from(segmented.is_some());
         if manifest.components.len() != expected_components {
             return Err(corrupt(
@@ -1583,6 +1830,7 @@ impl FileBody {
             blooms,
             certificates,
             tiles,
+            blocks,
             segmented,
             profiles: manifest.profiles,
         })
@@ -1608,6 +1856,33 @@ impl FileBody {
         for tile_set in &self.tiles {
             if tile_set.covers(offset, end) {
                 tile_set.read_range(&self.file, offset, end, out)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Path 0.5: a persisted block index reads the covering restart record plus a
+    /// bounded machine replay, byte-exact for the whole object.
+    fn read_via_blocks(
+        &self,
+        offset: u64,
+        length: u64,
+        end: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<bool> {
+        for blocks in &self.blocks {
+            if blocks.covers(offset, end) {
+                blocks.read_range(
+                    &self.file,
+                    self.core_offset,
+                    self.core_len,
+                    self.physical_len,
+                    offset,
+                    length,
+                    end,
+                    out,
+                )?;
                 return Ok(true);
             }
         }
@@ -1760,12 +2035,11 @@ impl FileBody {
             what: "checkpoint cursor",
         })?;
 
-        let rel = (CHECKPOINT_HEADER_LEN as u64)
-            .checked_add(j.checked_mul(Snapshot::PACKED_LEN as u64).ok_or(
-                EkbloomError::Overflow {
-                    what: "checkpoint entry",
-                },
-            )?)
+        let rel = cp
+            .header_len
+            .checked_add(j.checked_mul(cp.entry_len).ok_or(EkbloomError::Overflow {
+                what: "checkpoint entry",
+            })?)
             .ok_or(EkbloomError::Overflow {
                 what: "checkpoint entry",
             })?;
@@ -1775,9 +2049,15 @@ impl FileBody {
             .ok_or(EkbloomError::Overflow {
                 what: "checkpoint entry",
             })?;
-        let mut entry = [0u8; Snapshot::PACKED_LEN];
-        read_exact_at_len(&self.file, &mut entry, entry_off, self.physical_len)?;
-        let omega = Snapshot::unpack(&entry)?;
+        let omega = if cp.packed {
+            let mut e = [0u8; 2];
+            read_exact_at_len(&self.file, &mut e, entry_off, self.physical_len)?;
+            Snapshot::new(u32::from(u16::from_le_bytes(e)), expected_cursor)
+        } else {
+            let mut entry = [0u8; Snapshot::PACKED_LEN];
+            read_exact_at_len(&self.file, &mut entry, entry_off, self.physical_len)?;
+            Snapshot::unpack(&entry)?
+        };
         let machine = machine_by_id(self.machine_id).ok_or(EkbloomError::UnknownMachine {
             id: self.machine_id,
         })?;
@@ -2206,7 +2486,7 @@ fn parse_bloom(
     })
 }
 
-/// Parse a checkpoint-set header and validate every resume point's cursor via
+/// Parse a checkpoint-set header (compact or legacy) and validate its records via
 /// bounded batch reads (never materialising the set).
 fn parse_checkpoint(
     file: &File,
@@ -2215,59 +2495,54 @@ fn parse_checkpoint(
     total: u64,
     machine: &'static dyn crate::machine::OrMachine,
 ) -> Result<FileCheckpoint> {
-    if payload_len < CHECKPOINT_HEADER_LEN as u64 {
+    if payload_len < 1 {
         return Err(EkbloomError::Truncated {
-            needed: CHECKPOINT_HEADER_LEN as u64,
+            needed: 1,
             available: payload_len,
         });
     }
-    let mut h = [0u8; CHECKPOINT_HEADER_LEN];
-    read_exact_at_len(file, &mut h, payload_offset, total)?;
-    let interval = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
-    if !CheckpointSet::supported_interval(interval) {
-        return Err(EkbloomError::BadInterval { interval });
-    }
-    let count = le_u64(&h, 4);
-    if count == 0 {
-        return Err(bad("checkpoint set count is zero"));
-    }
-    let k = u64::from(interval);
-    (count - 1).checked_mul(k).ok_or(EkbloomError::Overflow {
-        what: "checkpoint span",
+    let n = usize::try_from(payload_len.min(CKPT_HEADER_MAX as u64)).unwrap_or(CKPT_HEADER_MAX);
+    let mut hbuf = [0u8; CKPT_HEADER_MAX];
+    read_exact_at_len(file, &mut hbuf[..n], payload_offset, total)?;
+    let layout = parse_checkpoint_layout(&hbuf[..n])?;
+    let need = layout.payload_len().ok_or(EkbloomError::Overflow {
+        what: "checkpoint byte length",
     })?;
-    let need = count
-        .checked_mul(Snapshot::PACKED_LEN as u64)
-        .and_then(|n| n.checked_add(CHECKPOINT_HEADER_LEN as u64))
-        .ok_or(EkbloomError::Overflow {
-            what: "checkpoint byte length",
-        })?;
     if payload_len < need {
         return Err(EkbloomError::Truncated {
             needed: need,
             available: payload_len,
         });
     }
-    validate_checkpoint_entries(file, payload_offset, count, k, total, machine)?;
+    validate_checkpoint_entries(file, payload_offset, &layout, total, machine)?;
     Ok(FileCheckpoint {
-        interval,
-        count,
+        interval: layout.interval,
+        count: layout.count,
+        header_len: layout.header_len as u64,
+        entry_len: layout.entry_len as u64,
+        packed: layout.packed,
         payload_offset,
     })
 }
 
 /// Validate every resume point's implicit cursor using bounded batch reads.
 ///
-/// The `cursor == j*K` invariant is only enforced for machine 1; other machines
-/// store the true backing cursor verbatim.
+/// Packed records derive the cursor, so nothing is read. The `cursor == j*K`
+/// invariant is only enforced for a legacy/full machine-1 set; a cursor-divergent
+/// machine stores the true backing cursor verbatim.
 fn validate_checkpoint_entries(
     file: &File,
     payload_offset: u64,
-    count: u64,
-    k: u64,
+    layout: &crate::checkpoint::CheckpointLayout,
     total: u64,
     machine: &'static dyn crate::machine::OrMachine,
 ) -> Result<()> {
+    if layout.packed {
+        return Ok(());
+    }
     let enforce_cursor = machine.machine_id() == MACHINE_NL2;
+    let count = layout.count;
+    let k = u64::from(layout.interval);
     let batch = CHECKPOINT_VALIDATE_BATCH as usize;
     let mut buf = vec![0u8; batch.saturating_mul(Snapshot::PACKED_LEN)];
     let mut j = 0u64;
@@ -2275,7 +2550,7 @@ fn validate_checkpoint_entries(
         let n = (count - j).min(CHECKPOINT_VALIDATE_BATCH);
         let bytes = (n as usize) * Snapshot::PACKED_LEN;
         let off = payload_offset
-            .checked_add(CHECKPOINT_HEADER_LEN as u64)
+            .checked_add(layout.header_len as u64)
             .and_then(|o| o.checked_add(j.checked_mul(Snapshot::PACKED_LEN as u64)?))
             .ok_or(EkbloomError::Overflow {
                 what: "checkpoint entry",

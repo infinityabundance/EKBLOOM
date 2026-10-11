@@ -206,10 +206,11 @@ fn tampered_section_payload_fails_authenticated() {
     writer::write_body_authenticated(&path, &body, &KEY).unwrap();
     let mut bytes = fs::read(&path).unwrap();
 
-    // Corrupt a checkpoint's successor state (which unkeyed `open` accepts: only
-    // the implicit cursor is validated there) and refresh that section's CRC-32 so
-    // the section still passes structural checks. The first resume point's packed
-    // `u32` state begins right after the 12-byte checkpoint header.
+    // Corrupt a checkpoint's first packed restart state (which unkeyed `open`
+    // accepts: only the derived cursor is checked there) and refresh that
+    // section's CRC-32 so the section still passes structural checks. The compact
+    // checkpoint header is 22 bytes (magic ++ version ++ format ++ interval ++
+    // count), so the first 2-byte packed state begins at `po + 22`.
     let scan = format::scan(&bytes).unwrap();
     let commit = scan.commits.last().unwrap();
     let section = commit
@@ -218,7 +219,7 @@ fn tampered_section_payload_fails_authenticated() {
         .find(|s| s.kind == SectionKind::Checkpoints)
         .unwrap();
     let po = section.payload_offset as usize;
-    bytes[po + 12] ^= 0x80; // first resume point's state (cursor left legal)
+    bytes[po + 22] ^= 0x80; // first packed restart state (derived cursor left legal)
     let crc = crc32fast::hash(&bytes[po..po + section.payload_len as usize]);
     let ho = section.header_offset as usize;
     bytes[ho + 32..ho + 36].copy_from_slice(&crc.to_le_bytes());

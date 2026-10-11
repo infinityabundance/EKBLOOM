@@ -260,6 +260,50 @@ pub fn state_log_with(machine: &dyn OrMachine, core: &[u8], logical_len: u64) ->
     machine.state_log(core, logical_len)
 }
 
+/// Record the complete resumable state `(x, p)` at the start of every logical
+/// block of `block_bytes` symbols: entries `0 ..= floor(logical_len / block_bytes)`
+/// at positions `k * block_bytes`.
+///
+/// This is the authoritative forward pass built on the machine's own `reveal`
+/// (with a prepared context), used by [`crate::blocks::BlockIndex`]. It is a
+/// read-only helper: no machine semantics are changed.
+pub fn block_restarts_with(
+    machine: &dyn OrMachine,
+    core: &[u8],
+    logical_len: u64,
+    block_bytes: u32,
+) -> Result<Vec<(u32, u64)>> {
+    if block_bytes == 0 {
+        return Err(EkbloomError::InvalidArgument {
+            what: "block size must be non-zero".to_string(),
+        });
+    }
+    machine.check_core(core, logical_len)?;
+    let ctx = prepare(machine, core)?;
+    let b = u64::from(block_bytes);
+    let count = logical_len
+        .checked_div(b)
+        .and_then(|blocks| blocks.checked_add(1))
+        .ok_or(EkbloomError::Overflow {
+            what: "block restart count",
+        })?;
+    let capacity = usize::try_from(count).map_err(|_| EkbloomError::Overflow {
+        what: "block restart count",
+    })?;
+    let mut entries: Vec<(u32, u64)> = Vec::with_capacity(capacity);
+    let mut omega = machine.init(core)?;
+    entries.push((omega.state, omega.cursor));
+    let mut i: u64 = 0;
+    while i < logical_len {
+        ctx.reveal(core, &mut omega)?;
+        i += 1;
+        if i.is_multiple_of(b) {
+            entries.push((omega.state, omega.cursor));
+        }
+    }
+    Ok(entries)
+}
+
 /// Compute the full state log `[x_0, ..., x_n]` for `core` and `logical_len`
 /// with the authoritative machine 1.
 ///

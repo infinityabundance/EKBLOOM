@@ -68,6 +68,9 @@ pub struct EkbloomBody {
     pub certificates: Vec<Certificate>,
     /// Selective hot-region byte tiles, in manifestation order (append-only).
     pub tiles: Vec<TileSet>,
+    /// Independently restartable block indexes, in manifestation order
+    /// (append-only). See [`crate::blocks::BlockIndex`].
+    pub blocks: Vec<crate::blocks::BlockIndex>,
     /// Monotonic manifestation generation (incremented by every `manifest`).
     pub generation: u64,
     /// Human-readable labels of the profiles applied, in order.
@@ -99,6 +102,9 @@ impl EkbloomBody {
         }
         for t in &self.tiles {
             total = total.saturating_add(t.physical_bytes());
+        }
+        for b in &self.blocks {
+            total = total.saturating_add(b.physical_bytes());
         }
         total
     }
@@ -265,6 +271,7 @@ fn build_body(
         blooms: Vec::new(),
         certificates: Vec::new(),
         tiles: Vec::new(),
+        blocks: Vec::new(),
         generation: 0,
         profiles: Vec::new(),
     };
@@ -385,10 +392,13 @@ pub fn grow(body: &mut EkbloomBody, profile: ManifestationProfile) -> Result<()>
 //
 // The accounting identities below mirror [`EkbloomBody::physical_bytes`] and the
 // per-structure payload layouts (`history`, `checkpoint`, `bloom`, `bloom_path`,
-// `bloom_global`, `bloom_region`). The estimate is deliberately conservative: it
-// never under-estimates, so a budget check built on it can only over-reject, never
-// admit an over-budget body; the authoritative runtime check uses the real
-// `physical_bytes()` after building.
+// `bloom_global`, `bloom_region`). The estimate is exact (or conservative) for
+// machine 1, whose compact restart is 2 bytes/entry; it never under-estimates a
+// machine-1 body, so a budget check built on it can only over-reject, never admit
+// an over-budget machine-1 body. A cursor-divergent (machine-2) checkpoint stores
+// 12-byte restarts, so the estimate can under-count them; the authoritative
+// post-build `physical_bytes()` check in `create_machine_within_budget` still
+// enforces the hard cap transactionally.
 // ---------------------------------------------------------------------------
 
 /// Fixed path-bloom payload prefix: `depth u16`, `logical_len u64`, `nblocks u64`.
@@ -407,8 +417,11 @@ const REGIONAL_PAYLOAD_PREFIX_BYTES: u64 = 2 + 8 + 8 + 8 + 8 + 4 + 8;
 /// Per-entry regional record width beyond the depth bytes: `key u16` `++`
 /// `next u32`. The full record is `depth + 6` bytes.
 const REGIONAL_PER_ENTRY_EXTRA: u64 = 2 + 4;
-/// Packed resume-point width (`u32` state `++` `u64` cursor).
-const CHECKPOINT_ENTRY_BYTES: u64 = 12;
+/// Compact machine-1 resume-point width: a 2-byte packed state (the cursor is
+/// the implicit position). A cursor-divergent machine stores 12-byte
+/// `(state, cursor)` restarts; the static estimate is the machine-1 view and the
+/// authoritative post-build `physical_bytes()` check still enforces the cap.
+const CHECKPOINT_ENTRY_BYTES: u64 = 2;
 
 /// Certificate wire size for `kind`: the fixed receipt header plus the four
 /// length-prefixed strings, both 32-byte content hashes, and the trailing
@@ -428,7 +441,8 @@ fn history_bytes(logical_len: u64) -> u64 {
     logical_len.saturating_add(1).saturating_mul(4)
 }
 
-/// `12 * (floor(N / K) + 1)`: packed resume points for interval `K`.
+/// `2 * (floor(N / K) + 1)`: compact machine-1 packed resume points for interval
+/// `K` (exact for machine 1; a lower bound for a cursor-divergent machine).
 fn checkpoint_bytes(logical_len: u64, interval: u32) -> u64 {
     if interval == 0 {
         return u64::MAX;
@@ -808,6 +822,13 @@ pub fn inspect(body: &EkbloomBody) -> ManifestationReport {
             name: format!("tiles[{i}] shift={}", t.tile_shift),
             kind: "tiles".to_string(),
             bytes: t.physical_bytes(),
+        });
+    }
+    for (i, b) in body.blocks.iter().enumerate() {
+        components.push(ComponentReport {
+            name: format!("blocks[{i}] size={}", b.block_bytes),
+            kind: "blocks".to_string(),
+            bytes: b.physical_bytes(),
         });
     }
 

@@ -15,6 +15,7 @@
 //! |---|---|---|
 //! | [`AccessPath::HotBytes`] | a certified path bloom's `hot` array, or a persisted exact [`crate::tiles::TileSet`] covering the region | one contiguous copy (pure memory movement) |
 //! | [`AccessPath::PackedRestart`] | a checkpoint set (`K`-bounded replay), the machine-1 analogue of packed 16-bit restarts | `O(K)` bounded machine steps |
+//! | [`AccessPath::BlockRestart`] | a persisted [`crate::blocks::BlockIndex`]: a fixed-size block restart plus a bounded positional replay | `O(block)` bounded machine steps |
 //! | [`AccessPath::AffineBlock`] | the full state history (O(1) snapshot per position; the affine/associative block structure of `prefix`) | one state load + per-byte reveal |
 //! | [`AccessPath::CoreReplay`] | authoritative replay from `Omega_0` | `O(offset)` machine steps |
 //!
@@ -23,9 +24,10 @@
 //! A plan never selects a path that is not backed by a certified structure:
 //! `HotBytes` requires a `Certified` path bloom (whole-object) or a tile set that
 //! fully covers the region; `PackedRestart` requires a checkpoint set;
-//! `AffineBlock` requires a complete history on the cursor==position machine;
-//! `CoreReplay` is always valid. [`AccessPlan::all_certified`] exposes the verdict
-//! and the tests pin it.
+//! `BlockRestart` requires a block index that covers the object with the body's
+//! machine; `AffineBlock` requires a complete history on the cursor==position
+//! machine; `CoreReplay` is always valid. [`AccessPlan::all_certified`] exposes the
+//! verdict and the tests pin it.
 //!
 //! # O(1) dispatch
 //!
@@ -59,6 +61,9 @@ pub enum AccessPath {
     HotBytes,
     /// A checkpoint restart with bounded machine replay.
     PackedRestart,
+    /// An independently restartable block index: bounded positional replay from a
+    /// fixed-size block boundary.
+    BlockRestart,
     /// The full state history (O(1) per-position state).
     AffineBlock,
     /// Authoritative replay from `Omega_0`.
@@ -71,6 +76,7 @@ impl AccessPath {
         match self {
             AccessPath::HotBytes => "hot-bytes",
             AccessPath::PackedRestart => "packed-restart",
+            AccessPath::BlockRestart => "block-restart",
             AccessPath::AffineBlock => "affine-block",
             AccessPath::CoreReplay => "core-replay",
         }
@@ -82,8 +88,9 @@ impl AccessPath {
         match self {
             AccessPath::HotBytes => 0,
             AccessPath::PackedRestart => 1,
-            AccessPath::AffineBlock => 2,
-            AccessPath::CoreReplay => 3,
+            AccessPath::BlockRestart => 2,
+            AccessPath::AffineBlock => 3,
+            AccessPath::CoreReplay => 4,
         }
     }
 }
@@ -97,6 +104,8 @@ pub enum CertRef {
     TileSet(usize),
     /// Index into `body.checkpoints` of the restart set.
     Checkpoint(usize),
+    /// Index into `body.blocks` of the block-restart index.
+    BlockIndex(usize),
     /// The complete history.
     History,
     /// The authoritative machine (always valid).
@@ -220,6 +229,7 @@ impl AccessPlan {
             .checkpoints
             .iter()
             .position(|cp| cp.interval != 0 && cp.restart_point(0).is_some());
+        let block_index = covering_block_index(body);
         let history_ok = body.machine_id == MACHINE_NL2
             && body.history.as_ref().is_some_and(|h| h.logical_len == n);
 
@@ -257,6 +267,20 @@ impl AccessPlan {
                     AccessPath::PackedRestart,
                     cost,
                     CertRef::Checkpoint(ci),
+                );
+            }
+
+            // BlockRestart: bounded positional replay from a fixed-size block
+            // boundary. Expected skip is half a block on average.
+            if let Some(bi) = block_index {
+                let block_bytes = u64::from(body.blocks[bi].block_bytes).max(1);
+                let avg_skip = (block_bytes.saturating_sub(1)) as f64 / 2.0;
+                let cost = model.restart_ns + avg_skip * model.step_ns + model.reveal_ns * len;
+                consider(
+                    &mut best,
+                    AccessPath::BlockRestart,
+                    cost,
+                    CertRef::BlockIndex(bi),
                 );
             }
 
@@ -363,9 +387,10 @@ impl AccessPlan {
     /// The chosen-path distribution: one `(path, count)` per distinct path, in
     /// fixed path order.
     pub fn distribution(&self) -> Vec<(AccessPath, usize)> {
-        const PATHS: [AccessPath; 4] = [
+        const PATHS: [AccessPath; 5] = [
             AccessPath::HotBytes,
             AccessPath::PackedRestart,
+            AccessPath::BlockRestart,
             AccessPath::AffineBlock,
             AccessPath::CoreReplay,
         ];
@@ -384,6 +409,7 @@ impl AccessPlan {
         self.regions.iter().all(|r| match r.path {
             AccessPath::HotBytes => matches!(r.cert, CertRef::PathBloom(_) | CertRef::TileSet(_)),
             AccessPath::PackedRestart => matches!(r.cert, CertRef::Checkpoint(_)),
+            AccessPath::BlockRestart => matches!(r.cert, CertRef::BlockIndex(_)),
             AccessPath::AffineBlock => matches!(r.cert, CertRef::History),
             AccessPath::CoreReplay => matches!(r.cert, CertRef::Machine),
         })
@@ -429,6 +455,17 @@ fn covering_tile_set(body: &EkbloomBody, start: u64, end: u64) -> Option<usize> 
         let last = (end - 1) >> shift;
         (first..=last).all(|tile| ts.tile_bytes_at(tile).is_some())
     })
+}
+
+/// Index of the first block index that covers the whole object with the body's
+/// machine, preferring the smallest block (tightest bounded replay).
+fn covering_block_index(body: &EkbloomBody) -> Option<usize> {
+    body.blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.machine_id() == body.machine_id && b.logical_len() == body.logical_len)
+        .min_by_key(|(_, b)| b.block_bytes)
+        .map(|(i, _)| i)
 }
 
 /// Latency-critical dispatcher over a pre-certified plan.
@@ -545,6 +582,18 @@ fn dispatch_owned(
             read_via_checkpoint(body, offset, length, &mut out)?;
             Ok(out)
         }
+        AccessPath::BlockRestart => match region.cert {
+            CertRef::BlockIndex(bi) => {
+                let block = body
+                    .blocks
+                    .get(bi)
+                    .ok_or_else(|| EkbloomError::BadSection {
+                        reason: "planned block index is out of range".to_string(),
+                    })?;
+                block.read_range(&body.core, offset, length)
+            }
+            _ => crate::reader::read(body, ReadRequest { offset, length }),
+        },
         AccessPath::AffineBlock => {
             let mut out = Vec::new();
             read_via_history(body, offset, length, &mut out)?;
@@ -586,6 +635,24 @@ fn dispatch_into(
             }
         },
         AccessPath::PackedRestart => read_via_checkpoint(body, offset, length, out),
+        AccessPath::BlockRestart => match region.cert {
+            CertRef::BlockIndex(bi) => {
+                let block = body
+                    .blocks
+                    .get(bi)
+                    .ok_or_else(|| EkbloomError::BadSection {
+                        reason: "planned block index is out of range".to_string(),
+                    })?;
+                let bytes = block.read_range(&body.core, offset, length)?;
+                out.extend_from_slice(&bytes);
+                Ok(())
+            }
+            _ => {
+                let bytes = crate::reader::read(body, ReadRequest { offset, length })?;
+                out.extend_from_slice(&bytes);
+                Ok(())
+            }
+        },
         AccessPath::AffineBlock => read_via_history(body, offset, length, out),
         AccessPath::CoreReplay => read_via_machine(body, offset, length, out),
     }

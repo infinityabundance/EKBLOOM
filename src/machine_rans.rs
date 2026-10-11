@@ -232,6 +232,35 @@ impl RansContext {
         let mut probe = *omega;
         self.step(core, &mut probe)
     }
+
+    /// Advance `omega` by exactly `n` decoder steps, discarding the symbols.
+    ///
+    /// This is the prepared block-decoder skip used to reach a block's read
+    /// offset (bounded by the block size) without re-parsing the model.
+    pub fn skip(&self, core: &[u8], omega: &mut Snapshot, n: u64) -> Result<()> {
+        for _ in 0..n {
+            self.step(core, omega)?;
+        }
+        Ok(())
+    }
+
+    /// Reveal `n` symbols from `omega`, appending them to `out` using the prepared
+    /// table (the prepared block decoder).
+    pub fn decode_into(
+        &self,
+        core: &[u8],
+        omega: &mut Snapshot,
+        n: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        if let Ok(cap) = usize::try_from(n) {
+            out.reserve(cap);
+        }
+        for _ in 0..n {
+            out.push(self.step(core, omega)?);
+        }
+        Ok(())
+    }
 }
 
 impl Rans0 {

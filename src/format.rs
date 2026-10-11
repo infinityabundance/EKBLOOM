@@ -99,6 +99,10 @@ pub enum SectionKind {
     /// A persisted [`crate::tiles::TileSet`]: exact hot-region byte tiles plus
     /// their directory, serialized by [`crate::tiles::TileSet::to_bytes`].
     Tiles,
+    /// A persisted [`crate::blocks::BlockIndex`]: independently restartable
+    /// fixed-size logical blocks with compact restart records, serialized by
+    /// [`crate::blocks::BlockIndex::to_bytes`].
+    Blocks,
 }
 
 impl SectionKind {
@@ -117,6 +121,7 @@ impl SectionKind {
             SectionKind::Auth => 10,
             SectionKind::HistorySegmented => 11,
             SectionKind::Tiles => 12,
+            SectionKind::Blocks => 13,
         }
     }
 
@@ -135,6 +140,7 @@ impl SectionKind {
             10 => SectionKind::Auth,
             11 => SectionKind::HistorySegmented,
             12 => SectionKind::Tiles,
+            13 => SectionKind::Blocks,
             _ => return None,
         })
     }
@@ -154,6 +160,7 @@ impl SectionKind {
             SectionKind::Manifest => "manifest",
             SectionKind::Auth => "auth",
             SectionKind::Tiles => "tiles",
+            SectionKind::Blocks => "blocks",
         }
     }
 }
@@ -1022,12 +1029,12 @@ mod tests {
 
     #[test]
     fn section_kind_codes_roundtrip() {
-        for code in 1..=12u32 {
+        for code in 1..=13u32 {
             let kind = SectionKind::from_u32(code).unwrap();
             assert_eq!(kind.to_u32(), code);
         }
         assert!(SectionKind::from_u32(0).is_none());
-        assert!(SectionKind::from_u32(13).is_none());
+        assert!(SectionKind::from_u32(14).is_none());
         assert!(SectionKind::from_u32(u32::MAX).is_none());
     }
 
