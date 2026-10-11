@@ -35,6 +35,7 @@ pub mod format;
 #[cfg(feature = "fuse")]
 pub mod fuse;
 pub mod history;
+pub mod history_store;
 pub mod machine;
 pub mod manifest;
 pub mod metrics;
@@ -61,6 +62,7 @@ pub use filesystem::{FileMeta, ObjectPhysical, OrFs, PhysicalReport};
 #[cfg(feature = "fuse")]
 pub use fuse::{mount, OrFsMount};
 pub use history::History;
+pub use history_store::{current_rss_bytes, peak_rss_bytes, HistoryStore, StoreConfig};
 pub use machine::{machine_by_id, OrMachine, MACHINE_NL2, NL2};
 pub use manifest::{
     create, grow, inspect, manifest, ComponentReport, EkbloomBody, ManifestationReport,
@@ -83,7 +85,8 @@ pub use sweep::{
 pub use verify::{verify, verify_deep, CheckOutcome, VerificationReport};
 pub use worker::{available_parallelism, manifest_background, regional_parallel};
 pub use writer::{
-    append_generation, append_generation_authenticated, write_body, write_body_authenticated,
+    append_generation, append_generation_authenticated, history_segmented_payload, write_body,
+    write_body_authenticated, write_history_segmented,
 };
 
 /// Progressively expanded operational-body profiles.

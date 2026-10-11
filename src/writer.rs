@@ -33,6 +33,7 @@ use crate::format::{
     self, align8, CommitFooter, ManifestComponent, ManifestRecord, SectionHeader, SectionKind,
     CORE_OFFSET, FOOTER_LEN, HEADER_LEN, SECTION_HEADER_LEN,
 };
+use crate::history_store::HistoryStore;
 use crate::manifest::{inspect, EkbloomBody};
 
 /// Create a fresh, committed `.ekb` file at `path` from `body`.
@@ -338,7 +339,10 @@ fn accumulated_counts(commits: &[format::ScannedCommit]) -> CommittedCounts {
                 | SectionKind::BloomRegion
                 | SectionKind::BloomPath => counts.blooms += 1,
                 SectionKind::Certificate => counts.certificates += 1,
-                SectionKind::CoreMachine | SectionKind::Manifest | SectionKind::Auth => {}
+                SectionKind::CoreMachine
+                | SectionKind::HistorySegmented
+                | SectionKind::Manifest
+                | SectionKind::Auth => {}
             }
         }
     }
@@ -476,6 +480,168 @@ fn fsync_dir(path: &Path) -> Result<()> {
 pub const FILE_HEADER_LEN: usize = HEADER_LEN;
 /// Fixed on-disk footer size.
 pub const FILE_FOOTER_LEN: usize = FOOTER_LEN;
+
+/// Serialize a [`HistoryStore`] into a [`SectionKind::HistorySegmented`] payload.
+///
+/// The payload is the fixed [`format::HS_FIXED_LEN`] header, a `u64`
+/// payload-relative offset per segment, the concatenated segment bytes, and the
+/// sparse checkpoint set. `core_hash` and `generation` bind the section to the
+/// object. This materialises the payload in RAM (intended for bounded
+/// embeddings); [`crate::reader::FileBody`] then reads states by `pread` without
+/// loading it.
+pub fn history_segmented_payload(
+    store: &HistoryStore,
+    core_hash: [u8; 32],
+    generation: u64,
+) -> Result<Vec<u8>> {
+    let segment_count = store.segment_count() as u64;
+    let state_count = store.state_count();
+    let index_len = segment_count.checked_mul(8).ok_or(EkbloomError::Overflow {
+        what: "history-segmented index",
+    })?;
+    let fixed = format::HS_FIXED_LEN as u64;
+    let states_offset = fixed.checked_add(index_len).ok_or(EkbloomError::Overflow {
+        what: "history-segmented layout",
+    })?;
+    let states_bytes = state_count.checked_mul(4).ok_or(EkbloomError::Overflow {
+        what: "history-segmented states",
+    })?;
+    let checkpoints_offset =
+        states_offset
+            .checked_add(states_bytes)
+            .ok_or(EkbloomError::Overflow {
+                what: "history-segmented layout",
+            })?;
+    let checkpoints = store.checkpoints().to_bytes();
+
+    let mut w = format::Writer::new();
+    w.u32(store.segment_bytes());
+    w.u32(store.checkpoints().interval);
+    w.u64(store.logical_len());
+    w.u64(state_count);
+    w.u64(segment_count);
+    w.u64(fixed);
+    w.u64(states_offset);
+    w.u64(checkpoints_offset);
+    w.u64(checkpoints.len() as u64);
+    w.raw(&core_hash);
+    w.u64(generation);
+
+    let mut cursor = states_offset;
+    for seg in 0..segment_count {
+        w.u64(cursor);
+        cursor =
+            cursor
+                .checked_add(store.segment_len_bytes(seg)?)
+                .ok_or(EkbloomError::Overflow {
+                    what: "history-segmented segment offset",
+                })?;
+    }
+    for seg in 0..segment_count as usize {
+        w.raw(&store.read_segment(seg)?);
+    }
+    w.raw(&checkpoints);
+    Ok(w.into_vec())
+}
+
+/// Create a fresh, committed `.ekb` file containing `core` as its visible core
+/// and `store` as a [`SectionKind::HistorySegmented`] section.
+///
+/// The file is directly readable by [`crate::reader::FileBody`], which answers
+/// [`crate::reader::FileBody::segmented_state_at`] with a bounded `pread` and no
+/// whole-history load. `core` must be the real core the store was built from and
+/// must satisfy `core.len() == store.logical_len()` (machine 1 consumes exactly
+/// one core byte per symbol).
+pub fn write_history_segmented(path: &Path, core: &[u8], store: &HistoryStore) -> Result<()> {
+    let logical_len = store.logical_len();
+    if core.len() as u64 != logical_len {
+        return Err(EkbloomError::InvalidArgument {
+            what: "core length must equal the segmented history logical length".to_string(),
+        });
+    }
+    let core_hash = *blake3::hash(core).as_bytes();
+    let object_id = derive_object_id(&core_hash);
+    let generation = 1u64;
+
+    let header = crate::format::GenesisHeader {
+        format_major: format::FORMAT_MAJOR,
+        format_minor: format::FORMAT_MINOR,
+        feature_flags: 0,
+        object_id,
+        logical_symbols: logical_len,
+        logical_bytes: logical_len,
+        core_len: core.len() as u64,
+        core_machine_id: crate::machine::MACHINE_NL2,
+    };
+    let header_bytes = header.encode();
+
+    let payload = history_segmented_payload(store, core_hash, generation)?;
+    let manifest = ManifestRecord {
+        generation,
+        logical_len,
+        object_id,
+        machine_id: crate::machine::MACHINE_NL2,
+        core_hash,
+        profiles: vec!["history-segmented".to_string()],
+        components: vec![
+            ManifestComponent {
+                name: "core".to_string(),
+                kind: "core".to_string(),
+                bytes: core.len() as u64,
+            },
+            ManifestComponent {
+                name: "history-segmented".to_string(),
+                kind: "history-segmented".to_string(),
+                bytes: payload.len() as u64,
+            },
+        ],
+    };
+    let sections: Vec<(SectionKind, Vec<u8>)> = vec![
+        (SectionKind::HistorySegmented, payload),
+        (SectionKind::Manifest, manifest.encode()),
+    ];
+
+    let core_end = CORE_OFFSET + core.len() as u64;
+    let base = align8(core_end);
+    let commit = build_commit(base, generation, 0, &sections, None)?;
+
+    let tmp = tmp_path(path);
+    let result = (|| -> Result<()> {
+        let file = File::create(&tmp)?;
+        let mut w = BufWriter::new(file);
+        w.write_all(&header_bytes)?;
+        w.write_all(core)?;
+        write_zeros(&mut w, base - core_end)?;
+        w.write_all(&commit.bytes)?;
+        w.flush()?;
+        let file = w
+            .into_inner()
+            .map_err(|e| EkbloomError::Io(e.into_error()))?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path)?;
+    fsync_dir(path)?;
+    Ok(())
+}
+
+/// Derive the deterministic object identity from the core hash.
+///
+/// Mirrors `crate::manifest::derive_object_id` (that module is not owned by this
+/// workstream); the same domain separator keeps identities compatible.
+fn derive_object_id(core_hash: &[u8; 32]) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ekbloom.object-id.v1");
+    hasher.update(core_hash);
+    let digest = hasher.finalize();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest.as_bytes()[..16]);
+    id
+}
 
 #[cfg(test)]
 mod tests {

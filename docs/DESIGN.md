@@ -80,8 +80,30 @@ together with the cursor.
   `ResumePoint` = `state: u32` (LE) ++ `cursor: u64` (LE) = 12 packed bytes,
   position implicit as `j*K`. Sparse mode stores resume points; `Full` stores the
   state projection (and can still answer cursor by `p = i`).
-- Sparse restart for position `i`, interval `K`: `j = i / K`; load `Omega_{jK}`;
+Sparse restart for position `i`, interval `K`: `j = i / K`; load `Omega_{jK}`;
   advance at most `K-1` steps. This bound is enforced and tested mechanically.
+
+  ### 2.1 State-only entry vs. complete resumable state (`history_store.rs`)
+
+  Two persisted forms are deliberately distinct:
+
+  - A **state-only entry** is a bare `u32` `x_i` — the machine state *before*
+    revealing symbol `i`. That is all `HISTORY_FULL` and the segmented segment
+    files store. It is **not** sufficient to resume: for `i >= 2` the next symbol
+    also depends on the core byte `core[i]`.
+  - A **complete resumable state** is `Omega_i = (x_i, p_i)`, packed as `u32`
+    state ++ `u64` cursor = 12 bytes ([`Snapshot`]). Only complete resumable
+    states (the sparse [`CheckpointSet`]) permit restart, bounded to `K-1` steps.
+
+  `history_store::HistoryStore` realizes the full `4*(N+1)`-byte projection as
+  **fixed-size segments on disk** (default `segment_bytes = 1 MiB` = 262144 states
+  per segment), built in a single streaming pass whose peak RAM is
+  `O(segment_bytes)` and is independent of `N`. A logical position maps to a
+  `(segment, offset)` by the constant-time arithmetic `segment = i / sps`,
+  `offset = (i % sps) * 4` over the segment path list; `state_at(i)` performs one
+  `pread` of a 4-byte window. Sparse complete resume states are stored alongside so
+  random access and restart remain bounded. `physical_bytes()` reports the real
+  segment bytes (`4*(N+1)` for an intact store).
 
 ---
 
@@ -170,11 +192,22 @@ offset 0   GenesisHeader (fixed 80 bytes)
              footer_checksum u32, reserved
 ```
 
-Section kinds: `HISTORY_FULL`, `CHECKPOINTS`, `BLOOM_GLOBAL`, `BLOOM_CONTEXT`,
-`BLOOM_REGION`, `BLOOM_PATH`, `CERTIFICATE`, `MANIFEST`. Publication order:
+Section kinds: `HISTORY_FULL`, `HISTORY_SEGMENTED`, `CHECKPOINTS`, `BLOOM_GLOBAL`,
+`BLOOM_CONTEXT`, `BLOOM_REGION`, `BLOOM_PATH`, `CERTIFICATE`, `MANIFEST`. Publication
+order:
 write payload -> write manifest -> flush -> append CommitFooter -> flush -> advertise.
 Recovery selects the newest valid committed generation; torn writes never invalidate
 earlier commits (documented durability model: append + fsync + footer validation).
+
+`HISTORY_SEGMENTED` payload: a fixed 104-byte header (`segment_bytes u32`,
+`checkpoint_interval u32`, `logical_len u64`, `state_count u64`, `segment_count u64`,
+`index_offset u64`, `states_offset u64`, `checkpoints_offset u64`,
+`checkpoints_len u64`, `core_hash [u8;32]`), then `segment_count` `u64`
+payload-relative offsets to each segment, the concatenated little-endian `u32`
+segment states, and the sparse `CheckpointSet` bytes. The writer embeds a
+[`history_store::HistoryStore`]; `reader::FileBody::segmented_state_at(i)` answers
+from a bounded `pread` (one index read plus one 4-byte state read), never loading
+the whole history.
 
 ---
 
@@ -186,6 +219,7 @@ earlier commits (documented durability model: append + fsync + footer validation
 | `state.rs` | `Snapshot`, pack/unpack, `StateLog` helpers |
 | `machine.rs` | `OrMachine` trait, `Nl2`, `machine_by_id`, encode/reveal/decode |
 | `history.rs` | full non-withdrawal log build/verify/serialize |
+| `history_store.rs` | persistent segmented state projection, bounded-memory streaming build, sparse resume states, `pread` access |
 | `checkpoint.rs` | checkpoint sets, build, restart |
 | `bloom_key.rs` | key projections `pi`, sufficiency check primitive |
 | `bloom.rs` | `BloomKind`, packed entries, `BloomShell`, `Certificate`, generic build/step |

@@ -220,3 +220,7 @@ to ~1.6× on this host (e.g. `path(D=32)` measured 81 GB/s in the frontier pass
 and 49 GB/s in the depth-curve pass; all at 30 ns p50). The frontier is therefore
 built on 2× tolerance buckets, and the reported wins are the steps that survive
 that tolerance — not the last noisy percent.
+
+### Segmented history at N = 2^30 (bounded-memory build)
+
+`HistoryStore::build` streamed a procedural core over 1073741824 logical positions into 1 MiB segments (checkpoint interval 65536), writing exactly 4294967300 bytes of `u32` state projection (`4*(N+1)`) in 3.666 s while peak RSS stayed at 3067904 bytes (2.9 MiB) — far below the 4 GiB the full projection would occupy in RAM. A sampled recompute-and-compare pass over 1025 positions (stride 1048576) passed. Evidence: `evidence/bench/history-2p30.json`.

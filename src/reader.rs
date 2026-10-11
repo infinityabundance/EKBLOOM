@@ -182,6 +182,8 @@ fn open_selected(
     let mut checkpoints: Vec<CheckpointSet> = Vec::new();
     let mut blooms: Vec<BloomShell> = Vec::new();
     let mut certificates: Vec<Certificate> = Vec::new();
+    let mut segmented_count = 0usize;
+    let mut segmented_link: Option<([u8; 32], u64)> = None;
 
     for commit in &scan.commits[..=upto] {
         for section in &commit.sections {
@@ -203,6 +205,15 @@ fn open_selected(
                     blooms.push(shell);
                 }
                 SectionKind::Certificate => certificates.push(Certificate::from_bytes(payload)?),
+                SectionKind::HistorySegmented => {
+                    // The in-memory `EkbloomBody` has no field for a segmented
+                    // projection, so the section is validated for linkage and
+                    // accounted for here, while `FileBody` is the streaming
+                    // access path for its states.
+                    let h = decode_segmented_header(payload)?;
+                    segmented_count += 1;
+                    segmented_link = Some((h.core_hash, h.logical_len));
+                }
                 SectionKind::Manifest | SectionKind::Auth => {}
                 SectionKind::CoreMachine => {
                     return Err(corrupt(commit.generation, "unexpected core section"))
@@ -287,8 +298,20 @@ fn open_selected(
             ));
         }
     }
-    let expected_components =
-        1 + usize::from(history.is_some()) + checkpoints.len() + blooms.len() + certificates.len();
+    if let Some((core_hash, logical_len)) = segmented_link {
+        if core_hash != core_digest || logical_len != manifest.logical_len {
+            return Err(corrupt(
+                selected.generation,
+                "history-segmented core linkage mismatch",
+            ));
+        }
+    }
+    let expected_components = 1
+        + usize::from(history.is_some())
+        + checkpoints.len()
+        + blooms.len()
+        + certificates.len()
+        + segmented_count;
     if manifest.components.len() != expected_components {
         return Err(corrupt(
             selected.generation,
@@ -604,6 +627,215 @@ struct FileCertificate {
     bytes: u64,
 }
 
+/// The fixed header of a [`SectionKind::HistorySegmented`] payload.
+#[derive(Clone, Copy, Debug)]
+struct SegmentedHeader {
+    segment_bytes: u32,
+    checkpoint_interval: u32,
+    logical_len: u64,
+    index_offset: u64,
+    states_offset: u64,
+    checkpoints_offset: u64,
+    checkpoints_len: u64,
+    core_hash: [u8; 32],
+}
+
+/// Decode and structurally validate a [`SegmentedHeader`].
+///
+/// Every declared offset is consistency-checked against `segment_bytes` and
+/// `logical_len`, so a malformed (yet checksum-valid) header is rejected rather
+/// than trusted.
+fn decode_segmented_header(bytes: &[u8]) -> Result<SegmentedHeader> {
+    use crate::format::HS_FIXED_LEN;
+    if bytes.len() < HS_FIXED_LEN {
+        return Err(EkbloomError::Truncated {
+            needed: HS_FIXED_LEN as u64,
+            available: bytes.len() as u64,
+        });
+    }
+    let segment_bytes = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let checkpoint_interval = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    if segment_bytes == 0 || segment_bytes % 4 != 0 {
+        return Err(bad(
+            "history-segmented segment_bytes must be a non-zero multiple of 4",
+        ));
+    }
+    if !CheckpointSet::supported_interval(checkpoint_interval) {
+        return Err(EkbloomError::BadInterval {
+            interval: checkpoint_interval,
+        });
+    }
+    let logical_len = le_u64(bytes, 8);
+    let state_count = le_u64(bytes, 16);
+    let segment_count = le_u64(bytes, 24);
+    let index_offset = le_u64(bytes, 32);
+    let states_offset = le_u64(bytes, 40);
+    let checkpoints_offset = le_u64(bytes, 48);
+    let checkpoints_len = le_u64(bytes, 56);
+    let mut core_hash = [0u8; 32];
+    core_hash.copy_from_slice(&bytes[64..96]);
+
+    let want_states = logical_len.checked_add(1).ok_or(EkbloomError::Overflow {
+        what: "history-segmented state count",
+    })?;
+    if state_count != want_states {
+        return Err(bad(format!(
+            "history-segmented state count {state_count} inconsistent with logical_len {logical_len}"
+        )));
+    }
+    let sps = u64::from(segment_bytes) / 4;
+    let want_segments = state_count
+        .checked_add(sps - 1)
+        .ok_or(EkbloomError::Overflow {
+            what: "history-segmented segment count",
+        })?
+        / sps;
+    if segment_count != want_segments {
+        return Err(bad(format!(
+            "history-segmented segment count {segment_count} inconsistent with {want_segments}"
+        )));
+    }
+    let fixed = HS_FIXED_LEN as u64;
+    if index_offset != fixed {
+        return Err(bad("history-segmented index offset mismatch"));
+    }
+    let want_states_offset = fixed
+        .checked_add(segment_count.checked_mul(8).ok_or(EkbloomError::Overflow {
+            what: "history-segmented index",
+        })?)
+        .ok_or(EkbloomError::Overflow {
+            what: "history-segmented layout",
+        })?;
+    if states_offset != want_states_offset {
+        return Err(bad("history-segmented states offset mismatch"));
+    }
+    let want_cp_offset = states_offset
+        .checked_add(state_count.checked_mul(4).ok_or(EkbloomError::Overflow {
+            what: "history-segmented states",
+        })?)
+        .ok_or(EkbloomError::Overflow {
+            what: "history-segmented layout",
+        })?;
+    if checkpoints_offset != want_cp_offset {
+        return Err(bad("history-segmented checkpoints offset mismatch"));
+    }
+    checkpoints_offset
+        .checked_add(checkpoints_len)
+        .ok_or(EkbloomError::Overflow {
+            what: "history-segmented layout",
+        })?;
+
+    Ok(SegmentedHeader {
+        segment_bytes,
+        checkpoint_interval,
+        logical_len,
+        index_offset,
+        states_offset,
+        checkpoints_offset,
+        checkpoints_len,
+        core_hash,
+    })
+}
+
+/// A parsed [`SectionKind::HistorySegmented`] section: the header plus the
+/// absolute payload range. States are read by `pread`, never loaded wholesale.
+#[derive(Clone, Copy, Debug)]
+struct FileSegmentedHistory {
+    header: SegmentedHeader,
+    payload_offset: u64,
+    payload_len: u64,
+    physical_len: u64,
+}
+
+impl FileSegmentedHistory {
+    /// Read `x_i` via one bounded index read plus one 4-byte state read.
+    fn state_at(&self, file: &File, i: u64) -> Result<u32> {
+        let h = &self.header;
+        if i > h.logical_len {
+            return Err(oob(i, 1, h.logical_len));
+        }
+        let sps = u64::from(h.segment_bytes) / 4;
+        let seg = i / sps;
+        let within = i % sps;
+        let index_rel = h
+            .index_offset
+            .checked_add(seg.checked_mul(8).ok_or(EkbloomError::Overflow {
+                what: "history-segmented index",
+            })?)
+            .ok_or(EkbloomError::Overflow {
+                what: "history-segmented index",
+            })?;
+        let index_off =
+            self.payload_offset
+                .checked_add(index_rel)
+                .ok_or(EkbloomError::Overflow {
+                    what: "history-segmented index",
+                })?;
+        let mut entry = [0u8; 8];
+        read_exact_at_len(file, &mut entry, index_off, self.physical_len)?;
+        let seg_rel = le_u64(&entry, 0);
+        let byte_rel = seg_rel
+            .checked_add(within.checked_mul(4).ok_or(EkbloomError::Overflow {
+                what: "history-segmented state offset",
+            })?)
+            .ok_or(EkbloomError::Overflow {
+                what: "history-segmented state offset",
+            })?;
+        let end_rel = byte_rel.checked_add(4).ok_or(EkbloomError::Overflow {
+            what: "history-segmented state offset",
+        })?;
+        if seg_rel < h.states_offset || end_rel > h.checkpoints_offset {
+            return Err(bad("history-segmented index entry out of range"));
+        }
+        let byte_off = self
+            .payload_offset
+            .checked_add(byte_rel)
+            .ok_or(EkbloomError::Overflow {
+                what: "history-segmented state offset",
+            })?;
+        let mut buf = [0u8; 4];
+        read_exact_at_len(file, &mut buf, byte_off, self.physical_len)?;
+        Ok(u32::from_le_bytes(buf))
+    }
+}
+
+/// Parse a [`SectionKind::HistorySegmented`] section header from the file.
+fn parse_segmented(
+    file: &File,
+    payload_offset: u64,
+    payload_len: u64,
+    total: u64,
+) -> Result<FileSegmentedHistory> {
+    use crate::format::HS_FIXED_LEN;
+    if payload_len < HS_FIXED_LEN as u64 {
+        return Err(EkbloomError::Truncated {
+            needed: HS_FIXED_LEN as u64,
+            available: payload_len,
+        });
+    }
+    let mut fixed = [0u8; HS_FIXED_LEN];
+    read_exact_at_len(file, &mut fixed, payload_offset, total)?;
+    let header = decode_segmented_header(&fixed)?;
+    let need = header
+        .checkpoints_offset
+        .checked_add(header.checkpoints_len)
+        .ok_or(EkbloomError::Overflow {
+            what: "history-segmented layout",
+        })?;
+    if payload_len < need {
+        return Err(EkbloomError::Truncated {
+            needed: need,
+            available: payload_len,
+        });
+    }
+    Ok(FileSegmentedHistory {
+        header,
+        payload_offset,
+        payload_len,
+        physical_len: total,
+    })
+}
+
 /// A fully-safe, file-backed, streaming view of a validated `.ekb` file.
 ///
 /// Unlike [`open`], which materialises the whole logical body (core, history,
@@ -636,6 +868,7 @@ pub struct FileBody {
     checkpoints: Vec<FileCheckpoint>,
     blooms: Vec<FileBloom>,
     certificates: Vec<FileCertificate>,
+    segmented: Option<FileSegmentedHistory>,
     profiles: Vec<String>,
 }
 
@@ -657,6 +890,32 @@ impl FileBody {
     #[inline]
     pub fn physical_len(&self) -> u64 {
         self.physical_len
+    }
+
+    /// The logical length (`N`) of the `HISTORY_SEGMENTED` section, if present.
+    pub fn segmented_logical_len(&self) -> Option<u64> {
+        self.segmented.as_ref().map(|s| s.header.logical_len)
+    }
+
+    /// The checkpoint interval of the `HISTORY_SEGMENTED` section, if present.
+    pub fn segmented_checkpoint_interval(&self) -> Option<u32> {
+        self.segmented
+            .as_ref()
+            .map(|s| s.header.checkpoint_interval)
+    }
+
+    /// Read state `x_i` from the `HISTORY_SEGMENTED` section by `pread`.
+    ///
+    /// Bounded: one index read plus one 4-byte state read; the whole history is
+    /// never loaded. Errors with [`EkbloomError::InvalidArgument`] when the file
+    /// has no such section, and with [`EkbloomError::OutOfBounds`] for `i > N`.
+    pub fn segmented_state_at(&self, i: u64) -> Result<u32> {
+        match &self.segmented {
+            Some(seg) => seg.state_at(&self.file, i),
+            None => Err(EkbloomError::InvalidArgument {
+                what: "file has no history-segmented section".to_string(),
+            }),
+        }
     }
 
     /// Read `req` by reading only the bytes it needs.
@@ -735,6 +994,13 @@ impl FileBody {
                 bytes: c.bytes,
             });
         }
+        if let Some(seg) = &self.segmented {
+            components.push(ComponentReport {
+                name: "history-segmented".to_string(),
+                kind: "history-segmented".to_string(),
+                bytes: seg.payload_len,
+            });
+        }
 
         let visible = self.core_len;
         let physical = components
@@ -777,6 +1043,7 @@ impl FileBody {
         let mut checkpoints: Vec<FileCheckpoint> = Vec::new();
         let mut blooms: Vec<FileBloom> = Vec::new();
         let mut certificates: Vec<FileCertificate> = Vec::new();
+        let mut segmented: Option<FileSegmentedHistory> = None;
 
         for commit in &commits {
             for section in &commit.sections {
@@ -804,6 +1071,9 @@ impl FileBody {
                     }
                     SectionKind::Certificate => {
                         certificates.push(parse_certificate(&file, off, len, physical_len)?)
+                    }
+                    SectionKind::HistorySegmented => {
+                        segmented = Some(parse_segmented(&file, off, len, physical_len)?)
                     }
                     SectionKind::Manifest | SectionKind::Auth => {}
                     SectionKind::CoreMachine => {
@@ -876,11 +1146,21 @@ impl FileBody {
                 ));
             }
         }
+        if let Some(seg) = &segmented {
+            if seg.header.core_hash != core_digest || seg.header.logical_len != manifest.logical_len
+            {
+                return Err(corrupt(
+                    selected.generation,
+                    "history-segmented core linkage mismatch",
+                ));
+            }
+        }
         let expected_components = 1
             + usize::from(history.is_some())
             + checkpoints.len()
             + blooms.len()
-            + certificates.len();
+            + certificates.len()
+            + usize::from(segmented.is_some());
         if manifest.components.len() != expected_components {
             return Err(corrupt(
                 selected.generation,
@@ -900,6 +1180,7 @@ impl FileBody {
             checkpoints,
             blooms,
             certificates,
+            segmented,
             profiles: manifest.profiles,
         })
     }

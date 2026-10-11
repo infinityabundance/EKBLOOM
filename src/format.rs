@@ -75,6 +75,10 @@ pub enum SectionKind {
     CoreMachine,
     /// A full non-withdrawal [`crate::history::History`].
     HistoryFull,
+    /// A segmented, persistent [`crate::history_store::HistoryStore`] projection
+    /// (concatenated fixed-size segment files plus a small position index and
+    /// sparse complete resume states).
+    HistorySegmented,
     /// A [`crate::checkpoint::CheckpointSet`].
     Checkpoints,
     /// A universal [`crate::bloom::BloomShell`].
@@ -108,6 +112,7 @@ impl SectionKind {
             SectionKind::Certificate => 8,
             SectionKind::Manifest => 9,
             SectionKind::Auth => 10,
+            SectionKind::HistorySegmented => 11,
         }
     }
 
@@ -124,6 +129,7 @@ impl SectionKind {
             8 => SectionKind::Certificate,
             9 => SectionKind::Manifest,
             10 => SectionKind::Auth,
+            11 => SectionKind::HistorySegmented,
             _ => return None,
         })
     }
@@ -133,6 +139,7 @@ impl SectionKind {
         match self {
             SectionKind::CoreMachine => "core",
             SectionKind::HistoryFull => "history",
+            SectionKind::HistorySegmented => "history-segmented",
             SectionKind::Checkpoints => "checkpoints",
             SectionKind::BloomGlobal => "bloom-global",
             SectionKind::BloomContext => "bloom-context",
@@ -147,6 +154,17 @@ impl SectionKind {
 
 /// Payload length of an [`SectionKind::Auth`] section: a 32-byte keyed MAC.
 pub const AUTH_MAC_LEN: usize = 32;
+
+/// Fixed byte length of a [`SectionKind::HistorySegmented`] payload header.
+///
+/// Layout (all little-endian): `segment_bytes u32`, `checkpoint_interval u32`,
+/// `logical_len u64`, `state_count u64`, `segment_count u64`, `index_offset u64`,
+/// `states_offset u64`, `checkpoints_offset u64`, `checkpoints_len u64`,
+/// `core_hash [u8;32]`, `generation u64`. The three offsets are relative to the
+/// payload start; the index is `segment_count` `u64` payload-relative offsets to
+/// each segment, states are the concatenated segment bytes, and the sparse
+/// `CheckpointSet` bytes close the payload.
+pub const HS_FIXED_LEN: usize = 4 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 32 + 8;
 
 /// The AUTH tag over `covered`: `blake3::keyed_hash(key, blake3(covered))`.
 ///
@@ -998,12 +1016,12 @@ mod tests {
 
     #[test]
     fn section_kind_codes_roundtrip() {
-        for code in 1..=10u32 {
+        for code in 1..=11u32 {
             let kind = SectionKind::from_u32(code).unwrap();
             assert_eq!(kind.to_u32(), code);
         }
         assert!(SectionKind::from_u32(0).is_none());
-        assert!(SectionKind::from_u32(11).is_none());
+        assert!(SectionKind::from_u32(12).is_none());
         assert!(SectionKind::from_u32(u32::MAX).is_none());
     }
 

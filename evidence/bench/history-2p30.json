@@ -1,0 +1,10 @@
+{
+  "logical_len": 1073741824,
+  "segment_bytes": 1048576,
+  "checkpoint_interval": 65536,
+  "state_bytes": 4294967300,
+  "peak_rss_bytes": 3067904,
+  "seconds": 3.666,
+  "sampled_checks": 1025,
+  "status": "PASS"
+}
