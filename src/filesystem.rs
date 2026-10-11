@@ -30,7 +30,15 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+
+// The `OrFs` index is the crate's one genuine shared-mutable structure. Under
+// `--cfg loom` the very same code is compiled against loom's instrumented
+// `Mutex`/`MutexGuard` so `tests/loom.rs` can exhaustively explore its lock
+// interleavings; production builds use `std::sync`. No behaviour differs.
+#[cfg(loom)]
+use loom::sync::{Mutex, MutexGuard};
+#[cfg(not(loom))]
+use std::sync::{Mutex, MutexGuard};
 
 use crate::bloom::BloomKind;
 use crate::error::{EkbloomError, Result};
@@ -324,7 +332,7 @@ impl OrFs {
     }
 
     /// Acquire the index lock, mapping poisoning to an argument error.
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, BTreeMap<String, IndexEntry>>> {
+    fn lock(&self) -> Result<MutexGuard<'_, BTreeMap<String, IndexEntry>>> {
         self.index
             .lock()
             .map_err(|_| EkbloomError::InvalidArgument {

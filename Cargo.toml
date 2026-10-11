@@ -35,6 +35,19 @@ fuse = ["dep:fuser"]
 proptest = "1.5"
 divan = "0.1"
 
+# Loom model-checking, enabled only by `RUSTFLAGS="--cfg loom"`. This is a
+# *target-gated normal dependency*, not a dev-dependency: `src/filesystem.rs`
+# itself selects `loom::sync::Mutex` under `#[cfg(loom)]` so the real `OrFs`
+# index is model-checked, and a library cannot see dev-dependencies. Normal
+# builds never activate `cfg(loom)` and so never compile or link loom.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+# Declare `loom` as a known cfg name so the `unexpected_cfgs` lint does not fire
+# under `-D warnings` for either the loom build or ordinary builds.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 # Divan benchmarks own their entry point, so the libtest harness is disabled.
 [[bench]]
 name = "ekbloom"
