@@ -17,16 +17,20 @@
 //! ```text
 //! <root>/<logical_path>                      pointer/registration artifact
 //! <root>/.ekbloom/index                      concealed registry
-//! <root>/.ekbloom/<object-id-hex>/core       visible representation V
-//! <root>/.ekbloom/<object-id-hex>/history    manifested history (if present)
-//! <root>/.ekbloom/<object-id-hex>/checkpoints
-//! <root>/.ekbloom/<object-id-hex>/bloom4     non-regional transition blooms
-//! <root>/.ekbloom/<object-id-hex>/regional   regional blooms
-//! <root>/.ekbloom/<object-id-hex>/manifests  the committed `.ekb` generation
+//! <root>/.ekbloom/<logical-id-hex>/core       visible representation V
+//! <root>/.ekbloom/<logical-id-hex>/history    manifested history (if present)
+//! <root>/.ekbloom/<logical-id-hex>/checkpoints
+//! <root>/.ekbloom/<logical-id-hex>/bloom4     non-regional transition blooms
+//! <root>/.ekbloom/<logical-id-hex>/regional   regional blooms
+//! <root>/.ekbloom/<logical-id-hex>/manifests  the committed `.ekb` generation
 //! ```
 //!
-//! The logical artifacts are content-addressed: two logical paths holding
-//! identical bytes share one operational object directory.
+//! Each object's concealed directory is keyed by its **logical identity** — a
+//! digest of the normalized logical path — not by its content. Two independently
+//! manifested objects therefore never share a physical directory, even when
+//! their bytes are identical: identical contents at distinct logical paths
+//! occupy separate physical space, and [`OrFs::inspect_physical`] accounts for
+//! each honestly. Content-addressed sharing is deliberately not implemented.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -67,7 +71,8 @@ pub struct FileMeta {
     pub visible_bytes: u64,
     /// Real on-disk bytes the object occupies under the concealed namespace.
     pub physical_bytes: u64,
-    /// Deterministic content-derived object identity.
+    /// Deterministic content-derived object identity (not the concealed
+    /// directory key; see [`OrFs`] for logical-identity keying).
     pub object_id: [u8; 16],
     /// Manifestation profile labels applied, in order.
     pub profiles: Vec<String>,
@@ -159,7 +164,7 @@ impl OrFs {
         }
 
         let body = manifest::create(source, profile)?;
-        let obj_dir = self.object_dir(&body.object_id);
+        let obj_dir = self.object_dir(&rel);
         std::fs::create_dir_all(&obj_dir)?;
 
         write_file(&obj_dir.join("core"), &body.core)?;
@@ -188,7 +193,10 @@ impl OrFs {
         }
         writer::write_body(&obj_dir.join("manifests"), &body)?;
 
-        write_file(&pointer, pointer_artifact(&body.object_id).as_bytes())?;
+        write_file(
+            &pointer,
+            pointer_artifact(&derive_logical_id(&rel)).as_bytes(),
+        )?;
 
         index.insert(
             rel,
@@ -268,12 +276,12 @@ impl OrFs {
         let mut logical_bytes = 0u64;
         let mut visible_total = 0u64;
         let mut objects = Vec::with_capacity(index.len());
-        for (logical_path, entry) in index.iter() {
+        for logical_path in index.keys() {
             let pointer = self.root.join(logical_path);
             if let Ok(metadata) = std::fs::symlink_metadata(&pointer) {
                 total_bytes = total_bytes.saturating_add(metadata.len());
             }
-            let obj_dir = self.object_dir(&entry.object_id);
+            let obj_dir = self.object_dir(logical_path);
             let body = reader::open(&obj_dir.join("manifests"))?;
             logical_bytes = logical_bytes.saturating_add(body.logical_len);
             let visible = body.visible_bytes();
@@ -302,23 +310,27 @@ impl OrFs {
     /// Resolve a registered object to its validated body and directory.
     fn load(&self, logical_path: &str) -> Result<(EkbloomBody, PathBuf)> {
         let rel = normalize_file_path(logical_path)?;
-        let entry = {
+        {
             let index = self.lock()?;
-            index
-                .get(&rel)
-                .cloned()
-                .ok_or_else(|| EkbloomError::InvalidArgument {
+            if !index.contains_key(&rel) {
+                return Err(EkbloomError::InvalidArgument {
                     what: format!("no such logical object: {rel}"),
-                })?
-        };
-        let obj_dir = self.object_dir(&entry.object_id);
+                });
+            }
+        }
+        let obj_dir = self.object_dir(&rel);
         let body = reader::open(&obj_dir.join("manifests"))?;
         Ok((body, obj_dir))
     }
 
-    /// The concealed directory for an object identity.
-    fn object_dir(&self, object_id: &[u8; 16]) -> PathBuf {
-        self.root.join(CONCEALED_DIR).join(hex_encode(object_id))
+    /// The concealed directory for a normalized logical path.
+    ///
+    /// Keyed by the object's *logical identity*, so two independently manifested
+    /// objects never share a directory even when their content is identical.
+    fn object_dir(&self, logical_path: &str) -> PathBuf {
+        self.root
+            .join(CONCEALED_DIR)
+            .join(hex_encode(&derive_logical_id(logical_path)))
     }
 
     /// Resolve a logical directory to its host path.
@@ -383,9 +395,25 @@ fn is_concealed(name: &str) -> bool {
     name.starts_with(CONCEALED_DIR)
 }
 
+/// Derive the concealed physical-directory identity from a normalized logical
+/// path.
+///
+/// This is the *logical* identity: it depends on the path, never on the content,
+/// so identically-valued objects at distinct logical paths get distinct physical
+/// directories and can never overwrite each other's manifestation.
+fn derive_logical_id(logical_path: &str) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ekbloom.logical-id.v1");
+    hasher.update(logical_path.as_bytes());
+    let digest = hasher.finalize();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest.as_bytes()[..16]);
+    id
+}
+
 /// The small visible pointer artifact registered for an object.
-fn pointer_artifact(object_id: &[u8; 16]) -> String {
-    format!("ekbloom:object {}\n", hex_encode(object_id))
+fn pointer_artifact(logical_id: &[u8; 16]) -> String {
+    format!("ekbloom:object {}\n", hex_encode(logical_id))
 }
 
 /// Frame a sequence of length-prefixed parts: `u64` count, then `u64` length and

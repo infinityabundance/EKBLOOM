@@ -6,7 +6,7 @@
 //! bytes and never conflates them with logical content.
 
 use ekbloom::{FileMeta, ManifestationProfile, ObjectPhysical, OrFs, PhysicalReport, ReadRequest};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Deterministic pseudorandom bytes from a small LCG (no new dependencies).
 fn lcg(seed: u64, len: usize) -> Vec<u8> {
@@ -59,6 +59,20 @@ fn temp_root(tag: &str) -> PathBuf {
     dir
 }
 
+/// The concealed object directories (hex-named subdirectories of `.ekbloom/`),
+/// sorted. Used to prove that independent objects get distinct physical homes.
+fn object_dirs(root: &Path) -> Vec<String> {
+    let concealed = root.join(".ekbloom");
+    let mut dirs: Vec<String> = std::fs::read_dir(&concealed)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_type().unwrap().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
 #[test]
 fn create_read_and_stat_across_profiles() {
     let root = temp_root("rt");
@@ -83,7 +97,7 @@ fn create_read_and_stat_across_profiles() {
         fs.create(&logical, &src, profile).unwrap();
     }
 
-    for (name, _) in profiles {
+    for (name, profile) in profiles {
         let logical = format!("data/{name}");
         let full = fs
             .read(
@@ -110,7 +124,22 @@ fn create_read_and_stat_across_profiles() {
         assert_eq!(meta.visible_bytes, src.len() as u64);
         assert!(meta.physical_bytes >= meta.visible_bytes);
         assert_eq!(meta.object_id, fs.stat(&logical).unwrap().object_id);
+        // Each object must report its OWN profile: identical source content must
+        // not let one object's manifestation overwrite another's.
+        assert_eq!(
+            meta.profiles,
+            vec![profile.label()],
+            "stat reported the wrong profile for {logical}"
+        );
     }
+
+    // Every logical path here shares identical source bytes, yet each must occupy
+    // a distinct concealed directory (content does not determine physical home).
+    assert_eq!(
+        object_dirs(&root).len(),
+        profiles.len(),
+        "identically-valued objects shared a physical directory"
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -263,6 +292,125 @@ fn duplicate_logical_path_is_rejected() {
         )
         .unwrap(),
         b"first".to_vec()
+    );
+
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// Regression (reviewer scenario): two objects with identical source bytes at
+/// distinct logical paths and distinct profiles must never share a concealed
+/// directory, and each must keep its own manifestation.
+#[test]
+fn identical_source_distinct_paths_do_not_share_physical_directory() {
+    let root = temp_root("identity");
+    let fs = OrFs::open(&root).unwrap();
+    let s = lcg(0xABCD_1234_5678_9012, 2048);
+    let full = ReadRequest {
+        offset: 0,
+        length: s.len() as u64,
+    };
+
+    fs.create("data/a.bin", &s, ManifestationProfile::Root)
+        .unwrap();
+    fs.create("data/b.bin", &s, ManifestationProfile::Path { depth: 32 })
+        .unwrap();
+
+    // Both read back byte-exact == S.
+    assert_eq!(fs.read("data/a.bin", full).unwrap(), s);
+    assert_eq!(fs.read("data/b.bin", full).unwrap(), s);
+
+    // Each reports its own profile.
+    assert_eq!(
+        fs.stat("data/a.bin").unwrap().profiles,
+        vec!["root".to_string()]
+    );
+    assert_eq!(
+        fs.stat("data/b.bin").unwrap().profiles,
+        vec!["path(D=32)".to_string()]
+    );
+
+    // Distinct physical directories under `.ekbloom/`.
+    let dirs = object_dirs(&root);
+    assert_eq!(
+        dirs.len(),
+        2,
+        "objects shared a concealed directory: {dirs:?}"
+    );
+
+    // Distinct per-object bytes: the path manifestation is strictly larger than
+    // the root-only one, and reads never perturb either object.
+    let a = fs.stat("data/a.bin").unwrap();
+    let b = fs.stat("data/b.bin").unwrap();
+    assert!(
+        b.physical_bytes > a.physical_bytes,
+        "path manifestation {} not larger than root {}",
+        b.physical_bytes,
+        a.physical_bytes
+    );
+    assert_eq!(fs.read("data/b.bin", full).unwrap(), s);
+    assert_eq!(fs.read("data/a.bin", full).unwrap(), s);
+    assert_eq!(fs.stat("data/a.bin").unwrap(), a);
+    assert_eq!(fs.stat("data/b.bin").unwrap(), b);
+
+    // Physical accounting covers both independent objects.
+    let report = fs.inspect_physical().unwrap();
+    assert_eq!(report.objects.len(), 2);
+    assert_eq!(report.logical_bytes, 2 * s.len() as u64);
+    let summed = a.physical_bytes.saturating_add(b.physical_bytes);
+    assert!(
+        report.total_bytes >= summed,
+        "total {} < sum of both objects {}",
+        report.total_bytes,
+        summed
+    );
+    assert_eq!(
+        dirs,
+        object_dirs(&root),
+        "directory set changed after reads"
+    );
+
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// Content-identity stress: many logical paths from the SAME source with many
+/// DIFFERENT profiles must stay fully isolated (no cross-contamination).
+#[test]
+fn same_source_many_profiles_stay_isolated() {
+    let root = temp_root("stress");
+    let fs = OrFs::open(&root).unwrap();
+    let s = lcg(0x5151_2626_3737_4848, 1024);
+    let full = ReadRequest {
+        offset: 0,
+        length: s.len() as u64,
+    };
+    let cases = [
+        ("data/root.bin", ManifestationProfile::Root),
+        ("data/p4.bin", ManifestationProfile::Path { depth: 4 }),
+        ("data/p16.bin", ManifestationProfile::Path { depth: 16 }),
+        ("data/p32.bin", ManifestationProfile::Path { depth: 32 }),
+        ("data/full.bin", ManifestationProfile::Full),
+        (
+            "data/sparse.bin",
+            ManifestationProfile::Sparse { interval: 64 },
+        ),
+    ];
+    for (path, profile) in cases {
+        fs.create(path, &s, profile).unwrap();
+    }
+
+    for (path, profile) in cases {
+        assert_eq!(fs.read(path, full).unwrap(), s, "read mismatch for {path}");
+        assert_eq!(
+            fs.stat(path).unwrap().profiles,
+            vec![profile.label()],
+            "profile cross-contamination for {path}"
+        );
+    }
+
+    assert_eq!(
+        object_dirs(&root).len(),
+        cases.len(),
+        "identically-valued objects shared physical directories"
     );
 
     std::fs::remove_dir_all(&root).unwrap();
