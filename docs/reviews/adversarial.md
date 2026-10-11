@@ -215,3 +215,67 @@ run directly) to include it.
   integrity-not-authenticity model as F2/Finding C; only opt-in `AUTH` covers it.
 * The AVX-512 path was exercised by equality tests and the scalar fallback, not
   by a dedicated fuzzer; it is not on the default path.
+
+---
+
+## Revision 3 — `prefix`, `packed`, `tiles`, `handle`, `planner`, `court`
+
+Independent third pass over the round-3 modules. Executable in
+`tests/adversarial_r2.rs` (11 tests) plus new fuzz targets `fuzz_packed` and
+`fuzz_tiles` (registered in `fuzz/Cargo.toml`). Hostile `.ekb` images are produced
+by mutating a real body and re-serialising with the writer (so the section CRC-32
+and footer checksum are valid), or by patching the writer's output and
+recomputing both CRCs with an inline IEEE CRC-32.
+
+### Attack 7 result — fuzz campaign
+
+`sh scripts/container-fuzz.sh` runs **all six** targets clean
+(`fuzz_machine`, `fuzz_open`, `fuzz_bloom`, `fuzz_history_store`, `fuzz_packed`,
+`fuzz_tiles`); the script's target list is kept in sync with `fuzz/Cargo.toml`.
+The two new targets `fuzz_packed` (packed restart/history parsers +
+`state_from_hot`) and `fuzz_tiles` (`parse_tile_set_prefix` / `TileSet::from_bytes`
+/ tile reads) were verified here: 40,000 runs each, no crash artifacts, and clean
+via the script.
+
+### F6 (defect, fixed) — `TileSet::from_bytes` panic on an out-of-range `tile_shift`
+
+Summary of Finding D in `security.md`. `reader::open_bytes` -> (`src/reader.rs:219`)
+`TileSet::from_bytes` trusted the wire `tile_shift`; `1u64 << tile_shift` panicked
+for `>= 64` and shifts `0` / `31..=63` were silently accepted. Fixed with the
+`1..=MAX_TILE_SHIFT` guard (`src/tiles.rs`).
+
+Repro (failing before, passing after):
+
+```sh
+sh scripts/container-test.sh --test adversarial_r2
+```
+
+`tile_set_from_bytes_rejects_out_of_range_shift` and
+`persisted_out_of_range_tile_shift_is_rejected_not_panicked`; both aborted at
+`src/tiles.rs:635` with the guard removed.
+
+### Attacks that held (Revision 3)
+
+* **`prefix`** — affine summaries/prefix scan/parallel reconstruction/positional
+  state are byte-exact to the machine on empty, all-zero, all-`0xFF`, 1-byte and
+  non-dividing-block corpora; `LinMap` compose/power match the bit-matrix action
+  and are associative on random maps.
+* **`packed`** — snapshot/history equal `state_log` for every position and every
+  stride `0..=63`; crafted/truncated bytes give clean `Err`s; `u16` is a type
+  invariant, not a runtime hope.
+* **`tiles` persistence** — tampered blob with both CRCs recomputed is rejected at
+  `open`/`FileBody`/`OpenObject`; boundary/empty/degenerate reads are exact; budget
+  cap never exceeded; no-fit is inert; radix empty groups correct.
+* **`handle`** — append invalidates the cached handle (new generation, fresh
+  `Arc`); held snapshots never tear under concurrent appends and readers.
+* **`planner`** — byte-exact to `reader::read` for adversarial requests; selects
+  only certified paths; `path_for` is a pure shift/index with no search.
+* **`court`** — 0 reps / empty lists / `ws = 0` / `ws < request` never panic; empty
+  reports serialise; `n = 1` CI is the sample.
+
+### Residual risk (Revision 3)
+
+Same integrity-not-authenticity boundary as Findings C/F2: a forged `TileSet` or a
+forged `Certified` path-bloom label is trusted by `read`/`planner` (only
+`verify`/opt-in `AUTH` disagree). The planner is a certified-*dispatch* layer, not
+an authenticity boundary. No memory-safety or panic defect remains after F6.

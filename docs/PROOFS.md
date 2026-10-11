@@ -411,6 +411,162 @@ machine for machine 2, and that `machine_one_is_unaffected`.
 
 ---
 
+## P11. The `OrANS-NL2` block transform is affine, composition is associative, and the prefix scan reconstructs exactly — **PROVED** (algebra + byte-exactness), **EMPIRICALLY OBSERVED** (speed / regimes)
+
+**Claim.** Write the 16-bit state as `x = (h, l)` with `l = x & 0xFF`. The one-step
+recurrence is `x' = A x ^ B r` with
+
+```text
+A(h, l) = (l, S(h) ^ l)        B(r) = (0, r)
+```
+
+`A` is linear over `GF(2)` (a 16×16 bit-matrix) because `S` is linear and
+`XOR`/addition is `GF(2)`-linear, and `B` is linear; over a block of `D` input bytes
+`r_0..r_{D-1}`,
+
+```text
+x_{i+D} = A^D x_i ^ b_{i,D},   b_{i,D} = XOR_{j} A^{D-1-j} B r_{i+j}.
+```
+
+Block transforms `(P, b)` compose as `(P2, b2) ∘ (P1, b1) = (P2 P1, P2 b1 ^ b2)`,
+which is **associative** (matrix multiplication is associative and the offsets
+compose accordingly). Hence the scan `out[k] = block[k-1] ∘ out[k-1]`, `out[0] = id`,
+gives `out[k].apply(x_0) = x_{kD}` — each block's exact machine state at position
+`k·D`.
+
+**Proof (byte-exactness).** `block_summary(r)` computes `b_{i,D}` with the machine's
+own recurrence (the state reached from `0` consuming the block) and `A^D` by
+square-and-multiply; the scan yields every block's incoming transform exactly. For
+machine 1 the cursor *is* the position (`p_i = i`, `docs/DESIGN.md` §1), so
+`(x_{kD}, kD)` is a complete resumable state and each worker decodes its block with
+the machine's own `reveal`; concatenating the blocks reproduces `NL2::decode`
+byte-for-byte. ∎
+
+**Corroboration (regimes).** On a 4 MiB core the parallel block decode reaches
+**4.36 GB/s (1.18 cyc/B)** vs the scalar recurrence's **0.50 GB/s (10.34 cyc/B)** —
+**8.7×** on 8 threads; `state_at_via_prefix` answers an exact positional state in
+**110 ns** vs **765,331 ns** replaying from genesis (**6,958×**). The honest limits
+are stated in `docs/PREFIX.md`: the block-summary build is a serial pass of the same
+order as the decode, so an end-to-end two-pass pipeline nets only ≈1.4× on 4 MiB and
+**loses 5–9× on inputs ≤ 64 KiB**; oversubscription beyond the core count is slower.
+
+**Tested:** `tests/prefix.rs` (`LinMap`/`Affine` against a bit-matrix reference,
+`apply` linearity, `compose`/`power`, `Affine` associativity, `block_summary`
+against repeated machine steps, `prefix_scan` against the state log,
+`reconstruct_blocks` against `NL2::decode` for every thread count); independently
+attacked in `docs/reviews/adversarial.md` (Revision 3).
+
+---
+
+## P12. Packed 16-bit restart/history storage is exact for machine 1 — **PROVED** (semantics), **EMPIRICALLY OBSERVED** (sizes / latency)
+
+**Claim.** For machine 1, every state `x_i` is exactly a `u16` and the cursor equals
+the position, so `PackedHistory` (`u16` `x_0..=x_N`) and `PackedRestarts` (a `u16`
+restart grid at `stride = 1 << stride_shift`) store the complete resumable states
+with **no information loss**; `state_at`/`snapshot_at` reproduce the authoritative
+state log, and `state_from_hot` reconstructs `x_i` from a manifested output surface.
+
+**Proof.** By P2, `x_i = (s_{i-2} << 8) | s_{i-1}` for `i ≥ 2` (and `x_0 = 0`,
+`x_1 = s_0`), so `x_i` is a 16-bit value — a `u16` holds it exactly. For machine 1
+the backing cursor is the logical position (`p_i = i`), so a complete resumable state
+at position `i` is fully described by `x_i` given `i`; the wire header carries
+`logical_len` (and the stride shift for restarts), so `i` is recovered and
+`Omega_i = (x_i, i)`. `state_from_hot(hot, i) = hot[i-2] << 8 | hot[i-1] =
+(s_{i-2} << 8) | s_{i-1} = x_i` by P2. `from_bytes` validates the header
+(truncation, trailing bytes, reserved bytes, stride range), so a malformed packed
+image is a clean error. ∎
+
+**Scope (proved boundary).** Packed-by-position is a *machine-1 property*: for a
+cursor-divergent machine (`OrANS-RANS0`, machine 2) the cursor is independent of the
+position, so a state alone does not resume and packed-by-position does not apply.
+
+**Corroboration.** Complete restarts are exactly **1/6** the bytes (2 B vs 12 B) and
+the full history exactly **1/2** (`u16` vs `u32`) at every `K` and corpus size, at
+equal-or-better positional latency (smaller restart grid ⇒ less cache pressure), and
+a one-byte-per-position budget buys **6× denser** restarts (0.5 vs 5.5 average
+replays). `state_from_hot` matched the state log for **all 1,048,577 positions (0
+mismatches)**. The existing `History`/`CheckpointSet`/wire formats are unchanged.
+
+**Tested:** `tests/packed.rs`,
+`src/packed.rs::machine1_structures_are_unaffected_by_packing`; fuzzed by
+`fuzz/fuzz_targets/fuzz_packed.rs`; reviewed in `docs/reviews/adversarial.md`
+(Revision 3).
+
+---
+
+## P13. Selective byte tiles are certified, byte-exact, persistent and tamper-rejecting — **PROVED** (by construction), **EMPIRICALLY OBSERVED** (latency vs bytes)
+
+**Claim.** Every materialised tile in a `TileSet` is the **authoritative machine
+decode** of its range (certified before publication); a read served from tiles is
+byte-exact (boundary-crossing requests are split at tile boundaries and
+concatenated); a tampered tile is rejected by `verify`/`verify_deep` at open and by
+re-certification against the core; and a `TILES` section persists a tile set so the
+file reader serves a fully-materialised range by bounded `pread` of the needed tiles.
+
+**Proof.** `manifest_hot_tiles` replays the machine from `Omega_0` over each tile's
+range and compares the revealed symbols to the tile bytes, aborting before
+publication on mismatch; hence any stored tile equals the authoritative decode. A
+read fragment inside a tile is a slice of an exact decode; requests crossing a tile
+boundary are split and concatenated, so the result is byte-exact. `verify`/
+`verify_deep` check the section `core_hash`, the content digest, **and** — separately
+from the digest — that each tile equals the authoritative machine decode, so a
+digest-consistent tamper still fails. The `TILES` writer embeds the serialized
+`TileSet` in the committed generation and `FileBody` keeps only offsets, serving a
+covered range with one `pread` per tile fragment, never loading the whole blob. ∎
+
+**Corroboration.** Under one 4 MiB corpus, one 64 KiB hot trace and the whole-object
+`P_32` budget, the 4 KiB radix tile set serves **80–110 ns hot p50** for **65,856 B**
+vs the shell's **80 ns** for **4,718,827 B** — **≈68–72× fewer added bytes** for the
+same hot latency. Honest limits (see P-limitations 10): the cold path is
+**replay-bound** and uniform access gains nothing.
+
+**Tested:** `tests/tiles.rs` (9 tests: boundary/empty/degenerate reads, byte-exact
+non-materialised reconstruction, directory lookups for both kinds, radix < flat when
+sparse, tamper rejection, budget no-fit no-op, additivity, power-of-two lookups,
+byte roundtrip); `tests/handles.rs` (persisted tile tamper at open and by
+machine-decode); `src/tiles.rs` unit tests; fuzzed by
+`fuzz/fuzz_targets/fuzz_tiles.rs`; `tile_shift` guard from `docs/reviews/security.md`
+Finding D (fixed, Regression `F6` in `docs/reviews/adversarial.md`).
+
+---
+
+## P14. The planner dispatches to certified paths with no search and is byte-exact — **PROVED** (dispatch + equality), **EMPIRICALLY OBSERVED** (candidate picks)
+
+**Claim.** `AccessPlan::plan` selects, for every region, a **certified** path (or the
+always-valid `CoreReplay` fallback); `Planner::read` performs an **O(1), search-free**
+dispatch (`path_for(offset) = regions[offset >> region_shift].path`); and `Planner::read`
+is **byte-exact** to `reader::read` for any request, including region-boundary
+crossings.
+
+**Proof.** `plan` evaluates the per-region candidates with a cost model and records
+the cheapest; the candidate set is restricted to structures that are
+`Certification::Certified` / exact-by-construction, and an uncovered region falls
+back to `CoreReplay`, which is always valid — so no region is ever dispatched to an
+uncertified or invented path. The dispatch is a single `match` on a pre-computed
+`Copy` enum reached by one shift and one index (no map, no loop, no search). Every
+`AccessPath` re-implements the identical primitive `reader::read` would choose
+(`read_via_checkpoint`/`_history`/`_machine`, the fast-path `hot` slice, or
+`TileSet::read`); a request spanning regions is split at boundaries and
+concatenated, so the output equals `reader::read`. ∎
+
+**Corroboration.** On a 4 MiB body (1 MiB tiled exactly + a `Sparse{K=64}`
+checkpoint remainder, no whole-object path bloom and no history — the planner *must*
+mix paths) all 64 regions use a certified path: **16 hot → `HotBytes`, 48 cold →
+`PackedRestart`**. The planner reads hot in **19 ns** (best fixed `HotBytes` 16 ns)
+and cold in **129 ns** (best fixed `PackedRestart` 230 ns; fixed `HotBytes` 6.3 ms).
+
+**Honest scope.** The planner is a certified-*dispatch* layer, not an authenticity
+boundary: a forged `Certified` label (or a forged `TileSet`) is trusted by
+`read`/`planner`; only `verify` and the opt-in `AUTH` mode disagree — the same
+*integrity-not-authenticity* boundary as Finding C/F2 in `docs/reviews/security.md`.
+
+**Tested:** `tests/court_planner.rs` (`plan_picks_certified_paths_only`,
+`dispatch_has_no_search`, `planner_matches_reader_byte_for_byte` across five
+profiles and eleven requests); reviewed in `docs/reviews/adversarial.md`
+(Revision 3).
+
+---
+
 ## Unresolved limitations (honest)
 
 1. **No certified universal 65,536-entry `T_4[x]` for the byte machine.** By P6
@@ -457,4 +613,19 @@ machine for machine 2, and that `machine_one_is_unaffected`.
    forger-chosen states. Only the opt-in keyed-MAC `AUTH` mode covers the whole
    file prefix (see `docs/SECURITY.md`); it has no anti-rollback and key
    management is the caller's. This is the same *integrity-not-authenticity*
-   model recorded in `docs/reviews/security.md` (Findings C / rev 2).
+   model recorded in `docs/reviews/security.md` (Findings C / rev 2), and it also
+   bounds P13/P14: a forged `TileSet` or `Certified` path-bloom label is trusted by
+   `read`/`planner`, and the planner is a certified-*dispatch* layer, not an
+   authenticity boundary.
+9. **The selective-tile cold path is replay-bound.** A `TileSet` holds no
+   checkpoint set, so a read whose tile is not materialised reconstructs by
+   replaying the machine from `Ω₀`: cold 1-byte p50 is **10.9–12.4 ms** for tiles
+   vs **40 ns** for the whole-object `P_32` surface. Tiles are a hot-read structure
+   (P13), not a whole-object substitute, and on uniformly random access the trace
+   names every tile so nothing is saved (`docs/TILES.md`).
+10. **FUSE passthrough and FUSE-over-`io_uring` are infeasible here.** The
+    reviewer's target — letting the kernel serve a fully materialised, logically
+    aligned output file via FUSE passthrough — is a recorded **non-result** in this
+    environment, as is FUSE-over-`io_uring`; the measured FUSE read-path cost is
+    committed in `evidence/bench/fuse-perf.json` and the findings are stated
+    verbatim in `docs/FUSE.md`.

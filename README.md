@@ -19,7 +19,7 @@ binary (`ekbloom`). The frozen internal contract is `docs/DESIGN.md`; the
 original specification lives in `research/`.
 
 **Honest headline findings** (all measured; see `docs/RESULTS.md`, `docs/BASELINES.md`,
-`docs/COMPETITIVE.md`):
+`docs/COMPETITIVE.md`, and the per-phase docs linked below):
 
 1. **Speed vs replay: large.** The exact path bloom turns reads into memory
    movement — ≈123× sequential throughput and ≈57,000× lower single-byte latency
@@ -42,6 +42,35 @@ original specification lives in `research/`.
 5. **io_uring is genuine but slower here.** A real completion-driven backend was
    built and run (`seccomp=unconfined`); for a ~1 MiB publication it measured
    ≈2.2–2.3× **slower** than the synchronous writer (`docs/ASYNC.md`).
+6. **Parallel-prefix reconstruction is real, with an honest asterisk.** The
+   `OrANS-NL2` step is *affine over GF(2)*, so blocks compose associatively and one
+   prefix scan yields every block's start state. Decode-only this is **8.7×**
+   faster (4.36 vs 0.50 GB/s on 8 threads) and `state_at_via_prefix` is **6,958×**
+   faster than replay-from-genesis — but the serial block-summary build costs about
+   as much as the decode it accelerates, so an end-to-end two-pass pipeline nets
+   only ≈1.4× on 4 MiB and **loses 5–9× on short inputs** (`docs/PREFIX.md`).
+7. **Packed 16-bit restart/history is an exact, free space win.** For machine 1 the
+   state is a `u16`, so complete restarts shrink to **1/6** and the full history to
+   **1/2**, at equal-or-better latency, with no change to any existing format
+   (`docs/PACKED.md`).
+8. **Selective hot tiles match whole-object hot latency for ≈68–72× fewer added
+   bytes.** Exact, independently certified byte tiles materialise only where the
+   trace is hot: 80–110 ns hot p50 at **65,792–69,632 B** vs the whole-object
+   `P_32` shell's 80 ns at **4,718,827 B** — but the cold path is replay-bound
+   (~11 ms) and uniform access gains nothing (`docs/TILES.md`).
+9. **Persistent verified handles: ~3,400× over reopen + reparse, lock-free.** A
+   validated `OpenObject` serves a 1-byte read in **120 ns** vs ~413 µs for
+   `open`+`read`, and RCU-style generation publication means readers never block on
+   the publisher (`docs/HANDLES.md`).
+10. **io_uring is a batched cold-I/O win, not a hot-read win.** The hybrid reader
+    keeps single/hot reads on plain `pread` and sends only batched cold reads
+    through the ring: **7.02×** the `pread` loop at 4 KiB / depth 64, but parity
+    (0.97–1.01×) at depth 1 (`docs/IOURING.md`).
+11. **No hot-read win vs raw, restated by the court — and machine 2 still gives
+    `V < N`.** The rigorous court reproduces `raw-vec` winning the latency axis
+    (3 ns) while `ekbloom-path32` wins throughput, and `planner-hotcold` is
+    dominated on uniform workloads; machine 2 compresses skewed sources to
+    `V/N = 0.511×` (`docs/COURT.md`, `docs/PLANNER.md`, `docs/CODEC.md`).
 
 ---
 
@@ -397,6 +426,97 @@ publication and pays submit/completion round-trips. See
 
 ---
 
+## Research phases (v0.3): reconstruction, packing, tiles, handles, court & planner
+
+The 0.3 round is organised around a **three-role separation**: *machine semantics*
+(`src/machine.rs`), the *manifestation engine* (exact certified structures), and an
+*execution planner* (`src/planner.rs`) that is the only impure part. The phases
+below are each documented, implemented, measured and independently reviewed; every
+number is read from committed evidence.
+
+### Parallel-prefix reconstruction (`docs/PREFIX.md`)
+
+`OrANS-NL2`'s one-step transition is **affine over GF(2)**: with
+`x' = A x ^ B r`, a `D`-byte block is an affine map, blocks compose**associatively**,
+and a single prefix scan (`out[k] = block[k-1] ∘ out[k-1]`) turns `ceil(n/D)`
+independent summaries into every block's exact start state, so blocks decode
+independently and byte-exactly in parallel. Decode-only reaches **4.36 GB/s (1.18
+cyc/B)** vs the scalar 0.50 GB/s (10.34 cyc/B) — **8.7×** on 8 threads (16 threads
+oversubscribe the 8-CPU cap and are slower). `state_at_via_prefix` answers an exact
+positional state in **110 ns** vs **765,331 ns** replaying from genesis (**6,958×**)
+for `18·ceil(n/D)` summary bytes. The honest limits: the block-summary build is a
+serial pass of the same order as the decode, so naive two-pass nets only ≈1.4× on
+4 MiB and **loses 5–9×** on inputs ≤ 64 KiB; it pays only when summaries are a
+persisted structure or the summary build is itself parallelised.
+
+### Packed 16-bit restart/history (`docs/PACKED.md`)
+
+For machine 1 every state is exactly a `u16` and the cursor equals the position, so
+complete restarts pack to **2 bytes** (vs 12) and the full history to `u16` (vs
+`u32`): **1/6** and **1/2** the bytes, exactly, at every `K` and corpus size. The
+smaller restart grid is also a little *faster* (2-byte entries ⇒ ~8× less cache
+pressure); a one-byte-per-position budget buys **6× denser** restarts (0.5 vs 5.5
+average replays). `state_from_hot` reconstructs `x_i` from an existing manifested
+output surface with **0 mismatches**, so no separate state array is needed. Scope is
+explicit: it is a *machine-1 property*; cursor-divergent machine 2 is rejected/N/A.
+No existing format changes (`machine1_structures_are_unaffected_by_packing`).
+
+### Selective hot tiles (`docs/TILES.md`)
+
+A `TileSet` materialises **exact** power-of-two byte tiles only where an access
+trace is hot, with a `Flat` or `TwoLevelRadix` directory. Each tile is certified
+against the authoritative machine decode **before** publication and is additive /
+budget-bounded. Under one 4 MiB corpus, one 64 KiB hot trace and the same budget the
+whole-object `P_32` shell consumes, the 4 KiB radix tile set serves **80–110 ns hot
+p50** for **65,856 B** total vs the shell's **80 ns** for **4,718,827 B** — **≈72×
+fewer added bytes** for the same hot latency, and ≈725× faster than the previous
+regional transition table. Honest limits: no checkpoint set, so cold/non-materialised
+reads replay from genesis (10.9–12.4 ms), and uniformly random access names every
+tile (no win). Tiles **persist** as a `TILES` section and are verified like every
+other structure.
+
+### Persistent verified handles + RCU publication (`docs/HANDLES.md`)
+
+`OpenObject::open` parses and validates a generation **once**; `read` takes `&self`
+— no re-open, no re-parse, **no lock**. A cached handle serves a 1-byte read in
+**120 ns** and a 4 KiB read in **201 ns**, versus **~413–424 µs** for reopen +
+reparse (**~3,400× / ~2,100×**). `ObjectCache` publishes a new generation by
+building a fresh `OpenObject` privately and swapping the `Arc` (RCU-style), so
+readers holding an older snapshot never tear and never block on the publisher (p50
+is flat with and without background construction). Persisted tiles cost exactly one
+bounded `pread` per request (310 ns vs 100 ns in-memory); `OrFs::read` routes through
+the cache and no longer takes the namespace index mutex.
+
+### io_uring hybrid read path (`docs/IOURING.md`)
+
+The reviewer's warning is the design premise: a ring is **not** automatically
+faster. `read_direct` keeps single/hot reads on a plain `pread` (structurally
+asserted: 64 single reads submit nothing to the ring), while `read_batch` submits
+one owned-buffer `IORING_OP_READ` SQE per request for *batched cold* reads, with a
+byte-identical `pread` fallback and `O_DIRECT` for genuine coldness. Measured:
+**7.02×** the `pread` loop at 4 KiB / depth 64 (496,278 vs 70,706 IOPS; p50 2.0 vs
+14.1 µs), **2.88×** at 64 KiB and **1.58×** at 1 MiB, but **0.97–1.01×** (parity or
+worse) at depth 1, and far behind a warm cached handle (2.0 µs vs 0.27 µs). The
+publication backend remains the slower path for small single-file writes
+(`docs/ASYNC.md`).
+
+### Court + certified planner (`docs/COURT.md`, `docs/PLANNER.md`)
+
+The **court** measures candidates with interleaved, seed-randomised repetitions,
+pooled per-operation distributions with bootstrap 95% CIs, batch-timed sub-100 ns
+ops, and a raw direct-access baseline at identical residency for every workload —
+then reports a 3-D Pareto frontier (latency ↓, throughput ↑, efficiency ↑) without
+collapsing it to a single score. On uniform workloads `raw-vec` and `ekbloom-path32`
+are both on the frontier and do not dominate each other; `planner-hotcold` is
+dominated. The **planner** does its expensive work offline (`AccessPlan::plan`) and
+serves every read through a tiny immutable dispatch (`path_for(offset) = regions[offset
+>> region_shift].path`, a shift + index with **no search, no lock**), choosing only
+**certified** paths (`HotBytes`, `PackedRestart`, `AffineBlock`, `CoreReplay`) and
+matching `reader::read` byte-for-byte on a mixed hot/cold 4 MiB body (hot 19 ns vs
+best fixed 16 ns; cold 129 ns vs fixed restart 230 ns and fixed hot 6.3 ms).
+
+---
+
 ## Layout / SIMD experiments and concurrency
 
 Five layout/SIMD experiments were implemented, measured and decided; **four were
@@ -453,13 +573,22 @@ sh scripts/run-baselines.sh         # evidence/bench/baselines.json (conventiona
 sh scripts/run-competitive.sh       # evidence/bench/competitive.json (vs LRU/raw)
 sh scripts/container-perf.sh        # evidence/bench/perf.json (hardware counters)
 sh scripts/container-async-io.sh    # evidence/bench/io-uring.json (seccomp=unconfined)
+sh scripts/run-io.sh                # evidence/bench/io-batch.json (io_uring hybrid read path)
+sh scripts/run-prefix.sh            # evidence/bench/prefix.json (parallel-prefix reconstruction)
+sh scripts/run-packed.sh            # evidence/bench/packed.json (packed restarts/history)
+sh scripts/run-tiles.sh             # evidence/bench/tiles.json (selective hot tiles)
+sh scripts/run-handles.sh           # evidence/bench/handles.json (handles + RCU + persisted tiles)
+sh scripts/run-court.sh             # evidence/bench/{court,planner}.json (court + planner)
+sh scripts/run-fuse-perf.sh         # evidence/bench/fuse-perf.json (requires /dev/fuse)
 sh scripts/container-loom.sh        # Loom model checking (tests/loom.rs)
 sh scripts/container-reproduce.sh   # clean build + tests from scratch
 sh scripts/capture-environment.sh   # write evidence/environment.txt
 ```
 
 Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
-(libFuzzer), `scripts/container-miri.sh` (UB), `scripts/container-sanitize.sh`
+(libFuzzer — runs **every** target declared in `fuzz/Cargo.toml`:
+`fuzz_machine`, `fuzz_open`, `fuzz_bloom`, `fuzz_history_store`, `fuzz_packed`,
+`fuzz_tiles`), `scripts/container-miri.sh` (UB), `scripts/container-sanitize.sh`
 (AddressSanitizer), and `scripts/container-fuse.sh` (read-only FUSE mount).
 
 ### Verified tooling
@@ -497,6 +626,19 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 - **SIMD/CPU tuning did not win.** Alignment, software prefetch, AVX-512 gather
   and AVX2 gather all measured neutral or slower; the hot path stays scalar
   (`docs/LAYOUT.md`).
+- **Parallel-prefix reconstruction is construction-bound.** The affine/associative
+  structure gives an 8.7× decode-only and a 6,958× positional win, but the serial
+  block-summary build costs about as much as the decode it accelerates: an
+  end-to-end two-pass pipeline nets only ≈1.4× on 4 MiB and **loses 5–9×** on
+  inputs ≤ 64 KiB (`docs/PREFIX.md`).
+- **Tiles are a hot-read structure, not a whole-object substitute.** A `TileSet`
+  holds no checkpoint set, so cold/non-materialised reads replay from genesis
+  (10.9–12.4 ms), and uniformly random access names every tile (`docs/TILES.md`).
+- **Packed restart/history forms are machine-1 only.** They rely on
+  `cursor == position`; cursor-divergent machine 2 is rejected/N/A (`docs/PACKED.md`).
+- **FUSE passthrough and FUSE-over-`io_uring` are infeasible here.** The target of
+  serving a fully materialised, logically aligned file via kernel passthrough is a
+  recorded non-result (`docs/FUSE.md`, `evidence/bench/fuse-perf.json`).
 - **io_uring is slower here for small single-file writes** (~2.2×, median
   416,158 vs 189,884 ns over 15 publications for a ~1 MiB body); its value is a
   genuine completion-driven API and transparent fallback, not throughput. It is
@@ -526,6 +668,14 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 - `evidence/bench/baselines.json` — conventional direct-access baselines.
 - `evidence/bench/competitive.json` — region-scoped manifestation vs LRU/raw.
 - `evidence/bench/io-uring.json` — the async publication measurement.
+- `evidence/bench/prefix.json` — parallel-prefix reconstruction (8.7× decode, 6,958× positional).
+- `evidence/bench/packed.json` — packed 16-bit restarts/history (1/6 and 1/2 the bytes).
+- `evidence/bench/tiles.json` — selective hot tiles vs whole-object `P_32` and raw.
+- `evidence/bench/handles.json` — persistent handles, RCU concurrency, persisted tiles.
+- `evidence/bench/io-batch.json` — the `io_uring` batched-read hybrid vs `pread`.
+- `evidence/bench/court.json` — the rigorous performance court (distributions, 3-D Pareto).
+- `evidence/bench/planner.json` — the certified access planner vs each fixed path.
+- `evidence/bench/fuse-perf.json` — measured FUSE read-path cost and the passthrough non-result.
 - `evidence/counterexamples/` — rejected state-keyed blooms.
 - `evidence/model-search/` — finite-model sufficiency sweep.
 
@@ -536,7 +686,7 @@ Documentation map:
 | [`docs/INDEX.md`](docs/INDEX.md) | One-page index of all docs and evidence. |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Frozen internal engineering contract. |
 | [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | The 10 hard gates mapped to tests and commands. |
-| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties (machine 1 + machine 2) and honest limitations. |
+| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties P1–P14 (machine 1 + machine 2 + round-3 modules) and honest limitations. |
 | [`docs/RESULTS.md`](docs/RESULTS.md) | Measured results and the 65,536 research outcome. |
 | [`docs/CODEC.md`](docs/CODEC.md) | Machine 2 (`OrANS-RANS0`) compressing codec contract. |
 | [`docs/BASELINES.md`](docs/BASELINES.md) | Conventional baseline comparison (`RawVec`/`RawFile`/…). |
@@ -546,6 +696,13 @@ Documentation map:
 | [`docs/FUSE.md`](docs/FUSE.md) | Read-only FUSE projection of the OrFs namespace. |
 | [`docs/LAYOUT.md`](docs/LAYOUT.md) | Layout & SIMD experiments (§9/§23). |
 | [`docs/ADAPTIVE.md`](docs/ADAPTIVE.md) | Adaptive shells (O7), parallel readers (O8), memory tiers (O9). |
+| [`docs/PREFIX.md`](docs/PREFIX.md) | Parallel-prefix (affine/associative) reconstruction of the machine core. |
+| [`docs/PACKED.md`](docs/PACKED.md) | Packed 16-bit restart/history storage (machine 1). |
+| [`docs/TILES.md`](docs/TILES.md) | Selective certified hot-region byte tiles. |
+| [`docs/HANDLES.md`](docs/HANDLES.md) | Persistent verified handles + RCU publication, persisted tiles. |
+| [`docs/IOURING.md`](docs/IOURING.md) | The `io_uring` hybrid batched read path. |
+| [`docs/COURT.md`](docs/COURT.md) | The rigorous performance court (95% CIs, 3-D Pareto). |
+| [`docs/PLANNER.md`](docs/PLANNER.md) | The certified, search-free access planner. |
 | [`docs/reviews/adversarial.md`](docs/reviews/adversarial.md) | Adversarial correctness review. |
 | [`docs/reviews/concurrency.md`](docs/reviews/concurrency.md) | Concurrency audit + Loom model checking. |
 | [`docs/reviews/mathematics.md`](docs/reviews/mathematics.md) | Independent re-derivation of the proofs. |

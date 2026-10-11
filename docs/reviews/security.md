@@ -371,4 +371,91 @@ No attempt produced a corrupt or partially-published generation readable by
 all four targets PASS (`fuzz_machine`, `fuzz_open`, `fuzz_bloom`,
 `fuzz_history_store` @100k runs, cov 1121). **Verdict: SAFE — no memory-safety or
 durability defect found.**
+
+---
+
+## Revision 3 — `prefix`, `packed`, `tiles`, `handle`, `planner`, `court` (verdict **ONE DEFECT, FIXED**)
+
+Independent adversarial pass over the round-3 modules. Executable in
+`tests/adversarial_r2.rs` (11 tests), plus the new fuzz targets `fuzz_packed` and
+`fuzz_tiles`. Method: craft byte images and hostile files from the real writer's
+output, recompute section CRC-32 and commit-footer checksums where needed, and
+re-derive every claimed invariant against the authoritative machine.
+
+### Finding D (**Medium**, fixed) — `TileSet::from_bytes` trusted an out-of-range `tile_shift`
+
+| # | Severity | Location | Concrete input | Status |
+|---|---|---|---|---|
+| D | **Medium** | `src/tiles.rs:609` (`from_bytes`) | A `Tiles` section whose prefix byte 9 (`tile_shift`) is `>= 64` (also `0` or `31..=63`) over an otherwise well-formed payload | **Fixed** |
+
+`reader::open_bytes` reaches `TileSet::from_bytes` directly (`src/reader.rs:219`)
+for the in-memory path. `from_bytes` read `tile_shift` and immediately computed
+`logical_len.div_ceil(1u64 << tile_shift)` **without** the range check that its
+sibling `parse_tile_set_prefix` (and `to_bytes`' provenance) enforce. A crafted
+section with `tile_shift >= 64` therefore aborted a debug build with `attempt to
+shift left with overflow` — a reachable panic from `open_bytes`/`open` on hostile
+input (the file is a valid commit; the section CRC is attacker-recomputable).
+Shifts `0` and `31..=63` were silently *accepted*, contradicting the module's
+`1..=MAX_TILE_SHIFT` (30) contract and the `u32` directory-offset domain.
+
+**Why the file-backed path was safe.** `FileBody::open` parses via
+`parse_tiles`, which calls `parse_tile_set_prefix` and rejects the shift — so the
+bug was an asymmetry between the two readers, exactly the kind an attacker
+reaches through `open_bytes`/`reader::open` (both of which use the in-memory path).
+
+**Fix (`src/tiles.rs`, 3 lines).** After reading `tile_shift`:
+`if tile_shift == 0 || tile_shift > MAX_TILE_SHIFT { return Err(bad(...)); }`,
+mirroring `parse_tile_set_prefix`.
+
+**Failing-then-passing evidence.** `tile_set_from_bytes_rejects_out_of_range_shift`
+(unit) and `persisted_out_of_range_tile_shift_is_rejected_not_panicked`
+(end-to-end: mutate `body.tiles[0].tile_shift`, `write_body`, then `open_bytes`).
+Confirmed to fail at `src/tiles.rs:635` (`attempt to shift left with overflow`)
+with the guard removed, and to pass with it restored.
+
+### Attacks that held
+
+* **`prefix` affine claim.** `block_summary` / `prefix_scan` / `reconstruct_blocks`
+  / `state_at_via_prefix` equal the authoritative machine for empty, all-zero,
+  all-`0xFF`, 1-byte, and block-size-non-dividing corpora; `LinMap::compose`/
+  `power` equal the direct bit-matrix action over the whole 16-bit domain and are
+  associative on random triples; `power(a)∘power(b) == power(a+b)`.
+* **`packed` exactness.** `PackedRestarts::snapshot_at` and `PackedHistory` equal
+  `state_log` exactly for every position and stride `0..=63`; crafted/truncated
+  bytes (including `logical_len = u64::MAX`) are clean `Err`s with no
+  attacker-sized allocation; `state_from_hot` is exact exactly when covered. The
+  `u16` assumption is a **type invariant** and cannot be violated by parsing.
+* **`tiles` persistence.** Tampering the tile blob with the section CRC-32 **and**
+  footer checksum recomputed is rejected (content-digest mismatch) at `open`/
+  `FileBody`/`OpenObject`; `verify` re-derives against the machine. Boundary-crossing
+  reads, empty/1-byte sets and shifts `1..=14` are byte-exact. `TwoLevelRadix`
+  with empty middle groups is correct (both before and after the fix).
+* **Budget cap.** 2 kinds x 6 allowances (incl. 0 and `u64::MAX`):
+  `after_physical_bytes <= cap`, `after == before + added`, and a no-fit call is
+  byte-for-byte inert with no generation bump.
+* **`handle`.** An appended generation is re-validated (fresh `Arc`, newer
+  generation); a held snapshot keeps reading its immutable bytes while appends and
+  4 reader threads run (no torn read).
+* **`planner`.** `read` is byte-exact to `reader::read` across tile/region/
+  checkpoint boundaries, 0-length and whole-object requests; `all_certified()`
+  holds; `path_for` is the flat `offset >> region_shift` index (no search).
+* **`court`.** 0 reps, empty candidate lists, `working_set = 0`, and a working set
+  smaller than the request all return without panic; empty reports serialise to
+  valid JSON; `n = 1` collapses the bootstrap CI to the sample.
+
+### Residual risk (Revision 3)
+
+* A persisted `TileSet` is integrity-checked, not authenticated: a forger who
+  recomputes the content digest and the digests linkage authors a different valid
+  object (same non-authenticity model as Findings C/F2; only opt-in `AUTH`
+  covers it). This includes the `planner`'s `TileSet` path and `read`'s
+  `Certified` path-bloom label: both trust in-file verdicts, so the planner is a
+  *performance* dispatch over certified structures, not an authenticity boundary.
+* The `planner` does not re-derive a checkpoint's validity before selecting
+  `PackedRestart`; on a hostile body a `restore_with` failure surfaces as `Err`
+  rather than falling back to replay (reader parity holds for valid bodies, which
+  is what the planner contract promises).
+* `scripts/container-fuzz.sh` now lists the whole fuzz surface and runs **all
+  six** targets, including `fuzz_packed` and `fuzz_tiles` (verified: 40,000 runs
+  each, no crash artifacts).
  

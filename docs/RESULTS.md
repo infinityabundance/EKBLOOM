@@ -21,7 +21,7 @@ Captured by `scripts/capture-environment.sh` into
 - **toolchain** `rustc 1.99.0 (b940084d7 2026-09-28)`, `cargo 1.99.0`,
   host `x86_64-unknown-linux-gnu`;
 - **host** AMD Ryzen 7 9800X3D, `nproc 16`, kernel `7.2.9-2-cachyos`;
-- **source** `Cargo.lock` sha256 `64b1b4f1…`, git HEAD `e624b98d…`;
+- **source** `Cargo.lock` sha256 `64b1b4f1…`, git HEAD `cf5754ee…`;
 - **nightly harness image** `rustlang/rust:nightly-bookworm-slim@sha256:2fe113dd…`.
 
 Detected CPU features for the sweep (`evidence/bench/cpu.json`): `sse2`, `avx2`,
@@ -329,6 +329,33 @@ creates a fresh ring per publication and pays submit/completion round-trips the
 plain `write`+`fsync` path does not. `docs/ASYNC.md` reports these exact committed
 medians. The backend's value is the genuine completion-driven API, owned-buffer
 handling, and transparent fallback — not throughput for small single-file writes.
+
+---
+
+## Research phases (v0.3 additions)
+
+Seven later artifacts measure the round-3 modules. Each is read from its committed
+`evidence/bench/*.json` and detailed in its own doc; the numbers below are the
+headline rows, not a substitute for those docs.
+
+| Phase | Headline measured result | Doc | Evidence |
+|---|---|---|---|
+| Parallel-prefix reconstruction | decode **4.36 vs 0.50 GB/s** (8.7×, 8 threads); `state_at_via_prefix` **110 ns vs 765,331 ns** (6,958×); two-pass loses 5–9× on ≤ 64 KiB | [`PREFIX.md`](PREFIX.md) | `prefix.json` |
+| Packed 16-bit restarts/history | restarts **1/6** (2 B vs 12 B), history **1/2** (`u16` vs `u32`), equal-or-better latency; 6× denser restarts; `state_from_hot` 0/1,048,577 mismatches | [`PACKED.md`](PACKED.md) | `packed.json` |
+| Selective hot tiles | 4 KiB radix tiles **80–110 ns** hot p50 for **65,856 B** vs whole-object `P_32` **80 ns** for **4,718,827 B** (≈72× fewer added bytes); cold replay-bound (~11 ms) | [`TILES.md`](TILES.md) | `tiles.json` |
+| Persistent verified handles | cached 1 B / 4 KiB read **120 / 201 ns** vs reopen+reparse **~413 / ~424 µs** (~3,400× / ~2,100×); flat p50 under background publication | [`HANDLES.md`](HANDLES.md) | `handles.json` |
+| io_uring hybrid read path | batched cold read **7.02×** `pread` at 4 KiB / depth 64; **0.97–1.01×** at depth 1; single reads never touch the ring | [`IOURING.md`](IOURING.md) | `io-batch.json` |
+| Performance court | `raw-vec` 3 ns vs `ekbloom-path32` 8–9 ns random-1b; path wins throughput (42 vs 19 GB/s at 1 MiB); 3-D Pareto per working set | [`COURT.md`](COURT.md) | `court.json` |
+| Certified planner | 16 hot regions → `HotBytes`, 48 cold → `PackedRestart`; hot **19 ns**, cold **129 ns**; byte-exact to `reader::read` | [`PLANNER.md`](PLANNER.md) | `planner.json` |
+| FUSE read path | measured FUSE overhead vs a direct read, and the passthrough / FUSE-over-io_uring **non-result** | [`FUSE.md`](FUSE.md) | `fuse-perf.json` |
+
+**Honest reading.** These phases add *capabilities* and one exact space win
+(packing), not a new hot-read speed ceiling: the court restates that `raw-vec` wins
+the latency axis and the path bloom wins throughput, and the machine-2 `V < N` win
+remains the only bytes win (see the baseline and machine-2 sections above). The
+prefix decode win is genuine but construction-bound (P11); tiles trade cold access
+for hot (P13); the io_uring win is batched-cold-only ([`IOURING.md`](IOURING.md)).
+Their proved/observed properties are P11–P14 in [`PROOFS.md`](PROOFS.md).
 
 ---
 

@@ -607,6 +607,14 @@ impl TileSet {
             return Err(bad(format!("unsupported tile set version {version}")));
         }
         let tile_shift = cur.u8()?;
+        // Mirror `parse_tile_set_prefix`: an untrusted `tile_shift` outside
+        // `1..=MAX_TILE_SHIFT` is rejected here. Without this guard a crafted
+        // section with `tile_shift >= 64` made `1u64 << tile_shift` below panic
+        // (`attempt to shift left with overflow`) in a debug build, i.e. a
+        // reachable abort from `reader::open_bytes` on hostile input.
+        if tile_shift == 0 || tile_shift > MAX_TILE_SHIFT {
+            return Err(bad(format!("tile shift {tile_shift} out of range")));
+        }
         let kind = DirectoryKind::from_code(cur.u8()?)
             .ok_or_else(|| bad("unknown tile directory kind"))?;
         let _reserved = cur.u8()?;

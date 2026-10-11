@@ -11,7 +11,7 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 |---|---|
 | [`DESIGN.md`](DESIGN.md) | **Frozen engineering contract** — machine semantics, state log, blooms, data model, `.ekb` wire layout, module interfaces. |
 | [`ACCEPTANCE.md`](ACCEPTANCE.md) | The **10 hard acceptance gates**, each mapped to its implementing module, artifact and exact reproduction command, plus additional evidence. |
-| [`PROOFS.md`](PROOFS.md) | **Proved properties P1–P10** (machine 1 + machine 2, tagged PROVED / EMPIRICALLY OBSERVED) and the honest unresolved limitations. |
+| [`PROOFS.md`](PROOFS.md) | **Proved properties P1–P14** (machine 1 + machine 2 + the round-3 modules, tagged PROVED / EMPIRICALLY OBSERVED) and the honest unresolved limitations. |
 | [`RESULTS.md`](RESULTS.md) | **Measured results** — the speed-vs-space frontier, budget frontier, curves, hardware counters, machine 2, baselines, the cache competition, and the 65,536-entry `T_4[x]` research outcome. |
 | [`CODEC.md`](CODEC.md) | **Machine 2** (`OrANS-RANS0`): the static order-0 range-ANS compressing machine (`V < N` on skewed data). |
 | [`BASELINES.md`](BASELINES.md) | **Conventional baseline comparison** (`RawVec`/`RawFile`/`Predecoded`/`IndexedArray`) plus machine 2 vs `raw`. |
@@ -21,13 +21,20 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`FUSE.md`](FUSE.md) | The **read-only FUSE projection** of the in-process `OrFs` namespace (opt-in `fuse` feature). |
 | [`LAYOUT.md`](LAYOUT.md) | **Layout & SIMD experiments** (§9/§23): five implemented, measured keep/reject decisions. |
 | [`ADAPTIVE.md`](ADAPTIVE.md) | **Adaptive shells (O7), parallel different-shell readers (O8), memory tiers (O9)**. |
+| [`PREFIX.md`](PREFIX.md) | **Parallel-prefix reconstruction** of the `OrANS-NL2` core (affine block composition + associative prefix scan). |
+| [`PACKED.md`](PACKED.md) | **Packed 16-bit restart/history storage** (machine 1): 1/6 and 1/2 the bytes. |
+| [`TILES.md`](TILES.md) | **Selective certified hot-region byte tiles** vs whole-object `P_32`. |
+| [`HANDLES.md`](HANDLES.md) | **Persistent verified handles + RCU publication**, persisted (`TILES`) sections. |
+| [`IOURING.md`](IOURING.md) | The **`io_uring` hybrid batched read path** (`HybridReader`) plus the publication backend. |
+| [`COURT.md`](COURT.md) | The **rigorous performance court**: interleaved reps, bootstrap 95% CIs, 3-D Pareto frontier. |
+| [`PLANNER.md`](PLANNER.md) | The **certified, search-free access planner** (`§14` three-role separation). |
 | [`INDEX.md`](INDEX.md) | This file. |
 
 ## Independent reviews (`docs/reviews/`)
 
 | Review | One line |
 |---|---|
-| [`reviews/adversarial.md`](reviews/adversarial.md) | Try-to-break-correctness pass: 15 tests + a rev-2 segmented/budget/adaptive pass; fixes and residuals. |
+| [`reviews/adversarial.md`](reviews/adversarial.md) | Try-to-break-correctness pass: 15 tests, a rev-2 segmented/budget/adaptive pass, and a rev-3 `prefix`/`packed`/`tiles`/`handle`/`planner`/`court` pass (11 tests + `fuzz_packed`/`fuzz_tiles`). |
 | [`reviews/concurrency.md`](reviews/concurrency.md) | Concurrency audit + **Loom** model checking of the `OrFs` index critical section. |
 | [`reviews/mathematics.md`](reviews/mathematics.md) | Independent re-derivation of P1–P6; only defect is a wording clause (benign). |
 | [`reviews/performance.md`](reviews/performance.md) | Locality & SIMD investigation of the certified path-bloom hot path. |
@@ -50,6 +57,14 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`bench/baselines.json`](../evidence/bench/baselines.json) | Conventional direct-access baselines vs the `Root`/`Path{D=4}`/`Full` profiles. |
 | [`bench/competitive.json`](../evidence/bench/competitive.json) | Region-scoped manifestation vs an LRU cache vs raw, under one corpus/trace/budget. |
 | [`bench/io-uring.json`](../evidence/bench/io-uring.json) | The `io_uring` publication measurement (usable, byte-identical, and its wall-clock). |
+| [`bench/prefix.json`](../evidence/bench/prefix.json) | Parallel-prefix reconstruction: block/thread strategies, construction cost, short-input warning, `state_at_via_prefix` vs replay. |
+| [`bench/packed.json`](../evidence/bench/packed.json) | Packed 16-bit restarts/history vs existing forms: bytes, positional latency, locality, `state_from_hot`. |
+| [`bench/tiles.json`](../evidence/bench/tiles.json) | Selective hot tiles (1/4/16/64 KiB, flat/radix) vs whole-object `P_32`, regional, and raw baselines. |
+| [`bench/handles.json`](../evidence/bench/handles.json) | Cached handle vs reopen/reparse, concurrent readers under publication, persisted-tile `pread` cost. |
+| [`bench/io-batch.json`](../evidence/bench/io-batch.json) | The `io_uring` batch path vs a serial `pread` loop and the cached handle, by size and depth. |
+| [`bench/court.json`](../evidence/bench/court.json) | The performance court: 152 rows of distributions/95% CIs and the per-working-set 3-D Pareto frontier. |
+| [`bench/planner.json`](../evidence/bench/planner.json) | The planner's chosen-path distribution and latency vs each fixed path on a mixed hot/cold body. |
+| [`bench/fuse-perf.json`](../evidence/bench/fuse-perf.json) | Measured FUSE read-path cost vs a direct read and the `FUSE` passthrough / `FUSE`-over-`io_uring` non-result. |
 | [`counterexamples/bloom-key-0001.json`](../evidence/counterexamples/bloom-key-0001.json) | The rejected universal `T_4[x]` witness (key `175`, two equal-state/different-outcome positions). |
 | [`model-search/model-search-sweep.json`](../evidence/model-search/model-search-sweep.json) | The `D = 4` finite-model sufficiency sweep (`k = 0..4` conflicts `64/256/1024/4096/0`). |
 
@@ -63,7 +78,15 @@ sh scripts/run-large-history.sh     # history-2p30.json
 sh scripts/run-baselines.sh         # baselines.json
 sh scripts/run-competitive.sh       # competitive.json
 sh scripts/container-perf.sh        # perf.json
-sh scripts/container-async-io.sh    # io-uring.json (seccomp=unconfined)
+sh scripts/container-async-io.sh    # io-uring.json (seccomp=unconfined); also probes + tests/io_batch
+sh scripts/run-io.sh                # io-batch.json (seccomp=unconfined)
+sh scripts/run-prefix.sh            # prefix.json
+sh scripts/run-packed.sh            # packed.json
+sh scripts/run-tiles.sh             # tiles.json
+sh scripts/run-handles.sh           # handles.json
+sh scripts/run-court.sh             # court.json + planner.json
+sh scripts/run-fuse-perf.sh         # fuse-perf.json (requires /dev/fuse)
+sh scripts/container-fuzz.sh        # all libFuzzer targets (fuzz_machine/open/bloom/history_store/packed/tiles)
 sh scripts/container-loom.sh        # Loom model checking
 sh scripts/capture-environment.sh   # environment.txt
 ```

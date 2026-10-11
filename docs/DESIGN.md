@@ -263,3 +263,69 @@ ekbloom bench    <file.ekb> --workload <seq|random-1b|rand-4k|range-64k|mixed>
 - Memory-capped (`--memory`), non-root where practical.
 - `evidence/` holds environment capture, counterexamples, benchmark JSON.
 - Acceptance gates: see `docs/ACCEPTANCE.md`.
+
+---
+
+## 9. Addenda (v0.3 research)
+
+This section is **additive**. It records the modules and interfaces added by the
+0.3 research round. It does **not** change the frozen machine contract in §1, the
+state-log/history semantics in §2, the bloom definitions in §3, the data model in
+§4 (except that new additive structures may be appended to a body), or the wire
+layout in §5 (except for one new section kind). Where an addendum and the frozen
+text could disagree, the frozen text wins.
+
+### 9.1 The three-role separation
+
+The round makes three distinct roles explicit; only the last is allowed to be impure
+(see [`docs/PLANNER.md`](PLANNER.md) §14):
+
+```text
+machine semantics   --  OrANS-NL2 / OrANS-RANS0 (src/machine.rs, src/machine_rans.rs): what a symbol is
+manifestation engine --  manifest / tiles / bloom_path / checkpoint / history / prefix / packed: certified structures
+ execution planner   --  src/planner.rs: which certified path serves each region, and dispatch
+```
+
+- *Machine semantics* is the frozen §1 contract: deterministic, exactly invertible,
+  expansion-only for machine 1. It is unchanged.
+- *Manifestation engine* builds the additive, certified structures (`V, L, T_D, R,
+  A`) described in §2–§4. Every structure is exact-by-construction or certified, and
+  each new structure is added as a new generation without altering earlier ones.
+- *Execution planner* performs the expensive choice **offline** and then serves every
+  read through a tiny immutable dispatch (`path_for(offset) = regions[offset >>
+  region_shift].path`) with no search, no per-read planning and no lock. It only ever
+  dispatches to a certified path and never invents one.
+
+### 9.2 New modules
+
+| Module | Role | Addendum | Doc |
+|---|---|---|---|
+| `src/prefix.rs` | manifestation / reconstruction | affine block composition + associative prefix scan over the §1 step; byte-exact parallel reconstruction | [`PREFIX.md`](PREFIX.md) |
+| `src/packed.rs` | manifestation | packed 16-bit restart/history forms for machine 1 (cursor == position) | [`PACKED.md`](PACKED.md) |
+| `src/tiles.rs` | manifestation | selective certified hot-region byte tiles (`Flat` / `TwoLevelRadix`) | [`TILES.md`](TILES.md) |
+| `src/handle.rs` | manifestation / reader | `OpenObject` + `ObjectCache`: validated generation, lock-free read, RCU-style publication | [`HANDLES.md`](HANDLES.md) |
+| `src/planner.rs` | execution planner | `AccessPath`, `AccessPlan::plan`, `Planner::read` (certified, search-free) | [`PLANNER.md`](PLANNER.md) |
+| `src/court.rs` | measurement | distributions + bootstrap CIs, interleaved reps, 3-D Pareto frontier | [`COURT.md`](COURT.md) |
+| `src/async_io.rs` (`HybridReader`) | reader | batched cold-read `io_uring` path; single/hot reads stay on `pread` | [`IOURING.md`](IOURING.md) |
+
+`src/prefix.rs` and `src/packed.rs` are *machine-1 properties*: `packed` relies on
+`p_i = i` (§1), and the prefix scan relies on the affine step of §1. Tiles and the
+planner are machine-general (they dispatch through `reader`/`machine` primitives).
+
+### 9.3 New wire section kind
+
+One section kind is added to §5: **`TILES` (wire code 12)**, carrying a serialized
+`tiles::TileSet` (geometry, directory, exact tile bytes, content digest, and the
+`core_hash` it was certified against). It is written as a new generation and parsed
+by `reader::FileBody` without loading the tile blob (bounded `pread`). It is
+logically part of the additive `A`/`R` family and follows the same
+payload -> manifest -> flush -> footer publication order; it does not change the
+meaning of any existing section. Every other section kind, the `GenesisHeader`, the
+`CommitFooter`, and the frozen recovery model are unchanged.
+
+### 9.4 Scope note
+
+These addenda were each implemented, measured and independently reviewed (see
+[`docs/reviews/adversarial.md`](reviews/adversarial.md) Revision 3 and
+[`docs/reviews/security.md`](reviews/security.md) Finding D). Their proved/observed
+properties are recorded as P11–P14 in [`docs/PROOFS.md`](PROOFS.md).

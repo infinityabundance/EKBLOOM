@@ -42,3 +42,17 @@ path = "fuzz_targets/fuzz_history_store.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_packed"
+path = "fuzz_targets/fuzz_packed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tiles"
+path = "fuzz_targets/fuzz_tiles.rs"
+test = false
+doc = false
+bench = false
