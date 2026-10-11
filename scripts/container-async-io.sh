@@ -50,7 +50,7 @@ run_backend() {
         -e EKB_IOURING_EVIDENCE="/work/$EVIDENCE_REL" \
         -e EKB_IOURING_CONTAINER_FLAGS="$recorded" \
         "$IMAGE" \
-        cargo test --features io-uring --test async_io -- --nocapture --test-threads=1
+        cargo test --features io-uring --test async_io --test io_batch -- --nocapture --test-threads=1
 }
 
 show_evidence() {
@@ -97,6 +97,12 @@ fi
 
 echo "== final evidence: $EVIDENCE_REL =="
 cat "$EVIDENCE_ABS" 2>/dev/null || echo "(no evidence file was written)"
+
+# Batched cold-read benchmark (io_uring batch vs pread loop vs the cached handle).
+# `run-io.sh` relaxes only seccomp and writes evidence/bench/io-batch.json.
+echo
+sh "$(dirname "$0")/run-io.sh" || \
+    echo "io-batch benchmark did not complete (see above); evidence may be partial"
 
 if [ "$usable" != "true" ]; then
     echo

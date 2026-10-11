@@ -1,0 +1,570 @@
+{
+  "io_uring_usable": true,
+  "ring_available": true,
+  "uncached_via": "O_DIRECT (buffer/offset/length aligned to 4096 B); cached_handle and in_memory_tile rows are warm"
+  "corpus_seed": 16938038201776218150,
+  "file_bytes": 67108864,
+  "tile_shift": 20,
+  "sizes_bytes": [4096, 65536, 1048576],
+  "queue_depths": [1, 4, 16, 32, 64],
+  "cache_probe": [
+    {
+      "size_bytes": 4096,
+      "page_cached_p50_ns": 131,
+      "o_direct_p50_ns": 23444
+    },
+    {
+      "size_bytes": 65536,
+      "page_cached_p50_ns": 702,
+      "o_direct_p50_ns": 45495
+    },
+    {
+      "size_bytes": 1048576,
+      "page_cached_p50_ns": 43181,
+      "o_direct_p50_ns": 448560
+    }
+  ],
+  "results": [
+    {
+      "size_bytes": 4096,
+      "queue_depth": 1,
+      "io_uring": {
+        "iops": 49855.4,
+        "wall_iops": 48818.2,
+        "gbps": 0.204,
+        "p50_ns": 20058,
+        "p99_ns": 41848,
+        "cpu_ns_per_op": 5803.9
+      },
+      "pread_loop": {
+        "iops": 51557.0,
+        "wall_iops": 48778.9,
+        "gbps": 0.211,
+        "p50_ns": 19396,
+        "p99_ns": 36488,
+        "cpu_ns_per_op": 5129.8
+      },
+      "cached_handle": {
+        "iops": 2770083.1,
+        "wall_iops": 2682997.2,
+        "gbps": 11.346,
+        "p50_ns": 361,
+        "p99_ns": 380,
+        "cpu_ns_per_op": 339.4
+      },
+      "in_memory_tile": {
+        "iops": 9900990.1,
+        "wall_iops": 8293765.2,
+        "gbps": 40.554,
+        "p50_ns": 101,
+        "p99_ns": 210,
+        "cpu_ns_per_op": 0.0
+      }
+    },
+    {
+      "size_bytes": 4096,
+      "queue_depth": 4,
+      "io_uring": {
+        "iops": 169837.0,
+        "wall_iops": 168317.8,
+        "gbps": 0.696,
+        "p50_ns": 5888,
+        "p99_ns": 8886,
+        "cpu_ns_per_op": 1691.1
+      },
+      "pread_loop": {
+        "iops": 67159.2,
+        "wall_iops": 61853.6,
+        "gbps": 0.275,
+        "p50_ns": 14890,
+        "p99_ns": 23985,
+        "cpu_ns_per_op": 2491.2
+      },
+      "cached_handle": {
+        "iops": 3194888.2,
+        "wall_iops": 3157051.5,
+        "gbps": 13.086,
+        "p50_ns": 313,
+        "p99_ns": 325,
+        "cpu_ns_per_op": 226.2
+      },
+      "in_memory_tile": {
+        "iops": 11111111.1,
+        "wall_iops": 10860416.5,
+        "gbps": 45.511,
+        "p50_ns": 90,
+        "p99_ns": 100,
+        "cpu_ns_per_op": 0.0
+      }
+    },
+    {
+      "size_bytes": 4096,
+      "queue_depth": 16,
+      "io_uring": {
+        "iops": 329706.6,
+        "wall_iops": 323284.0,
+        "gbps": 1.350,
+        "p50_ns": 3033,
+        "p99_ns": 4363,
+        "cpu_ns_per_op": 801.7
+      },
+      "pread_loop": {
+        "iops": 71423.5,
+        "wall_iops": 66313.0,
+        "gbps": 0.293,
+        "p50_ns": 14001,
+        "p99_ns": 25752,
+        "cpu_ns_per_op": 1713.4
+      },
+      "cached_handle": {
+        "iops": 3663003.7,
+        "wall_iops": 3617791.6,
+        "gbps": 15.004,
+        "p50_ns": 273,
+        "p99_ns": 356,
+        "cpu_ns_per_op": 395.5
+      },
+      "in_memory_tile": {
+        "iops": 13333333.3,
+        "wall_iops": 13027883.7,
+        "gbps": 54.613,
+        "p50_ns": 75,
+        "p99_ns": 82,
+        "cpu_ns_per_op": 156.1
+      }
+    },
+    {
+      "size_bytes": 4096,
+      "queue_depth": 32,
+      "io_uring": {
+        "iops": 371609.1,
+        "wall_iops": 363171.5,
+        "gbps": 1.522,
+        "p50_ns": 2691,
+        "p99_ns": 3578,
+        "cpu_ns_per_op": 672.3
+      },
+      "pread_loop": {
+        "iops": 71159.2,
+        "wall_iops": 66406.2,
+        "gbps": 0.291,
+        "p50_ns": 14053,
+        "p99_ns": 21738,
+        "cpu_ns_per_op": 1637.8
+      },
+      "cached_handle": {
+        "iops": 3745318.4,
+        "wall_iops": 3716777.0,
+        "gbps": 15.341,
+        "p50_ns": 267,
+        "p99_ns": 297,
+        "cpu_ns_per_op": 304.0
+      },
+      "in_memory_tile": {
+        "iops": 14084507.0,
+        "wall_iops": 13519365.4,
+        "gbps": 57.690,
+        "p50_ns": 71,
+        "p99_ns": 86,
+        "cpu_ns_per_op": 234.1
+      }
+    },
+    {
+      "size_bytes": 4096,
+      "queue_depth": 64,
+      "io_uring": {
+        "iops": 496277.9,
+        "wall_iops": 395538.0,
+        "gbps": 2.033,
+        "p50_ns": 2015,
+        "p99_ns": 4265,
+        "cpu_ns_per_op": 570.0
+      },
+      "pread_loop": {
+        "iops": 70706.4,
+        "wall_iops": 68372.5,
+        "gbps": 0.290,
+        "p50_ns": 14143,
+        "p99_ns": 20852,
+        "cpu_ns_per_op": 1536.5
+      },
+      "cached_handle": {
+        "iops": 3773584.9,
+        "wall_iops": 3626509.6,
+        "gbps": 15.457,
+        "p50_ns": 265,
+        "p99_ns": 371,
+        "cpu_ns_per_op": 287.0
+      },
+      "in_memory_tile": {
+        "iops": 12048192.8,
+        "wall_iops": 11535959.3,
+        "gbps": 49.349,
+        "p50_ns": 83,
+        "p99_ns": 138,
+        "cpu_ns_per_op": 162.6
+      }
+    },
+    {
+      "size_bytes": 65536,
+      "queue_depth": 1,
+      "io_uring": {
+        "iops": 23217.5,
+        "wall_iops": 22645.7,
+        "gbps": 1.522,
+        "p50_ns": 43071,
+        "p99_ns": 67847,
+        "cpu_ns_per_op": 6839.7
+      },
+      "pread_loop": {
+        "iops": 23120.9,
+        "wall_iops": 22722.8,
+        "gbps": 1.515,
+        "p50_ns": 43251,
+        "p99_ns": 59020,
+        "cpu_ns_per_op": 6616.3
+      },
+      "cached_handle": {
+        "iops": 831946.8,
+        "wall_iops": 773226.3,
+        "gbps": 54.522,
+        "p50_ns": 1202,
+        "p99_ns": 3045,
+        "cpu_ns_per_op": 3372.2
+      },
+      "in_memory_tile": {
+        "iops": 1584786.1,
+        "wall_iops": 1564828.9,
+        "gbps": 103.861,
+        "p50_ns": 631,
+        "p99_ns": 772,
+        "cpu_ns_per_op": 2495.1
+      }
+    },
+    {
+      "size_bytes": 65536,
+      "queue_depth": 4,
+      "io_uring": {
+        "iops": 33999.7,
+        "wall_iops": 33642.6,
+        "gbps": 2.228,
+        "p50_ns": 29412,
+        "p99_ns": 36576,
+        "cpu_ns_per_op": 3167.1
+      },
+      "pread_loop": {
+        "iops": 23192.2,
+        "wall_iops": 22797.6,
+        "gbps": 1.520,
+        "p50_ns": 43118,
+        "p99_ns": 54337,
+        "cpu_ns_per_op": 3640.2
+      },
+      "cached_handle": {
+        "iops": 691085.0,
+        "wall_iops": 642926.7,
+        "gbps": 45.291,
+        "p50_ns": 1447,
+        "p99_ns": 5475,
+        "cpu_ns_per_op": 2184.8
+      },
+      "in_memory_tile": {
+        "iops": 1512859.3,
+        "wall_iops": 1428714.9,
+        "gbps": 99.147,
+        "p50_ns": 661,
+        "p99_ns": 3018,
+        "cpu_ns_per_op": 649.6
+      }
+    },
+    {
+      "size_bytes": 65536,
+      "queue_depth": 16,
+      "io_uring": {
+        "iops": 36681.1,
+        "wall_iops": 36321.3,
+        "gbps": 2.404,
+        "p50_ns": 27262,
+        "p99_ns": 52815,
+        "cpu_ns_per_op": 2783.6
+      },
+      "pread_loop": {
+        "iops": 12535.7,
+        "wall_iops": 12797.6,
+        "gbps": 0.822,
+        "p50_ns": 79772,
+        "p99_ns": 90230,
+        "cpu_ns_per_op": 3313.7
+      },
+      "cached_handle": {
+        "iops": 587199.1,
+        "wall_iops": 529638.0,
+        "gbps": 38.483,
+        "p50_ns": 1703,
+        "p99_ns": 5061,
+        "cpu_ns_per_op": 1964.9
+      },
+      "in_memory_tile": {
+        "iops": 1312336.0,
+        "wall_iops": 1234150.3,
+        "gbps": 86.005,
+        "p50_ns": 762,
+        "p99_ns": 2710,
+        "cpu_ns_per_op": 650.3
+      }
+    },
+    {
+      "size_bytes": 65536,
+      "queue_depth": 32,
+      "io_uring": {
+        "iops": 35020.1,
+        "wall_iops": 34889.1,
+        "gbps": 2.295,
+        "p50_ns": 28555,
+        "p99_ns": 29251,
+        "cpu_ns_per_op": 2598.5
+      },
+      "pread_loop": {
+        "iops": 14748.2,
+        "wall_iops": 14543.2,
+        "gbps": 0.967,
+        "p50_ns": 67805,
+        "p99_ns": 78954,
+        "cpu_ns_per_op": 2829.9
+      },
+      "cached_handle": {
+        "iops": 600961.5,
+        "wall_iops": 515299.1,
+        "gbps": 39.385,
+        "p50_ns": 1664,
+        "p99_ns": 5088,
+        "cpu_ns_per_op": 1608.1
+      },
+      "in_memory_tile": {
+        "iops": 1114827.2,
+        "wall_iops": 872960.4,
+        "gbps": 73.061,
+        "p50_ns": 897,
+        "p99_ns": 3890,
+        "cpu_ns_per_op": 1447.2
+      }
+    },
+    {
+      "size_bytes": 65536,
+      "queue_depth": 64,
+      "io_uring": {
+        "iops": 46875.7,
+        "wall_iops": 46759.4,
+        "gbps": 3.072,
+        "p50_ns": 21333,
+        "p99_ns": 21748,
+        "cpu_ns_per_op": 2628.1
+      },
+      "pread_loop": {
+        "iops": 16277.6,
+        "wall_iops": 15949.9,
+        "gbps": 1.067,
+        "p50_ns": 61434,
+        "p99_ns": 71039,
+        "cpu_ns_per_op": 2834.9
+      },
+      "cached_handle": {
+        "iops": 547345.4,
+        "wall_iops": 457801.8,
+        "gbps": 35.871,
+        "p50_ns": 1827,
+        "p99_ns": 3936,
+        "cpu_ns_per_op": 2095.1
+      },
+      "in_memory_tile": {
+        "iops": 1086956.5,
+        "wall_iops": 875235.1,
+        "gbps": 71.235,
+        "p50_ns": 920,
+        "p99_ns": 3253,
+        "cpu_ns_per_op": 1300.5
+      }
+    },
+    {
+      "size_bytes": 1048576,
+      "queue_depth": 1,
+      "io_uring": {
+        "iops": 2257.9,
+        "wall_iops": 2260.6,
+        "gbps": 2.368,
+        "p50_ns": 442899,
+        "p99_ns": 465012,
+        "cpu_ns_per_op": 24686.4
+      },
+      "pread_loop": {
+        "iops": 2245.7,
+        "wall_iops": 2001.3,
+        "gbps": 2.355,
+        "p50_ns": 445304,
+        "p99_ns": 2139278,
+        "cpu_ns_per_op": 29488.7
+      },
+      "cached_handle": {
+        "iops": 38717.7,
+        "wall_iops": 32680.5,
+        "gbps": 40.598,
+        "p50_ns": 25828,
+        "p99_ns": 281778,
+        "cpu_ns_per_op": 26752.5
+      },
+      "in_memory_tile": {
+        "iops": 67581.3,
+        "wall_iops": 64849.3,
+        "gbps": 70.864,
+        "p50_ns": 14797,
+        "p99_ns": 48841,
+        "cpu_ns_per_op": 20809.2
+      }
+    },
+    {
+      "size_bytes": 1048576,
+      "queue_depth": 4,
+      "io_uring": {
+        "iops": 2903.3,
+        "wall_iops": 2898.3,
+        "gbps": 3.044,
+        "p50_ns": 344430,
+        "p99_ns": 349141,
+        "cpu_ns_per_op": 30200.2
+      },
+      "pread_loop": {
+        "iops": 2268.9,
+        "wall_iops": 2259.4,
+        "gbps": 2.379,
+        "p50_ns": 440733,
+        "p99_ns": 483350,
+        "cpu_ns_per_op": 24622.4
+      },
+      "cached_handle": {
+        "iops": 37683.2,
+        "wall_iops": 30983.4,
+        "gbps": 39.514,
+        "p50_ns": 26537,
+        "p99_ns": 124781,
+        "cpu_ns_per_op": 26177.6
+      },
+      "in_memory_tile": {
+        "iops": 69725.3,
+        "wall_iops": 55257.3,
+        "gbps": 73.112,
+        "p50_ns": 14342,
+        "p99_ns": 45189,
+        "cpu_ns_per_op": 20879.6
+      }
+    },
+    {
+      "size_bytes": 1048576,
+      "queue_depth": 16,
+      "io_uring": {
+        "iops": 3434.4,
+        "wall_iops": 3408.9,
+        "gbps": 3.601,
+        "p50_ns": 291173,
+        "p99_ns": 304136,
+        "cpu_ns_per_op": 29919.5
+      },
+      "pread_loop": {
+        "iops": 2250.4,
+        "wall_iops": 2228.9,
+        "gbps": 2.360,
+        "p50_ns": 444372,
+        "p99_ns": 465503,
+        "cpu_ns_per_op": 26149.0
+      },
+      "cached_handle": {
+        "iops": 20659.4,
+        "wall_iops": 20828.0,
+        "gbps": 21.663,
+        "p50_ns": 48404,
+        "p99_ns": 62774,
+        "cpu_ns_per_op": 42796.1
+      },
+      "in_memory_tile": {
+        "iops": 68747.4,
+        "wall_iops": 38749.7,
+        "gbps": 72.087,
+        "p50_ns": 14546,
+        "p99_ns": 57979,
+        "cpu_ns_per_op": 31200.9
+      }
+    },
+    {
+      "size_bytes": 1048576,
+      "queue_depth": 32,
+      "io_uring": {
+        "iops": 3531.8,
+        "wall_iops": 3525.9,
+        "gbps": 3.703,
+        "p50_ns": 283140,
+        "p99_ns": 284517,
+        "cpu_ns_per_op": 34476.8
+      },
+      "pread_loop": {
+        "iops": 2252.5,
+        "wall_iops": 2239.1,
+        "gbps": 2.362,
+        "p50_ns": 443953,
+        "p99_ns": 453995,
+        "cpu_ns_per_op": 23249.9
+      },
+      "cached_handle": {
+        "iops": 22272.7,
+        "wall_iops": 21755.5,
+        "gbps": 23.355,
+        "p50_ns": 44898,
+        "p99_ns": 48790,
+        "cpu_ns_per_op": 45094.3
+      },
+      "in_memory_tile": {
+        "iops": 55781.8,
+        "wall_iops": 37269.8,
+        "gbps": 58.491,
+        "p50_ns": 17927,
+        "p99_ns": 44228,
+        "cpu_ns_per_op": 23190.0
+      }
+    },
+    {
+      "size_bytes": 1048576,
+      "queue_depth": 64,
+      "io_uring": {
+        "iops": 3548.7,
+        "wall_iops": 3550.7,
+        "gbps": 3.721,
+        "p50_ns": 281792,
+        "p99_ns": 282077,
+        "cpu_ns_per_op": 40119.1
+      },
+      "pread_loop": {
+        "iops": 2246.5,
+        "wall_iops": 2242.4,
+        "gbps": 2.356,
+        "p50_ns": 445137,
+        "p99_ns": 447115,
+        "cpu_ns_per_op": 23206.1
+      },
+      "cached_handle": {
+        "iops": 18855.5,
+        "wall_iops": 18567.0,
+        "gbps": 19.771,
+        "p50_ns": 53035,
+        "p99_ns": 54929,
+        "cpu_ns_per_op": 50964.9
+      },
+      "in_memory_tile": {
+        "iops": 24258.3,
+        "wall_iops": 22217.3,
+        "gbps": 25.437,
+        "p50_ns": 41223,
+        "p99_ns": 50774,
+        "cpu_ns_per_op": 46339.0
+      }
+    }
+  ],
+  "verdict": "io_uring batch is 0.99x the serial pread loop at queue depth 1 (per-op submit/reap overhead dominates: it loses), 3.02x at depth 16, and 3.83x at depth 64 (concurrent uncached reads win). At depth 64 it reaches 0.13x the warm cached handle and 0.04x the in-memory tile copy; at depth 1 it is only 0.02x the cached handle."
+}

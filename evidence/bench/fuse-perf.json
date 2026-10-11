@@ -1,0 +1,76 @@
+{
+  "fuse_available": true,
+  "kernel": "7.2.9-2-cachyos",
+  "object_bytes": 2097152,
+  "window_bytes": 4096,
+  "window_samples": 256,
+  "logically_aligned_export": "target/fuse-perf-tmp/export.bin",
+  "passthrough": {
+    "supported": false,
+    "fuser_version": "0.15.1",
+    "fuser_max_abi": "7.31",
+    "reason": "fuser 0.15.1 exposes no FUSE_PASSTHROUGH init flag, no FUSE_DEV_IOC_BACKING_OPEN ioctl, and no per-inode backing id. FUSE passthrough landed in FUSE ABI 7.40 (Linux 6.9+); fuser 0.15.1 tops out at abi-7-31. Enabling it needs a newer fuser (a new dependency) or unsafe ioctl FFI outside the sanctioned src/async_io.rs, so it is out of scope here.",
+    "ekb_is_not_a_valid_backing_file": "a .ekb generation has headers/core before the tile blob, so file offset != logical offset"
+  },
+  "io_uring_fuse": {
+    "supported": false,
+    "reason": "fuser 0.15.1 does not negotiate FUSE-over-io_uring (the FUSE_HAS_IO_URING init flag and per-queue uring setup added in Linux 6.14+); no API is exposed, so the mount uses the classic /dev/fuse request loop."
+  },
+  "full_read": [
+    {
+      "name": "fuse (std::fs::read via mount)",
+      "p50_ns": 3721114,
+      "p99_ns": 3823546,
+      "min_ns": 3679276,
+      "mbps": 535.8
+    },
+    {
+      "name": "direct OpenObject::open + read",
+      "p50_ns": 4228762,
+      "p99_ns": 4407465,
+      "min_ns": 4025562,
+      "mbps": 473.3
+    },
+    {
+      "name": "direct FileBody::open + read",
+      "p50_ns": 4291368,
+      "p99_ns": 4337495,
+      "min_ns": 4256594,
+      "mbps": 465.8
+    },
+    {
+      "name": "raw file (std::fs::read export.bin)",
+      "p50_ns": 28954,
+      "p99_ns": 86221,
+      "min_ns": 28594,
+      "mbps": 59772.4
+    }
+  ],
+  "window_read": [
+    {
+      "name": "fuse window (persistent fd, warm page cache)",
+      "p50_ns": 490,
+      "p99_ns": 174606,
+      "mean_ns": 13647.5
+    },
+    {
+      "name": "fuse window (open per read, uncached FUSE request)",
+      "p50_ns": 20759,
+      "p99_ns": 38812,
+      "mean_ns": 22733.7
+    },
+    {
+      "name": "direct OpenObject window (persistent)",
+      "p50_ns": 6943,
+      "p99_ns": 12253,
+      "mean_ns": 7300.7
+    },
+    {
+      "name": "raw file window (persistent fd)",
+      "p50_ns": 230,
+      "p99_ns": 411,
+      "mean_ns": 216.5
+    }
+  ],
+  "verdict": "FUSE adds no measurable overhead over the direct read of a materialised object: a full 2.0 MiB read costs 3721 us through FUSE vs 4229 us direct (both are the EKBLOOM decode, ~146x the 29.0 us raw-file read). Per uncached 4 KiB request FUSE adds 13.8 us over the direct handle (20.8 us vs 6.9 us; the /dev/fuse round trip plus open); a persistent handle is served from the kernel page cache at 0.5 us p50, and the raw file at 0.2 us. Passthrough is NOT available through fuser 0.15.1."
+}

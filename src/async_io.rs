@@ -52,6 +52,17 @@
 //! the async output is byte-for-byte identical to the synchronous output for both
 //! `publish` and `append`.
 //!
+//! # Hybrid batched reads
+//!
+//! The same module also provides [`HybridReader`], a positional reader that applies
+//! the reviewer's warning that `io_uring` is *not* automatically faster: a single
+//! (hot) read is served by a direct `pread(2)` and never touches the ring, whereas a
+//! batch of cold reads is submitted through the ring with owned buffers and reaped
+//! in request order. When no ring can be created, the batch path falls back to a
+//! serial `pread` loop that returns exactly the same bytes. [`probe`] covers the
+//! write path; a `HybridReader` created without a ring (or with
+//! [`HybridReader::open_pread_only`]) exercises the read fallback.
+//!
 //! # Safety
 //!
 //! This is, besides `crate::simd`, the only module permitted to contain `unsafe`.
@@ -60,8 +71,9 @@
 //! that the buffer outlives the submission and is only read by the kernel until
 //! completion.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
@@ -302,6 +314,478 @@ fn fsync_fd(ring: &mut IoUring, fd: RawFd) -> Result<()> {
         return Err(short_write("io_uring fsync reported no completion"));
     }
     Ok(())
+}
+
+/// One positional read in a [`HybridReader::read_batch`] submission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchRead {
+    /// Absolute byte offset in the file.
+    pub offset: u64,
+    /// Number of bytes to read.
+    pub length: u64,
+}
+
+impl BatchRead {
+    /// Construct a positional read request.
+    #[inline]
+    pub const fn new(offset: u64, length: u64) -> BatchRead {
+        BatchRead { offset, length }
+    }
+}
+
+/// `user_data` tag for the standalone page-cache eviction SQE.
+const EVICT_TAG: u64 = u64::MAX - 1;
+
+/// `posix_fadvise(2)` advice: the pages will not be needed again.
+const FADV_DONTNEED: i32 = 4;
+
+/// Linux `O_DIRECT`, so a read bypasses the page cache and is genuinely uncached.
+const O_DIRECT: i32 = 0o40000;
+
+/// A heap buffer whose contents begin on a caller-chosen alignment boundary.
+///
+/// `O_DIRECT` requires the user buffer, file offset, and length to be aligned to
+/// the device block size. This provides such a buffer using only safe Rust: an
+/// over-allocated `Vec` is sliced at the first suitably-aligned offset.
+pub struct AlignedBuffer {
+    storage: Vec<u8>,
+    offset: usize,
+    len: usize,
+}
+
+impl AlignedBuffer {
+    /// Allocate `len` usable bytes aligned to `align` (a power of two).
+    pub fn new(len: usize, align: usize) -> AlignedBuffer {
+        let align = align.max(1);
+        let storage = vec![0u8; len.saturating_add(align)];
+        let base = storage.as_ptr() as usize;
+        let offset = (align - (base % align)) % align;
+        AlignedBuffer {
+            storage,
+            offset,
+            len,
+        }
+    }
+
+    /// The aligned contents.
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.storage[self.offset..self.offset + self.len]
+    }
+
+    /// The aligned contents, mutable.
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.storage[self.offset..self.offset + self.len]
+    }
+
+    /// Number of usable bytes.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether there are no usable bytes.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Whether the contents begin on an `align` boundary.
+    #[inline]
+    pub fn is_aligned(&self, align: usize) -> bool {
+        (self.as_slice().as_ptr() as usize).is_multiple_of(align)
+    }
+}
+
+/// A hybrid positional reader over one file.
+///
+/// The distinction is deliberate and matches the reviewer's warning that
+/// `io_uring` is *not* automatically faster:
+///
+/// * a **single** (hot) read is served by a direct `pread(2)` and never touches
+///   the ring — [`HybridReader::read_direct`];
+/// * a **batch** of cold reads is submitted through a real `io_uring` ring with
+///   owned buffers and reaped in request order — [`HybridReader::read_batch`].
+///
+/// When no ring can be created (no `io_uring`, or a seccomp policy denying
+/// `io_uring_setup(2)`), the batch path transparently falls back to a serial
+/// `pread` loop, returning exactly the same bytes.
+pub struct HybridReader {
+    file: File,
+    ring: Option<IoUring>,
+    ring_submissions: u64,
+    fallback_batches: u64,
+}
+
+impl HybridReader {
+    /// Open `path` for positional reads, creating a ring when one is available.
+    ///
+    /// A ring that cannot be created is a first-class fallback, not an error: the
+    /// reader still serves every request by `pread`.
+    pub fn open(path: &Path) -> io::Result<HybridReader> {
+        let file = File::open(path)?;
+        Ok(HybridReader {
+            file,
+            ring: IoUring::new(RING_ENTRIES).ok(),
+            ring_submissions: 0,
+            fallback_batches: 0,
+        })
+    }
+
+    /// Open `path` in pure-`pread` mode, never touching a ring.
+    pub fn open_pread_only(path: &Path) -> io::Result<HybridReader> {
+        Ok(HybridReader {
+            file: File::open(path)?,
+            ring: None,
+            ring_submissions: 0,
+            fallback_batches: 0,
+        })
+    }
+
+    /// Open `path` with `O_DIRECT`, so every read bypasses the page cache and is
+    /// genuinely uncached. Offsets and lengths (and the supplied buffers) must be
+    /// aligned to the device block size.
+    pub fn open_direct(path: &Path) -> io::Result<HybridReader> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_DIRECT)
+            .open(path)?;
+        Ok(HybridReader {
+            file,
+            ring: IoUring::new(RING_ENTRIES).ok(),
+            ring_submissions: 0,
+            fallback_batches: 0,
+        })
+    }
+
+    /// Whether a usable `io_uring` ring backs the batch path.
+    #[inline]
+    pub fn ring_available(&self) -> bool {
+        self.ring.is_some()
+    }
+
+    /// Number of SQEs submitted to the ring so far (batch reads and evictions).
+    #[inline]
+    pub fn ring_submissions(&self) -> u64 {
+        self.ring_submissions
+    }
+
+    /// Number of batches served by the `pread` fallback so far.
+    #[inline]
+    pub fn fallback_batches(&self) -> u64 {
+        self.fallback_batches
+    }
+
+    /// Serve one read directly with `pread(2)`; no kernel operation is submitted to
+    /// the ring.
+    pub fn read_direct(&self, offset: u64, length: u64) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; length_to_usize(length)?];
+        self.file.read_exact_at(&mut buf, offset)?;
+        Ok(buf)
+    }
+
+    /// Serve a batch of cold positional reads.
+    ///
+    /// With a ring, every request is submitted through it with an owned buffer and
+    /// reaped in request order; without one, the requests are served by a serial
+    /// `pread` loop. The returned vector is indexed like `reqs`, so ordering is
+    /// preserved regardless of the order in which completions arrive.
+    pub fn read_batch(&mut self, reqs: &[BatchRead]) -> io::Result<Vec<Vec<u8>>> {
+        match self.ring.as_mut() {
+            Some(ring) => {
+                let (bufs, submitted) = read_batch_ring(ring, &self.file, reqs)?;
+                self.ring_submissions += submitted;
+                Ok(bufs)
+            }
+            None => {
+                self.fallback_batches += 1;
+                read_batch_pread(&self.file, reqs)
+            }
+        }
+    }
+
+    /// Serve a batch of cold positional reads into caller-provided aligned buffers.
+    ///
+    /// This is the `O_DIRECT` form of [`HybridReader::read_batch`]: the buffers are
+    /// owned by the caller (so they stay aligned and can be reused), and the reads
+    /// are submitted through the ring or served by the `pread` fallback. `bufs`
+    /// must be indexed like `reqs` and each buffer's length must equal the matching
+    /// request length.
+    pub fn read_batch_into(
+        &mut self,
+        reqs: &[BatchRead],
+        bufs: &mut [AlignedBuffer],
+    ) -> io::Result<()> {
+        if reqs.len() != bufs.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read_batch_into: request and buffer counts differ",
+            ));
+        }
+        for (req, buf) in reqs.iter().zip(bufs.iter()) {
+            if buf.len() as u64 != req.length {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "read_batch_into: buffer length does not match request",
+                ));
+            }
+        }
+        match self.ring.as_mut() {
+            Some(ring) => {
+                let submitted = read_batch_ring_into(ring, &self.file, reqs, bufs)?;
+                self.ring_submissions += submitted;
+                Ok(())
+            }
+            None => {
+                self.fallback_batches += 1;
+                read_batch_pread_into(&self.file, reqs, bufs)
+            }
+        }
+    }
+
+    /// Best-effort page-cache eviction (`FADV_DONTNEED`) over
+    /// `[offset, offset + length)`, submitted through the ring.
+    ///
+    /// A no-op when no ring is available: the crate has no other dependency-free
+    /// `posix_fadvise` path. Used by the cold-read benchmark so its reads miss the
+    /// page cache.
+    pub fn evict_page_cache(&mut self, offset: u64, length: u64) -> io::Result<()> {
+        if length == 0 {
+            return Ok(());
+        }
+        let len = i64::try_from(length).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "eviction length exceeds i64")
+        })?;
+        let fd = self.file.as_raw_fd();
+        let Some(ring) = self.ring.as_mut() else {
+            return Ok(());
+        };
+        let entry = opcode::Fadvise::new(types::Fd(fd), len, FADV_DONTNEED)
+            .offset(offset)
+            .build()
+            .user_data(EVICT_TAG);
+        {
+            let mut sq = ring.submission();
+            // SAFETY: `Fadvise` carries no data buffer; it references only `fd`, which
+            // `self.file` keeps open until this method has returned.
+            unsafe { sq.push(&entry) }.map_err(|_| {
+                io::Error::new(io::ErrorKind::WouldBlock, "io_uring submission queue full")
+            })?;
+        }
+        ring.submitter().submit_and_wait(1)?;
+        let mut cq = ring.completion();
+        for cqe in &mut cq {
+            let res = cqe.result();
+            if res < 0 {
+                return Err(io::Error::from_raw_os_error(-res));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Convert a byte length to `usize`, rejecting values that cannot be addressed.
+fn length_to_usize(length: u64) -> io::Result<usize> {
+    usize::try_from(length).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "read length exceeds addressable memory",
+        )
+    })
+}
+
+/// Serve `reqs` by a serial `pread` loop, preserving request order.
+fn read_batch_pread(file: &File, reqs: &[BatchRead]) -> io::Result<Vec<Vec<u8>>> {
+    let mut out = Vec::with_capacity(reqs.len());
+    for req in reqs {
+        let mut buf = vec![0u8; length_to_usize(req.length)?];
+        file.read_exact_at(&mut buf, req.offset)?;
+        out.push(buf);
+    }
+    Ok(out)
+}
+
+/// Serve `reqs` by a serial `pread` loop into caller-provided aligned buffers.
+fn read_batch_pread_into(
+    file: &File,
+    reqs: &[BatchRead],
+    bufs: &mut [AlignedBuffer],
+) -> io::Result<()> {
+    for (req, buf) in reqs.iter().zip(bufs.iter_mut()) {
+        file.read_exact_at(buf.as_mut_slice(), req.offset)?;
+    }
+    Ok(())
+}
+
+/// Serve `reqs` through `ring` with owned buffers, reaped in request order.
+///
+/// Returns the buffers (indexed like `reqs`) and the number of SQEs submitted.
+fn read_batch_ring(
+    ring: &mut IoUring,
+    file: &File,
+    reqs: &[BatchRead],
+) -> io::Result<(Vec<Vec<u8>>, u64)> {
+    let fd = file.as_raw_fd();
+    let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(reqs.len());
+    for req in reqs {
+        bufs.push(vec![0u8; length_to_usize(req.length)?]);
+    }
+    let mut done = 0usize;
+    let mut submitted_total = 0u64;
+    while done < reqs.len() {
+        let mut in_flight: Vec<usize> = Vec::new();
+        {
+            let mut sq = ring.submission();
+            let capacity = sq.capacity();
+            let mut idx = done;
+            while idx < reqs.len() && in_flight.len() < capacity {
+                let len = u32::try_from(reqs[idx].length).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "read length exceeds u32")
+                })?;
+                let ptr = bufs[idx].as_mut_ptr();
+                let entry = opcode::Read::new(types::Fd(fd), ptr, len)
+                    .offset(reqs[idx].offset)
+                    .build()
+                    .user_data(idx as u64);
+                // SAFETY: `ptr` points at the owned buffer `bufs[idx]`, which stays
+                // alive in `bufs` until every submitted completion below has been
+                // reaped; the kernel only writes it until then. Every buffer is
+                // allocated before the first submission and `bufs` is never
+                // reallocated afterwards, so the pointers stay valid.
+                match unsafe { sq.push(&entry) } {
+                    Ok(()) => {
+                        in_flight.push(idx);
+                        idx += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        if in_flight.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "io_uring read submission queue made no progress",
+            ));
+        }
+        submitted_total += in_flight.len() as u64;
+        ring.submitter().submit_and_wait(in_flight.len())?;
+
+        let mut reaped = 0usize;
+        {
+            let mut cq = ring.completion();
+            for cqe in &mut cq {
+                let user_data = cqe.user_data();
+                let res = cqe.result();
+                reaped += 1;
+                let idx = usize::try_from(user_data).map_err(|_| {
+                    io::Error::other("io_uring read completion with unknown user_data")
+                })?;
+                let expected = bufs.get(idx).map(Vec::len).ok_or_else(|| {
+                    io::Error::other("io_uring read completion with unknown user_data")
+                })?;
+                if res < 0 {
+                    return Err(io::Error::from_raw_os_error(-res));
+                }
+                if res as usize != expected {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("io_uring read short: {res} of {expected} bytes"),
+                    ));
+                }
+            }
+        }
+        if reaped == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "io_uring reported no read completions",
+            ));
+        }
+        done += in_flight.len();
+    }
+    Ok((bufs, submitted_total))
+}
+
+/// Serve `reqs` through `ring` into caller-provided aligned buffers, reaped in
+/// request order. Returns the number of SQEs submitted.
+fn read_batch_ring_into(
+    ring: &mut IoUring,
+    file: &File,
+    reqs: &[BatchRead],
+    bufs: &mut [AlignedBuffer],
+) -> io::Result<u64> {
+    let fd = file.as_raw_fd();
+    let mut done = 0usize;
+    let mut submitted_total = 0u64;
+    while done < reqs.len() {
+        let mut in_flight: Vec<usize> = Vec::new();
+        {
+            let mut sq = ring.submission();
+            let capacity = sq.capacity();
+            let mut idx = done;
+            while idx < reqs.len() && in_flight.len() < capacity {
+                let len = u32::try_from(reqs[idx].length).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "read length exceeds u32")
+                })?;
+                let ptr = bufs[idx].as_mut_slice().as_mut_ptr();
+                let entry = opcode::Read::new(types::Fd(fd), ptr, len)
+                    .offset(reqs[idx].offset)
+                    .build()
+                    .user_data(idx as u64);
+                // SAFETY: `ptr` points at the caller-owned buffer `bufs[idx]`, which
+                // the caller keeps alive and unmodified until every submitted
+                // completion below has been reaped; the kernel only writes it until
+                // then. `bufs` is neither reallocated nor reordered during submission.
+                match unsafe { sq.push(&entry) } {
+                    Ok(()) => {
+                        in_flight.push(idx);
+                        idx += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        if in_flight.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "io_uring read submission queue made no progress",
+            ));
+        }
+        submitted_total += in_flight.len() as u64;
+        ring.submitter().submit_and_wait(in_flight.len())?;
+        let mut reaped = 0usize;
+        {
+            let mut cq = ring.completion();
+            for cqe in &mut cq {
+                let user_data = cqe.user_data();
+                let res = cqe.result();
+                reaped += 1;
+                let idx = usize::try_from(user_data).map_err(|_| {
+                    io::Error::other("io_uring read completion with unknown user_data")
+                })?;
+                let expected = bufs.get(idx).map(AlignedBuffer::len).ok_or_else(|| {
+                    io::Error::other("io_uring read completion with unknown user_data")
+                })?;
+                if res < 0 {
+                    return Err(io::Error::from_raw_os_error(-res));
+                }
+                if res as usize != expected {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("io_uring read short: {res} of {expected} bytes"),
+                    ));
+                }
+            }
+        }
+        if reaped == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "io_uring reported no read completions",
+            ));
+        }
+        done += in_flight.len();
+    }
+    Ok(submitted_total)
 }
 
 /// The exact bytes [`crate::writer::write_body`] would place in a fresh file.
