@@ -21,6 +21,8 @@
 //! [`grow`] and [`inspect`].
 
 pub mod adapt;
+#[cfg(feature = "io-uring")]
+pub mod async_io;
 pub mod asyncpub;
 pub mod bloom;
 pub mod bloom_context;

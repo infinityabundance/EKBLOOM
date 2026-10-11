@@ -8,44 +8,41 @@
 //!   which writes a private `*.tmp` file, `fsync`s it, and atomically renames it
 //!   over the destination (for `publish`), or appends a fully-fsynced section set
 //!   closed by a complete `CommitFooter` (for `append`).
-//! - [`Backend::IoUring`] is compiled only under `#[cfg(feature = "io-uring")]`.
+//! - [`Backend::IoUring`] is compiled only under `#[cfg(feature = "io-uring")]`
+//!   and performs **genuine completion-driven asynchronous I/O** through
+//!   [`crate::async_io`]: it creates an `io_uring` ring, submits write SQEs whose
+//!   buffers are owned and kept alive until their completions are reaped, waits on
+//!   those completions, and propagates per-operation errors. It then `fsync`s and
+//!   advertises exactly as the synchronous writer does.
 //!
 //! # Never expose a partial shell
 //!
-//! The publication contract from `docs/DESIGN.md` §16 is reused verbatim: bytes
+//! The publication contract from `docs/DESIGN.md` §5 is reused verbatim: bytes
 //! become visible only when a complete commit is durable. `publish` therefore
 //! prefers a private temp file plus rename; `append` only ever leaves a fully
 //! written and `fsync`ed section set followed by a complete, checksummed
 //! `CommitFooter`. A reader therefore never observes an incomplete shell, and a
 //! torn final block never invalidates an earlier committed generation.
 //!
-//! # Buffer ownership (async completion)
+//! # Detection and fallback
 //!
-//! Buffers passed to a write must stay owned and alive until that write
-//! completes. In the synchronous path this holds trivially: the write returns
-//! only after the kernel has copied the bytes. In the `io-uring` design the
-//! serialized byte image is owned by the submitting scope and kept alive until
-//! the matching completion-queue event is reaped, after which the `fsync` and
-//! rename are performed.
+//! [`detect_backend`] returns [`Backend::IoUring`] **only** when the `io-uring`
+//! feature is enabled *and* [`crate::async_io::probe`] succeeds: a ring must be
+//! creatable *and* a real probe write must complete. Creation alone is not enough,
+//! because a container seccomp policy can deny `io_uring_setup(2)` (typically
+//! `EPERM`). If the ring cannot be created, or if any `io_uring` operation fails
+//! mid-publication, [`publish`]/[`append`] transparently fall back to the
+//! synchronous writer. The async `publish` path removes its temp file on failure,
+//! and the async `append` path only ever appends past a valid commit, so the
+//! fallback can never observe a half-written generation.
 //!
-//! # Deviation — `io-uring` submission
-//!
-//! The `io-uring` crate's submission API (`SubmissionQueue::push`,
-//! `squeue::Write` built from raw pointers) is intrinsically `unsafe`. This crate
-//! forbids `unsafe`, so the `IoUring` backend uses ring creation as a runtime
-//! **capability probe** and performs the durable write through the transactional
-//! sync writer. This is fully correct (identical bytes and atomicity) but does
-//! not yet offload the syscall. See `detect_backend`, which returns
-//! [`Backend::IoUring`] only when a ring can actually be created.
+//! With the `io-uring` feature *disabled*, `Backend::IoUring` requests always take
+//! the synchronous path.
 
 use std::path::Path;
 
 use crate::error::Result;
 use crate::manifest::EkbloomBody;
-
-/// Submission-queue entries requested when probing for an `io_uring` ring.
-#[cfg(feature = "io-uring")]
-const RING_ENTRIES: u32 = 16;
 
 /// The publication backend actually used for a write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,33 +56,25 @@ pub enum Backend {
 /// Detect the best available publication backend at runtime.
 ///
 /// Returns [`Backend::IoUring`] only when the `io-uring` feature is enabled
-/// **and** an `io_uring` ring can be created (i.e. `io_uring_setup(2)` is
-/// permitted); otherwise it returns [`Backend::Sync`]. Never panics.
+/// **and** a ring can be created **and** a probe write through it completes
+/// (see [`crate::async_io::probe`]); otherwise it returns [`Backend::Sync`].
+/// Never panics.
 pub fn detect_backend() -> Backend {
     #[cfg(feature = "io-uring")]
     {
-        if ring_available() {
+        if crate::async_io::probe().is_ok() {
             return Backend::IoUring;
         }
     }
     Backend::Sync
 }
 
-/// Whether an `io_uring` ring can be created in this environment.
-///
-/// Creating the ring invokes `io_uring_setup(2)`, which the kernel — or a
-/// container seccomp policy — rejects with `EPERM`/`ENOSYS` when `io_uring` is
-/// unavailable.
-#[cfg(feature = "io-uring")]
-fn ring_available() -> bool {
-    io_uring::IoUring::new(RING_ENTRIES).is_ok()
-}
-
 /// Publish a complete body, committing a fresh generation.
 ///
 /// Replaces any existing file at `path` atomically (temp file + rename), so a
 /// reader never sees a partial shell. `backend` selects the preferred I/O path;
-/// the result is durable and byte-identical either way.
+/// the durable result is byte-identical either way, and any `io_uring` failure
+/// falls back transparently to the synchronous writer.
 pub fn publish(path: &Path, body: &EkbloomBody, backend: Backend) -> Result<()> {
     match backend {
         Backend::Sync => crate::writer::write_body(path, body),
@@ -97,7 +86,8 @@ pub fn publish(path: &Path, body: &EkbloomBody, backend: Backend) -> Result<()> 
 ///
 /// Only a fully written and `fsync`ed section set closed by a complete
 /// `CommitFooter` is ever left behind; a torn tail is truncated back to the
-/// newest valid commit before appending.
+/// newest valid commit before appending. Any `io_uring` failure falls back
+/// transparently to the synchronous writer.
 pub fn append(path: &Path, body: &EkbloomBody, backend: Backend) -> Result<u64> {
     match backend {
         Backend::Sync => crate::writer::append_generation(path, body),
@@ -105,18 +95,18 @@ pub fn append(path: &Path, body: &EkbloomBody, backend: Backend) -> Result<u64> 
     }
 }
 
-/// The `io_uring` publication path.
+/// The `io_uring` publication path, with a transparent synchronous fallback.
 ///
-/// Attempts to create a ring (the capability probe). If a ring cannot be
-/// created — the common case under container seccomp — it transparently falls
-/// back. In both cases the durable bytes come from the transactional sync
-/// writer, so an incomplete shell is never exposed. See the module docs for why
-/// SQE submission is not performed.
+/// Under `#[cfg(feature = "io-uring")]` this performs the real completion-driven
+/// write via [`crate::async_io::publish`]; if ring creation or any operation
+/// fails, it falls back to [`crate::writer::write_body`] so the durable bytes are
+/// always produced and no partial shell is exposed.
 fn publish_async(path: &Path, body: &EkbloomBody) -> Result<()> {
     #[cfg(feature = "io-uring")]
     {
-        // Owned ring; dropped after the sync publication completes.
-        let _ring = io_uring::IoUring::new(RING_ENTRIES);
+        if crate::async_io::publish(path, body).is_ok() {
+            return Ok(());
+        }
     }
     crate::writer::write_body(path, body)
 }
@@ -125,7 +115,9 @@ fn publish_async(path: &Path, body: &EkbloomBody) -> Result<()> {
 fn append_async(path: &Path, body: &EkbloomBody) -> Result<u64> {
     #[cfg(feature = "io-uring")]
     {
-        let _ring = io_uring::IoUring::new(RING_ENTRIES);
+        if let Ok(generation) = crate::async_io::append(path, body) {
+            return Ok(generation);
+        }
     }
     crate::writer::append_generation(path, body)
 }
