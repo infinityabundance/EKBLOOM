@@ -32,6 +32,7 @@ pub mod bloom_key;
 pub mod bloom_path;
 pub mod bloom_region;
 pub mod checkpoint;
+pub mod court;
 pub mod error;
 pub mod fastpath;
 pub mod filesystem;
@@ -47,6 +48,7 @@ pub mod manifest;
 pub mod metrics;
 pub mod model_search;
 pub mod packed;
+pub mod planner;
 pub mod prefix;
 pub mod reader;
 pub mod recovery;
@@ -74,6 +76,11 @@ pub use bloom_global::{Counterexample, GlobalBloom, GlobalCertification};
 pub use bloom_path::PathBloom;
 pub use bloom_region::{RegionCertification, RegionDescriptor};
 pub use checkpoint::CheckpointSet;
+pub use court::Workload as CourtWorkload;
+pub use court::{
+    calibrate_clock_ghz, collect_environment, default_working_sets, lcg_bytes, loop_overhead_ns,
+    write_court_json, Candidate, Court, CourtConfig, CourtEnv, CourtReport, Dist, ParetoPoint, Row,
+};
 pub use error::{EkbloomError, Result};
 pub use fastpath::{
     copy_hot_sequential, cpu_features, gather_hot_1b, read_random_1b, read_ranges,
@@ -97,6 +104,9 @@ pub use model_search::{
     canonical_state_only_counterexample, sufficiency_sweep, AbstractCounterexample, SufficiencyRow,
 };
 pub use packed::{state_from_hot, PackedHistory, PackedRestarts};
+pub use planner::{
+    AccessPath, AccessPlan, CertRef, CostModel, Planner, RegionPlan, PLANNER_REGION_BYTES,
+};
 pub use prefix::{
     block_summary, prefix_scan, reconstruct_blocks, reconstruct_scalar, state_at_via_prefix,
     Affine, LinMap,

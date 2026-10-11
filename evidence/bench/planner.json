@@ -1,0 +1,22 @@
+{
+  "generated_by": "examples/court.rs (sh scripts/run-court.sh)",
+  "logical_len": 4194304,
+  "physical_bytes": 6030412,
+  "tiles_selected": 256,
+  "hot_region_bytes": 1048576,
+  "region_bytes": 65536,
+  "certified_paths_only": true,
+  "request_length_bytes": 1,
+  "chosen_path_distribution": [
+    { "path": "hot-bytes", "regions": 16 },
+    { "path": "packed-restart", "regions": 48 }
+  ],
+  "latency": [
+    { "path": "planner (per-region)", "hot_p50_ns": 19.0, "hot_ci95": [18.9, 19.2], "cold_p50_ns": 129.0, "cold_ci95": [137.7, 137.7] },
+    { "path": "fixed hot-bytes (tiles)", "hot_p50_ns": 16.0, "hot_ci95": [15.9, 16.0], "cold_p50_ns": 6275317.0, "cold_ci95": [6484096.7, 6484096.7] },
+    { "path": "fixed packed-restart", "hot_p50_ns": 87.0, "hot_ci95": [82.6, 94.5], "cold_p50_ns": 230.0, "cold_ci95": [235.8, 235.8] },
+    { "path": "fixed core-replay", "hot_p50_ns": 6866449.0, "hot_ci95": [6922441.8, 6922441.8], "cold_p50_ns": 6866449.0, "cold_ci95": [6922441.8, 6922441.8] },
+    { "path": "raw-vec baseline", "hot_p50_ns": 1.0, "hot_ci95": [1.4, 1.6], "cold_p50_ns": 209.0, "cold_ci95": [196.3, 196.3] }
+  ],
+  "note": "hot reads are served by exact byte tiles (HotBytes); cold reads by bounded checkpoint restart (PackedRestart); the planner matches the best fixed path on each region while every fixed path is slow somewhere."
+}
