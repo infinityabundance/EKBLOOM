@@ -93,9 +93,12 @@ pub enum SectionKind {
     Certificate,
     /// The self-describing manifest record that closes a commit.
     Manifest,
-    /// Optional authentication tag (a 32-byte keyed BLAKE3 MAC) written
+    /// An optional authentication tag (a 32-byte keyed BLAKE3 MAC) written
     /// immediately before the commit footer. See `docs/SECURITY.md`.
     Auth,
+    /// A persisted [`crate::tiles::TileSet`]: exact hot-region byte tiles plus
+    /// their directory, serialized by [`crate::tiles::TileSet::to_bytes`].
+    Tiles,
 }
 
 impl SectionKind {
@@ -113,6 +116,7 @@ impl SectionKind {
             SectionKind::Manifest => 9,
             SectionKind::Auth => 10,
             SectionKind::HistorySegmented => 11,
+            SectionKind::Tiles => 12,
         }
     }
 
@@ -130,6 +134,7 @@ impl SectionKind {
             9 => SectionKind::Manifest,
             10 => SectionKind::Auth,
             11 => SectionKind::HistorySegmented,
+            12 => SectionKind::Tiles,
             _ => return None,
         })
     }
@@ -148,6 +153,7 @@ impl SectionKind {
             SectionKind::Certificate => "certificate",
             SectionKind::Manifest => "manifest",
             SectionKind::Auth => "auth",
+            SectionKind::Tiles => "tiles",
         }
     }
 }
@@ -1016,12 +1022,12 @@ mod tests {
 
     #[test]
     fn section_kind_codes_roundtrip() {
-        for code in 1..=11u32 {
+        for code in 1..=12u32 {
             let kind = SectionKind::from_u32(code).unwrap();
             assert_eq!(kind.to_u32(), code);
         }
         assert!(SectionKind::from_u32(0).is_none());
-        assert!(SectionKind::from_u32(12).is_none());
+        assert!(SectionKind::from_u32(13).is_none());
         assert!(SectionKind::from_u32(u32::MAX).is_none());
     }
 

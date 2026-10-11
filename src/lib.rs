@@ -38,6 +38,7 @@ pub mod filesystem;
 pub mod format;
 #[cfg(feature = "fuse")]
 pub mod fuse;
+pub mod handle;
 pub mod history;
 pub mod history_store;
 pub mod machine;
@@ -81,6 +82,7 @@ pub use fastpath::{
 pub use filesystem::{FileMeta, ObjectPhysical, OrFs, PhysicalReport};
 #[cfg(feature = "fuse")]
 pub use fuse::{mount, OrFsMount};
+pub use handle::{ObjectCache, OpenObject, ReadDirectory};
 pub use history::History;
 pub use history_store::{current_rss_bytes, peak_rss_bytes, HistoryStore, StoreConfig};
 pub use machine::{machine_by_id, state_log_with, OrMachine, MACHINE_NL2, MACHINE_RANS0, NL2};
@@ -119,7 +121,10 @@ pub use sweep::{
     write_evidence_json, write_memory_tiers_json, DepthMetrics, DepthPoint, MemoryTiersReport,
     SweepConfig, SweepPoint, SweepReport, TierPoint,
 };
-pub use tiles::{DirectoryKind, TileAdaptReport, TileDirectory, TileSet, RADIX_GROUP_SHIFT};
+pub use tiles::{
+    parse_tile_set_prefix, DirectoryKind, TileAdaptReport, TileDirectory, TileSet, TileSetPrefix,
+    TileSummary, RADIX_GROUP_SHIFT, TILE_SET_PREFIX_LEN,
+};
 pub use verify::{verify, verify_deep, CheckOutcome, VerificationReport};
 pub use worker::{available_parallelism, manifest_background, regional_parallel};
 pub use writer::{

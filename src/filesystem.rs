@@ -47,6 +47,7 @@ use std::sync::{Mutex, MutexGuard};
 use crate::bloom::BloomKind;
 use crate::error::{EkbloomError, Result};
 use crate::format::{Reader, Writer};
+use crate::handle::ObjectCache;
 use crate::manifest::{self, EkbloomBody};
 use crate::reader;
 use crate::writer;
@@ -119,6 +120,10 @@ struct IndexEntry {
 pub struct OrFs {
     root: PathBuf,
     index: Mutex<BTreeMap<String, IndexEntry>>,
+    /// Generation-aware cache of validated object handles. The hot read path
+    /// consults this without acquiring the namespace index lock, so repeated
+    /// reads of an already-open object neither re-parse nor block.
+    objects: ObjectCache,
 }
 
 impl OrFs {
@@ -139,6 +144,7 @@ impl OrFs {
         Ok(OrFs {
             root: root.to_path_buf(),
             index: Mutex::new(index),
+            objects: ObjectCache::new(),
         })
     }
 
@@ -214,9 +220,25 @@ impl OrFs {
     }
 
     /// Read a logical range from an object, returning byte-exact source bytes.
+    ///
+    /// The read goes through a generation-aware [`ObjectCache`] keyed by the
+    /// concealed `.ekb` file: an already-open object is reused (no re-open, no
+    /// re-parse) and its reads take no lock at all. The namespace index mutex is
+    /// **not** acquired on this path — registration is equivalent to the concealed
+    /// object file existing, so an unregistered path surfaces as the same argument
+    /// error the index would have produced.
     pub fn read(&self, logical_path: &str, req: ReadRequest) -> Result<Vec<u8>> {
-        let (body, _) = self.load(logical_path)?;
-        reader::read(&body, req)
+        let rel = normalize_file_path(logical_path)?;
+        let manifest_path = self.object_dir(&rel).join("manifests");
+        match self.objects.open(&manifest_path) {
+            Ok(object) => object.read(req),
+            Err(EkbloomError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(EkbloomError::InvalidArgument {
+                    what: format!("no such logical object: {rel}"),
+                })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// List a logical directory.

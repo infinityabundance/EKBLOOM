@@ -24,6 +24,9 @@ use crate::history::History;
 use crate::machine::{machine_by_id, MACHINE_NL2};
 use crate::manifest::{ComponentReport, EkbloomBody, ManifestationReport};
 use crate::state::Snapshot;
+use crate::tiles::{
+    parse_tile_set_prefix, DirectoryKind, TileSummary, RADIX_GROUP_SHIFT, TILE_SET_PREFIX_LEN,
+};
 use crate::ReadRequest;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -182,6 +185,7 @@ fn open_selected(
     let mut checkpoints: Vec<CheckpointSet> = Vec::new();
     let mut blooms: Vec<BloomShell> = Vec::new();
     let mut certificates: Vec<Certificate> = Vec::new();
+    let mut tiles: Vec<crate::tiles::TileSet> = Vec::new();
     let mut segmented_count = 0usize;
     let mut segmented_link: Option<([u8; 32], u64)> = None;
 
@@ -212,6 +216,7 @@ fn open_selected(
                     blooms.push(shell);
                 }
                 SectionKind::Certificate => certificates.push(Certificate::from_bytes(payload)?),
+                SectionKind::Tiles => tiles.push(crate::tiles::TileSet::from_bytes(payload)?),
                 SectionKind::HistorySegmented => {
                     // The in-memory `EkbloomBody` has no field for a segmented
                     // projection, so the section is validated for linkage and
@@ -313,11 +318,20 @@ fn open_selected(
             ));
         }
     }
+    for tile_set in &tiles {
+        if tile_set.core_hash() != core_digest || tile_set.logical_len != manifest.logical_len {
+            return Err(corrupt(
+                selected.generation,
+                "tile set core linkage mismatch",
+            ));
+        }
+    }
     let expected_components = 1
         + usize::from(history.is_some())
         + checkpoints.len()
         + blooms.len()
         + certificates.len()
+        + tiles.len()
         + segmented_count;
     if manifest.components.len() != expected_components {
         return Err(corrupt(
@@ -336,7 +350,7 @@ fn open_selected(
         checkpoints,
         blooms,
         certificates,
-        tiles: Vec::new(),
+        tiles,
         generation: selected.generation,
         profiles: manifest.profiles,
     })
@@ -548,6 +562,343 @@ fn read_vec_at(file: &File, off: u64, len: u64, total: u64) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; n];
     read_exact_at_len(file, &mut buf, off, total)?;
     Ok(buf)
+}
+
+/// Marker for "this tile is not materialised" in a serialized tile directory.
+const TILE_ABSENT: u32 = u32::MAX;
+/// Tiles per top-level radix group (`1 << RADIX_GROUP_SHIFT`).
+const TILE_RADIX_GROUP_TILES: u64 = 1u64 << RADIX_GROUP_SHIFT;
+
+/// A sequential, bounds-checked reader over a fixed byte window of a file.
+///
+/// Every field is a small `pread` bounded by `[start, end)` inside the file of
+/// length `total`; a read past the window is a clean [`EkbloomError`].
+struct BoundedFileReader<'a> {
+    file: &'a File,
+    off: u64,
+    end: u64,
+    total: u64,
+}
+
+impl<'a> BoundedFileReader<'a> {
+    fn new(file: &'a File, start: u64, end: u64, total: u64) -> BoundedFileReader<'a> {
+        BoundedFileReader {
+            file,
+            off: start,
+            end,
+            total,
+        }
+    }
+
+    fn position(&self) -> u64 {
+        self.off
+    }
+
+    fn take(&mut self, n: u64) -> Result<Vec<u8>> {
+        let e = self.off.checked_add(n).ok_or(EkbloomError::Overflow {
+            what: "tile section read",
+        })?;
+        if e > self.end {
+            return Err(EkbloomError::Truncated {
+                needed: e,
+                available: self.end,
+            });
+        }
+        let buf = read_vec_at(self.file, self.off, n, self.total)?;
+        self.off = e;
+        Ok(buf)
+    }
+
+    fn u64(&mut self) -> Result<u64> {
+        let b = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
+    /// Read a `u64`-length-prefixed little-endian `u32` vector.
+    fn u32_vec(&mut self) -> Result<Vec<u32>> {
+        let n = self.u64()?;
+        let n = usize::try_from(n).map_err(|_| EkbloomError::Overflow {
+            what: "tile directory vector length",
+        })?;
+        let bytes = self.take((n as u64).checked_mul(4).ok_or(EkbloomError::Overflow {
+            what: "tile directory vector bytes",
+        })?)?;
+        let mut out = Vec::with_capacity(n);
+        for chunk in bytes.as_chunks::<4>().0 {
+            out.push(u32::from_le_bytes(*chunk));
+        }
+        Ok(out)
+    }
+}
+
+/// A parsed, offset-only view of one persisted `TILES` section.
+///
+/// The directory is held in memory (it is the index); the tile blob itself is
+/// never loaded — individual tiles are read by bounded `pread`.
+#[derive(Clone, Debug)]
+struct FileTiles {
+    tile_shift: u8,
+    logical_len: u64,
+    kind: DirectoryKind,
+    tiles: u64,
+    present: u64,
+    core_hash: [u8; 32],
+    flat: Vec<u32>,
+    groups: Vec<u32>,
+    slots: Vec<u32>,
+    /// Absolute file offset of the tile blob.
+    data_offset: u64,
+    /// Length of the tile blob.
+    data_len: u64,
+    /// File length, used to bound every `pread`.
+    physical_len: u64,
+}
+
+impl FileTiles {
+    #[inline]
+    fn tile_size(&self) -> u64 {
+        1u64 << self.tile_shift
+    }
+
+    /// Exact byte length of tile `tile` (the final tile may be partial).
+    #[inline]
+    fn tile_len(&self, tile: u64) -> u64 {
+        let size = self.tile_size();
+        let start = tile << self.tile_shift;
+        if start >= self.logical_len {
+            0
+        } else {
+            size.min(self.logical_len - start)
+        }
+    }
+
+    /// The blob offset of tile `tile`, or `None` when it is not materialised.
+    #[inline]
+    fn offset_of(&self, tile: u64) -> Option<u32> {
+        if tile >= self.tiles {
+            return None;
+        }
+        match self.kind {
+            DirectoryKind::Flat => match self.flat.get(tile as usize) {
+                Some(&v) if v != TILE_ABSENT => Some(v),
+                _ => None,
+            },
+            DirectoryKind::TwoLevelRadix => {
+                let group = (tile >> RADIX_GROUP_SHIFT) as usize;
+                let base = match self.groups.get(group) {
+                    Some(&b) if b != TILE_ABSENT => b as usize,
+                    _ => return None,
+                };
+                let slot = (tile & (TILE_RADIX_GROUP_TILES - 1)) as usize;
+                match self.slots.get(base + slot) {
+                    Some(&v) if v != TILE_ABSENT => Some(v),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    fn directory_bytes(&self) -> u64 {
+        match self.kind {
+            DirectoryKind::Flat => self.flat.len() as u64 * 4,
+            DirectoryKind::TwoLevelRadix => {
+                (self.groups.len() as u64).saturating_add(self.slots.len() as u64) * 4
+            }
+        }
+    }
+
+    fn physical_bytes(&self) -> u64 {
+        self.data_len.saturating_add(self.directory_bytes())
+    }
+
+    fn summary(&self) -> TileSummary {
+        TileSummary {
+            tile_shift: self.tile_shift,
+            logical_len: self.logical_len,
+            kind: self.kind,
+            tiles_total: self.tiles,
+            present_tiles: self.present,
+            tile_bytes: self.data_len,
+            directory_bytes: self.directory_bytes(),
+        }
+    }
+
+    /// Whether every tile intersecting `[offset, end)` is materialised.
+    fn covers(&self, offset: u64, end: u64) -> bool {
+        if end <= offset {
+            return true;
+        }
+        let shift = self.tile_shift;
+        let first = offset >> shift;
+        let last = (end - 1) >> shift;
+        (first..=last).all(|tile| self.offset_of(tile).is_some())
+    }
+
+    /// Read `[offset, end)` from materialised tiles by bounded `pread`.
+    fn read_range(&self, file: &File, offset: u64, end: u64, out: &mut Vec<u8>) -> Result<()> {
+        if !self.covers(offset, end) {
+            return Err(bad("tile range is not fully materialised"));
+        }
+        let shift = self.tile_shift;
+        let size = self.tile_size();
+        let mut pos = offset;
+        while pos < end {
+            let tile = pos >> shift;
+            let tile_start = tile << shift;
+            let tile_end = tile_start.saturating_add(size).min(self.logical_len);
+            let seg_end = end.min(tile_end);
+            let seg_len = seg_end - pos;
+            let off = self
+                .offset_of(tile)
+                .ok_or_else(|| bad("tile directory lost a present tile"))?;
+            let in_tile = pos - tile_start;
+            let file_off = self
+                .data_offset
+                .checked_add(u64::from(off))
+                .and_then(|o| o.checked_add(in_tile))
+                .ok_or(EkbloomError::Overflow {
+                    what: "tile file offset",
+                })?;
+            let n = usize::try_from(seg_len).map_err(|_| EkbloomError::Overflow {
+                what: "tile read length",
+            })?;
+            let prev = out.len();
+            let new_len = prev.checked_add(n).ok_or(EkbloomError::Overflow {
+                what: "tile read buffer",
+            })?;
+            out.resize(new_len, 0);
+            read_exact_at_len(file, &mut out[prev..], file_off, self.physical_len)?;
+            pos = seg_end;
+        }
+        Ok(())
+    }
+}
+
+/// Parse one `TILES` section header and directory without loading the tile blob.
+fn parse_tiles(
+    file: &File,
+    payload_offset: u64,
+    payload_len: u64,
+    total: u64,
+    machine_id: u32,
+    logical_len: u64,
+) -> Result<FileTiles> {
+    if payload_len < TILE_SET_PREFIX_LEN as u64 {
+        return Err(EkbloomError::Truncated {
+            needed: TILE_SET_PREFIX_LEN as u64,
+            available: payload_len,
+        });
+    }
+    let mut prefix = [0u8; TILE_SET_PREFIX_LEN];
+    read_exact_at_len(file, &mut prefix, payload_offset, total)?;
+    let p = parse_tile_set_prefix(&prefix)?;
+    if p.machine_id != machine_id {
+        return Err(bad("tile set machine id disagrees with the header"));
+    }
+    if p.logical_len != logical_len {
+        return Err(bad("tile set logical length disagrees with the object"));
+    }
+    let payload_end = payload_offset
+        .checked_add(payload_len)
+        .ok_or(EkbloomError::Overflow {
+            what: "tile section extent",
+        })?;
+    let dir_start = payload_offset
+        .checked_add(TILE_SET_PREFIX_LEN as u64)
+        .ok_or(EkbloomError::Overflow {
+            what: "tile directory offset",
+        })?;
+    let mut rdr = BoundedFileReader::new(file, dir_start, payload_end, total);
+    let (flat, groups, slots) = match p.kind {
+        DirectoryKind::Flat => (rdr.u32_vec()?, Vec::new(), Vec::new()),
+        DirectoryKind::TwoLevelRadix => {
+            let groups = rdr.u32_vec()?;
+            let slots = rdr.u32_vec()?;
+            (Vec::new(), groups, slots)
+        }
+    };
+    let data_len = rdr.u64()?;
+    let data_offset = rdr.position();
+    let data_end = data_offset
+        .checked_add(data_len)
+        .ok_or(EkbloomError::Overflow {
+            what: "tile blob extent",
+        })?;
+    if data_end > payload_end {
+        return Err(EkbloomError::Truncated {
+            needed: data_end,
+            available: payload_end,
+        });
+    }
+
+    let tiles = p.logical_len.div_ceil(1u64 << p.tile_shift);
+    let tile_set = FileTiles {
+        tile_shift: p.tile_shift,
+        logical_len: p.logical_len,
+        kind: p.kind,
+        tiles,
+        present: p.present,
+        core_hash: p.core_hash,
+        flat,
+        groups,
+        slots,
+        data_offset,
+        data_len,
+        physical_len: total,
+    };
+
+    // Structural validation of the directory: exact shape, valid group bases,
+    // in-range blob offsets, and a presence count that agrees field-for-field.
+    match p.kind {
+        DirectoryKind::Flat => {
+            if tile_set.flat.len() as u64 != tiles {
+                return Err(bad("flat tile directory length mismatch"));
+            }
+        }
+        DirectoryKind::TwoLevelRadix => {
+            let want_groups = tiles.div_ceil(TILE_RADIX_GROUP_TILES);
+            if tile_set.groups.len() as u64 != want_groups {
+                return Err(bad("radix tile group count mismatch"));
+            }
+            if !(tile_set.slots.len() as u64).is_multiple_of(TILE_RADIX_GROUP_TILES) {
+                return Err(bad("radix tile slot block is not a whole number of groups"));
+            }
+            for &base in &tile_set.groups {
+                if base == TILE_ABSENT {
+                    continue;
+                }
+                let base = usize::try_from(base).map_err(|_| EkbloomError::Overflow {
+                    what: "radix group base",
+                })?;
+                if !base.is_multiple_of(TILE_RADIX_GROUP_TILES as usize)
+                    || base + TILE_RADIX_GROUP_TILES as usize > tile_set.slots.len()
+                {
+                    return Err(bad("radix group base outside the slot block"));
+                }
+            }
+        }
+    }
+    let mut counted: u64 = 0;
+    for tile in 0..tiles {
+        if let Some(off) = tile_set.offset_of(tile) {
+            let len = tile_set.tile_len(tile);
+            let end = u64::from(off)
+                .checked_add(len)
+                .ok_or(EkbloomError::Overflow {
+                    what: "tile blob offset",
+                })?;
+            if end > data_len {
+                return Err(bad("tile directory points outside the tile blob"));
+            }
+            counted = counted.saturating_add(1);
+        }
+    }
+    if counted != p.present {
+        return Err(bad("tile presence count disagrees with the directory"));
+    }
+    Ok(tile_set)
 }
 
 /// Stream a CRC-32 over `[off, off + len)` in bounded chunks.
@@ -881,6 +1232,7 @@ pub struct FileBody {
     checkpoints: Vec<FileCheckpoint>,
     blooms: Vec<FileBloom>,
     certificates: Vec<FileCertificate>,
+    tiles: Vec<FileTiles>,
     segmented: Option<FileSegmentedHistory>,
     profiles: Vec<String>,
 }
@@ -897,6 +1249,17 @@ impl FileBody {
     #[inline]
     pub fn logical_len(&self) -> u64 {
         self.logical_len
+    }
+
+    /// The newest committed generation this body was opened from.
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// A compact summary of every persisted tile set (geometry/accounting only).
+    pub fn tile_summaries(&self) -> Vec<TileSummary> {
+        self.tiles.iter().map(FileTiles::summary).collect()
     }
 
     /// The on-disk file length in bytes.
@@ -955,6 +1318,9 @@ impl FileBody {
         if req.length == 0 {
             return Ok(());
         }
+        if self.read_via_tiles(req.offset, end, out)? {
+            return Ok(());
+        }
         if self.read_via_path(req.offset, end, out)? {
             return Ok(());
         }
@@ -1005,6 +1371,13 @@ impl FileBody {
                 name: format!("certificate[{i}] {}", c.kind.as_str()),
                 kind: "certificate".to_string(),
                 bytes: c.bytes,
+            });
+        }
+        for (i, t) in self.tiles.iter().enumerate() {
+            components.push(ComponentReport {
+                name: format!("tiles[{i}] shift={}", t.tile_shift),
+                kind: "tiles".to_string(),
+                bytes: t.physical_bytes(),
             });
         }
         if let Some(seg) = &self.segmented {
@@ -1060,6 +1433,7 @@ impl FileBody {
         let mut checkpoints: Vec<FileCheckpoint> = Vec::new();
         let mut blooms: Vec<FileBloom> = Vec::new();
         let mut certificates: Vec<FileCertificate> = Vec::new();
+        let mut tiles: Vec<FileTiles> = Vec::new();
         let mut segmented: Option<FileSegmentedHistory> = None;
 
         for commit in &commits {
@@ -1089,6 +1463,14 @@ impl FileBody {
                     SectionKind::Certificate => {
                         certificates.push(parse_certificate(&file, off, len, physical_len)?)
                     }
+                    SectionKind::Tiles => tiles.push(parse_tiles(
+                        &file,
+                        off,
+                        len,
+                        physical_len,
+                        header.core_machine_id,
+                        header.logical_symbols,
+                    )?),
                     SectionKind::HistorySegmented => {
                         segmented = Some(parse_segmented(&file, off, len, physical_len)?)
                     }
@@ -1172,11 +1554,20 @@ impl FileBody {
                 ));
             }
         }
+        for tile_set in &tiles {
+            if tile_set.core_hash != core_digest {
+                return Err(corrupt(
+                    selected.generation,
+                    "tile set core linkage mismatch",
+                ));
+            }
+        }
         let expected_components = 1
             + usize::from(history.is_some())
             + checkpoints.len()
             + blooms.len()
             + certificates.len()
+            + tiles.len()
             + usize::from(segmented.is_some());
         if manifest.components.len() != expected_components {
             return Err(corrupt(
@@ -1197,9 +1588,36 @@ impl FileBody {
             checkpoints,
             blooms,
             certificates,
+            tiles,
             segmented,
             profiles: manifest.profiles,
         })
+    }
+
+    /// Whether a persisted tile set fully materialises
+    /// `[offset, offset + length)`, so a read is served by bounded `pread` with
+    /// no reconstruction.
+    pub fn tiles_cover(&self, offset: u64, length: u64) -> bool {
+        let Some(end) = offset.checked_add(length) else {
+            return false;
+        };
+        if end > self.logical_len {
+            return false;
+        }
+        self.tiles.iter().any(|t| t.covers(offset, end))
+    }
+
+    /// Path 0: a persisted tile set that fully materialises the request. Tile
+    /// bytes are exact copies read by bounded `pread`; a partially-materialised
+    /// range falls through to the other paths, which reconstruct exactly.
+    fn read_via_tiles(&self, offset: u64, end: u64, out: &mut Vec<u8>) -> Result<bool> {
+        for tile_set in &self.tiles {
+            if tile_set.covers(offset, end) {
+                tile_set.read_range(&self.file, offset, end, out)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Read the core window `[from, to)` into a fresh buffer (bounds-checked).

@@ -1,0 +1,127 @@
+{
+  "corpus_bytes": 4194304,
+  "corpus_seed": 16938038201776218150,
+  "file_bytes": 4260696,
+  "hot_bytes": 65536,
+  "tile_shift": 12,
+  "window_bytes": 4096,
+  "samples": 512,
+  "reparse_samples": 96,
+  "reads_per_thread": 16000,
+  "cached_vs_reopen": [
+    {
+      "name": "1-byte cached handle read",
+      "p50_ns": 120.0,
+      "p99_ns": 150.0,
+      "p999_ns": 190.0,
+      "mean_ns": 124.4
+    },
+    {
+      "name": "1-byte reopen + reparse",
+      "p50_ns": 413011.0,
+      "p99_ns": 427127.0,
+      "p999_ns": 427127.0,
+      "mean_ns": 413985.1
+    },
+    {
+      "name": "4 KiB cached handle read",
+      "p50_ns": 201.0,
+      "p99_ns": 251.0,
+      "p999_ns": 1172.0,
+      "mean_ns": 207.9
+    },
+    {
+      "name": "4 KiB reopen + reparse",
+      "p50_ns": 424262.0,
+      "p99_ns": 541701.0,
+      "p999_ns": 541701.0,
+      "mean_ns": 437147.1
+    },
+    {
+      "name": "4 KiB ObjectCache hit + read",
+      "p50_ns": 1002.0,
+      "p99_ns": 1243.0,
+      "p999_ns": 3626.0,
+      "mean_ns": 1025.5
+    }
+  ],
+  "concurrency": [
+    {
+      "threads": 1,
+      "baseline_reads_per_sec": 2938281,
+      "bg_reads_per_sec": 2910674,
+      "baseline_p50_ns": 281.0,
+      "baseline_p99_ns": 361.0,
+      "baseline_p999_ns": 542.0,
+      "bg_p50_ns": 291.0,
+      "bg_p99_ns": 341.0,
+      "bg_p999_ns": 571.0,
+      "bg_manifestations": 4
+    },
+    {
+      "threads": 2,
+      "baseline_reads_per_sec": 5166115,
+      "bg_reads_per_sec": 5245563,
+      "baseline_p50_ns": 291.0,
+      "baseline_p99_ns": 401.0,
+      "baseline_p999_ns": 601.0,
+      "bg_p50_ns": 330.0,
+      "bg_p99_ns": 401.0,
+      "bg_p999_ns": 461.0,
+      "bg_manifestations": 4
+    },
+    {
+      "threads": 4,
+      "baseline_reads_per_sec": 8999557,
+      "bg_reads_per_sec": 9395168,
+      "baseline_p50_ns": 361.0,
+      "baseline_p99_ns": 501.0,
+      "baseline_p999_ns": 651.0,
+      "bg_p50_ns": 351.0,
+      "bg_p99_ns": 491.0,
+      "bg_p999_ns": 651.0,
+      "bg_manifestations": 4
+    },
+    {
+      "threads": 8,
+      "baseline_reads_per_sec": 11273084,
+      "bg_reads_per_sec": 12325376,
+      "baseline_p50_ns": 400.0,
+      "baseline_p99_ns": 651.0,
+      "baseline_p999_ns": 922.0,
+      "bg_p50_ns": 390.0,
+      "bg_p99_ns": 661.0,
+      "bg_p999_ns": 2786.0,
+      "bg_manifestations": 4
+    },
+    {
+      "threads": 16,
+      "baseline_reads_per_sec": 13829036,
+      "bg_reads_per_sec": 14328595,
+      "baseline_p50_ns": 421.0,
+      "baseline_p99_ns": 732.0,
+      "baseline_p999_ns": 1233.0,
+      "bg_p50_ns": 401.0,
+      "bg_p99_ns": 691.0,
+      "bg_p999_ns": 1122.0,
+      "bg_manifestations": 4
+    }
+  ],
+  "tile_persistence": [
+    {
+      "name": "file-backed tile range (pread)",
+      "p50_ns": 310.0,
+      "p99_ns": 381.0,
+      "p999_ns": 2905.0,
+      "mean_ns": 317.9
+    },
+    {
+      "name": "in-memory tile range",
+      "p50_ns": 100.0,
+      "p99_ns": 421.0,
+      "p999_ns": 1643.0,
+      "mean_ns": 112.5
+    }
+  ],
+  "verdict": "cached read ~3442x faster than reopen+reparse at 1 byte (120 vs 413011 ns p50) and ~2111x at 4 KiB (201 vs 424262 ns p50); background construction left p50/p99 flat and moved the worst thread-count p99.9 by 3.02x; persisted tiles cost 3.1x the in-memory copy (310 vs 100 ns p50) due to one pread per request."
+}

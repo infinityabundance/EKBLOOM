@@ -313,6 +313,9 @@ fn all_sections(body: &EkbloomBody) -> Vec<(SectionKind, Vec<u8>)> {
     for cert in &body.certificates {
         out.push((SectionKind::Certificate, cert.to_bytes()));
     }
+    for tile_set in &body.tiles {
+        out.push((SectionKind::Tiles, tile_set.to_bytes()));
+    }
     out.push((SectionKind::Manifest, manifest_record(body).encode()));
     out
 }
@@ -324,6 +327,7 @@ struct CommittedCounts {
     checkpoints: usize,
     blooms: usize,
     certificates: usize,
+    tiles: usize,
 }
 
 /// Count the accumulated structures of the valid commit prefix.
@@ -339,6 +343,7 @@ fn accumulated_counts(commits: &[format::ScannedCommit]) -> CommittedCounts {
                 | SectionKind::BloomRegion
                 | SectionKind::BloomPath => counts.blooms += 1,
                 SectionKind::Certificate => counts.certificates += 1,
+                SectionKind::Tiles => counts.tiles += 1,
                 SectionKind::CoreMachine
                 | SectionKind::HistorySegmented
                 | SectionKind::Manifest
@@ -370,6 +375,7 @@ fn new_sections(
     if body.checkpoints.len() < counts.checkpoints
         || body.blooms.len() < counts.blooms
         || body.certificates.len() < counts.certificates
+        || body.tiles.len() < counts.tiles
     {
         return Err(EkbloomError::InvalidArgument {
             what: "body withdraws committed structures".to_string(),
@@ -383,6 +389,9 @@ fn new_sections(
     }
     for cert in &body.certificates[counts.certificates..] {
         out.push((SectionKind::Certificate, cert.to_bytes()));
+    }
+    for tile_set in &body.tiles[counts.tiles..] {
+        out.push((SectionKind::Tiles, tile_set.to_bytes()));
     }
 
     out.push((SectionKind::Manifest, manifest_record(body).encode()));

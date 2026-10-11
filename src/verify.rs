@@ -140,6 +140,12 @@ fn run(body: &EkbloomBody, deep: bool) -> Result<VerificationReport> {
     // Certificates.
     checks.push(check_certificates(body));
 
+    // Persisted hot-region tiles: geometry/digest, core linkage, and every
+    // materialised tile against the authoritative decode.
+    for (idx, tile_set) in body.tiles.iter().enumerate() {
+        checks.push(check_tiles(body, tile_set, idx, decoded));
+    }
+
     if deep {
         checks.push(check_deep_symbols(body, decoded, machine));
     }
@@ -473,6 +479,42 @@ fn check_contextual(
         true,
         format!("{} contextual entries reproduce Phi_D", bloom.entries.len()),
     )
+}
+
+/// Verify one persisted tile set: core linkage, content digest, and every
+/// materialised tile against the authoritative machine decode of its range.
+fn check_tiles(
+    body: &EkbloomBody,
+    tile_set: &crate::tiles::TileSet,
+    idx: usize,
+    decoded: Option<&Vec<u8>>,
+) -> CheckOutcome {
+    let name = format!("tiles[{idx}] shift={}", tile_set.tile_shift);
+    if tile_set.core_hash() != body.core_hash {
+        return check(name, false, "tile set core hash does not match the body");
+    }
+    if !tile_set.verify() {
+        return check(name, false, "tile content digest mismatch");
+    }
+    let Some(decoded) = decoded else {
+        return check(name, false, "authoritative decode unavailable");
+    };
+    match tile_set.verify_decoded(decoded) {
+        Ok(true) => check(
+            name,
+            true,
+            format!(
+                "{} materialised tile(s) certify against the machine",
+                tile_set.present_tiles()
+            ),
+        ),
+        Ok(false) => check(
+            name,
+            false,
+            "a materialised tile disagrees with the authoritative decode",
+        ),
+        Err(e) => check(name, false, e.to_string()),
+    }
 }
 
 fn check_certificates(body: &EkbloomBody) -> CheckOutcome {

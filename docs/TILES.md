@@ -152,12 +152,15 @@ These are measured limits, stated plainly:
   so tiles must manifest ≈ `N` tile bytes **plus** directory metadata — no better
   than `P_32` and strictly worse than `raw-vec` (which needs no directory). The
   win is inherently workload-dependent: **skewed/regional access, not uniform.**
-- **Persistence.** Tiles are an in-memory manifestation in this iteration; the
-  `.ekb` writer/format are outside this module's ownership, so a `TILES` section
-  is future work. The tile set does serialise/parse byte-exactly
-  (`TileSet::to_bytes` / `from_bytes`, digest-checked).
-- **Certification scope.** `verify_deep` does not yet know about tiles (that is
-  `verify.rs`); a tile set certifies itself via `verify_against(&body.core)`.
+- **Persistence.** Tiles now persist: the writer embeds each tile set as a
+  `TILES` section (wire code 12) in the committed generation, and
+  `reader::FileBody` answers a fully-materialised range with bounded `pread` of the
+  needed tile bytes, never loading the whole blob. See `docs/HANDLES.md`.
+- **Certification scope.** `verify` and `verify_deep` check tiles: the section's
+  `core_hash` and content digest must match and every materialised tile must equal
+  the authoritative machine decode of its range, so a tampered tile fails
+  verification. A tile set also certifies itself via `verify_against(&body.core)`
+  / `verify_decoded`.
 
 ---
 
@@ -169,7 +172,7 @@ directory lookup for both kinds including empty top-level groups; radix < flat
 metadata when sparse; tamper detection (a flipped tile byte is rejected);
 budget enforcement and the no-fit no-op; additivity (earlier generations are
 byte-identical and still verify); power-of-two lookups for every tile size; and
-a byte roundtrip of the tile set. `src/tiles.rs` adds 2 unit tests.
+a byte roundtrip of the tile set. `src/tiles.rs` adds 3 unit tests.
 
 ## 5. Reproduce
 

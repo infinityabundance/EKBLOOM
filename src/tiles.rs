@@ -79,7 +79,7 @@ impl DirectoryKind {
     }
 
     /// Stable wire code.
-    fn code(self) -> u8 {
+    pub fn code(self) -> u8 {
         match self {
             DirectoryKind::Flat => 0,
             DirectoryKind::TwoLevelRadix => 1,
@@ -87,12 +87,113 @@ impl DirectoryKind {
     }
 
     /// Decode a wire code, or `None` if unknown.
-    fn from_code(code: u8) -> Option<DirectoryKind> {
+    pub fn from_code(code: u8) -> Option<DirectoryKind> {
         match code {
             0 => Some(DirectoryKind::Flat),
             1 => Some(DirectoryKind::TwoLevelRadix),
             _ => None,
         }
+    }
+}
+
+/// Current serialized tile-set wire version (see [`TileSet::to_bytes`]).
+pub const TILE_SET_VERSION: u8 = 1;
+/// Fixed byte length of the serialized tile-set prefix: magic(8) ++ version(1)
+/// ++ tile_shift(1) ++ kind(1) ++ reserved(1) ++ machine_id(4) ++ logical_len(8)
+/// ++ present(8) ++ core_hash(32) ++ digest(32).
+pub const TILE_SET_PREFIX_LEN: usize = 96;
+
+/// The fixed-prefix fields of a serialized tile set (no tile bytes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileSetPrefix {
+    /// Tile size is `1 << tile_shift`.
+    pub tile_shift: u8,
+    /// The directory kind.
+    pub kind: DirectoryKind,
+    /// Machine that encoded the object.
+    pub machine_id: u32,
+    /// Number of logical symbols the tile set indexes.
+    pub logical_len: u64,
+    /// Number of materialised tiles.
+    pub present: u64,
+    /// BLAKE3 hash of the visible core the tiles were certified against.
+    pub core_hash: [u8; 32],
+    /// Content digest over geometry + present tiles.
+    pub digest: [u8; 32],
+}
+
+/// Parse and structurally validate the fixed prefix of a serialized tile set.
+///
+/// The tile blob and directory are not touched; this is what a bounded file
+/// reader uses to locate them. Rejects an unknown magic/version and an
+/// out-of-range tile shift.
+pub fn parse_tile_set_prefix(bytes: &[u8]) -> Result<TileSetPrefix> {
+    if bytes.len() < TILE_SET_PREFIX_LEN {
+        return Err(EkbloomError::Truncated {
+            needed: TILE_SET_PREFIX_LEN as u64,
+            available: bytes.len() as u64,
+        });
+    }
+    if &bytes[..8] != b"EKBTILES" {
+        return Err(bad("tile set magic mismatch"));
+    }
+    if bytes[8] != TILE_SET_VERSION {
+        return Err(bad(format!("unsupported tile set version {}", bytes[8])));
+    }
+    let tile_shift = bytes[9];
+    if tile_shift == 0 || tile_shift > MAX_TILE_SHIFT {
+        return Err(bad(format!("tile shift {tile_shift} out of range")));
+    }
+    let kind =
+        DirectoryKind::from_code(bytes[10]).ok_or_else(|| bad("unknown tile directory kind"))?;
+    let machine_id = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    let logical_len = u64::from_le_bytes([
+        bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
+    ]);
+    let present = u64::from_le_bytes([
+        bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
+    ]);
+    let mut core_hash = [0u8; 32];
+    core_hash.copy_from_slice(&bytes[32..64]);
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&bytes[64..96]);
+    Ok(TileSetPrefix {
+        tile_shift,
+        kind,
+        machine_id,
+        logical_len,
+        present,
+        core_hash,
+        digest,
+    })
+}
+
+/// An immutable, compact description of one persisted tile set (geometry and
+/// accounting only, never tile bytes). Published inside an `Arc` by the
+/// persistent handle so readers observe it lock-free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileSummary {
+    /// Tile size is `1 << tile_shift`.
+    pub tile_shift: u8,
+    /// Number of logical symbols the tile set indexes.
+    pub logical_len: u64,
+    /// The directory kind.
+    pub kind: DirectoryKind,
+    /// Number of tile slots indexed.
+    pub tiles_total: u64,
+    /// Number of materialised tiles.
+    pub present_tiles: u64,
+    /// Bytes held by materialised tile data.
+    pub tile_bytes: u64,
+    /// Directory metadata bytes.
+    pub directory_bytes: u64,
+}
+
+impl TileSummary {
+    /// Total manifested bytes: tile data plus directory metadata.
+    #[inline]
+    pub fn physical_bytes(&self) -> u64 {
+        self.tile_bytes.saturating_add(self.directory_bytes)
     }
 }
 
@@ -280,6 +381,26 @@ impl TileSet {
         self.tile_bytes().saturating_add(self.directory_bytes())
     }
 
+    /// The BLAKE3 hash of the visible core these tiles were certified against.
+    #[inline]
+    pub fn core_hash(&self) -> [u8; 32] {
+        self.core_hash
+    }
+
+    /// A compact geometry/accounting summary (never the tile bytes).
+    #[inline]
+    pub fn summary(&self) -> TileSummary {
+        TileSummary {
+            tile_shift: self.tile_shift,
+            logical_len: self.logical_len,
+            kind: self.directory.kind(),
+            tiles_total: self.directory.tiles(),
+            present_tiles: self.present,
+            tile_bytes: self.tile_bytes(),
+            directory_bytes: self.directory_bytes(),
+        }
+    }
+
     /// The exact bytes of materialised tile `tile`, or `None` when absent.
     pub fn tile_bytes_at(&self, tile: u64) -> Option<&[u8]> {
         let off = self.directory.offset_of(tile)? as usize;
@@ -402,16 +523,31 @@ impl TileSet {
         if *blake3::hash(core).as_bytes() != self.core_hash {
             return Ok(false);
         }
-        if !self.verify() {
-            return Ok(false);
-        }
         let machine = machine_by_id(self.machine_id).ok_or(EkbloomError::UnknownMachine {
             id: self.machine_id,
         })?;
         let decoded = machine.decode(core, self.logical_len)?;
+        self.verify_decoded(&decoded)
+    }
+
+    /// Certify every materialised tile against a precomputed authoritative
+    /// decode of the whole object (from [`crate::machine::OrMachine::decode`]).
+    ///
+    /// Returns `Ok(true)` only when the content digest is intact and each present
+    /// tile's bytes equal `decoded[start .. start + len]` exactly. The caller is
+    /// responsible for checking [`TileSet::core_hash`] against the body.
+    pub fn verify_decoded(&self, decoded: &[u8]) -> Result<bool> {
         if decoded.len() as u64 != self.logical_len {
             return Ok(false);
         }
+        if !self.verify() {
+            return Ok(false);
+        }
+        Ok(self.tiles_match_decode(decoded))
+    }
+
+    /// Whether every materialised tile equals its slice of `decoded`.
+    fn tiles_match_decode(&self, decoded: &[u8]) -> bool {
         let mut ok = true;
         self.directory.for_each_present(|tile, off| {
             if !ok {
@@ -429,7 +565,7 @@ impl TileSet {
                 _ => ok = false,
             }
         });
-        Ok(ok)
+        ok
     }
 
     /// Serialise the tile set (self-describing, length-checked).
@@ -1108,6 +1244,60 @@ mod tests {
             assert!(dir.offset_of(2).is_none());
             assert!(dir.offset_of(500).is_none());
             assert!(dir.offset_of(tiles_total).is_none());
+        }
+    }
+
+    /// `verify` must reject a tile whose bytes do not match the authoritative
+    /// machine decode — even when the content digest has been made to agree with
+    /// the tampered bytes, so only the per-tile machine check can catch it.
+    #[test]
+    fn verify_detects_a_tampered_persisted_tile() {
+        use crate::manifest::create;
+        use crate::region_adapt::AccessTrace;
+        use crate::{ManifestationBudget, ManifestationProfile};
+
+        let src = lcg(0x7111_0000_0000_000C, 64 * 1024);
+        let mut body = create(&src, ManifestationProfile::Root).unwrap();
+        let trace = AccessTrace {
+            regions: vec![(0, 4096)],
+            counts: vec![1000],
+        };
+        TileSet::manifest_hot_tiles(
+            &mut body,
+            &trace,
+            12,
+            DirectoryKind::Flat,
+            &ManifestationBudget {
+                maximum_physical_bytes: u64::MAX,
+            },
+        )
+        .unwrap();
+        assert!(crate::verify::verify(&body).unwrap().ok);
+        assert!(crate::verify::verify_deep(&body).unwrap().ok);
+
+        // Tamper a materialised tile, then make the digest agree with the tampered
+        // bytes so the digest check alone would pass and only the machine-decode
+        // comparison can reject it.
+        {
+            let t = &mut body.tiles[0];
+            t.data[0] ^= 0xFF;
+            t.digest = t.recompute_digest();
+            assert!(t.verify(), "digest now agrees with the tampered bytes");
+        }
+
+        for report in [
+            crate::verify::verify(&body).unwrap(),
+            crate::verify::verify_deep(&body).unwrap(),
+        ] {
+            assert!(!report.ok, "a tampered tile must fail verification");
+            assert!(
+                report
+                    .checks
+                    .iter()
+                    .any(|c| !c.passed && c.name.starts_with("tiles[")),
+                "expected a failing tiles check: {:?}",
+                report.checks
+            );
         }
     }
 }
