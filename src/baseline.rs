@@ -16,11 +16,19 @@
 //!   make that equivalence explicit and honest; it is not a different structure.
 //! * [`BaselineKind::IndexedArray`] — raw bytes plus a plain block-offset index
 //!   (a representative conventional structure).
+//! * [`BaselineKind::LruCache`] — an ordinary **byte-budgeted LRU cache** over the
+//!   raw bytes, backed by a `pread`-served raw file. It holds at most
+//!   `capacity_bytes` of block data in RAM; a miss loads the covering block from
+//!   the backing file and may evict the least-recently-used block. This is the
+//!   conventional caching structure EKBLOOM's manifested regions must be compared
+//!   against under the **same** byte budget.
 //!
 //! These intentionally mirror EKBLOOM's certified path-bloom `hot` array, which
 //! **is** a raw `N`-byte array. The comparison is therefore fair: no read-speed
 //! win over `RawVec` is expected, and EKBLOOM's cost is its extra structures.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -35,6 +43,9 @@ use crate::{CpuFeatures, ReadRequest, SweepConfig};
 /// Default block size (bytes) of the [`BaselineKind::IndexedArray`] offset index.
 pub const DEFAULT_INDEX_BLOCK: usize = 4096;
 
+/// Default block size (bytes) of the [`BaselineKind::LruCache`] resident cache.
+pub const DEFAULT_LRU_BLOCK: usize = 4096;
+
 /// One conventional direct-access baseline construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BaselineKind {
@@ -46,6 +57,8 @@ pub enum BaselineKind {
     Predecoded,
     /// Raw bytes plus a plain block-offset index.
     IndexedArray,
+    /// An ordinary byte-budgeted LRU cache over the raw bytes (file-backed).
+    LruCache,
 }
 
 impl BaselineKind {
@@ -56,6 +69,7 @@ impl BaselineKind {
             BaselineKind::RawFile => "raw-file",
             BaselineKind::Predecoded => "predecoded",
             BaselineKind::IndexedArray => "indexed-array",
+            BaselineKind::LruCache => "lru-cache",
         }
     }
 
@@ -66,16 +80,18 @@ impl BaselineKind {
             BaselineKind::RawFile => "source on disk, pread (File::read_exact_at)",
             BaselineKind::Predecoded => "materialised output cache (== raw bytes, V=N)",
             BaselineKind::IndexedArray => "raw bytes + plain block-offset index",
+            BaselineKind::LruCache => "byte-budgeted LRU cache over the raw bytes (file-backed)",
         }
     }
 
     /// Every baseline kind, in report order.
-    pub fn all() -> [BaselineKind; 4] {
+    pub fn all() -> [BaselineKind; 5] {
         [
             BaselineKind::RawVec,
             BaselineKind::RawFile,
             BaselineKind::Predecoded,
             BaselineKind::IndexedArray,
+            BaselineKind::LruCache,
         ]
     }
 }
@@ -98,10 +114,35 @@ fn finite(v: f64) -> f64 {
     }
 }
 
+/// An internal invariant failure for the LRU cache (a block vanished after a
+/// successful load); surfaced as a section error rather than a panic.
+fn corrupt_lru(block: u64) -> EkbloomError {
+    EkbloomError::BadSection {
+        reason: format!("lru-cache block {block} missing after load"),
+    }
+}
+
+/// Mutable LRU-cache state (interior mutability so reads keep the `&self` API).
+#[derive(Debug, Default)]
+struct LruState {
+    /// Resident block data, keyed by block ordinal.
+    resident: BTreeMap<u64, Vec<u8>>,
+    /// Recency order of resident blocks, least-recently-used first.
+    recency: Vec<u64>,
+    /// Total resident block bytes.
+    resident_bytes: u64,
+    /// Cache hits (resident block touched).
+    hits: u64,
+    /// Cache misses (block loaded from the backing file).
+    misses: u64,
+}
+
 /// A conventional direct-access baseline over a single source.
 ///
-/// `bytes` (in-memory kinds) and/or `file` (the file-backed kind) hold the only
-/// bytes retained to serve reads; `physical_bytes` reports exactly those.
+/// `bytes` (in-memory kinds) and/or `file` (the file-backed kinds) hold the only
+/// bytes retained to serve reads; `physical_bytes` reports exactly those. For
+/// [`BaselineKind::LruCache`] `physical_bytes` reports the declared byte budget
+/// and `resident_bytes` reports the block bytes currently held in RAM.
 #[derive(Debug)]
 pub struct Baseline {
     kind: BaselineKind,
@@ -112,22 +153,44 @@ pub struct Baseline {
     index: Vec<u64>,
     file: Option<File>,
     path: Option<PathBuf>,
+    capacity: u64,
+    block: u64,
+    cache: RefCell<LruState>,
 }
 
 impl Baseline {
     /// Build a baseline of `kind` over `source`.
     ///
-    /// `dir` is used only by [`BaselineKind::RawFile`], which materialises the
-    /// source at `dir/baseline-rawfile.bin` and opens it for `pread`. The
-    /// construction wall-clock time is recorded (the read from disk is part of
-    /// the cost a consumer would pay to obtain the baseline).
+    /// `dir` is used by [`BaselineKind::RawFile`] (which materialises the source
+    /// at `dir/baseline-rawfile.bin`) and by [`BaselineKind::LruCache`] (which
+    /// materialises a backing file at `dir/baseline-lru-backing.bin`). The
+    /// construction wall-clock time is recorded.
+    ///
+    /// The [`BaselineKind::LruCache`] byte budget defaults to the whole source;
+    /// use [`Baseline::build_lru`] or [`Baseline::build_with_capacity`] to set an
+    /// explicit budget.
     pub fn build(kind: BaselineKind, source: &[u8], dir: &Path) -> Result<Baseline> {
+        let default_capacity = source.len() as u64;
+        Baseline::build_with_capacity(kind, source, dir, default_capacity)
+    }
+
+    /// Build a baseline with an explicit byte budget (only
+    /// [`BaselineKind::LruCache`] uses `capacity_bytes`; every other kind ignores
+    /// it).
+    pub fn build_with_capacity(
+        kind: BaselineKind,
+        source: &[u8],
+        dir: &Path,
+        capacity_bytes: u64,
+    ) -> Result<Baseline> {
         let start = now_ns();
         let logical_len = source.len() as u64;
         let mut bytes: Vec<u8> = Vec::new();
         let mut index: Vec<u64> = Vec::new();
         let mut file: Option<File> = None;
         let mut path: Option<PathBuf> = None;
+        let mut capacity = capacity_bytes;
+        let block = DEFAULT_LRU_BLOCK as u64;
         let physical: u64 = match kind {
             BaselineKind::RawVec => {
                 bytes = source.to_vec();
@@ -157,6 +220,18 @@ impl Baseline {
                 }
                 (bytes.len() as u64).saturating_add((index.len() as u64).saturating_mul(8))
             }
+            BaselineKind::LruCache => {
+                std::fs::create_dir_all(dir)?;
+                let p = dir.join("baseline-lru-backing.bin");
+                std::fs::write(&p, source)?;
+                let f = File::open(&p)?;
+                file = Some(f);
+                path = Some(p);
+                // The retained RAM is the byte budget; resident bytes never
+                // exceed it (one block is always retained).
+                capacity = capacity_bytes;
+                capacity
+            }
         };
         let construction_ns = now_ns().saturating_sub(start);
         Ok(Baseline {
@@ -168,7 +243,16 @@ impl Baseline {
             index,
             file,
             path,
+            capacity,
+            block,
+            cache: RefCell::new(LruState::default()),
         })
+    }
+
+    /// Build an ordinary byte-budgeted LRU cache over `source` with an explicit
+    /// resident-byte budget.
+    pub fn build_lru(source: &[u8], capacity_bytes: u64, dir: &Path) -> Result<Baseline> {
+        Baseline::build_with_capacity(BaselineKind::LruCache, source, dir, capacity_bytes)
     }
 
     /// The baseline construction kind.
@@ -216,6 +300,48 @@ impl Baseline {
         &self.index
     }
 
+    /// The declared byte budget of an [`BaselineKind::LruCache`] (its retained RAM
+    /// ceiling); `0` for other kinds.
+    #[inline]
+    pub fn capacity_bytes(&self) -> u64 {
+        if self.kind == BaselineKind::LruCache {
+            self.capacity
+        } else {
+            0
+        }
+    }
+
+    /// The block bytes currently resident in an [`BaselineKind::LruCache`]'s
+    /// cache; `0` for other kinds.
+    pub fn resident_bytes(&self) -> u64 {
+        if self.kind == BaselineKind::LruCache {
+            self.cache.borrow().resident_bytes
+        } else {
+            0
+        }
+    }
+
+    /// Cache hits recorded so far (LRU only; `0` otherwise).
+    pub fn hits(&self) -> u64 {
+        self.cache.borrow().hits
+    }
+
+    /// Cache misses recorded so far (LRU only; `0` otherwise).
+    pub fn misses(&self) -> u64 {
+        self.cache.borrow().misses
+    }
+
+    /// Drop every resident block (models a close-and-reopen of the cache; the
+    /// backing file is untouched). Cumulative hit/miss counters are reset too.
+    pub fn clear_cache(&self) {
+        let mut st = self.cache.borrow_mut();
+        st.resident.clear();
+        st.recency.clear();
+        st.resident_bytes = 0;
+        st.hits = 0;
+        st.misses = 0;
+    }
+
     /// The capabilities this baseline retains (none of EKBLOOM's).
     pub fn capabilities(&self) -> Capabilities {
         Capabilities::none()
@@ -236,6 +362,9 @@ impl Baseline {
         }
         if req.length == 0 {
             return Ok(());
+        }
+        if self.kind == BaselineKind::LruCache {
+            return self.lru_read_into(req.offset, end, out);
         }
         let len = usize::try_from(req.length).map_err(|_| EkbloomError::Overflow {
             what: "read length",
@@ -260,6 +389,69 @@ impl Baseline {
         Ok(())
     }
 
+    /// LRU-served read: touch every block covering `[offset, end)` and copy the
+    /// requested slice of each out of the resident cache.
+    fn lru_read_into(&self, offset: u64, end: u64, out: &mut Vec<u8>) -> Result<()> {
+        let block = self.block.max(1);
+        let first = offset / block;
+        let last = (end - 1) / block;
+        for b in first..=last {
+            self.lru_ensure(b)?;
+            let bstart = b.saturating_mul(block);
+            let st = self.cache.borrow();
+            let data = st.resident.get(&b).ok_or_else(|| corrupt_lru(b))?;
+            let lo = usize::try_from(offset.max(bstart) - bstart)
+                .map_err(|_| EkbloomError::Overflow { what: "lru slice" })?;
+            let hi = usize::try_from(end.min(bstart.saturating_add(data.len() as u64)) - bstart)
+                .map_err(|_| EkbloomError::Overflow { what: "lru slice" })?;
+            out.extend_from_slice(&data[lo..hi]);
+        }
+        Ok(())
+    }
+
+    /// Ensure block `b` is resident, loading it from the backing file on a miss
+    /// and evicting least-recently-used blocks while over budget.
+    fn lru_ensure(&self, b: u64) -> Result<()> {
+        {
+            let mut st = self.cache.borrow_mut();
+            if st.resident.contains_key(&b) {
+                st.hits = st.hits.saturating_add(1);
+                st.recency.retain(|&x| x != b);
+                st.recency.push(b);
+                return Ok(());
+            }
+            st.misses = st.misses.saturating_add(1);
+        }
+        let block = self.block.max(1);
+        let bstart = b.saturating_mul(block);
+        if bstart >= self.logical_len {
+            return Err(oob(bstart, block, self.logical_len));
+        }
+        let bstop = bstart.saturating_add(block).min(self.logical_len);
+        let nbytes = usize::try_from(bstop - bstart)
+            .map_err(|_| EkbloomError::Overflow { what: "lru block" })?;
+        let f = self
+            .file
+            .as_ref()
+            .ok_or_else(|| EkbloomError::InvalidArgument {
+                what: "lru-cache has no backing file".to_string(),
+            })?;
+        let mut buf = vec![0u8; nbytes];
+        f.read_exact_at(&mut buf, bstart)?;
+        let mut st = self.cache.borrow_mut();
+        st.resident_bytes = st.resident_bytes.saturating_add(buf.len() as u64);
+        st.resident.insert(b, buf);
+        st.recency.retain(|&x| x != b);
+        st.recency.push(b);
+        while st.resident_bytes > self.capacity && st.resident.len() > 1 {
+            let victim = st.recency.remove(0);
+            if let Some(bytes) = st.resident.remove(&victim) {
+                st.resident_bytes = st.resident_bytes.saturating_sub(bytes.len() as u64);
+            }
+        }
+        Ok(())
+    }
+
     /// Byte-exact read of `req` as a fresh `Vec`.
     pub fn read(&self, req: ReadRequest) -> Result<Vec<u8>> {
         let mut out = Vec::new();
@@ -279,6 +471,17 @@ impl Baseline {
                 .ok_or(EkbloomError::Overflow { what: "read range" })?;
             if end > self.logical_len {
                 return Err(oob(offset, 1, self.logical_len));
+            }
+            if self.kind == BaselineKind::LruCache {
+                let block = self.block.max(1);
+                let b = offset / block;
+                self.lru_ensure(b)?;
+                let st = self.cache.borrow();
+                let data = st.resident.get(&b).ok_or_else(|| corrupt_lru(b))?;
+                let idx = usize::try_from(offset - b.saturating_mul(block))
+                    .map_err(|_| EkbloomError::Overflow { what: "lru byte" })?;
+                out.push(*data.get(idx).ok_or_else(|| corrupt_lru(b))?);
+                continue;
             }
             match &self.file {
                 Some(f) => {

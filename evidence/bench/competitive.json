@@ -1,0 +1,57 @@
+{
+  "corpus_bytes": 4194304,
+  "corpus_seed": 16938038201776218150,
+  "iterations": 32,
+  "sweep_seed": 11400714819323198485,
+  "hot_regions": 512,
+  "region_len": 64,
+  "hot_bytes": 32768,
+  "samples": 512,
+  "budget_bytes": 6291456,
+  "ekbloom_region_adapt": {
+    "selected_regions": 504,
+    "certified_regions": 504,
+    "added_physical_bytes": 1224924,
+    "new_generation": 2,
+    "cold_checkpoint_interval": 64,
+    "improved": true,
+    "metrics": {
+      "hot_ns_p50": 871.0,
+      "hot_ns_p99": 1663.0,
+      "cold_ns_p50": 240.0,
+      "post_thrash_first_read_ns": 3467,
+      "post_thrash_hot_ns_p50": 942.0,
+      "reopen_first_read_ns": 1593,
+      "reopen_first_hot_ns_p50": 872.0,
+      "reopen_warm_hot_ns_p50": 852.0
+    }
+  },
+  "lru_cache": {
+    "capacity_bytes": 1224924,
+    "hits": 1017,
+    "misses": 8,
+    "metrics": {
+      "hot_ns_p50": 60.0,
+      "hot_ns_p99": 80.0,
+      "cold_ns_p50": 662.0,
+      "post_thrash_first_read_ns": 1062,
+      "post_thrash_hot_ns_p50": 150.0,
+      "reopen_first_read_ns": 752,
+      "reopen_first_hot_ns_p50": 60.0,
+      "reopen_warm_hot_ns_p50": 60.0
+    }
+  },
+  "raw_no_cache": {
+    "accel_bytes": 0,
+    "metrics": {
+      "hot_ns_p50": 181.0,
+      "hot_ns_p99": 221.0,
+      "cold_ns_p50": 281.0,
+      "post_thrash_first_read_ns": 711,
+      "post_thrash_hot_ns_p50": 180.0,
+      "reopen_first_read_ns": 181,
+      "reopen_first_hot_ns_p50": 181.0,
+      "reopen_warm_hot_ns_p50": 181.0
+    }
+  }
+}
