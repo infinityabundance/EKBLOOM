@@ -104,3 +104,93 @@ any `ManifestationProfile`, so exposure is currently nil.
 * `Certificate.status` vs bloom `status` agreement is unchecked (subsumed by F3).
 * Contextual/regional certification status semantics for multi-region objects
   were only spot-checked for one region size.
+
+---
+
+## Revision 2 — 0.3 additions (segmented history, budgets, adaptive shells, O8)
+
+Independent second pass over the code added since the first review:
+`history_store.rs`, the `HISTORY_SEGMENTED` reader path, `bloom.rs`
+`Bloom4Resume`, `manifest.rs` budget functions, `adapt.rs` (O7) and the O8
+shell readers, plus `simd.rs::gather_bytes_avx512`. Executable in
+`tests/segmented_hardening.rs` (12 tests) and the new fuzz target
+`fuzz/fuzz_targets/fuzz_history_store.rs`. Hostile `.ekb` images are produced by
+patching the real writer's output and recomputing the section CRC-32 in test
+code, so the streaming parser is actually reached.
+
+### Verdicts
+
+* **Segmented index/segment parsing (held).** Corrupt header fields (zero /
+  non-multiple-of-4 `segment_bytes`, bad interval, `MAX` counts/offsets,
+  flipped `core_hash`) are clean `Err`s at `open`. Hostile index entries below
+  `states_offset`, straddling `checkpoints_offset`, far past the file, or at
+  `u64::MAX` are clean errors from the range guard or the checked arithmetic in
+  `FileSegmentedHistory::state_at`; no panic, no OOB, no attacker-sized read.
+  Truncated/missing/zero-length segment files error only for the mapped
+  positions; a flipped on-disk state is returned by `state_at` (no panic) and
+  caught by `verify_at`.
+* **`Bloom4Resume::unpack` (held).** Every length `< 16` is `Truncated`; the
+  16-byte form round-trips exactly and preserves the `u64` cursor; trailing
+  bytes are ignored as documented.
+* **Budget transactional integrity (held).** A rejected/`Err`
+  `manifest_within_budget` leaves a canonical serialization of every
+  byte-carrying field bit-for-bit unchanged, with `physical_bytes()` and
+  `generation` unchanged; `create_within_budget` one byte short yields no body.
+* **`estimate_physical_bytes` (held, no counterexample).** Exact identities for
+  `Root`/`Sparse`/`Dense`/`Full`/`Bloom`/`Path`/`MaxSpeed` and a deliberate
+  over-count for `Regional`; 32 lengths x 37 profile parameterizations (1,419
+  builds) all asserted `estimate >= actual`.
+* **O7 additive claim (held).** Adapting a body that already carries a
+  checkpoint + global bloom appends a path shell as a new generation; every
+  earlier structure is byte-identical and `append_generation` leaves the earlier
+  on-disk bytes as an exact prefix (verified by `starts_with`). The reopened file
+  still verifies, the pre-existing bloom survives, and reads are unchanged. A
+  body that already carries a certified path bloom is a true no-op (bit-for-bit
+  unchanged, no generation bump).
+* **O8 byte-exactness (held).** For `D in {1,2,4,8,16,32}` and lengths around
+  block boundaries (`D-1, D, D+1, 2D-1, 2D, 2D+1`) including the final partial
+  block, the `Path`/`Checkpoint`/`History`/`Machine` shells all return the same
+  bytes as `read` and the source, and empty reads agree. File-backed reads equal
+  the in-memory reads.
+* **AVX-512 gather (held).** See the addendum in `security.md`: identical to the
+  scalar reference including boundary/overflow cases; not wired into any default
+  path.
+
+### F5 (flaky determinism, reported) — `sweep::budget_frontier` is not
+seed-deterministic
+
+`budget_frontier` claims determinism for a fixed seed and
+`tests/sweep_curves.rs::budget_frontier_is_deterministic_for_a_fixed_seed`
+asserts it, but selection is decided by *measured* timings. Speed scores within
+`SPEED_TOLERANCE_OCTAVES = 1.0` are treated as a tie and broken by
+`physical_bytes`; timing noise can move two path depths across that 1-octave
+boundary between calls, flipping the winner. Repro:
+
+```sh
+sh scripts/container-test.sh --release --test sweep_curves \
+    budget_frontier_is_deterministic_for_a_fixed_seed
+```
+
+observed `path(D=16)` vs `path(D=32)`, then `path(D=8)` vs `path(D=32)`, ~1 in
+5 release runs (passes in debug and in isolation). Root cause is measurement
+noise, not the machine or the reader. Reported rather than fixed: `src/sweep.rs`
+and this test are outside the modules under review, and the honest fix (a
+coarser/derived tolerance or removing timing from the tie-break) is a design
+choice. No core correctness impact.
+
+### Fuzz target added
+
+`fuzz_history_store` embeds a fuzz-derived store, corrupts the section
+(header/index/states) with the CRC fixed, and queries in-range and out-of-range
+positions; 357,482 runs clean (cov 1119), no crash. Note the shipped
+`scripts/container-fuzz.sh` lists targets explicitly and must be extended (or
+run directly) to include it.
+
+### Still not attacked
+
+* `HISTORY_SEGMENTED` **states** are unauthenticated (unkeyed CRC + recomputable
+  `core_hash`); `open`/`verify` do not represent the segment in `EkbloomBody`, so
+  `segmented_state_at` returns forger-chosen, bounds-checked states. Same
+  integrity-not-authenticity model as F2/Finding C; only opt-in `AUTH` covers it.
+* The AVX-512 path was exercised by equality tests and the scalar fallback, not
+  by a dedicated fuzzer; it is not on the default path.

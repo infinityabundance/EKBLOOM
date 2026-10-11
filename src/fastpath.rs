@@ -143,7 +143,7 @@ impl AlignedBuffer {
     /// Whether the payload pointer is genuinely 64-byte aligned.
     #[inline]
     pub fn is_aligned(&self) -> bool {
-        self.as_slice().as_ptr() as usize % CACHE_LINE == 0
+        (self.as_slice().as_ptr() as usize).is_multiple_of(CACHE_LINE)
     }
 
     /// A view starting `offset` bytes into the payload, of length `len`.

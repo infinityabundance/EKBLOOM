@@ -655,7 +655,7 @@ fn decode_segmented_header(bytes: &[u8]) -> Result<SegmentedHeader> {
     }
     let segment_bytes = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     let checkpoint_interval = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    if segment_bytes == 0 || segment_bytes % 4 != 0 {
+    if segment_bytes == 0 || !segment_bytes.is_multiple_of(4) {
         return Err(bad(
             "history-segmented segment_bytes must be a non-zero multiple of 4",
         ));

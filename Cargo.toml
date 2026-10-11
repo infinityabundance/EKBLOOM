@@ -2,7 +2,7 @@
 name = "ekbloom"
 version = "0.3.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.89"
 description = "EKBLOOM — concealed-expansion codec. Spend manifested space to maximise speed."
 license = "MIT OR Apache-2.0"
 publish = false

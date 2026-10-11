@@ -51,7 +51,7 @@ impl CheckpointSet {
         while i < logical_len {
             NL2.reveal(core, &mut omega)?;
             i += 1;
-            if i % k == 0 {
+            if i.is_multiple_of(k) {
                 resume.push(omega);
             }
         }

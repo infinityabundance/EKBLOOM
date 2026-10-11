@@ -23,6 +23,8 @@ Environment for every run: [`../evidence/environment.txt`](../evidence/environme
 Complete machine, correct for arbitrary byte input.
 
 - **Implements:** `src/machine.rs` (`Nl2`, `OrMachine`, `MACHINE_NL2`).
+- **Artifact:** machine unit tests in `src/machine.rs`; `tests/properties.rs`
+  (`machine_roundtrip`); `tests/correctness.rs` (`category_*`).
 - **Proves:**
   - unit tests in `src/machine.rs`: `sbox_is_bijective`, `roundtrip_various`,
     `genesis_matches_log0_zero`, `state_is_last_two_symbols`, `peek_matches_reveal`;
@@ -43,8 +45,12 @@ Complete machine, correct for arbitrary byte input.
 
 Committed history retained without overwriting earlier states.
 
-- **Implements:** `src/history.rs` (append-only `states`), `src/checkpoint.rs`,
-  additive `manifest`/`grow` in `src/manifest.rs`.
+- **Implements:** `src/history.rs` (append-only `states`), `src/history_store.rs`
+  (segmented streaming projection), `src/checkpoint.rs`, additive `manifest`/`grow`
+  in `src/manifest.rs`.
+- **Artifact:** `tests/history_checkpoint.rs`, `tests/history_store.rs`,
+  `tests/manifest_read_verify.rs`, `tests/format_roundtrip.rs`; streaming-store
+  evidence [`../evidence/bench/history-2p30.json`](../evidence/bench/history-2p30.json).
 - **Proves:**
   - `tests/history_checkpoint.rs::history_positions_and_decode_agree`,
     `history_roundtrip_and_truncation`, `history_verify_against_detects_tampering`;
@@ -68,6 +74,8 @@ Checkpoint and full-state access return correct symbols and ranges.
 
 - **Implements:** `src/checkpoint.rs` (`restore`, bounded `max_replay_steps`),
   `src/reader.rs` (path selection), `src/fastpath.rs`.
+- **Artifact:** `tests/history_checkpoint.rs`, `tests/properties.rs`,
+  `tests/correctness.rs`, `tests/manifest_read_verify.rs`.
 - **Proves:**
   - `tests/history_checkpoint.rs::checkpoint_restore_agrees_with_state_log_all_intervals`
     (every supported interval, every position, replay bound `K-1` enforced);
@@ -91,6 +99,8 @@ A working `D = 4` structure returns four exact symbols and a correct successor.
 
 - **Implements:** `src/bloom_path.rs` (`PathBloom`, exact `P_D[j]`),
   `src/bloom_context.rs` (exact `T_D[x,c]`), `src/bloom.rs` (packed entries).
+- **Artifact:** `tests/bloom_path.rs`, `tests/properties.rs`,
+  `tests/blooms_research.rs`.
 - **Proves:**
   - `tests/bloom_path.rs::symbols_and_blocks_match_authoritative_every_depth`
     (confirms four symbols + successor state against the machine for `D=4`);
@@ -174,7 +184,9 @@ Regional, contextual and path blooms implemented and evaluated.
 
 - **Implements:** `src/format.rs` (fixed records, codecs, checksums),
   `src/writer.rs` (publication), `src/reader.rs` (validated open, generation
-  selection, `read`).
+  selection, `read`), `src/writer.rs`/`src/reader.rs` authenticated variants.
+- **Artifact:** `tests/format_roundtrip.rs`, `tests/cli.rs`, `tests/security.rs`,
+  `tests/authenticated.rs`, `tests/file_body.rs`, `tests/correctness.rs`.
 - **Proves:**
   - `tests/format_roundtrip.rs::write_open_read_roundtrip_for_every_profile`
     (10 inputs × 8 profiles, whole-object and ranged reads);
@@ -198,6 +210,8 @@ the documented durability model.
 
 - **Implements:** `src/recovery.rs` (`recover`, `scan_generations`,
   `truncate_to_valid`), `src/writer.rs` (footer-after-payload order).
+- **Artifact:** `tests/crash_recovery.rs`, `tests/correctness.rs`,
+  `tests/segmented_hardening.rs`, `tests/adversarial.rs`.
 - **Proves:**
   - `tests/crash_recovery.rs::truncate_mid_footer_keeps_previous_generation`,
     `corrupt_newest_section_payload_keeps_previous_generation`,
@@ -223,14 +237,23 @@ A real speed-versus-manifested-space frontier exists.
   driver `examples/sweep.rs`; harness `benches/ekbloom.rs`.
 - **Proves:** `tests/fastpath.rs::fast_paths_are_byte_exact_for_every_profile`
   (optimised paths are byte-identical to `read`), and the generated frontier.
+- **Artifact:** `tests/fastpath.rs`, `tests/sweep_curves.rs`, `tests/layout.rs`,
+  `tests/simd.rs`; benchmark driver `examples/sweep.rs` and
+  `examples/perf_target.rs`.
 - **Evidence:** [`../evidence/bench/sweep.json`](../evidence/bench/sweep.json),
-  [`../evidence/bench/cpu.json`](../evidence/bench/cpu.json).
+  [`../evidence/bench/cpu.json`](../evidence/bench/cpu.json),
+  [`../evidence/bench/sweep-large.json`](../evidence/bench/sweep-large.json),
+  [`../evidence/bench/depth-metrics.json`](../evidence/bench/depth-metrics.json),
+  [`../evidence/bench/memory-tiers.json`](../evidence/bench/memory-tiers.json),
+  [`../evidence/bench/adaptive.json`](../evidence/bench/adaptive.json),
+  [`../evidence/bench/perf.json`](../evidence/bench/perf.json).
 - **Reproduce:**
 
   ```sh
   sh scripts/container-test.sh --release --test fastpath
   sh scripts/run-sweep.sh
   sh scripts/container-bench.sh
+  sh scripts/container-perf.sh
   ```
 
 ---
@@ -257,3 +280,32 @@ benchmarks.
   sh scripts/run-sweep.sh              # representative benchmarks
   sh scripts/capture-environment.sh    # refresh evidence/environment.txt
   ```
+
+---
+
+## Additional evidence (post-0.3 additions)
+
+These artifacts back the properties beyond the original 10 gates. None is
+fabricated; each is regenerated by the command shown and by nothing else.
+
+| Artifact | What it shows | Regenerate with |
+|---|---|---|
+| [`../evidence/bench/history-2p30.json`](../evidence/bench/history-2p30.json) | Segmented `HistoryStore` streams the full `4*(N+1)` projection at `N = 2^30` (4,294,967,300 bytes in 3.666 s, peak RSS 2.9 MiB, sampled checks `PASS`) | `sh scripts/run-large-history.sh` |
+| [`../evidence/bench/perf.json`](../evidence/bench/perf.json) | Real hardware counters (cycles, IPC, cache/branch misses, bandwidth) for the `path(D=4)` workloads under `CAP_PERFMON` | `sh scripts/container-perf.sh` |
+| [`../evidence/bench/depth-metrics.json`](../evidence/bench/depth-metrics.json) | Per-depth path-bloom metrics `D ∈ {1,2,4,8,16,32}` (§10): identical semantics, falling physical bytes, flat 30 ns p50 | `sh scripts/run-sweep.sh` |
+| [`../evidence/bench/memory-tiers.json`](../evidence/bench/memory-tiers.json) | O9 L1/L2/LLC/DRAM tier curve: throughput 139 → 71 → 57 → 18 GB/s at constant `E_V = 2.13×` | `sh scripts/run-sweep.sh` |
+| [`../evidence/bench/adaptive.json`](../evidence/bench/adaptive.json) | O7 adaptive shell: appending an exact `P_32[j]` as generation 2 takes 52,727 → 6.96 ns/read (≈7,570×) for +1,179,883 bytes | `sh scripts/run-sweep.sh` |
+| [`../evidence/bench/sweep-large.json`](../evidence/bench/sweep-large.json) | 4 MiB budget frontier + region/depth/checkpoint curves, cold starts, cache-resident throughput | `sh scripts/run-sweep.sh` |
+| [`../evidence/environment.txt`](../evidence/environment.txt) | Pinned image/digest, toolchain, kernel, CPU, `Cargo.lock` sha256, git HEAD | `sh scripts/capture-environment.sh` |
+
+Loom model checking is reproducible with `sh scripts/container-loom.sh`
+([`reviews/concurrency.md`](reviews/concurrency.md)); the FUSE integration test
+with `sh scripts/container-fuse.sh` ([`FUSE.md`](FUSE.md)).
+
+Supporting documents added alongside these artifacts:
+[`LAYOUT.md`](LAYOUT.md) (layout/SIMD keep-or-reject decisions),
+[`ADAPTIVE.md`](ADAPTIVE.md) (O7/O8/O9),
+[`SECURITY.md`](SECURITY.md) (opt-in `AUTH`),
+[`INDEX.md`](INDEX.md) (one-page doc/evidence index), and the independent
+reviews in [`reviews/`](reviews/) (adversarial, concurrency, mathematics,
+performance, reproducibility, security).

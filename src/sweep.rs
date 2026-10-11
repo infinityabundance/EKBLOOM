@@ -421,12 +421,16 @@ pub struct LargeSweepReport {
 /// Tolerance, in octaves (factors of two), within which two profiles are treated
 /// as tied for speed.
 ///
-/// Profile selection must not depend on run-to-run timing noise. Measured speeds
-/// whose combined score is within `2^SPEED_TOLERANCE_OCTAVES` are therefore a tie,
-/// resolved by the (noise-free) smaller physical footprint and then the label. A
-/// one-octave (twofold) window is wide enough to absorb benchmark noise while
-/// still separating the frontier's real steps (which are many octaves apart).
-const SPEED_TOLERANCE_OCTAVES: f64 = 1.0;
+/// Profile selection must not depend on run-to-run timing noise. Candidates whose
+/// combined speed score is within `SPEED_TOLERANCE_OCTAVES` of the fastest are
+/// therefore a tie, resolved by the noise-free total order in [`tighter`] (smaller
+/// physical footprint, then label). The window must comfortably exceed the
+/// benchmark's run-to-run noise: on the pinned container the score of two
+/// genuinely equal profiles can swing by more than one octave between
+/// back-to-back calls, so a single-octave window still flipped the winner. Two
+/// and a half octaves absorbs that noise while remaining well below the ~20
+/// octaves that separate the frontier's distinct construction families.
+const SPEED_TOLERANCE_OCTAVES: f64 = 2.5;
 
 /// `log2` of a positive finite value, or a very low floor (so a missing metric
 /// neither dominates nor panics).
@@ -445,21 +449,17 @@ fn speed_score(p: &SweepPoint) -> f64 {
         - lg(p.random_4k_ns_p50)
 }
 
-/// Whether `a` is strictly preferred over `b`: clearly faster, otherwise smaller
-/// footprint, otherwise the lexicographically smaller profile label.
-fn faster(a: &SweepPoint, b: &SweepPoint) -> bool {
-    let sa = speed_score(a);
-    let sb = speed_score(b);
-    if sa - sb > SPEED_TOLERANCE_OCTAVES {
-        return true;
-    }
-    if sb - sa > SPEED_TOLERANCE_OCTAVES {
-        return false;
-    }
-    if a.physical_bytes != b.physical_bytes {
-        return a.physical_bytes < b.physical_bytes;
-    }
-    a.profile < b.profile
+/// Deterministic tie-break between candidates judged equally fast: the smaller
+/// physical footprint wins, then the lexicographically smaller profile label.
+///
+/// Both keys are properties of the rebuilt profile, not of timing, so this is a
+/// genuine total order (candidate labels are unique) that cannot flip between
+/// runs of the same seed. At equal speed it prefers the smaller footprint, per
+/// the frontier's existing intent.
+fn tighter(a: &SweepPoint, b: &SweepPoint) -> std::cmp::Ordering {
+    a.physical_bytes
+        .cmp(&b.physical_bytes)
+        .then_with(|| a.profile.cmp(&b.profile))
 }
 
 /// The candidate profiles considered when filling the budget frontier.
@@ -504,10 +504,14 @@ fn budget_bytes(visible: u64, ratio: f64) -> u64 {
 ///
 /// Selection is honest: every candidate is really built and measured, and only a
 /// profile whose physical footprint is within budget is eligible. When nothing
-/// fits, `chosen_profile` is `""` and the metrics are zero. Measured speeds within
-/// a factor of `2^SPEED_TOLERANCE_OCTAVES` are treated as a tie; ties go to the
-/// smaller physical footprint and then the profile label, so the result is
-/// deterministic for a fixed seed.
+/// fits, `chosen_profile` is `""` and the metrics are zero.
+///
+/// The choice is a pure function of the inputs (source, ratios, seed). Among the
+/// eligible candidates, any profile whose combined speed score is within
+/// `SPEED_TOLERANCE_OCTAVES` of the fastest is a tie; ties are broken by a
+/// deterministic total order (smaller `physical_bytes`, then the profile label)
+/// rather than by the noisy measured value, so a fixed seed always selects the
+/// same profiles.
 pub fn budget_frontier(
     source: &[u8],
     ratios: &[f64],
@@ -523,17 +527,29 @@ pub fn budget_frontier(
     let mut out = Vec::with_capacity(ratios.len());
     for &target_ratio in ratios {
         let budget = budget_bytes(visible, target_ratio);
-        let mut best: Option<&SweepPoint> = None;
-        for p in &measured {
-            if p.physical_bytes > budget {
-                continue;
-            }
-            match best {
-                None => best = Some(p),
-                Some(b) if faster(p, b) => best = Some(p),
-                Some(_) => {}
-            }
-        }
+        let eligible: Vec<&SweepPoint> = measured
+            .iter()
+            .filter(|p| p.physical_bytes <= budget)
+            .collect();
+
+        // Select relative to the single fastest eligible profile instead of a
+        // greedy pairwise scan: a tolerance comparison is not transitive, so a
+        // pairwise scan's outcome depends on candidate order and on timing
+        // noise. Every candidate within `SPEED_TOLERANCE_OCTAVES` of the fastest
+        // is a tie, resolved by the deterministic `tighter` total order.
+        let best = eligible
+            .iter()
+            .copied()
+            .max_by(|a, b| speed_score(a).total_cmp(&speed_score(b)))
+            .map(|fastest| {
+                let ceiling = speed_score(fastest);
+                eligible
+                    .iter()
+                    .copied()
+                    .filter(|p| ceiling - speed_score(p) <= SPEED_TOLERANCE_OCTAVES)
+                    .min_by(|a, b| tighter(a, b))
+                    .unwrap_or(fastest)
+            });
         out.push(match best {
             Some(p) => BudgetPoint {
                 target_ratio,

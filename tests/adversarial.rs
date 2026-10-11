@@ -56,7 +56,7 @@ fn pattern(kind: usize, len: usize) -> Vec<u8> {
             1 => 0x00,
             2 => 0xFF,
             3 => {
-                if i % 2 == 0 {
+                if i.is_multiple_of(2) {
                     0xAA
                 } else {
                     0x55

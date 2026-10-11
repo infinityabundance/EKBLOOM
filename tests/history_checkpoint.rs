@@ -30,7 +30,7 @@ fn cases() -> Vec<Vec<u8>> {
         (0u8..=255).collect(),
         vec![9u8; 100],
         (0..250u32)
-            .map(|i| if i % 3 == 0 { 0x01 } else { 0xFE })
+            .map(|i| if i.is_multiple_of(3) { 0x01 } else { 0xFE })
             .collect(),
         lcg(0x0BAD_F00D_CAFE_BEEF, 257),
         lcg(0x1122_3344_5566_7788, 1024),
@@ -154,7 +154,7 @@ fn history_and_checkpoint_agree() {
 
         for i in 0..=n {
             assert_eq!(h.snapshot_at(i).unwrap(), cps.restore(&core, i).unwrap());
-            if i % 16 == 0 {
+            if i.is_multiple_of(16) {
                 assert_eq!(h.snapshot_at(i).unwrap(), cps.restart_point(i).unwrap());
             }
         }

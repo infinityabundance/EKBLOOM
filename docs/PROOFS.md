@@ -260,6 +260,96 @@ ordinal. ∎
 
 ---
 
+## P7. Segmented streaming history preserves the identical state semantics with bounded RAM — **PROVED** (semantics), **EMPIRICALLY OBSERVED** (resources)
+
+**Claim.** `history_store::HistoryStore` materialises the full projection
+`L_full[i] = x_i` as fixed-size on-disk **segments**; for every logical position
+`i` the value returned by `state_at(i)` is exactly the in-memory projection's
+`u32`, and the streaming build's peak RAM is `O(segment_bytes)`, independent of
+`N`.
+
+**Proof (semantics).** The store performs one logical-position pass with the same
+recurrence `x_{i+1} = G(x_i, s_i)`; segment `s` covers positions
+`[s·sps, (s+1)·sps)` and the state for `i` sits at byte offset `(i % sps)·4`
+within segment `s = i / sps`. Segmentation is therefore a pure *storage layout*:
+slicing the projection into fixed windows cannot change any `x_i`, so `state_at`
+agrees with the full projection wherever the projection is defined (an intact
+store reports `4·(N+1)` physical bytes). The streaming build never holds the
+whole projection: it keeps one `segment_bytes` window and the sparse restart
+states, so peak RSS is bounded by the segment size rather than `N`.
+
+**Corroboration (resources).** At `N = 2^30`, `HistoryStore::build` wrote exactly
+`4,294,967,300` bytes (`4·(N+1)`) of state projection in `3.666 s` while peak RSS
+stayed at `3,067,904` bytes (2.9 MiB), and a 1,025-position sampled
+recompute-and-compare pass passed. Evidence
+`evidence/bench/history-2p30.json`.
+
+**Tested:** `tests/history_store.rs`; hostile-image parsing in
+`tests/segmented_hardening.rs`; reproduced by `sh scripts/run-large-history.sh`.
+
+---
+
+## P8. The budget never under-estimates and is transactional — **PROVED** (identities), **EMPIRICALLY OBSERVED** (no counterexample)
+
+**Claim.** `manifest::estimate_physical_bytes(profile, N) ≥` the built body's
+`physical_bytes()` for every profile and length; and enforcement
+(`create_within_budget`, `manifest_within_budget`, `select_profile_within_budget`)
+rejects any build that would exceed `ManifestationBudget` with
+`AllocationTooLarge`, leaving the body unchanged.
+
+**Proof (identities).** For `Root`, `Sparse`, `Dense`, `Full`, `Bloom`, `Path` and
+`MaxSpeed` the estimate is computed from the *same* closed-form accounting
+identities the builders use for `physical_bytes()` (the `u32` history projection,
+the packed checkpoint states, the `D`-byte-entry universal table, the
+`N + 4·⌈N/D⌉` path payload, and the certificate), so the estimate equals the
+built size exactly — never below it. `Regional` is a deliberate **over-count**
+(one shell per `⌈N/R⌉` regions × `min(R, 2^16)` entries × `(D+6)` bytes +
+certificate), hence is also `≥`. Because the pre-filter is a valid upper bound,
+no build that passes it can exceed the budget; the runtime re-check of the real
+`physical_bytes()` is authoritative.
+
+**Proof (transactional).** `create_within_budget` pre-filters then re-checks the
+built body; `manifest_within_budget` applies the generation to a scratch clone
+and commits only when the clone's total is within budget. A rejected call
+therefore either yields no body or leaves every byte-carrying field
+bit-for-bit unchanged (a clone that is discarded cannot mutate the original).
+
+**Corroboration.** An exhaustive search over 32 lengths × 37 profile
+parameterizations (1,419 successful builds) asserted `estimate ≥ actual` with no
+counterexample; a rejected `manifest_within_budget` left a canonical
+serialization of every field bit-for-bit unchanged. See
+`docs/reviews/security.md` (rev 2) and `docs/reviews/adversarial.md` (rev 2).
+
+**Tested:** `tests/budget.rs`, `tests/segmented_hardening.rs`.
+
+---
+
+## P9. Adaptive shells are additive — **PROVED** (by construction), **EMPIRICALLY OBSERVED** (effect)
+
+**Claim.** `adapt::adapt_to_workload` observes a workload and appends a tailored
+outward shell as a **new generation** through `manifest`; it never rewrites or
+removes earlier structures, and when the body already carries a certified
+full-object path bloom it appends **nothing** and leaves the body bit-for-bit
+unchanged.
+
+**Proof.** The append goes through the same additive `manifest`/`grow` law as P2
+(each generation increments `generation` and appends; earlier structures are
+retained), so the earlier profile list is a strict prefix of the new one and
+`physical_bytes()` grows by exactly the reported `added_physical_bytes`. For the
+no-op branch the adapter performs no `manifest` call, so there is nothing to
+change. `append_generation` writes only new bytes after the existing prefix, so
+the on-disk prefix stays byte-identical.
+
+**Corroboration.** On a synthetic hot-set workload (512 single-byte reads over a
+512 B working set on a 1 MiB `root` body), adaptation took generation `1 → 2`,
+added `1,179,883` bytes, and improved `52,727 → 6.96 ns` per read (≈7,570×); an
+existing checkpoint set was untouched and the adapted body still passes
+`verify_deep`. Evidence `evidence/bench/adaptive.json`.
+
+**Tested:** `tests/adaptive.rs`.
+
+---
+
 ## Unresolved limitations (honest)
 
 1. **No certified universal 65,536-entry `T_4[x]` for the byte machine.** By P6
@@ -284,4 +374,14 @@ ordinal. ∎
    (`evidence/bench/cpu.json`).
 6. **Backends.** `io-uring` is optional and not exercised by the default build
    or the benchmark evidence; the synchronous fallback is what was measured.
-   OrFS is in-process only (FUSE out of scope).
+   OrFS is in-process; its read-only FUSE projection is opt-in and separate.
+7. **Manifested structure bytes are unauthenticated unless `AUTH` is used.**
+   CRC-32/BLAKE3 detect accidental corruption, not forgery: a writer with file
+   access can recompute them consistently. In particular **segmented history
+   states are unauthenticated** — `open`/`verify` check the
+   `core_hash`/`logical_len` linkage but do not represent the segment in
+   `EkbloomBody`, so `segmented_state_at` returns bounds-checked,
+   forger-chosen states. Only the opt-in keyed-MAC `AUTH` mode covers the whole
+   file prefix (see `docs/SECURITY.md`); it has no anti-rollback and key
+   management is the caller's. This is the same *integrity-not-authenticity*
+   model recorded in `docs/reviews/security.md` (Findings C / rev 2).

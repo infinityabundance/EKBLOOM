@@ -72,10 +72,10 @@ The specification decomposes the operational body `O = (V, L, T_D, R, A)`:
 | Symbol | Meaning | Implementation |
 |---|---|---|
 | **V** | visible logical surface (the encoded core) | `EkbloomBody::core` |
-| **L** | retained, non-withdrawal operational history | `history.rs`, `checkpoint.rs` |
+| **L** | retained, non-withdrawal operational history | `history.rs`, `history_store.rs`, `checkpoint.rs` |
 | **T_D** | manifested `D`-step transition structure | `bloom_global.rs`, `bloom_context.rs` |
 | **R** | positional / regional reach structures | `bloom_region.rs`, `bloom_path.rs` |
-| **A** | additional manifested acceleration | `fastpath.rs`, `worker.rs`, `asyncpub.rs` |
+| **A** | additional manifested acceleration | `fastpath.rs`, `worker.rs`, `asyncpub.rs`, `adapt.rs` |
 
 Manifestation is **strictly additive** (`manifest` / `grow`): each generation
 increments `generation` and appends structures. Earlier structures are never
@@ -84,6 +84,22 @@ removed or overwritten, so a later generation can only add access paths.
 `physical_bytes()` counts every manifested structure; `visible_bytes()` counts
 the core. The concealed excess is `H = M - V`, and the expansion ratios are
 `E_V = M/V` and `E_N = M/N`.
+
+### Streaming, segmented history at 2^30 scale
+
+The full `L` projection is `4*(N+1)` bytes of `u32` state — at `N = 2^30` that
+is exactly **4 GiB on disk**, but it must not require 4 GiB of RAM. `HistoryStore`
+(`src/history_store.rs`) materialises it as fixed-size **segments on disk**
+(default `segment_bytes = 1 MiB`), built in a single streaming pass whose peak
+RSS is `O(segment_bytes)` and independent of `N`; a position maps to a
+`(segment, offset)` by constant-time arithmetic and `state_at(i)` performs one
+`pread` of a 4-byte window. Measured evidence
+([`evidence/bench/history-2p30.json`](evidence/bench/history-2p30.json)): a
+procedural core over **1,073,741,824** logical positions streamed **4,294,967,300
+bytes** of state projection in **3.666 s** at **peak RSS 3,067,904 bytes (2.9
+MiB)**, with a 1,025-position sampled recompute-and-compare pass `PASS`. The
+segmented form is carried in the `.ekb` `HISTORY_SEGMENTED` section
+(`docs/DESIGN.md` §5).
 
 ---
 
@@ -100,12 +116,25 @@ align8(80 + core_len) commit blocks, repeated:
                         CommitFooter (fixed 64 bytes; marker "EKBCOMM\0")
 ```
 
-Section kinds: `HISTORY_FULL`, `CHECKPOINTS`, `BLOOM_GLOBAL`, `BLOOM_CONTEXT`,
-`BLOOM_REGION`, `BLOOM_PATH`, `CERTIFICATE`, `MANIFEST`. Each commit block ends
-with a `MANIFEST` section immediately followed by a `CommitFooter`, so the block
-stream is forward-parseable without a separate index. Publication order is
-payload → manifest → flush → footer → flush. Recovery selects the newest valid
-committed generation; torn writes never invalidate earlier commits.
+Section kinds: `HISTORY_FULL`, `HISTORY_SEGMENTED`, `CHECKPOINTS`,
+`BLOOM_GLOBAL`, `BLOOM_CONTEXT`, `BLOOM_REGION`, `BLOOM_PATH`, `CERTIFICATE`,
+`MANIFEST`, `AUTH`. Each commit block ends with a `MANIFEST` section immediately
+followed by a `CommitFooter`, so the block stream is forward-parseable without a
+separate index. Publication order is payload → manifest → flush → footer →
+flush. Recovery selects the newest valid committed generation; torn writes never
+invalidate earlier commits.
+
+### Opt-in authentication (`AUTH`)
+
+The default format is **unkeyed** and corruption-detecting only. An optional
+keyed-MAC mode appends an `AUTH` section carrying
+`blake3::keyed_hash(K, blake3(file[0 .. auth_header_offset]))`, covering the
+genesis header, the core, padding and every section up to and including
+`MANIFEST`. `open_authenticated` rejects a missing or mismatching tag (never
+falling back to an unkeyed read). See [`docs/SECURITY.md`](docs/SECURITY.md) for
+the threat model, exact coverage and the honest anti-rollback limitation.
+**Segmented states are unauthenticated unless `AUTH` is used** (see
+`docs/PROOFS.md` limitations).
 
 ---
 
@@ -113,17 +142,28 @@ committed generation; torn writes never invalidate earlier commits.
 
 The crate root (`ekbloom`) exposes:
 
-- `create(source, profile) -> EkbloomBody` — encode and manifest;
-- `manifest(&mut body, profile)` / `grow(&mut body, profile)` — additive expansion;
-- `read(&body, ReadRequest { offset, length })` — exact positional read across all paths;
-- `read_sequential`, `read_random_1b`, `read_ranges` — optimised read paths;
+- `create`, `create_within_budget`, `manifest`, `manifest_within_budget`, `grow`,
+  `select_profile_within_budget`, `estimate_physical_bytes` — encode and manifest
+  under an optional hard budget;
+- `read`, `read_sequential`, `read_random_1b`, `read_ranges`, `read_ranges_parallel`
+  — exact positional reads across all paths;
 - `verify` / `verify_deep` — integrity and deep cross-structure checks;
-- `inspect(body) -> ManifestationReport` — physical accounting;
-- file I/O: `write_body`, `append_generation`, `open`, `read_file`, `inspect_file`;
+- `inspect` — physical accounting (`ManifestationReport`);
+- file I/O: `write_body`, `write_body_authenticated`, `append_generation`,
+  `append_generation_authenticated`, `open`, `open_authenticated`,
+  `open_bytes_authenticated`, `read_file`, `inspect_file`, `FileBody`;
 - recovery: `recover`, `scan_generations`, `truncate_to_valid`;
-- blooms: `BloomShell`, `Certificate`, `ContextBloom`, `GlobalBloom`, `PathBloom`;
+- streaming history: `HistoryStore`, `StoreConfig`, `peak_rss_bytes`,
+  `current_rss_bytes`;
+- blooms: `BloomShell`, `Bloom4Resume`, `Certificate`, `ContextBloom`,
+  `GlobalBloom`, `PathBloom`;
+- adaptive shells / radial readers (`adapt`): `adapt_to_workload`,
+  `read_shell`, `available_shells`, `ShellChoice`, `Workload`, `WorkloadKind`;
 - model search: `sufficiency_sweep`, `canonical_state_only_counterexample`;
-- `OrFs` — in-process logical namespace with concealed physical accounting.
+- measurement: `sweep::manifestation_sweep`, `sweep::depth_metrics`,
+  `sweep::memory_tiers`;
+- `OrFs` — in-process logical namespace with concealed physical accounting, plus
+  an optional read-only FUSE projection (`fuse` feature: `mount`, `OrFsMount`).
 
 `read` selects the fastest *correct* path: certified path bloom → nearest
 checkpoint restart → full history → authoritative machine replay. Every path
@@ -131,6 +171,17 @@ returns identical bytes.
 
 `ManifestationProfile`: `Root`, `Sparse{interval}`, `Dense{interval}`, `Full`,
 `Bloom{depth}`, `Regional{depth,region_bytes}`, `Path{depth}`, `MaxSpeed`.
+
+### Budgets are hard caps
+
+`ManifestationBudget { maximum_physical_bytes }` is a real ceiling, not a label.
+`create_within_budget` / `manifest_within_budget` reject any profile whose
+manifested bytes would exceed it with `EkbloomError::AllocationTooLarge`, and
+enforcement is **transactional**: a rejected call leaves the body byte-for-byte
+and generation-for-generation unchanged. `estimate_physical_bytes` is an exact
+upper bound (never an under-estimate) and serves as a safe pre-filter; the
+runtime check is authoritative. The CLI accepts `--max-physical-bytes B` and
+exits nonzero without writing on rejection.
 
 ---
 
@@ -150,13 +201,20 @@ ekbloom recover  archive.ekb
 ekbloom bench    archive.ekb --workload random-1b --iterations 200
 ```
 
-`certify` runs the requested certification over the object's core and writes
-nothing. A `Rejected` verdict is a research outcome, not a process error.
+`certify` runs the requested certification (`--bloom universal|contextual|regional`)
+over the object's core and writes nothing. A `Rejected` verdict is a research
+outcome, not a process error.
 
 Profiles: `root, sparse, dense, full, bloom4, bloom8, bloom16, bloom32,
 regional, path, max-speed` (sparse/dense use `--interval`, default 1024;
 regional uses `--depth`/`--region-bytes`, default 4/4096; path uses `--depth`,
 default 4).
+
+`bench --workload` accepts `seq|random-1b|random-4k|range-64k|mixed|hot-set` and
+reports both an **in-memory** and a **file-backed** measurement. `create`,
+`manifest`, `grow`, `read`, `inspect` and `verify` accept `--key-hex H` /
+`--key-file F` to use the opt-in authenticated path (the key is never printed),
+and `create`/`manifest`/`grow` accept `--max-physical-bytes B`.
 
 ---
 
@@ -169,24 +227,77 @@ nanoseconds.
 
 | profile | physical bytes | `E_V` | seq MB/s | 1b p50 | 1b p99 | 4k p50 | 64k MB/s |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| root | 2,097,152 | 1.00 | 602 | 1,570,139 | 3,310,007 | 1,690,134 | 36 |
-| sparse(K=1024) | 2,121,740 | 1.01 | 605 | 882 | 1,793 | 7,354 | 605 |
-| sparse(K=64) | 2,490,380 | 1.19 | 605 | 211 | 400 | 6,913 | 610 |
-| full | 10,485,764 | 5.00 | 733 | 50 | 120 | 6,352 | 647 |
-| bloom(D=4) | 2,629,852 | 1.25 | 605 | 1,569,869 | 3,315,387 | 1,691,075 | 36 |
-| regional(D=4,R=4096) | 22,546,752 | 10.75 | 604 | 1,568,737 | 3,319,074 | 1,690,004 | 36 |
-| path(D=4) | 6,291,691 | 3.00 | 66,765 | 30 | 41 | 70 | 34,774 |
-| path(D=8) | 5,243,115 | 2.50 | 66,588 | 30 | 40 | 70 | 35,907 |
-| max-speed | 14,704,891 | 7.01 | 69,757 | 30 | 41 | 70 | 40,324 |
+| root | 2,097,152 | 1.00 | 542.0 | 1,721,009 | 3,603,761 | 1,841,936 | 33 |
+| sparse(K=1024) | 2,121,740 | 1.01 | 597.7 | 931 | 1,874 | 7,734 | 573 |
+| sparse(K=64) | 2,490,380 | 1.19 | 598.5 | 150 | 341 | 7,064 | 578 |
+| full | 10,485,764 | 5.00 | 635.5 | 50 | 61 | 7,104 | 569 |
+| bloom(D=4) | 2,629,852 | 1.25 | 542.9 | 1,704,679 | 3,598,070 | 1,835,683 | 33 |
+| regional(D=4,R=4096) | 22,546,752 | 10.75 | 537.2 | 1,727,501 | 3,660,206 | 1,833,780 | 33 |
+| path(D=4) | 6,291,691 | 3.00 | 66,712.2 | 30 | 40 | 70 | 84,353 |
+| path(D=8) | 5,243,115 | 2.50 | 68,611.9 | 30 | 41 | 70 | 90,971 |
+| max-speed | 14,704,891 | 7.01 | 68,027.5 | 30 | 40 | 61 | 84,797 |
 
 Reading the table: the exact **path** bloom turns reads into memory movement
-(≈111× sequential speedup, ≈52,000× lower single-byte latency). On this
+(≈123× sequential speedup, ≈57,000× lower single-byte latency). On this
 *pseudorandom* core the universal `T_4[x]` and regional blooms are correctly
 **rejected** (no certified state-keyed table exists for arbitrary bytes), so
 they fall back to authoritative replay — an honest result, not a speedup.
 `full` history and `sparse` checkpoints give intermediate gains.
 
-Full results, provenance and the 65,536-entry research outcome: `docs/RESULTS.md`.
+**Deeper path blooms are cheaper at the same speed.** The path `hot` array is
+`N` bytes at every depth; only the cold successor array shrinks, so physical cost
+falls monotonically (`D = 1 → 6.00×` … `D = 32 → 2.125×`) while 1-byte p50 stays
+at 30 ns (`evidence/bench/depth-metrics.json`). The 4 MiB budget frontier
+(`evidence/bench/sweep-large.json`) selects `path(D=32)` for every budget from
+4× to 64×: the decisive step is the exact path bloom, not its size.
+
+**The tier curve** (`evidence/bench/memory-tiers.json`, O9) steps sequential
+throughput **139 → 71 → 57 → 18 GB/s** as the same `D=32` hot array moves
+L1 → L2 → LLC → DRAM (single-byte p50 **20 → 30 → 41 → 120 ns**), saturating
+between L2 and LLC and falling off a cliff into DRAM.
+
+**Adaptive shells** (`evidence/bench/adaptive.json`, O7): observing a hot-set
+workload and appending an exact `P_32[j]` shell as a new generation takes a 1 MiB
+`root` body from **52,727 ns/read (19.0 kB/s)** to **6.96 ns/read (143.6 MB/s)**
+for **+1,179,883 bytes**, additively and without touching earlier generations.
+
+**Hardware counters** (`evidence/bench/perf.json`, `perf stat` under
+`CAP_PERFMON`) corroborate the shape: the `path(D=4)` sequential read runs at
+**72.9 GB/s, IPC 0.67** (memory-bound, near-pure copy), `range-4k` is memcpy-bound
+(IPC 0.12), and `random-1b` is instruction-bound (IPC 4.9, 0.00047% branch
+misses). Full results and the 65,536-entry research outcome: `docs/RESULTS.md`.
+
+---
+
+## Layout / SIMD experiments (directive §9/§23)
+
+Five experiments were implemented, measured and decided; **four were rejected**
+and the fifth kept only as a non-default available layout. No default read path
+changed. From [`docs/LAYOUT.md`](docs/LAYOUT.md) (Divan, ~1 MiB corpus):
+
+- 16-byte `Bloom4Resume` entry variant: 512 KiB → 1 MiB at 65,536 entries —
+  **KEEP (available layout, not default)**;
+- 64-byte cache-line alignment: sequential identical, random-1b signal within
+  noise — **REJECT**;
+- software prefetch `_mm_prefetch`: **+21% slower** — **REJECT**;
+- AVX-512 gather `_mm512_i32gather_epi32`: **+7.8% slower** than scalar
+  (**+13.3%** vs AVX2) — **REJECT**;
+- parallel regional reads: 2.9 µs (1 thread) → 61.6 µs (8 threads) — **REJECT**.
+
+The AVX2 gather (`simd::gather_bytes`) was likewise **~5–7% slower** than the
+scalar loop in independent runs and remains unwired; the certified hot path is a
+straight-line `memcpy`-lowered copy plus a scalar random-1b loop.
+
+---
+
+## FUSE projection (optional)
+
+The `fuse` cargo feature (off by default) adds a **read-only** FUSE filesystem
+presenting the logical `OrFs` namespace while keeping the manifested store
+concealed; `.ekbloom-physical.json` at the mount root reports administrative
+physical accounting and is never logical content. Mounting needs `/dev/fuse` and
+`CAP_SYS_ADMIN` and only ever happens when `mount` is called explicitly. See
+[`docs/FUSE.md`](docs/FUSE.md); run with `sh scripts/container-fuse.sh`.
 
 ---
 
@@ -202,14 +313,28 @@ sh scripts/container-build.sh       # build the crate
 sh scripts/container-test.sh        # full test suite
 sh scripts/container-verify.sh      # fmt + clippy -D warnings + tests
 sh scripts/container-bench.sh       # divan benchmarks
-sh scripts/run-sweep.sh             # regenerate evidence/bench/{sweep,cpu}.json
+sh scripts/run-sweep.sh             # regenerate evidence/bench/{sweep,sweep-large,depth-metrics,memory-tiers,adaptive,cpu}.json
+sh scripts/run-large-history.sh     # regenerate evidence/bench/history-2p30.json (2^30 streaming build)
+sh scripts/container-perf.sh        # regenerate evidence/bench/perf.json (hardware counters)
+sh scripts/container-loom.sh        # Loom model checking (tests/loom.rs)
 sh scripts/container-reproduce.sh   # clean build + tests from scratch
 sh scripts/capture-environment.sh   # write evidence/environment.txt
 ```
 
 Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 (libFuzzer), `scripts/container-miri.sh` (UB), `scripts/container-sanitize.sh`
-(AddressSanitizer).
+(AddressSanitizer), and `scripts/container-fuse.sh` (read-only FUSE mount).
+
+### Verified tooling
+
+- **Loom** (`sh scripts/container-loom.sh`) exhaustively model-checks the one
+  genuine shared-mutable structure (`OrFs`'s index mutex): 330 schedules at
+  preemptions = 2, 1,416 at preemptions = 3, all pass. Publication ordering is a
+  filesystem property and is covered by crash-recovery tests, not Loom
+  ([`docs/reviews/concurrency.md`](docs/reviews/concurrency.md)).
+- **Budgets** never under-estimate and are transactional; 1,419 builds asserted
+  `estimate ≥ actual`
+  ([`docs/reviews/security.md`](docs/reviews/security.md) rev 2).
 
 ---
 
@@ -226,19 +351,52 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
   entries), practical only for small objects.
 - **Regional blooms certify only where the per-region state→context map is
   unambiguous**; on pseudorandom data they are rejected and give no speedup.
+- **SIMD/CPU tuning did not win.** Alignment, software prefetch, AVX-512 gather
+  and AVX2 gather all measured neutral or slower; the hot path stays scalar
+  (`docs/LAYOUT.md`).
+- **Segmented history states are unauthenticated by default.** `open`/`verify`
+  check the `core_hash`/`logical_len` linkage but never authenticate the stored
+  segments; only the opt-in `AUTH` mode covers them.
 - **Benchmarks are single-host, single-run, memory/CPU-capped.** Not a
-  multi-platform study; percentiles come from 256 samples.
+  multi-platform study; percentiles come from 256 samples. Path-family ordering
+  within ~3% is run-to-run noise (`docs/reviews/reproducibility.md`).
+- **Budgets have no anti-rollback and no key management.** `AUTH` is opt-in; a
+  leaked key defeats it ([`docs/SECURITY.md`](docs/SECURITY.md)).
 - `io-uring` is an optional backend; the default build uses the synchronous
-  fallback and is not benchmarked here. OrFS is in-process; FUSE is out of scope.
+  fallback and is not benchmarked here. OrFS is in-process; the FUSE projection
+  is opt-in and read-only.
 
 ---
 
 ## Evidence & acceptance
 
 - `evidence/environment.txt` — pinned toolchain, image and CPU capture.
-- `evidence/bench/sweep.json`, `evidence/bench/cpu.json` — the speed frontier.
+- `evidence/bench/sweep.json`, `cpu.json` — the speed frontier.
+- `evidence/bench/sweep-large.json` — budget frontier, curves, cold starts.
+- `evidence/bench/depth-metrics.json` — per-depth path-bloom metrics (§10).
+- `evidence/bench/memory-tiers.json` — the L1/L2/LLC/DRAM tier curve (O9).
+- `evidence/bench/adaptive.json` — the adaptive-shell demonstration (O7).
+- `evidence/bench/perf.json` — hardware counters (`perf stat`).
+- `evidence/bench/history-2p30.json` — the 2^30 bounded-memory streaming build.
 - `evidence/counterexamples/` — rejected state-keyed blooms.
 - `evidence/model-search/` — finite-model sufficiency sweep.
-- `docs/ACCEPTANCE.md` — the 10 hard gates mapped to tests and commands.
-- `docs/PROOFS.md` — proved properties and honest limitations.
-- `docs/RESULTS.md` — measured results and the 65,536 research outcome.
+
+Documentation map:
+
+| Doc | One line |
+|---|---|
+| [`docs/INDEX.md`](docs/INDEX.md) | One-page index of all docs and evidence. |
+| [`docs/DESIGN.md`](docs/DESIGN.md) | Frozen internal engineering contract. |
+| [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | The 10 hard gates mapped to tests and commands. |
+| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties and honest limitations. |
+| [`docs/RESULTS.md`](docs/RESULTS.md) | Measured results and the 65,536 research outcome. |
+| [`docs/SECURITY.md`](docs/SECURITY.md) | Opt-in keyed-MAC authenticated mode (`AUTH`). |
+| [`docs/FUSE.md`](docs/FUSE.md) | Read-only FUSE projection of the OrFs namespace. |
+| [`docs/LAYOUT.md`](docs/LAYOUT.md) | Layout & SIMD experiments (§9/§23). |
+| [`docs/ADAPTIVE.md`](docs/ADAPTIVE.md) | Adaptive shells (O7), parallel readers (O8), memory tiers (O9). |
+| [`docs/reviews/adversarial.md`](docs/reviews/adversarial.md) | Adversarial correctness review. |
+| [`docs/reviews/concurrency.md`](docs/reviews/concurrency.md) | Concurrency audit + Loom model checking. |
+| [`docs/reviews/mathematics.md`](docs/reviews/mathematics.md) | Independent re-derivation of the proofs. |
+| [`docs/reviews/performance.md`](docs/reviews/performance.md) | Locality & SIMD investigation. |
+| [`docs/reviews/reproducibility.md`](docs/reviews/reproducibility.md) | Independent reproducibility review. |
+| [`docs/reviews/security.md`](docs/reviews/security.md) | Wire-form/unsafe security review. |

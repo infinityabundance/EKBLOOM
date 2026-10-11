@@ -31,7 +31,7 @@ fn cases() -> Vec<Vec<u8>> {
         (0u8..=255).collect(),
         vec![0x5Au8; 300],
         (0..301u32)
-            .map(|i| if i % 2 == 0 { 0x11 } else { 0xEE })
+            .map(|i| if i.is_multiple_of(2) { 0x11 } else { 0xEE })
             .collect(),
         lcg(0x1234_5678_9ABC_DEF0, 777),
         lcg(0x0FED_CBA9_8765_4321, 1023),

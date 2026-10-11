@@ -113,7 +113,7 @@ impl HistoryStore {
         cfg: StoreConfig,
         checkpoint_interval: u32,
     ) -> Result<HistoryStore> {
-        if cfg.segment_bytes == 0 || cfg.segment_bytes % 4 != 0 {
+        if cfg.segment_bytes == 0 || !cfg.segment_bytes.is_multiple_of(4) {
             return Err(EkbloomError::InvalidArgument {
                 what: "segment_bytes must be a non-zero multiple of 4".to_string(),
             });
@@ -164,13 +164,13 @@ impl HistoryStore {
 
             if seg_buf.len() as u64 == segment_bytes {
                 let idx = segments.len();
-                let sync = (idx + 1) % SYNC_EVERY_SEGMENTS == 0;
+                let sync = (idx + 1).is_multiple_of(SYNC_EVERY_SEGMENTS);
                 segments.push(write_segment(dir, idx, &seg_buf, sync)?);
                 seg_buf.clear();
             }
 
             let pos = i + 1; // i < logical_len, so this cannot overflow
-            if pos % k == 0 {
+            if pos.is_multiple_of(k) {
                 resume.push(Snapshot::new(local.state, pos));
             }
         }

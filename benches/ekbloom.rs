@@ -304,7 +304,7 @@ fn aligned_hot() -> &'static AlignedBuffer {
 fn seq_aligned(bencher: divan::Bencher) {
     let buf = aligned_hot();
     let hot = buf.view(0, SRC_LEN).unwrap();
-    assert!(hot.as_ptr() as usize % CACHE_LINE == 0);
+    assert!((hot.as_ptr() as usize).is_multiple_of(CACHE_LINE));
     let mut out = Vec::with_capacity(SRC_LEN);
     bencher.bench_local(|| {
         out.clear();
@@ -317,7 +317,7 @@ fn seq_aligned(bencher: divan::Bencher) {
 fn seq_unaligned(bencher: divan::Bencher) {
     let buf = aligned_hot();
     let hot = buf.view(8, SRC_LEN).unwrap();
-    assert!(hot.as_ptr() as usize % CACHE_LINE != 0);
+    assert!(!(hot.as_ptr() as usize).is_multiple_of(CACHE_LINE));
     let mut out = Vec::with_capacity(SRC_LEN);
     bencher.bench_local(|| {
         out.clear();

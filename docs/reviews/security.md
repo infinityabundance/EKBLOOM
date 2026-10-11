@@ -159,3 +159,113 @@ review; as shipped it is opt-in and not on the critical path.
   for `core_hash` linkage at open; state-forgery authenticity (checkpoints, path
   `hot`) is not a memory-safety issue and needs a keyed MAC — now provided
   **opt-in** (see the residual risk section above and `docs/SECURITY.md`).
+
+---
+
+## Revision 2 — segmented history, budgets, adaptive shells, AVX-512 (verdict **SAFE**)
+
+Scope added since Revision 1: the persistent segmented store
+(`src/history_store.rs`), the `HISTORY_SEGMENTED` `.ekb` section
+(`format::HS_FIXED_LEN`, `reader::{decode_segmented_header, parse_segmented,
+FileSegmentedHistory::state_at}`, `FileBody::segmented_state_at`), the
+`Bloom4Resume` 16-byte packing, the budget pre-filter
+(`estimate_physical_bytes`), the O7 adaptive shell (`adapt_to_workload`), and the
+AVX-512 gather (`simd::gather_bytes_avx512`). Method: crafted byte images with
+the section CRC-32 **recomputed** so the parser is genuinely reached.
+
+### Segmented index/segment parsing — **held**
+Adversarial inputs (all with a valid section CRC so `open` reaches the parser):
+
+- **Header fields**: `segment_bytes ∈ {0, 5, 0xFFFFFFFD}`, invalid/zero
+  `checkpoint_interval`, `logical_len = u64::MAX`, `state_count ∈ {0, MAX}`,
+  `segment_count ∈ {0, MAX}`, `index_offset`/`states_offset`/`checkpoints_offset
+  = {0, MAX}`, `checkpoints_len = MAX`, and a flipped `core_hash` — every one is
+  a clean `Err` at `open` (`decode_segmented_header` consistency checks +
+  overflow-checked layout, and the `core_hash`/`logical_len` linkage check).
+- **Index entries** (header untouched, so `open` succeeds and `state_at` is
+  reached): `seg_rel ∈ {0, states_offset-1, checkpoints_offset-3,
+  checkpoints_offset, 1<<40, u64::MAX, u64::MAX-3}` (for entry 0 and the final
+  entry) are all rejected by the `seg_rel < states_offset || end_rel >
+  checkpoints_offset` guard, and `u64::MAX`/`u64::MAX-3` hit the
+  `checked_mul`/`checked_add` `Overflow` path. No panic, no OOB, no read past
+  the declared file length (`read_exact_at_len` bounds every `pread`).
+- **`u64` position math**: `within.checked_mul(4)` cannot overflow (`within <
+  segment_bytes/4 ≤ (2^32-1)/4`) and every absolute offset is `checked_add`ed
+  against the file length.
+- **Segment files on disk**: missing, zero-length, and truncated segments all
+  yield clean errors only for the positions that map into them; in-range reads
+  never panic; a flipped state byte is returned by `state_at` (no panic) and
+  caught by `verify_at`.
+
+### `Bloom4Resume::unpack` — **held**
+Every length `0..=15` is a clean `Truncated` (via `get(..16)`), the full 16-byte
+form round-trips bit-exactly for `cursor ∈ {0, 1, DEADBEEF…, u64::MAX}` with no
+narrowing, and trailing bytes are ignored exactly as documented.
+
+### AVX-512 gather (`unsafe`, addendum to the unsafe review) — **SAFE**
+`gather_bytes_avx512_impl` reuses the AVX2 page-safety argument: `validate_offsets`
+runs first, a 16-lane group is gathered only when `hot.len() >= 4` **and** every
+index `≤ len-4`, and boundary groups/`len < 4`/the tail use the validated scalar
+loop. `hot.len() <= i32::MAX` prevents `i32` lane truncation. Equality with the
+scalar path holds for empty, single, uniform, boundary, near-`u32::MAX`, and
+overflowing offset lists; out-of-range offsets error identically with no partial
+output. The function is **not** wired into any default path.
+
+### Budget pre-filter (`estimate_physical_bytes`) — **held (no counterexample)**
+The estimate is a hard upper bound on the built `physical_bytes()`:
+`Root`/`Sparse`/`Dense`/`Full`/`Bloom`/`Path`/`MaxSpeed` are *exact* identities
+(the `u32` history, `12·(⌊N/K⌋+1)` checkpoints, `D`-byte-entry universal table,
+`N + 4·⌈N/D⌉` path payload, and the four length-prefixed-string certificate all
+match the builders), and `Regional` is a deliberate over-count (one shell per
+`⌈N/R⌉` region × `min(R, 2^16)` entries × `(D+6)` bytes + certificate).
+Exhaustive search over 32 lengths (including `0`, `D±1`, `K±1`, segment
+boundaries) × 37 profile parameterizations found **no** under-estimate (1,419
+successful builds asserted `estimate ≥ actual`).
+
+### Transactional budget rejection — **held**
+`manifest_within_budget` clones first and only commits on success. Across
+`Root`/`Sparse`/`Bloom`/`Full` starts, budgets `base ± {0,1,8,64,4096}`, and
+profile attempts that all reject or fail to build (including unsupported depth
+`3`), a canonical serialization of every byte-carrying field (core, history,
+checkpoints, blooms, certificates, profiles, generation) is **bit-for-bit**
+unchanged; `physical_bytes()` and `generation` are unchanged.
+`create_within_budget` at `actual-1` returns `AllocationTooLarge` and yields no
+body.
+
+### New fuzz target — `fuzz_history_store`
+Builds a store over a fuzz-derived core, embeds it via `write_history_segmented`,
+then corrupts the section payload (header/index/states) with the CRC recomputed
+and queries many state positions and out-of-range indices, and truncates an
+on-disk segment before querying. 357,482 runs clean (cov 1119), no crash/OOM.
+The shipped `scripts/container-fuzz.sh` still lists only the original three
+targets, so the new target must be invoked directly (`cargo fuzz run
+fuzz_history_store`); see the process note below.
+
+### Findings and residual risk (Revision 2)
+- **No memory-safety defect found** in any newly reviewed module.
+- **Residual (integrity, not safety):** `EkbloomBody` has no segmented field, so
+  `open`/`verify` never validate `HISTORY_SEGMENTED` *states*: `open` checks the
+  `core_hash`/`logical_len` linkage, but a forger who authors the file can
+  recompute the (unkeyed) section CRC and the BLAKE3 `core_hash`, after which
+  `segmented_state_at` returns their chosen states (only bounds-checked, never
+  authenticated; aliased/overlapping index entries return plausible-but-wrong
+  states). This is the same *integrity-not-authenticity* model as Finding C;
+  states are not a memory-safety boundary. `verify` does not cover the segmented
+  section either (no body field), so only the opt-in `AUTH` mode authenticates
+  the whole file prefix.
+- **Process gap (minor):** `scripts/container-fuzz.sh` hard-codes
+  `fuzz_machine fuzz_open fuzz_bloom`, so a newly added target is silently
+  excluded from the shipped campaign. Consider globbing `fuzz/fuzz_targets/*.rs`.
+- **Determinism (reported, not fixed — outside this revision's modules):**
+  `sweep::budget_frontier` is not deterministic for a fixed seed despite its doc
+  and `tests/sweep_curves.rs::budget_frontier_is_deterministic_for_a_fixed_seed`.
+  Speed ties (within `SPEED_TOLERANCE_OCTAVES = 1.0`) break by `physical_bytes`,
+  but genuinely measured *timings* decide the "clearly faster" branch, so timing
+  noise can flip the winner between path depths across runs. Repro:
+  `sh scripts/container-test.sh --release --test sweep_curves
+  budget_frontier_is_deterministic_for_a_fixed_seed` failed ~1/5 release runs
+  (observed `path(D=16)` vs `path(D=32)`, then `path(D=8)` vs `path(D=32)`); it
+  passes in debug and in isolation. Not caused by this revision.
+- **Regression suite:** new adversarial tests live in
+  `tests/segmented_hardening.rs` (12 tests); the full debug suite is 300 passed / 0
+  failed and the release suite is 299 / 0 with the flaky determinism test skipped. 

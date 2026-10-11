@@ -362,7 +362,7 @@ fn check_regional(
     let len = table.logical_len;
     if start
         .checked_add(len)
-        .map_or(true, |end| end > body.logical_len)
+        .is_none_or(|end| end > body.logical_len)
     {
         return check(name, false, "region range exceeds logical length");
     }

@@ -154,7 +154,7 @@ fn few_mib_sampled_positions_and_checkpoints() {
     let stride = 1 << 16;
     let count = store.verify_sample(|p| core[p as usize], stride).unwrap();
     let mut expected = n as u64 / stride + 1;
-    if n as u64 % stride != 0 {
+    if !(n as u64).is_multiple_of(stride) {
         expected += 1;
     }
     assert_eq!(count, expected);

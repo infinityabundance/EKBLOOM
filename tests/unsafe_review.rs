@@ -110,7 +110,7 @@ fn scalar_tail_lengths_agree() {
     for extra in 1..=7usize {
         let mut offs: Vec<u64> = (0..8usize).map(|k| (k as u64 * 37) % n).collect();
         for k in 0..extra {
-            offs.push(if k % 2 == 0 {
+            offs.push(if k.is_multiple_of(2) {
                 n - 1
             } else {
                 (k as u64 * 91) % n
@@ -137,7 +137,7 @@ fn mixed_boundary_and_vector_groups_agree() {
         }
     }
     assert_agree(&hot, &offs);
-    assert!(offs.len() % 8 == 0);
+    assert!(offs.len().is_multiple_of(8));
 }
 
 /// A very long list (with a non-multiple-of-eight tail) still agrees, exercising

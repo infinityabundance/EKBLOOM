@@ -21,7 +21,7 @@ Captured by `scripts/capture-environment.sh` into
 - **toolchain** `rustc 1.99.0 (b940084d7 2026-09-28)`, `cargo 1.99.0`,
   host `x86_64-unknown-linux-gnu`;
 - **host** AMD Ryzen 7 9800X3D, `nproc 16`, kernel `7.2.9-2-cachyos`;
-- **source** `Cargo.lock` sha256 `b922be92…`, git HEAD `934a9148…`;
+- **source** `Cargo.lock` sha256 `64b1b4f1…`, git HEAD `88313a9b…`;
 - **nightly harness image** `rustlang/rust:nightly-bookworm-slim@sha256:2fe113dd…`.
 
 Detected CPU features for the sweep (`evidence/bench/cpu.json`): `sse2`, `avx2`,

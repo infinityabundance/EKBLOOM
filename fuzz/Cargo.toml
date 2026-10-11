@@ -35,3 +35,10 @@ path = "fuzz_targets/fuzz_bloom.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_history_store"
+path = "fuzz_targets/fuzz_history_store.rs"
+test = false
+doc = false
+bench = false

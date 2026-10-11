@@ -267,10 +267,10 @@ fn category_repeating_and_alternating() {
     let repeating: Vec<Vec<u8>> = vec![vec![0xA5u8; 300], vec![0x00u8; 255], vec![0xFFu8; 257]];
     let alternating: Vec<Vec<u8>> = vec![
         (0..301u32)
-            .map(|i| if i % 2 == 0 { 0x11 } else { 0xEE })
+            .map(|i| if i.is_multiple_of(2) { 0x11 } else { 0xEE })
             .collect(),
         (0..200u32)
-            .map(|i| if i % 3 == 0 { 0x01 } else { 0xFE })
+            .map(|i| if i.is_multiple_of(3) { 0x01 } else { 0xFE })
             .collect(),
     ];
     for (tag, src) in repeating
@@ -411,7 +411,7 @@ fn category_final_partial_bloom_group() {
             assert_eq!(syms.len() as u64, end - start, "D={d} n={n} last block len");
             assert_eq!(syms, decoded[start as usize..end as usize].to_vec());
             assert_eq!(succ, logs[end as usize], "D={d} n={n} last successor");
-            if n64 % dd != 0 {
+            if !n64.is_multiple_of(dd) {
                 assert!(
                     (syms.len() as u64) < dd,
                     "final block must be partial: D={d} n={n}"

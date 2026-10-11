@@ -286,7 +286,13 @@ fn avx2_avx512_and_scalar_all_agree() {
     let hot = lcg(0xA512_0003, 2048);
     let n = hot.len() as u64;
     let offs: Vec<u64> = (0..64u64)
-        .map(|k| if k % 9 == 0 { n - 1 } else { (k * 53) % n })
+        .map(|k| {
+            if k.is_multiple_of(9) {
+                n - 1
+            } else {
+                (k * 53) % n
+            }
+        })
         .collect();
     let mut s = Vec::new();
     gather_bytes_scalar(&hot, &offs, &mut s).unwrap();

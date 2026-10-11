@@ -76,7 +76,7 @@ docker run --rm \
 
         cd /work/fuzz
         failed=0
-        for TARGET in fuzz_machine fuzz_open fuzz_bloom; do
+        for TARGET in fuzz_machine fuzz_open fuzz_bloom fuzz_history_store; do
             start=$(date +%s)
             echo "ekbloom-fuzz: running $TARGET"
             if cargo fuzz run "$TARGET" -- -runs="$EKB_FUZZ_RUNS" -max_total_time="$EKB_FUZZ_SECS"; then
