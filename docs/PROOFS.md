@@ -567,6 +567,128 @@ profiles and eleven requests); reviewed in `docs/reviews/adversarial.md`
 
 ---
 
+## P15. The SIMD reconstruction kernels are byte-exact against the machine — **PROVED** (byte-exactness by construction), **EMPIRICALLY OBSERVED** (keep/reject ratios)
+
+**Claim.** Both directive §6 kernels reconstruct output byte-for-byte identical to
+`NL2::decode`: Kernel A (`nl2_windows16_avx2`, sixteen independent restart windows
+per AVX2 register) and Kernel B (associative block summaries + prefix scan →
+transposed vector step, optionally multi-threaded) each reproduce the machine on
+every window/block/length, and the AVX2 path falls back to a byte-identical scalar
+reference when AVX2 is unavailable.
+
+**Proof.** The `OrANS-NL2` step is a *serial* dependent chain within one window
+(`s_i` depends on `s_{i-1}` and `s_{i-2}`), so the only exploitable parallelism is
+**across** independent windows/blocks; each kernel's vector lane therefore computes
+the same per-window recurrence as the scalar reference, over the identical
+input/output bytes (the scalar control reads and writes exactly the same layout), so
+lane-by-lane equality is the machine's own step. Kernel B's start states come from
+the affine/associative prefix scan of P11, which is exact. ∎
+
+**Corroboration.** Equal-residency measurements (`evidence/bench/kernels.json`, 68
+rows; court harness, bootstrap 95% CI): Kernel A vector batch is **5.9× / 7.3× /
+8.0×** the equal-layout scalar control at window `L = 16 / 32 / 64` (**KEEP**);
+manual unrolling is **1.7–2.2×** lower p50 and **2–4×** lower p99 (**KEEP**); the
+2-symbol table is equal-or-slower (**REJECT**). Kernel B vector **KEEP** only for
+blocks ≤ 1024 (**~1.07×** at 1 thread, **~1.04×** at 4) and **REJECT** for blocks
+≥ 4096 (0.83× / 0.59×, the group-major transpose dominating); the pure-parallel
+decode-only path reproduces `docs/PREFIX.md` (4.34 GB/s @ 8 threads). Every kernel
+is checked byte-for-byte against `NL2::decode`.
+
+**Honest scope.** `cycles/byte` uses a calibrating dependency-chain clock estimate
+(3.02 GHz in the recorded run), so the *ratios* are the stable quantity, not absolute
+GB/s. The intra-window recurrence is unvectorisable; only the across-window/batch
+kernels win. No `unsafe` was added outside the sanctioned modules (`src/simd.rs`).
+
+**Tested:** `tests/kernels_planner.rs`
+(`kernel_a_variants_are_byte_exact_for_all_lengths`,
+`kernel_a_window_batches_match_scalar_and_machine`,
+`kernel_b_matches_sequential_decode_for_all_threads_and_boundaries`); example
+`examples/kernels.rs`; reviewed in `docs/reviews/performance.md`.
+
+---
+
+## P16. The background planner adapts a moving hot window from a lock-free read path, select-only-certified and additively — **PROVED** (lock-free read path / certified selection / additivity / determinism by construction), **EMPIRICALLY OBSERVED** (adaptation recovery)
+
+**Claim.** `BackgroundPlanner`'s read path is **lock-free** (no per-read lock, no
+per-byte work); it selects only **certified** regions (strictly positive benefit
+`G_r`, each materialised tile re-verified against the machine before publication);
+it is **additive / non-withdrawal** (committed history and earlier tile sets are
+never deleted); and `plan_benefits` is a pure, deterministic, tie-ordered function.
+
+**Proof.** `AccessObserver::observe` performs one relaxed `fetch_add` per touched
+region in the calling thread's cache-line-padded shard — no mutex and nothing per
+byte. `Publication` builds and certifies the whole next generation *before* an
+atomic swap and `PlannerReader` reads its cached `Arc` with no lock, taking only the
+*shared* publication lock when the version changes — so lock acquisitions are
+`O(epochs)`, never `O(reads)`. `G_r = q_r·(L_current − L_hot) − C_build/T` rises with
+`q_r` and the latency saving and falls with the build cost, so a region whose build
+is not amortised is never selected; the selection is a pure function of the
+observation. The planner clones the committed body and *adds* tiles to it, so
+committed history is untouched. ∎
+
+**Corroboration.** On a 4 MiB object (64 KiB regions) whose 8-region hot window hops
+to a fresh set six times (`evidence/bench/planner-bg.json`): median cold p50 **301 ns
+→ warm p50 130 ns** (~2.3×), cold p99 581 → warm 281 ns, hot-fraction **0% → 100%**
+in every window. Bytes spent `3,149,184` over 6 adaptations (768 regions, **0**
+certification failures); committed core hash stable, committed tile sets 0 → 6,
+`history` never created; over **12,288** reads the process took only **44**
+shared-lock acquisitions total. (Window-0 cold p99 of 124 µs is a single first-touch
+outlier; the medians above are the honest record.)
+
+**Honest scope.** The `G_r` heuristic is a cost model, not an oracle; it optimises
+the small region-local read, not bulk scans. A forged `Certified`/`TileSet` label is
+trusted by the reader — the same *integrity-not-authenticity* boundary as P14.
+
+**Tested:** `tests/kernels_planner.rs`
+(`observer_counts_are_additive_and_bounded`,
+`benefit_is_monotone_in_the_expected_direction`,
+`plan_selects_only_positive_benefit_within_budget_and_is_deterministic`,
+`publication_is_additive_committed_history_untouched_and_reads_never_partial`,
+`background_planner_adapts_additively_within_budget_under_concurrent_load`); example
+`examples/planner_bg.rs`.
+
+---
+
+## P17. The mapped read surface is exact, immutable-for-lifetime, and outside the untrusted parser — **PROVED** (invariants by construction), **EMPIRICALLY OBSERVED** (mmap vs `pread`; huge-page non-result)
+
+**Claim.** `MappedSurface` returns byte-exact copies of the mapped file; the mapped
+file is **immutable for the entire mapping lifetime**; old generations are
+**retained** (rename-then-retain publication, never a `SIGBUS`); and it is **never
+introduced into the untrusted-input parser** (`reader`/`verify`/`recovery`).
+
+**Proof.** `read`/`read_into` bound-check `offset.checked_add(len)? <= file_len <=
+map_len` *before* forming a slice (`Overflow` / `OutOfBounds` otherwise), form the
+slice only over a read-only (`PROT_READ`, `MAP_PRIVATE`) mapping, and copy it
+immediately into caller-owned output; `munmap` runs exactly once in `Drop` from
+privately stored base/length. Publication swaps the *path*, not the inode, so a live
+mapping keeps reading its old inode (rename-then-retain) while generation-old bytes
+stay readable. The module is not referenced by `reader`/`verify`/`recovery`, so no
+attacker-controlled `.ekb` offset can become a mapped fault. ∎
+
+**Corroboration.** Random-1-byte p50 drops **130 → 30 ns** at 1–64 MiB (**4.3×**) and
+**210 → 120 ns** at 256 MiB (1.75×); 4-KiB p50 drops 210 → 70 ns (1 MiB) and
+481 → 260 ns (256 MiB); sequential is 1.4–2.5× faster than `pread`
+(`evidence/bench/mmap.json`). Huge pages are **REJECTED**: this kernel already backs
+the read-only file mapping with PMDs (`FilePmdMapped` equals the whole mapping for
+every size ≥ 16 MiB; the 256 MiB plain mapping faults in only **125** minor faults
+≈ one 2 MiB PMD each), so `MADV_HUGEPAGE` is a **1.00×** no-op, while an anonymous
+huge-page probe confirms THP itself works. mmap does **not** beat a resident `Vec`
+(30 vs 20 ns at 1 MiB); its value is the fastest *source-from-file* mode.
+
+**Honest scope.** The mapped file must be immutable for the mapping lifetime
+(callers must not `set_len`/rewrite a mapped inode); sequential GB/s is
+bandwidth-bound and moves ±10–30% run to run, so the random-1b p50 columns carry the
+finding. `MappedSurface` is the crate's third sanctioned `unsafe` module.
+
+**Tested:** `tests/mmap.rs` (7 tests: byte-exact full/random/range/`read_into` reads;
+boundary and `Overflow` errors; clean errors on missing/empty/directory/`set_len(0)`;
+huge-page and prefault byte-identical; old generation readable after replace and
+unlink; 4 readers × 64 generations never torn;
+`unsafe_is_confined_to_three_sanctioned_modules`); reviewed in
+`docs/reviews/security.md` (mapped.rs — SAFE).
+
+---
+
 ## Unresolved limitations (honest)
 
 1. **No certified universal 65,536-entry `T_4[x]` for the byte machine.** By P6
@@ -629,3 +751,12 @@ profiles and eleven requests); reviewed in `docs/reviews/adversarial.md`
     environment, as is FUSE-over-`io_uring`; the measured FUSE read-path cost is
     committed in `evidence/bench/fuse-perf.json` and the findings are stated
     verbatim in `docs/FUSE.md`.
+11. **The mapped surface is an extra sanctioned `unsafe` boundary.** The crate has
+    exactly **three** sanctioned `unsafe` modules — `src/simd.rs` (feature-gated
+    AVX2/AVX-512 gathers), `src/async_io.rs` (the `io-uring` submission-queue
+    pushes), and `src/mapped.rs` (the read-only `mmap`/`madvise`/`munmap` surface) —
+    each independently reviewed SAFE; `tests/mmap.rs`
+    (`unsafe_is_confined_to_three_sanctioned_modules`) pins that set. `MappedSurface`
+    must never be pointed at an untrusted or concurrently-truncated file (a
+    truncation of an unfaulted page is a `SIGBUS`), and it is a *source-from-file*
+    mode, not a faster heap (P17).

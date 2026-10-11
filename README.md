@@ -71,6 +71,21 @@ original specification lives in `research/`.
     (3 ns) while `ekbloom-path32` wins throughput, and `planner-hotcold` is
     dominated on uniform workloads; machine 2 compresses skewed sources to
     `V/N = 0.511×` (`docs/COURT.md`, `docs/PLANNER.md`, `docs/CODEC.md`).
+12. **SIMD wins — on the correct axis.** The `OrANS-NL2` recurrence is serial
+    *within* a window, so the vector kernel processes sixteen independent restart
+    windows per AVX2 register: **5.9–8.0×** the equal-layout scalar control for
+    short windows (unrolled scalar is also KEEP at 1.7–2.2× lower p50). The
+    2-symbol table and the vector path for blocks ≥ 4096 B were REJECTED
+    (`docs/KERNELS.md`).
+13. **A workload-directed background planner adapts a moving hot window.** From
+    sharded relaxed counters alone (no lock on the read path) the planner promotes
+    the window and cuts median cold p50 from **301 → 130 ns** (~2.3×), with
+    hot-fraction 0% → 100%, additively and without touching committed history
+    (`docs/PLANNER.md` §4).
+14. **A read-only `mmap` surface is kept; huge pages are rejected.** mmap drops
+    random-1-byte p50 from **130 → 30 ns** (4.3×) at 1–64 MiB and beats `pread`
+    sequentially, but `MADV_HUGEPAGE` is a no-op because this kernel already backs
+    the file mapping with PMDs (`docs/MMAP.md`).
 
 ---
 
@@ -408,9 +423,10 @@ a **genuine completion-driven `io_uring` backend** (`[Backend::IoUring]`, the
 optional `io-uring` cargo feature). The async backend creates a real ring
 (`io_uring_setup(2)`), submits owned-buffer write SQEs and an `fsync` SQE, reaps
 their completions and propagates exact errors, and is **byte-for-byte identical**
-to the synchronous writer, preserving the durability ordering. `src/simd.rs` and
-`src/async_io.rs` are the crate's **two sanctioned `unsafe` modules**; both are
-independently reviewed SAFE (`docs/reviews/security.md`).
+to the synchronous writer, preserving the durability ordering. The crate has
+**three sanctioned `unsafe` modules** — `src/simd.rs`, `src/async_io.rs` and
+`src/mapped.rs` — each independently reviewed SAFE
+(`docs/reviews/security.md`).
 
 It was **run** here, not merely probed: `sh scripts/container-async-io.sh` runs
 `tests/async_io.rs` under `--security-opt seccomp=unconfined` (no capability, no
@@ -426,7 +442,7 @@ publication and pays submit/completion round-trips. See
 
 ---
 
-## Research phases (v0.3): reconstruction, packing, tiles, handles, court & planner
+## Research phases (v0.3): reconstruction, packing, tiles, handles, kernels, court, planner & mmap
 
 The 0.3 round is organised around a **three-role separation**: *machine semantics*
 (`src/machine.rs`), the *manifestation engine* (exact certified structures), and an
@@ -515,6 +531,47 @@ serves every read through a tiny immutable dispatch (`path_for(offset) = regions
 matching `reader::read` byte-for-byte on a mixed hot/cold 4 MiB body (hot 19 ns vs
 best fixed 16 ns; cold 129 ns vs fixed restart 230 ns and fixed hot 6.3 ms).
 
+### SIMD reconstruction kernels (`docs/KERNELS.md`)
+
+The `OrANS-NL2` step reveals `s = S(h)^l^r` and advances to `x' = (l<<8)|s`, so
+symbol `s_i` depends on `s_{i-1}` **and** `s_{i-2}`: a single restart window is an
+irreducible serial chain that LLVM cannot auto-vectorise. The SIMD win is
+therefore **across independent windows** — sixteen windows per AVX2 register.
+Kernel A's vector batch is **5.9× / 7.3× / 8.0×** the equal-layout scalar control
+at window `L = 16 / 32 / 64` (KEEP), and manual unrolling removes loop overhead for
+**1.7–2.2× lower p50** (KEEP); the 2-symbol table is equal-or-slower and is
+REJECTED. Kernel B (block summaries → associative prefix scan → transposed vector
+step) wins modestly for blocks ≤ 1024 (**≈1.07×**) and is REJECTED for blocks
+≥ 4096 (0.83× / 0.59× — the group-major transpose dominates). Every kernel is
+byte-exact against `NL2::decode`, and the serial block-summary build keeps the
+end-to-end pipeline ~10× below the decode-only reference. All SIMD `unsafe` stays
+in `src/simd.rs`.
+
+### Workload-directed background planner (`docs/PLANNER.md` §4)
+
+`BackgroundPlanner` observes accesses through sharded, cache-line-padded relaxed
+counters and reactively promotes a moving hot window into new certified tiles. The
+read path is **lock-free** (`PlannerReader` touches only its cached `Arc`; the
+shared publication lock is taken only on a version change, so acquisitions are
+`O(epochs)`, never `O(reads)`), selection is restricted to **certified** regions,
+and publication is **additive / non-withdrawal** (committed history is
+cloned-and-extended, never deleted). On a 4 MiB body whose 8-region hot window hops
+six times, median cold p50 falls **301 → 130 ns** (~2.3×) and hot-fraction goes
+**0% → 100%** in every window, for 3,149,184 B spent over 6 adaptations (0
+certification failures) and only 44 shared-lock acquisitions across 12,288 reads.
+
+### Mapped read surfaces & huge pages (`docs/MMAP.md`)
+
+A safe read-only `mmap` surface (`src/mapped.rs`, the third sanctioned `unsafe`
+module) is **KEEP**: random-1-byte p50 drops **130 → 30 ns** at 1–64 MiB (**4.3×**)
+and 210 → 120 ns at 256 MiB, and sequential is 1.4–2.5× faster than `pread`. It
+does **not** beat a resident `Vec` (30 vs 20 ns at 1 MiB); its value is the fastest
+*source-from-file* mode. Huge pages are **REJECTED**: this kernel already backs the
+read-only file mapping with PMDs (`FilePmdMapped` = the whole mapping; the 256 MiB
+plain mapping faults in only 125 minor faults), so `MADV_HUGEPAGE` is a **1.00×**
+no-op. Invariants: immutable-for-lifetime, rename-then-retain publication, explicit
+`munmap` on drop, and never wired into the untrusted `.ekb` parser.
+
 ---
 
 ## Layout / SIMD experiments and concurrency
@@ -579,6 +636,9 @@ sh scripts/run-packed.sh            # evidence/bench/packed.json (packed restart
 sh scripts/run-tiles.sh             # evidence/bench/tiles.json (selective hot tiles)
 sh scripts/run-handles.sh           # evidence/bench/handles.json (handles + RCU + persisted tiles)
 sh scripts/run-court.sh             # evidence/bench/{court,planner}.json (court + planner)
+sh scripts/run-kernels.sh           # evidence/bench/kernels.json (SIMD reconstruction kernels)
+sh scripts/run-planner-bg.sh        # evidence/bench/planner-bg.json (background planner)
+sh scripts/run-mmap.sh              # evidence/bench/mmap.json (mmap + huge pages)
 sh scripts/run-fuse-perf.sh         # evidence/bench/fuse-perf.json (requires /dev/fuse)
 sh scripts/container-loom.sh        # Loom model checking (tests/loom.rs)
 sh scripts/container-reproduce.sh   # clean build + tests from scratch
@@ -600,9 +660,10 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 - **Budgets** never under-estimate and are transactional; 1,419 builds asserted
   `estimate ≥ actual`
   ([`docs/reviews/security.md`](docs/reviews/security.md) rev 2).
-- **`unsafe`** is confined to two sanctioned, independently reviewed modules
-  (`src/simd.rs`, `src/async_io.rs`), both reviewed SAFE in
+- **`unsafe`** is confined to three sanctioned, independently reviewed modules
+  (`src/simd.rs`, `src/async_io.rs`, `src/mapped.rs`), each reviewed SAFE in
   [`docs/reviews/security.md`](docs/reviews/security.md).
+  `tests/mmap.rs::unsafe_is_confined_to_three_sanctioned_modules` pins the set.
 
 ---
 
@@ -675,6 +736,9 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 - `evidence/bench/io-batch.json` — the `io_uring` batched-read hybrid vs `pread`.
 - `evidence/bench/court.json` — the rigorous performance court (distributions, 3-D Pareto).
 - `evidence/bench/planner.json` — the certified access planner vs each fixed path.
+- `evidence/bench/kernels.json` — SIMD reconstruction kernels (A/B) with keep/reject ratios.
+- `evidence/bench/planner-bg.json` — the workload-directed background planner's moving hot window.
+- `evidence/bench/mmap.json` — mapped read surfaces vs `pread`/resident and the huge-page non-result.
 - `evidence/bench/fuse-perf.json` — measured FUSE read-path cost and the passthrough non-result.
 - `evidence/counterexamples/` — rejected state-keyed blooms.
 - `evidence/model-search/` — finite-model sufficiency sweep.
@@ -686,7 +750,7 @@ Documentation map:
 | [`docs/INDEX.md`](docs/INDEX.md) | One-page index of all docs and evidence. |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Frozen internal engineering contract. |
 | [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | The 10 hard gates mapped to tests and commands. |
-| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties P1–P14 (machine 1 + machine 2 + round-3 modules) and honest limitations. |
+| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties P1–P17 (machine 1 + machine 2 + the round-3/round-4 modules) and honest limitations. |
 | [`docs/RESULTS.md`](docs/RESULTS.md) | Measured results and the 65,536 research outcome. |
 | [`docs/CODEC.md`](docs/CODEC.md) | Machine 2 (`OrANS-RANS0`) compressing codec contract. |
 | [`docs/BASELINES.md`](docs/BASELINES.md) | Conventional baseline comparison (`RawVec`/`RawFile`/…). |
@@ -702,10 +766,12 @@ Documentation map:
 | [`docs/HANDLES.md`](docs/HANDLES.md) | Persistent verified handles + RCU publication, persisted tiles. |
 | [`docs/IOURING.md`](docs/IOURING.md) | The `io_uring` hybrid batched read path. |
 | [`docs/COURT.md`](docs/COURT.md) | The rigorous performance court (95% CIs, 3-D Pareto). |
-| [`docs/PLANNER.md`](docs/PLANNER.md) | The certified, search-free access planner. |
+| [`docs/PLANNER.md`](docs/PLANNER.md) | The certified, search-free access planner + workload-directed background planner. |
+| [`docs/KERNELS.md`](docs/KERNELS.md) | SIMD reconstruction kernels (§6): keep/reject per measured kernel. |
+| [`docs/MMAP.md`](docs/MMAP.md) | Read-only `mmap` surface + huge-page investigation (keep/reject). |
 | [`docs/reviews/adversarial.md`](docs/reviews/adversarial.md) | Adversarial correctness review. |
 | [`docs/reviews/concurrency.md`](docs/reviews/concurrency.md) | Concurrency audit + Loom model checking. |
 | [`docs/reviews/mathematics.md`](docs/reviews/mathematics.md) | Independent re-derivation of the proofs. |
 | [`docs/reviews/performance.md`](docs/reviews/performance.md) | Locality & SIMD investigation. |
 | [`docs/reviews/reproducibility.md`](docs/reviews/reproducibility.md) | Independent reproducibility review. |
-| [`docs/reviews/security.md`](docs/reviews/security.md) | Wire-form / `unsafe` security review (two `unsafe` modules). |
+| [`docs/reviews/security.md`](docs/reviews/security.md) | Wire-form / `unsafe` security review (three `unsafe` modules). |

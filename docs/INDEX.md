@@ -11,7 +11,7 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 |---|---|
 | [`DESIGN.md`](DESIGN.md) | **Frozen engineering contract** — machine semantics, state log, blooms, data model, `.ekb` wire layout, module interfaces. |
 | [`ACCEPTANCE.md`](ACCEPTANCE.md) | The **10 hard acceptance gates**, each mapped to its implementing module, artifact and exact reproduction command, plus additional evidence. |
-| [`PROOFS.md`](PROOFS.md) | **Proved properties P1–P14** (machine 1 + machine 2 + the round-3 modules, tagged PROVED / EMPIRICALLY OBSERVED) and the honest unresolved limitations. |
+| [`PROOFS.md`](PROOFS.md) | **Proved properties P1–P17** (machine 1 + machine 2 + the round-3/round-4 modules, tagged PROVED / EMPIRICALLY OBSERVED) and the honest unresolved limitations. |
 | [`RESULTS.md`](RESULTS.md) | **Measured results** — the speed-vs-space frontier, budget frontier, curves, hardware counters, machine 2, baselines, the cache competition, and the 65,536-entry `T_4[x]` research outcome. |
 | [`CODEC.md`](CODEC.md) | **Machine 2** (`OrANS-RANS0`): the static order-0 range-ANS compressing machine (`V < N` on skewed data). |
 | [`BASELINES.md`](BASELINES.md) | **Conventional baseline comparison** (`RawVec`/`RawFile`/`Predecoded`/`IndexedArray`) plus machine 2 vs `raw`. |
@@ -27,7 +27,9 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`HANDLES.md`](HANDLES.md) | **Persistent verified handles + RCU publication**, persisted (`TILES`) sections. |
 | [`IOURING.md`](IOURING.md) | The **`io_uring` hybrid batched read path** (`HybridReader`) plus the publication backend. |
 | [`COURT.md`](COURT.md) | The **rigorous performance court**: interleaved reps, bootstrap 95% CIs, 3-D Pareto frontier. |
-| [`PLANNER.md`](PLANNER.md) | The **certified, search-free access planner** (`§14` three-role separation). |
+| [`PLANNER.md`](PLANNER.md) | The **certified, search-free access planner** (`§14` three-role separation) plus the **workload-directed background planner** (`§4`). |
+| [`KERNELS.md`](KERNELS.md) | **SIMD reconstruction kernels** (directive §6): Kernel A/B, each kept or rejected with measured ratios. |
+| [`MMAP.md`](MMAP.md) | **Read-only mapped surface + huge pages** (`src/mapped.rs`): mmap KEEP, huge pages rejected. |
 | [`INDEX.md`](INDEX.md) | This file. |
 
 ## Independent reviews (`docs/reviews/`)
@@ -39,7 +41,7 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`reviews/mathematics.md`](reviews/mathematics.md) | Independent re-derivation of P1–P6; only defect is a wording clause (benign). |
 | [`reviews/performance.md`](reviews/performance.md) | Locality & SIMD investigation of the certified path-bloom hot path. |
 | [`reviews/reproducibility.md`](reviews/reproducibility.md) | Independent reproducibility review: pinning, lockfile, clean-checkout, benchmark drift. |
-| [`reviews/security.md`](reviews/security.md) | Wire-form security review and the **two** sanctioned `unsafe` modules (`src/simd.rs`, `src/async_io.rs`), both SAFE. |
+| [`reviews/security.md`](reviews/security.md) | Wire-form security review and the **three** sanctioned `unsafe` modules (`src/simd.rs`, `src/async_io.rs`, `src/mapped.rs`), all SAFE. |
 
 ## Evidence (`evidence/`)
 
@@ -64,6 +66,9 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`bench/io-batch.json`](../evidence/bench/io-batch.json) | The `io_uring` batch path vs a serial `pread` loop and the cached handle, by size and depth. |
 | [`bench/court.json`](../evidence/bench/court.json) | The performance court: 152 rows of distributions/95% CIs and the per-working-set 3-D Pareto frontier. |
 | [`bench/planner.json`](../evidence/bench/planner.json) | The planner's chosen-path distribution and latency vs each fixed path on a mixed hot/cold body. |
+| [`bench/kernels.json`](../evidence/bench/kernels.json) | SIMD reconstruction kernels (68 rows): Kernel A/B throughput/latency and keep/reject verdicts. |
+| [`bench/planner-bg.json`](../evidence/bench/planner-bg.json) | The workload-directed background planner: moving hot window, adaptation recovery, additive publication. |
+| [`bench/mmap.json`](../evidence/bench/mmap.json) | `pread`/resident/`mmap`/`mmap_huge`: latency, faults, and the huge-page non-result. |
 | [`bench/fuse-perf.json`](../evidence/bench/fuse-perf.json) | Measured FUSE read-path cost vs a direct read and the `FUSE` passthrough / `FUSE`-over-`io_uring` non-result. |
 | [`counterexamples/bloom-key-0001.json`](../evidence/counterexamples/bloom-key-0001.json) | The rejected universal `T_4[x]` witness (key `175`, two equal-state/different-outcome positions). |
 | [`model-search/model-search-sweep.json`](../evidence/model-search/model-search-sweep.json) | The `D = 4` finite-model sufficiency sweep (`k = 0..4` conflicts `64/256/1024/4096/0`). |
@@ -85,6 +90,9 @@ sh scripts/run-packed.sh            # packed.json
 sh scripts/run-tiles.sh             # tiles.json
 sh scripts/run-handles.sh           # handles.json
 sh scripts/run-court.sh             # court.json + planner.json
+sh scripts/run-kernels.sh           # kernels.json
+sh scripts/run-planner-bg.sh        # planner-bg.json
+sh scripts/run-mmap.sh              # mmap.json
 sh scripts/run-fuse-perf.sh         # fuse-perf.json (requires /dev/fuse)
 sh scripts/container-fuzz.sh        # all libFuzzer targets (fuzz_machine/open/bloom/history_store/packed/tiles)
 sh scripts/container-loom.sh        # Loom model checking

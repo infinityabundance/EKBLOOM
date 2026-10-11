@@ -87,8 +87,9 @@ Adversarial authenticity requires a **keyed MAC** over the committed bytes
 
 ## Unsafe review (`src/simd.rs`) — verdict **SAFE**
 
-This module's `unsafe` (one of the crate's **two** sanctioned `unsafe` modules;
-the other, `src/async_io.rs`, is reviewed at the end of this document):
+This module's `unsafe` (one of the crate's **three** sanctioned `unsafe`
+modules; the others, `src/async_io.rs` and `src/mapped.rs`, are reviewed later in
+this document):
 `gather_bytes_avx2` (`unsafe fn`, one block) plus its
 one call site in `gather_bytes`. It implements a `_mm256_i32gather_epi32` gather
 of many single bytes from a path-bloom `hot` array. Reviewed independently, not
@@ -125,10 +126,12 @@ Boundary groups, the tail, and `len < 4` use the validated scalar loads.
   (lane-0/1 analysis in the module docs is exact).
 
 **Other-unsafe confirmation:** `grep -E 'unsafe\s*(fn|\{|impl|extern|trait)'`
-across `src/` matches exactly two modules — `src/simd.rs` (the AVX2/AVX-512/
-prefetch gather blocks and their call sites) and `src/async_io.rs` (the two
-`SubmissionQueue::push` calls, reviewed below). These are the crate's **two**
-sanctioned `unsafe` modules. Zero other `unsafe` is present.
+across `src/` matches exactly three modules — `src/simd.rs` (the AVX2/AVX-512/
+prefetch gather blocks and their call sites), `src/async_io.rs` (the two
+`SubmissionQueue::push` calls), and `src/mapped.rs` (the read-only
+`mmap`/`madvise`/`munmap` and pointer-view blocks), all reviewed below. These are
+the crate's **three** sanctioned `unsafe` modules. Zero other `unsafe` is
+present.
 
 **Miri:** `scripts/container-miri.sh` runs `cargo miri test --lib -- machine::`,
 so `simd::tests::*` is **excluded**; Miri never interprets the AVX2 intrinsics
@@ -288,11 +291,13 @@ and is the real completion-driven publication backend for `.ekb` generations.
 
 ### Exact `unsafe` inventory (grep)
 
-`grep -rn unsafe src/` finds `unsafe` *code* in exactly two modules:
+`grep -rn unsafe src/` finds `unsafe` *code* in exactly three modules:
 `src/simd.rs` (`gather_bytes_avx2`, `gather_bytes_prefetch_sse`,
-`gather_bytes_avx512_impl` + their three gated call sites) and `src/async_io.rs`
-(two `SubmissionQueue::push` calls: one write SQE, one `Fsync` SQE). Every one
-carries a `// SAFETY:` comment. The string `unsafe` also appears in doc comments
+`gather_bytes_avx512_impl` + their three gated call sites), `src/async_io.rs`
+(two `SubmissionQueue::push` calls: one write SQE, one `Fsync` SQE), and
+`src/mapped.rs` (the read-only `mmap`/`madvise`/`munmap` and pointer-view
+blocks). Every one carries a `// SAFETY:` comment. The string `unsafe` also
+appears in doc comments
 in `src/fastpath.rs` / `src/reader.rs` (asserting they contain *no* `unsafe`),
 and in `tests/unsafe_review.rs` (the `simd` review), but no other `unsafe` blocks
 exist. No `unsafe` in tests, benches, examples, or fuzz targets.
@@ -461,6 +466,10 @@ with the guard removed, and to pass with it restored.
   each, no crash artifacts).
 
 ## Unsafe review (`src/mapped.rs`) — verdict **SAFE**
+
+**Boundary verdict:** an immutable-for-lifetime read-only map, published
+rename-then-retain, never reachable from the untrusted parser, every view
+bounds-checked, a single `munmap` on drop — **SAFE**.
 
 First independent review of the crate's *third* `unsafe` module: a read-only
 memory-mapped surface over an immutable output file. The module's **safe** public

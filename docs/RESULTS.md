@@ -21,7 +21,7 @@ Captured by `scripts/capture-environment.sh` into
 - **toolchain** `rustc 1.99.0 (b940084d7 2026-09-28)`, `cargo 1.99.0`,
   host `x86_64-unknown-linux-gnu`;
 - **host** AMD Ryzen 7 9800X3D, `nproc 16`, kernel `7.2.9-2-cachyos`;
-- **source** `Cargo.lock` sha256 `64b1b4f1…`, git HEAD `cf5754ee…`;
+- **source** `Cargo.lock` sha256 `8f4b41d4…`, git HEAD `2e9950d9…`;
 - **nightly harness image** `rustlang/rust:nightly-bookworm-slim@sha256:2fe113dd…`.
 
 Detected CPU features for the sweep (`evidence/bench/cpu.json`): `sse2`, `avx2`,
@@ -336,7 +336,8 @@ handling, and transparent fallback — not throughput for small single-file writ
 
 Seven later artifacts measure the round-3 modules. Each is read from its committed
 `evidence/bench/*.json` and detailed in its own doc; the numbers below are the
-headline rows, not a substitute for those docs.
+headline rows, not a substitute for those docs. (The table also adds the three
+final phases: SIMD kernels, the background planner, and the mapped surface.)
 
 | Phase | Headline measured result | Doc | Evidence |
 |---|---|---|---|
@@ -347,6 +348,9 @@ headline rows, not a substitute for those docs.
 | io_uring hybrid read path | batched cold read **7.02×** `pread` at 4 KiB / depth 64; **0.97–1.01×** at depth 1; single reads never touch the ring | [`IOURING.md`](IOURING.md) | `io-batch.json` |
 | Performance court | `raw-vec` 3 ns vs `ekbloom-path32` 8–9 ns random-1b; path wins throughput (42 vs 19 GB/s at 1 MiB); 3-D Pareto per working set | [`COURT.md`](COURT.md) | `court.json` |
 | Certified planner | 16 hot regions → `HotBytes`, 48 cold → `PackedRestart`; hot **19 ns**, cold **129 ns**; byte-exact to `reader::read` | [`PLANNER.md`](PLANNER.md) | `planner.json` |
+| SIMD reconstruction kernels | Kernel A vector batch **5.9–8.0×** the equal-layout scalar control (unrolled KEEP 1.7–2.2× lower p50, 2-symbol table REJECT); Kernel B vector KEEP ≤ 1024 B (~1.07×), REJECT ≥ 4096 B (0.83×/0.59×); all byte-exact vs `NL2::decode` | [`KERNELS.md`](KERNELS.md) | `kernels.json` |
+| Workload-directed background planner | moving 8-region hot window adapted, cold p50 **301 → 130 ns** (~2.3×), hot-fraction **0% → 100%**; additive, committed history untouched; 44 shared locks / 12,288 reads (lock-free read path) | [`PLANNER.md`](PLANNER.md) §4 | `planner-bg.json` |
+| Mapped surface + huge pages | `mmap` rand-1b p50 **130 → 30 ns** (4.3×, 1–64 MiB), faster than `pread` sequentially; resident `Vec` equal-or-better (20 vs 30 ns); huge pages **REJECTED** (`MADV_HUGEPAGE` 1.00× — mapping already file-THP backed) | [`MMAP.md`](MMAP.md) | `mmap.json` |
 | FUSE read path | measured FUSE overhead vs a direct read, and the passthrough / FUSE-over-io_uring **non-result** | [`FUSE.md`](FUSE.md) | `fuse-perf.json` |
 
 **Honest reading.** These phases add *capabilities* and one exact space win
@@ -355,7 +359,10 @@ the latency axis and the path bloom wins throughput, and the machine-2 `V < N` w
 remains the only bytes win (see the baseline and machine-2 sections above). The
 prefix decode win is genuine but construction-bound (P11); tiles trade cold access
 for hot (P13); the io_uring win is batched-cold-only ([`IOURING.md`](IOURING.md)).
-Their proved/observed properties are P11–P14 in [`PROOFS.md`](PROOFS.md).
+The kernels win only across windows/blocks (P15), the background planner is a
+certified-dispatch adapter (P16), and mmap is a `pread` replacement, not a heap
+replacement (P17). Their proved/observed properties are P11–P17 in
+[`PROOFS.md`](PROOFS.md).
 
 ---
 
@@ -365,8 +372,8 @@ Their proved/observed properties are P11–P14 in [`PROOFS.md`](PROOFS.md).
 shared-mutable structure (`OrFs`'s index mutex): **330** schedules at
 preemptions = 2 and **1,416** at preemptions = 3, all pass. Publication ordering
 is a filesystem property covered by `tests/crash_recovery.rs`, not Loom. The
-crate's `unsafe` is confined to **two** sanctioned modules (`src/simd.rs`,
-`src/async_io.rs`), each independently reviewed SAFE. See
+crate's `unsafe` is confined to **three** sanctioned modules (`src/simd.rs`,
+`src/async_io.rs`, `src/mapped.rs`), each independently reviewed SAFE. See
 [`docs/reviews/concurrency.md`](reviews/concurrency.md) and
 [`docs/reviews/security.md`](reviews/security.md).
 
