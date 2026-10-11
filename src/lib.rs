@@ -47,6 +47,7 @@ pub mod history_store;
 pub mod kernels;
 pub mod machine;
 pub mod machine_rans;
+pub mod machine_store;
 pub mod manifest;
 pub mod mapped;
 pub mod metrics;
@@ -97,8 +98,8 @@ pub use engine::{
 };
 pub use error::{EkbloomError, Result};
 pub use fastpath::{
-    copy_hot_sequential, cpu_features, gather_hot_1b, read_random_1b, read_ranges,
-    read_ranges_parallel, read_sequential, AlignedBuffer, CpuFeatures, CACHE_LINE,
+    byte_at, byte_at_hot, copy_hot_sequential, cpu_features, gather_hot_1b, read_random_1b,
+    read_ranges, read_ranges_parallel, read_sequential, AlignedBuffer, CpuFeatures, CACHE_LINE,
 };
 pub use filesystem::{FileMeta, ObjectPhysical, OrFs, PhysicalReport};
 #[cfg(feature = "fuse")]
@@ -110,13 +111,16 @@ pub use kernels::{
     block_start_states, kernel_a_scalar, kernel_a_scalar_windows, kernel_a_simd_windows,
     kernel_a_table, kernel_a_unrolled, kernel_b_simd, kernel_b_threads, window_start_states,
 };
-pub use machine::{machine_by_id, state_log_with, OrMachine, MACHINE_NL2, MACHINE_RANS0, NL2};
+pub use machine::{
+    machine_by_id, state_log_with, OrMachine, MACHINE_NL2, MACHINE_RANS0, MACHINE_STORE, NL2,
+};
 pub use machine_rans::{Rans0, RANS0};
+pub use machine_store::{Store, STORE};
 pub use manifest::{
-    create, create_machine, create_machine_within_budget, create_within_budget,
-    estimate_physical_bytes, estimate_physical_bytes_for_core, grow, inspect, manifest,
-    manifest_within_budget, select_profile_within_budget, ComponentReport, EkbloomBody,
-    ManifestationReport,
+    create, create_auto, create_auto_within_budget, create_machine, create_machine_within_budget,
+    create_within_budget, estimate_physical_bytes, estimate_physical_bytes_for_core, grow, inspect,
+    manifest, manifest_within_budget, select_machine, select_profile_within_budget,
+    ComponentReport, EkbloomBody, ManifestationReport,
 };
 pub use mapped::{thp_anonymous_probe, HugePageReport, MapMode, MappedSurface};
 pub use metrics::{now_ns, percentiles, Percentiles};

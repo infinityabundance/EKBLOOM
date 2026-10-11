@@ -35,7 +35,7 @@ use crate::bloom_region::build_regional_with;
 use crate::checkpoint::CheckpointSet;
 use crate::error::{EkbloomError, Result};
 use crate::history::History;
-use crate::machine::{machine_by_id, OrMachine, MACHINE_NL2};
+use crate::machine::{machine_by_id, OrMachine, MACHINE_NL2, MACHINE_RANS0, MACHINE_STORE};
 use crate::state::Snapshot;
 use crate::tiles::TileSet;
 use crate::{ManifestationBudget, ManifestationProfile};
@@ -246,6 +246,32 @@ pub fn create_machine(
         machine_by_id(machine_id).ok_or(EkbloomError::UnknownMachine { id: machine_id })?;
     let core = machine.encode(source)?;
     build_body(core, source.len() as u64, machine_id, profile)
+}
+
+/// The machine chosen by the `auto` representation policy for `source`.
+///
+/// The policy tries machine 2 (`OrANS-RANS0`); when its encoded core is **not**
+/// smaller than the source (`core_len >= source_len`) it falls back to machine 3
+/// (`OrANS-Store`, verbatim), so the base representation is **never larger than
+/// raw**: `V <= N` for every source. Explicit `machine_id = 1|2|3` overrides this.
+pub fn select_machine(source: &[u8]) -> Result<u32> {
+    let machine =
+        machine_by_id(MACHINE_RANS0).ok_or(EkbloomError::UnknownMachine { id: MACHINE_RANS0 })?;
+    let core = machine.encode(source)?;
+    if core.len() < source.len() {
+        Ok(MACHINE_RANS0)
+    } else {
+        Ok(MACHINE_STORE)
+    }
+}
+
+/// Build a fresh body from `source` using the `auto` representation policy.
+///
+/// The chosen machine is recorded in the body (and therefore the `.ekb` header and
+/// manifest) exactly as [`create_machine`] records an explicit one.
+pub fn create_auto(source: &[u8], profile: ManifestationProfile) -> Result<EkbloomBody> {
+    let machine_id = select_machine(source)?;
+    create_machine(source, profile, machine_id)
 }
 
 /// Assemble a body from an already-encoded `core` and apply `profile`.
@@ -600,6 +626,17 @@ pub fn create_within_budget(
     budget: &ManifestationBudget,
 ) -> Result<EkbloomBody> {
     create_machine_within_budget(source, profile, MACHINE_NL2, budget)
+}
+
+/// Budget-aware [`create_auto`]: select the machine with the `auto` policy, then
+/// build under the physical budget.
+pub fn create_auto_within_budget(
+    source: &[u8],
+    profile: ManifestationProfile,
+    budget: &ManifestationBudget,
+) -> Result<EkbloomBody> {
+    let machine_id = select_machine(source)?;
+    create_machine_within_budget(source, profile, machine_id, budget)
 }
 
 /// Machine-general [`create_within_budget`].

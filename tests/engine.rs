@@ -18,6 +18,7 @@ use ekbloom::{
 
 const M1: u32 = 1;
 const M2: u32 = 2;
+const M3: u32 = 3;
 
 fn generous() -> ManifestationBudget {
     ManifestationBudget {
@@ -186,6 +187,105 @@ fn engine_direct_storage_matches_reader() {
             engine.read(&body, ReadRequest { offset, length }).unwrap(),
             read(&body, ReadRequest { offset, length }).unwrap()
         );
+    }
+}
+
+#[test]
+fn byte_at_and_read_into_are_byte_exact_on_every_machine() {
+    // A fully-resident body (hot tile surface) exercises the allocation-free hot
+    // path; a path-profile body exercises the direct-storage hot path.
+    for machine in [M1, M2, M3] {
+        let body = rich_body(machine);
+        let n = body.logical_len;
+        let engine = Engine::plan(&body, &generous(), &workload4k()).unwrap();
+
+        let requests = [
+            (0u64, 1u64),
+            (0, 4096),
+            (1, 1),
+            (4093, 9),
+            (4096 - 3, 9),
+            (4096, 4096),
+            (n / 2, 1234),
+            (n - 7, 7),
+            (n - 1, 1),
+            (0, n),
+            (n / 3, n / 3),
+            (40000, 20000),
+        ];
+        for (offset, length) in requests {
+            let want = read(&body, ReadRequest { offset, length }).unwrap();
+            let mut buf = vec![0u8; length as usize];
+            engine
+                .read_into(&body, ReadRequest { offset, length }, &mut buf)
+                .unwrap();
+            assert_eq!(
+                buf, want,
+                "read_into machine {machine} at ({offset},{length})"
+            );
+            if length == 1 {
+                assert_eq!(
+                    engine.byte_at(&body, offset).unwrap(),
+                    want[0],
+                    "byte_at machine {machine} at {offset}"
+                );
+            }
+        }
+
+        // Zero-length and boundary errors mirror reader::read.
+        let mut empty: [u8; 0] = [];
+        engine
+            .read_into(
+                &body,
+                ReadRequest {
+                    offset: n,
+                    length: 0,
+                },
+                &mut empty,
+            )
+            .unwrap();
+        assert!(engine.byte_at(&body, n).is_err());
+        assert!(engine
+            .read_into(
+                &body,
+                ReadRequest {
+                    offset: n - 1,
+                    length: 2
+                },
+                &mut [0u8; 2]
+            )
+            .is_err());
+        // A destination of the wrong length is rejected for a non-zero request.
+        assert!(engine
+            .read_into(
+                &body,
+                ReadRequest {
+                    offset: 0,
+                    length: 4
+                },
+                &mut [0u8; 3]
+            )
+            .is_err());
+    }
+}
+
+#[test]
+fn byte_at_and_read_into_are_byte_exact_on_direct_storage() {
+    let source = lcg(0xD1D2_0000_0000_0001, 32 * 1024);
+    let body = create(&source, ManifestationProfile::Path { depth: 4 }).unwrap();
+    let engine = Engine::plan(&body, &generous(), &workload4k()).unwrap();
+    assert_eq!(engine.plan_ref().path_for(0), EnginePath::DirectStorage);
+    let n = body.logical_len;
+    for (offset, length) in [(0u64, 1u64), (1, 1), (n / 2, 4096), (n - 5, 5), (0, n)] {
+        let want = read(&body, ReadRequest { offset, length }).unwrap();
+        let mut buf = vec![0u8; length as usize];
+        engine
+            .read_into(&body, ReadRequest { offset, length }, &mut buf)
+            .unwrap();
+        assert_eq!(buf, want);
+        if length == 1 {
+            assert_eq!(engine.byte_at(&body, offset).unwrap(), want[0]);
+        }
     }
 }
 

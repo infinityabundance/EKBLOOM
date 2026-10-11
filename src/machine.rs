@@ -1,13 +1,18 @@
 //! The authoritative byte machines.
 //!
-//! EKBLOOM 0.3 ships two concrete machines. `OrANS-NL2` (`machine_id = 1`) is a
+//! EKBLOOM 0.3 ships three concrete machines. `OrANS-NL2` (`machine_id = 1`) is a
 //! deterministic, exactly invertible state-*expansion* machine (`V = N`); see
 //! `docs/DESIGN.md` §1 for the frozen contract. `OrANS-RANS0` (`machine_id = 2`)
 //! additionally *compresses* skewed sources (`V < N`); see `docs/CODEC.md` and
-//! [`crate::machine_rans`].
+//! [`crate::machine_rans`]. `OrANS-Store` (`machine_id = 3`) is the identity
+//! (verbatim) codec, `encode(source) = source` and `reveal = core[cursor]`, right
+//! at `V = N` with no model header; the `auto` representation policy falls back
+//! to it whenever order-0 rANS cannot shrink the source, so the base
+//! representation is never larger than raw. See [`crate::machine_store`].
 
 use crate::error::{EkbloomError, Result};
 use crate::machine_rans::{RansContext, RANS0};
+use crate::machine_store::STORE;
 use crate::state::Snapshot;
 
 /// Machine identifier for `OrANS-NL2`.
@@ -15,6 +20,9 @@ pub const MACHINE_NL2: u32 = 1;
 
 /// Machine identifier for `OrANS-RANS0`.
 pub const MACHINE_RANS0: u32 = 2;
+
+/// Machine identifier for `OrANS-Store` (the identity / verbatim codec).
+pub const MACHINE_STORE: u32 = 3;
 
 const fn build_sbox() -> [u8; 256] {
     let mut s = [0u8; 256];
@@ -250,6 +258,7 @@ pub fn machine_by_id(id: u32) -> Option<&'static dyn OrMachine> {
     match id {
         MACHINE_NL2 => Some(&NL2),
         MACHINE_RANS0 => Some(&RANS0),
+        MACHINE_STORE => Some(&STORE),
         _ => None,
     }
 }

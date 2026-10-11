@@ -153,6 +153,19 @@ pub struct RegionPath {
     pub structure: StructureRef,
 }
 
+/// The resident structure that serves **every** region when the plan is uniformly
+/// one pure-copy path, so a single byte can be read without a region lookup. This
+/// is the allocation-free fast dispatch for [`Engine::byte_at`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HotIndex {
+    /// No single resident structure covers the whole object (mixed-path plan).
+    None,
+    /// Every region is served by the same fully-resident tile set.
+    TileSet(usize),
+    /// Every region is served by the same certified path bloom.
+    PathBloom(usize),
+}
+
 /// An immutable, pre-certified access plan: one bounded [`Path`] per region,
 /// plus the worst-case positioning guarantee and the retained footprint.
 #[derive(Clone, Debug, PartialEq)]
@@ -165,6 +178,7 @@ pub struct AccessPlan {
     retained_bytes: u64,
     budget_bytes: u64,
     structures: Vec<StructureRef>,
+    hot: HotIndex,
 }
 
 impl AccessPlan {
@@ -340,6 +354,7 @@ impl Engine {
                     retained_bytes: core_bytes,
                     budget_bytes,
                     structures: Vec::new(),
+                    hot: HotIndex::None,
                 }),
             });
         }
@@ -418,6 +433,7 @@ impl Engine {
             });
         }
 
+        let hot = hot_index(&regions);
         Ok(Engine {
             plan: Arc::new(AccessPlan {
                 region_bytes,
@@ -428,6 +444,7 @@ impl Engine {
                 retained_bytes: retained,
                 budget_bytes,
                 structures: used,
+                hot,
             }),
         })
     }
@@ -565,6 +582,114 @@ impl Engine {
         Ok((out, steps))
     }
 
+    /// **Allocation-free single-byte read** — the branch-lean fast path.
+    ///
+    /// When the plan is uniformly one pure-copy path (a fully resident tile set or
+    /// a certified path bloom) this indexes the resident surface directly: one
+    /// hoisted bounds check and one slice index, with **no `Vec` allocation** and no
+    /// region lookup. Otherwise it serves the byte through the plan's certified
+    /// path (byte-exact vs [`crate::reader::read`]).
+    #[inline]
+    pub fn byte_at(&self, body: &EkbloomBody, offset: u64) -> Result<u8> {
+        if offset >= body.logical_len {
+            return Err(oob(offset, 1, body.logical_len));
+        }
+        match self.plan.hot {
+            HotIndex::TileSet(ti) => {
+                let ts = body
+                    .tiles
+                    .get(ti)
+                    .ok_or_else(|| bad("engine planned tile set index is out of range"))?;
+                let surf = ts
+                    .hot_surface()
+                    .ok_or_else(|| bad("engine planned tile set has no resident surface"))?;
+                let idx = usize::try_from(offset).map_err(|_| oob(offset, 1, body.logical_len))?;
+                surf.get(idx)
+                    .copied()
+                    .ok_or_else(|| oob(offset, 1, body.logical_len))
+            }
+            HotIndex::PathBloom(pi) => {
+                let shell = body
+                    .blooms
+                    .get(pi)
+                    .ok_or_else(|| bad("engine planned path bloom index is out of range"))?;
+                let hot = crate::fastpath::path_hot_of(shell, body.logical_len)
+                    .ok_or_else(|| bad("engine planned path bloom is not usable"))?;
+                crate::fastpath::byte_at_hot(hot, offset)
+            }
+            HotIndex::None => {
+                let mut buf = [0u8; 1];
+                self.read_into(body, ReadRequest { offset, length: 1 }, &mut buf)?;
+                Ok(buf[0])
+            }
+        }
+    }
+
+    /// **Allocation-free range read**: writes exactly `req.length` bytes into
+    /// `out`, which must be exactly that long.
+    ///
+    /// For a resident hot surface the copy is a single `copy_from_slice` with no
+    /// intermediate buffer. Bounds and overflow semantics match
+    /// [`crate::reader::read`]; the bytes are byte-for-byte identical to it on both
+    /// machines.
+    pub fn read_into(&self, body: &EkbloomBody, req: ReadRequest, out: &mut [u8]) -> Result<()> {
+        let end = req
+            .offset
+            .checked_add(req.length)
+            .ok_or(EkbloomError::Overflow { what: "read range" })?;
+        if end > body.logical_len {
+            return Err(oob(req.offset, req.length, body.logical_len));
+        }
+        if req.length == 0 {
+            return Ok(());
+        }
+        if out.len() as u64 != req.length {
+            return Err(EkbloomError::InvalidArgument {
+                what: format!(
+                    "read_into destination length {} does not match request length {}",
+                    out.len(),
+                    req.length
+                ),
+            });
+        }
+        // Hot single-region fast path: a resident output surface is one contiguous
+        // `copy_from_slice` with no intermediate buffer.
+        let shift = self.plan.region_shift;
+        let first = (req.offset >> shift) as usize;
+        if first == ((end - 1) >> shift) as usize {
+            if let Some(region) = self.plan.regions.get(first) {
+                match (region.path, region.structure) {
+                    (Path::HotTile, StructureRef::TileSet(ti)) => {
+                        if let Some(ts) = body.tiles.get(ti) {
+                            if let Some(slice) = ts.read_hot(req.offset, req.length) {
+                                out.copy_from_slice(slice);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    (Path::DirectStorage, StructureRef::PathBloom(pi)) => {
+                        if let Some(shell) = body.blooms.get(pi) {
+                            if let Some(hot) = crate::fastpath::path_hot_of(shell, body.logical_len)
+                            {
+                                if let Some(slice) = slice_checked(hot, req.offset, req.length) {
+                                    out.copy_from_slice(slice);
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let (bytes, _) = self.read_counted(body, req)?;
+        if bytes.len() != out.len() {
+            return Err(bad("engine read_into produced an unexpected length"));
+        }
+        out.copy_from_slice(&bytes);
+        Ok(())
+    }
+
     /// **The explicit guarantee**: the worst-case positioning work (machine steps)
     /// for any request, independent of the requested length.
     #[inline]
@@ -582,6 +707,34 @@ impl Engine {
     #[inline]
     pub fn plan_arc(&self) -> Arc<AccessPlan> {
         Arc::clone(&self.plan)
+    }
+}
+
+/// Whether `hot` covers `[offset, offset + length)`.
+#[inline]
+fn slice_checked(hot: &[u8], offset: u64, length: u64) -> Option<&[u8]> {
+    let a = usize::try_from(offset).ok()?;
+    let b = a.checked_add(usize::try_from(length).ok()?)?;
+    hot.get(a..b)
+}
+
+/// The uniformly-resident structure backing every region, if any.
+fn hot_index(regions: &[RegionPath]) -> HotIndex {
+    let Some(first) = regions.first() else {
+        return HotIndex::None;
+    };
+    let kind = match (first.path, first.structure) {
+        (Path::HotTile, StructureRef::TileSet(ti)) => HotIndex::TileSet(ti),
+        (Path::DirectStorage, StructureRef::PathBloom(pi)) => HotIndex::PathBloom(pi),
+        _ => return HotIndex::None,
+    };
+    let uniform = regions
+        .iter()
+        .all(|r| r.path == first.path && r.structure == first.structure);
+    if uniform {
+        kind
+    } else {
+        HotIndex::None
     }
 }
 

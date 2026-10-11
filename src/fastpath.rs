@@ -157,6 +157,59 @@ impl AlignedBuffer {
     }
 }
 
+/// Read a single byte from an explicit `hot` symbol array.
+///
+/// Bounds and overflow semantics are identical to [`read_random_1b`]: an offset
+/// that overflows `u64` is [`EkbloomError::Overflow`], and an offset at or past
+/// `hot.len()` is [`EkbloomError::OutOfBounds`]. This is the allocation-free
+/// single-byte primitive — no `Vec` is created.
+#[inline]
+pub fn byte_at_hot(hot: &[u8], offset: u64) -> Result<u8> {
+    let end = offset
+        .checked_add(1)
+        .ok_or(EkbloomError::Overflow { what: "read range" })?;
+    if end > hot.len() as u64 {
+        return Err(oob(offset, 1, hot.len() as u64));
+    }
+    let idx = usize::try_from(offset).map_err(|_| oob(offset, 1, hot.len() as u64))?;
+    hot.get(idx)
+        .copied()
+        .ok_or_else(|| oob(offset, 1, hot.len() as u64))
+}
+
+/// The fastest available byte-exact single-byte read (no allocation).
+///
+/// Priority mirrors [`crate::reader::read`]'s resident surfaces: a certified
+/// whole-object path bloom's `hot` symbol array (a direct index), then a fully
+/// materialised tile set's hot output surface. When neither is present the read
+/// delegates to [`reader::read`], which selects the next-best correct path.
+///
+/// The returned byte is identical to `reader::read(body, {offset, 1})[0]` for
+/// every request and both machines.
+pub fn byte_at(body: &EkbloomBody, offset: u64) -> Result<u8> {
+    if let Some(hot) = certified_path_hot(body) {
+        return byte_at_hot(hot, offset);
+    }
+    for ts in &body.tiles {
+        if ts.logical_len != body.logical_len {
+            continue;
+        }
+        if let Some(surf) = ts.hot_surface() {
+            return byte_at_hot(surf, offset);
+        }
+    }
+    if offset >= body.logical_len {
+        return Err(oob(offset, 1, body.logical_len));
+    }
+    let bytes = reader::read(body, ReadRequest { offset, length: 1 })?;
+    bytes
+        .first()
+        .copied()
+        .ok_or_else(|| EkbloomError::BadSection {
+            reason: "single-byte read returned no byte".to_string(),
+        })
+}
+
 /// The sequential fast-path primitive over an explicit `hot` symbol array.
 ///
 /// This is exactly what [`read_sequential`] does once a certified path bloom is
@@ -424,10 +477,11 @@ pub fn read_ranges_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::create;
+    use crate::manifest::{create, create_machine};
     use crate::sweep::sweep_profiles;
     use crate::ManifestationProfile;
 
+    /// Deterministic pseudorandom bytes from a small LCG (no dependencies).
     fn lcg(seed: u64, len: usize) -> Vec<u8> {
         let mut s = seed;
         let mut out = Vec::with_capacity(len);
@@ -438,6 +492,30 @@ mod tests {
             out.push((s >> 33) as u8);
         }
         out
+    }
+
+    #[test]
+    fn byte_at_matches_reader_on_every_manifested_surface() {
+        let src = lcg(0xB17E_0000_0000_0001, 16 * 1024);
+        for machine in [
+            crate::machine::MACHINE_NL2,
+            crate::machine::MACHINE_RANS0,
+            crate::machine::MACHINE_STORE,
+        ] {
+            for profile in [
+                ManifestationProfile::Root,
+                ManifestationProfile::Path { depth: 4 },
+                ManifestationProfile::MaxSpeed,
+            ] {
+                let body = create_machine(&src, profile, machine).unwrap();
+                for offset in [0u64, 1, 4095, 4096, src.len() as u64 - 1] {
+                    let want =
+                        crate::reader::read(&body, ReadRequest { offset, length: 1 }).unwrap();
+                    assert_eq!(byte_at(&body, offset).unwrap(), want[0]);
+                }
+                assert!(byte_at(&body, src.len() as u64).is_err());
+            }
+        }
     }
 
     #[test]

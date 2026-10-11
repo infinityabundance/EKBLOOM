@@ -14,9 +14,9 @@
 
 use ekbloom::adapt::{Workload, WorkloadKind};
 use ekbloom::{
-    create_machine, now_ns, percentiles, spread_offsets, AccessTrace, BlockIndex, DirectoryKind,
+    create_auto, now_ns, percentiles, spread_offsets, AccessTrace, BlockIndex, DirectoryKind,
     Engine, HotBlockCache, ManifestationBudget, ManifestationProfile, Percentiles, ReadRequest,
-    TileSet,
+    TileSet, MACHINE_STORE,
 };
 use std::path::Path;
 
@@ -31,13 +31,17 @@ const SAMPLES: usize = 512;
 /// Samples and best-of-N passes for the hot-index micro-measurement.
 const HOT_SAMPLES: usize = 2048;
 const HOT_REPS: usize = 5;
-/// Machine 2 (`OrANS-RANS0`) — the compressing machine.
-const M2: u32 = 2;
 /// LZ4 block size (bytes) — equal to the read length so a read is one block.
 const LZ4_BLOCK: usize = 4096;
 /// Zstandard chunk size (bytes) — a seekable chunk coarse enough to be realistic,
 /// fine enough that a scan evicts the hot chunks (so the tail is measurable).
 const ZSTD_CHUNK: usize = 16 * 1024;
+/// Working sets for the allocation-free `byte_at` vs `raw[i]` residency probe.
+const RES_1M: usize = 1 << 20;
+const RES_256M: usize = 256 << 20;
+/// Sequential sweeps per timing pass, and best-of-N passes, for the probe.
+const RES_SWEEPS: usize = 64;
+const RES_REPS: usize = 5;
 
 /// Deterministic LCG corpus.
 fn lcg(seed: u64, len: usize) -> Vec<u8> {
@@ -117,6 +121,185 @@ fn best_p50(reps: usize, offsets: &[u64], read: impl FnMut(u64) -> Vec<u8> + Cop
     best
 }
 
+/// A deterministic shuffle of one offset per 64-byte cache line across the whole
+/// working set. Sweeping it walks `len/64` distinct lines in random order, so the
+/// working set is genuinely exercised (a random sample that fits the cache would
+/// stay resident regardless of the array size, and a contiguous scan would be
+/// auto-vectorised into a bandwidth measurement rather than a per-access probe).
+fn line_offsets(len: usize) -> Vec<usize> {
+    let lines = (len / 64).max(1);
+    let mut v: Vec<usize> = (0..lines).map(|i| i * 64).collect();
+    let mut s: u64 = 0x9E37_79B9_7F4A_7C15 ^ lines as u64;
+    for i in (1..v.len()).rev() {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let j = ((s >> 33) as usize) % (i + 1);
+        v.swap(i, j);
+    }
+    v
+}
+
+/// Time `sweeps` passes over `offsets`, dividing wall time by the exact number of
+/// operations so two sub-nanosecond per-op costs can be compared.
+fn sweep_ns_per_op<F: FnMut(usize) -> u64>(offsets: &[usize], sweeps: usize, mut op: F) -> f64 {
+    let mut sink = 0u64;
+    for &off in offsets {
+        sink = sink.wrapping_add(op(off));
+    }
+    let t = now_ns();
+    for _ in 0..sweeps {
+        for &off in offsets {
+            sink = sink.wrapping_add(op(off));
+        }
+    }
+    let elapsed = now_ns().saturating_sub(t);
+    std::hint::black_box(sink);
+    elapsed as f64 / (sweeps.saturating_mul(offsets.len()).max(1)) as f64
+}
+
+/// The result of the allocation-free `byte_at` vs `raw[i]` probe at one working
+/// set: both sides read one byte per distinct cache line with no allocation, at
+/// equal residency. The `checked` column (`fastpath::byte_at_hot`, a plain
+/// bounds-checked + `Result` slice index) isolates the bounds cost from the engine
+/// dispatch/indirection.
+struct Residency {
+    working_bytes: u64,
+    machine: u32,
+    raw_p50_ns: f64,
+    checked_p50_ns: f64,
+    ek_p50_ns: f64,
+    ratio: f64,
+    bounds_overhead_ns: f64,
+    dispatch_overhead_ns: f64,
+    within_15pct: bool,
+}
+
+/// Build a fully-resident body of `working_bytes` and compare an allocation-free
+/// `engine.byte_at` against a raw `Vec<u8>` index at equal residency.
+fn measure_residency(working_bytes: usize) -> ekbloom::Result<Residency> {
+    let source = lcg(0x1B17_0000_0000_0001 ^ working_bytes as u64, working_bytes);
+    let n = source.len() as u64;
+    // `auto` picks machine 3 (verbatim) for this incompressible source, so the
+    // resident body is the source itself and the probe isolates the lookup dispatch.
+    let mut body = create_auto(&source, ManifestationProfile::Root)?;
+    let machine = body.machine_id;
+    let trace = AccessTrace {
+        regions: vec![(0, n)],
+        counts: vec![1],
+    };
+    TileSet::manifest_hot_tiles(
+        &mut body,
+        &trace,
+        12,
+        DirectoryKind::Flat,
+        &ManifestationBudget {
+            maximum_physical_bytes: u64::MAX,
+        },
+    )?;
+    let workload = Workload {
+        kind: WorkloadKind::RangeMixed,
+        hot_prefix: None,
+        sample: vec![(0, READ)],
+    };
+    let engine = Engine::plan(
+        &body,
+        &ManifestationBudget {
+            maximum_physical_bytes: u64::MAX,
+        },
+        &workload,
+    )?;
+    assert_eq!(engine.worst_case_steps(), 0);
+    let raw = source;
+    let hot = body
+        .tiles
+        .last()
+        .and_then(|ts| ts.hot_surface())
+        .expect("fully-resident tile set must expose its hot surface");
+    let offsets = line_offsets(working_bytes);
+
+    // Byte-exactness before timing.
+    for &off in offsets.iter().take(64) {
+        assert_eq!(engine.byte_at(&body, off as u64)?, raw[off]);
+        assert_eq!(ekbloom::byte_at_hot(hot, off as u64)?, raw[off]);
+    }
+
+    // Fewer sweeps for the 256 MiB set so a full working-set pass stays bounded.
+    let (sweeps, reps) = if working_bytes >= RES_256M {
+        (1usize, 3usize)
+    } else {
+        (RES_SWEEPS, RES_REPS)
+    };
+    let mut best_raw = f64::INFINITY;
+    let mut best_checked = f64::INFINITY;
+    let mut best_ek = f64::INFINITY;
+    for _ in 0..reps {
+        best_raw = best_raw.min(sweep_ns_per_op(&offsets, sweeps, |off| u64::from(raw[off])));
+        best_checked = best_checked.min(sweep_ns_per_op(&offsets, sweeps, |off| {
+            u64::from(ekbloom::byte_at_hot(hot, off as u64).unwrap_or(0))
+        }));
+        best_ek = best_ek.min(sweep_ns_per_op(&offsets, sweeps, |off| {
+            u64::from(engine.byte_at(&body, off as u64).unwrap_or(0))
+        }));
+    }
+    let ratio = best_ek / best_raw.max(f64::MIN_POSITIVE);
+    Ok(Residency {
+        working_bytes: working_bytes as u64,
+        machine,
+        raw_p50_ns: best_raw,
+        checked_p50_ns: best_checked,
+        ek_p50_ns: best_ek,
+        ratio,
+        bounds_overhead_ns: best_checked - best_raw,
+        dispatch_overhead_ns: best_ek - best_checked,
+        within_15pct: ratio <= 1.15,
+    })
+}
+
+/// The base-representation footprint under the `auto` policy: uniform data must
+/// store `<= N`, skewed data must still compress (`V < N`).
+struct Representation {
+    uniform_machine: u32,
+    uniform_base_bytes: u64,
+    uniform_source_bytes: u64,
+    uniform_ratio: f64,
+    skewed_machine: u32,
+    skewed_base_bytes: u64,
+    skewed_source_bytes: u64,
+    skewed_ratio: f64,
+}
+
+fn measure_representation() -> ekbloom::Result<Representation> {
+    let uniform = lcg(0x4E50_0000_0000_0001, N);
+    let text = skewed(0x4E50_0000_0000_0002, N);
+    let ub = create_auto(&uniform, ManifestationProfile::Root)?;
+    let sb = create_auto(&text, ManifestationProfile::Root)?;
+    assert_eq!(
+        ub.machine_id, MACHINE_STORE,
+        "uniform must be stored verbatim"
+    );
+    assert!(
+        ub.physical_bytes() <= uniform.len() as u64,
+        "uniform base footprint {} exceeds raw {}",
+        ub.physical_bytes(),
+        uniform.len()
+    );
+    assert!(
+        sb.visible_bytes() < text.len() as u64,
+        "skewed must compress"
+    );
+    Ok(Representation {
+        uniform_machine: ub.machine_id,
+        uniform_base_bytes: ub.physical_bytes(),
+        uniform_source_bytes: uniform.len() as u64,
+        uniform_ratio: ub.physical_bytes() as f64 / uniform.len() as f64,
+        skewed_machine: sb.machine_id,
+        skewed_base_bytes: sb.physical_bytes(),
+        skewed_source_bytes: text.len() as u64,
+        skewed_ratio: sb.physical_bytes() as f64 / text.len() as f64,
+    })
+}
+
 /// The outcome of the dedicated hot-index comparison (TASK 2): a **fully
 /// resident** body (the whole output materialised as tiles, `worst_case_steps =
 /// 0`) against a raw `Vec<u8>` index, at equal allocation discipline.
@@ -136,7 +319,7 @@ fn measure_hot_index(source: &[u8]) -> ekbloom::Result<HotIndex> {
     let n = source.len() as u64;
     // Full tile set: the whole object is resident, so every read is a direct
     // contiguous copy with no reconstruction and no directory arithmetic.
-    let mut body = create_machine(source, ManifestationProfile::Root, M2)?;
+    let mut body = create_auto(source, ManifestationProfile::Root)?;
     let trace = AccessTrace {
         regions: vec![(0, n)],
         counts: vec![1],
@@ -345,6 +528,7 @@ impl Row {
 
 struct CorpusReport {
     name: String,
+    machine_id: u32,
     source_len: u64,
     core_len: u64,
     budget_bytes: u64,
@@ -361,9 +545,10 @@ fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
     let n = source.len() as u64;
     let build_start = now_ns();
 
-    // ---- EKBLOOM: machine-2 body, hot tiles, a bounded cold block index, engine plan.
-    let mut body = create_machine(source, ManifestationProfile::Root, M2)?;
+    // ---- EKBLOOM: `auto` body, hot tiles, a bounded cold block index, engine plan.
+    let mut body = create_auto(source, ManifestationProfile::Root)?;
     let core_len = body.core.len() as u64;
+    let machine = body.machine_id;
     // One equal budget per corpus: headroom above raw for the manifested
     // structures (but *not* enough for a conventional cache of the whole output).
     let budget = n.max(core_len) + n / 8;
@@ -381,7 +566,7 @@ fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
         DirectoryKind::TwoLevelRadix,
         &budget_manifest,
     )?;
-    let block = BlockIndex::build_machine(&body.core, n, 1024, M2)?;
+    let block = BlockIndex::build_machine(&body.core, n, 1024, machine)?;
     body.blocks.push(block);
     body.generation += 1;
     let workload = Workload {
@@ -652,6 +837,7 @@ fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
     };
     let report = CorpusReport {
         name: name.to_string(),
+        machine_id: machine,
         source_len: n,
         core_len,
         budget_bytes: budget,
@@ -689,7 +875,12 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-fn render_json(corpora: &[CorpusReport], hot: &HotIndex) -> String {
+fn render_json(
+    corpora: &[CorpusReport],
+    hot: &HotIndex,
+    residency: &[Residency],
+    rep: &Representation,
+) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
     let _ = writeln!(s, "{{");
@@ -737,11 +928,65 @@ fn render_json(corpora: &[CorpusReport], hot: &HotIndex) -> String {
         hot.four_k_within_15pct
     );
     s.push_str("  },\n");
+    s.push_str("  \"byte_at_residency\": [\n");
+    for (i, r) in residency.iter().enumerate() {
+        s.push_str("    {\n");
+        let _ = writeln!(s, "      \"working_bytes\": {},", r.working_bytes);
+        let _ = writeln!(s, "      \"machine\": {},", r.machine);
+        let _ = writeln!(s, "      \"raw_p50_ns\": {:.4},", finite(r.raw_p50_ns));
+        let _ = writeln!(
+            s,
+            "      \"checked_p50_ns\": {:.4},",
+            finite(r.checked_p50_ns)
+        );
+        let _ = writeln!(s, "      \"ekbloom_p50_ns\": {:.4},", finite(r.ek_p50_ns));
+        let _ = writeln!(s, "      \"ratio\": {:.4},", finite(r.ratio));
+        let _ = writeln!(
+            s,
+            "      \"bounds_overhead_ns\": {:.4},",
+            finite(r.bounds_overhead_ns)
+        );
+        let _ = writeln!(
+            s,
+            "      \"dispatch_overhead_ns\": {:.4},",
+            finite(r.dispatch_overhead_ns)
+        );
+        let _ = writeln!(s, "      \"within_15pct\": {}", r.within_15pct);
+        let _ = write!(s, "    }}");
+        if i + 1 < residency.len() {
+            s.push(',');
+        }
+        s.push('\n');
+    }
+    s.push_str("  ],\n");
+    s.push_str("  \"representation\": {\n");
+    let _ = writeln!(s, "    \"uniform_machine\": {},", rep.uniform_machine);
+    let _ = writeln!(s, "    \"uniform_base_bytes\": {},", rep.uniform_base_bytes);
+    let _ = writeln!(
+        s,
+        "    \"uniform_source_bytes\": {},",
+        rep.uniform_source_bytes
+    );
+    let _ = writeln!(
+        s,
+        "    \"uniform_ratio\": {:.4},",
+        finite(rep.uniform_ratio)
+    );
+    let _ = writeln!(s, "    \"skewed_machine\": {},", rep.skewed_machine);
+    let _ = writeln!(s, "    \"skewed_base_bytes\": {},", rep.skewed_base_bytes);
+    let _ = writeln!(
+        s,
+        "    \"skewed_source_bytes\": {},",
+        rep.skewed_source_bytes
+    );
+    let _ = writeln!(s, "    \"skewed_ratio\": {:.4}", finite(rep.skewed_ratio));
+    s.push_str("  },\n");
     s.push_str("  \"corpora\": [\n");
     for (ci, c) in corpora.iter().enumerate() {
         s.push_str("    {\n");
         let _ = writeln!(s, "      \"name\": \"{}\",", json_escape(&c.name));
         let _ = writeln!(s, "      \"source_len\": {},", c.source_len);
+        let _ = writeln!(s, "      \"machine\": {},", c.machine_id);
         let _ = writeln!(s, "      \"core_len\": {},", c.core_len);
         let _ = writeln!(s, "      \"budget_bytes\": {},", c.budget_bytes);
         let _ = writeln!(s, "      \"hot_bytes\": {},", c.hot_bytes);
@@ -812,8 +1057,9 @@ fn render_json(corpora: &[CorpusReport], hot: &HotIndex) -> String {
 fn print_table(corpora: &[CorpusReport]) {
     for c in corpora {
         println!(
-            "\n== corpus {} ==  source {} B, core {} B (V/N {:.3}), budget {} B, hot {} B",
+            "\n== corpus {} ==  machine {}, source {} B, core {} B (V/N {:.3}), budget {} B, hot {} B",
             c.name,
+            c.machine_id,
             c.source_len,
             c.core_len,
             c.core_len as f64 / c.source_len as f64,
@@ -860,6 +1106,8 @@ fn print_table(corpora: &[CorpusReport]) {
 
 fn main() -> ekbloom::Result<()> {
     let hot_index = measure_hot_index(&skewed(0xE7B0_0000_00CC_0001, N))?;
+    let residency = vec![measure_residency(RES_1M)?, measure_residency(RES_256M)?];
+    let representation = measure_representation()?;
     let corpora: Vec<CorpusReport> = corpora()
         .into_iter()
         .map(|(name, source)| measure_corpus(name, &source))
@@ -881,6 +1129,40 @@ fn main() -> ekbloom::Result<()> {
         hot_index.one_byte_within_15pct, hot_index.four_k_within_15pct
     );
 
+    println!("\n== byte_at vs raw[i] (allocation-free, equal residency) ==");
+    for r in &residency {
+        println!(
+            "  {:>10} B working set (machine {}): raw {:.3} ns, checked {:.3} ns, ekbloom {:.3} ns, ratio {:.3} (within 15%: {})",
+            r.working_bytes,
+            r.machine,
+            r.raw_p50_ns,
+            r.checked_p50_ns,
+            r.ek_p50_ns,
+            r.ratio,
+            r.within_15pct
+        );
+        println!(
+            "      residual: bounds {:.3} ns + dispatch/indirection {:.3} ns",
+            r.bounds_overhead_ns, r.dispatch_overhead_ns
+        );
+    }
+    println!("\n== representation policy (base = core) ==");
+    println!(
+        "  uniform: machine {}, base {} B / raw {} B = {:.4} (<= raw: {})",
+        representation.uniform_machine,
+        representation.uniform_base_bytes,
+        representation.uniform_source_bytes,
+        representation.uniform_ratio,
+        representation.uniform_base_bytes <= representation.uniform_source_bytes
+    );
+    println!(
+        "  skewed:  machine {}, base {} B / raw {} B = {:.4}",
+        representation.skewed_machine,
+        representation.skewed_base_bytes,
+        representation.skewed_source_bytes,
+        representation.skewed_ratio
+    );
+
     let footprint_win = corpora.iter().any(|c| c.ekbloom_smaller_than_raw);
     let advantage_win = corpora.iter().any(|c| {
         c.ekbloom_hot_p99_best || c.ekbloom_cold_p99_best || c.ekbloom_thrash_hot_p99_best
@@ -892,7 +1174,7 @@ fn main() -> ekbloom::Result<()> {
     println!("  reproducible advantage over indexed codecs: {advantage_win}");
     println!("  HOLDS: {holds}");
 
-    let json = render_json(&corpora, &hot_index);
+    let json = render_json(&corpora, &hot_index, &residency, &representation);
     let out = Path::new("evidence/bench/frontier.json");
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;

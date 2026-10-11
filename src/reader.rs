@@ -22,7 +22,7 @@ use crate::checkpoint::{parse_checkpoint_layout, CheckpointSet, CKPT_HEADER_MAX}
 use crate::error::{EkbloomError, Result};
 use crate::format::{self, SectionKind};
 use crate::history::History;
-use crate::machine::{machine_by_id, prepare, MACHINE_NL2};
+use crate::machine::{machine_by_id, prepare, MACHINE_NL2, MACHINE_STORE};
 use crate::manifest::{ComponentReport, EkbloomBody, ManifestationReport};
 use crate::state::Snapshot;
 use crate::tiles::{
@@ -275,7 +275,8 @@ fn open_selected(
     // untrusted-input allocation vector: a crafted header could otherwise
     // declare a huge `logical_len` over a tiny core, and a forged-but-checksum-
     // valid checkpoint would make `read` size a buffer from that declaration.
-    if scan.header.core_machine_id == crate::machine::MACHINE_NL2
+    if (scan.header.core_machine_id == crate::machine::MACHINE_NL2
+        || scan.header.core_machine_id == MACHINE_STORE)
         && manifest.logical_len > core.len() as u64
     {
         return Err(corrupt(
@@ -1745,7 +1746,9 @@ impl FileBody {
                 "machine id disagrees with the header",
             ));
         }
-        if header.core_machine_id == crate::machine::MACHINE_NL2 && manifest.logical_len > core_len
+        if (header.core_machine_id == crate::machine::MACHINE_NL2
+            || header.core_machine_id == MACHINE_STORE)
+            && manifest.logical_len > core_len
         {
             return Err(corrupt(
                 selected.generation,

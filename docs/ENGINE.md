@@ -113,8 +113,11 @@ sweeps offsets at `base + {0, 1, K−2, K−1}` and asserts
 
 The result is a hot path that approaches a raw `Vec` index — see
 [`docs/FRONTIER.md`](FRONTIER.md) §2: a fully resident **4 KiB** read is within
-**15%** of a raw `Vec` (measured ratio **1.00–1.14×**), while a **1-byte** read is
-**~1.5×** (a fixed ~10 ns dispatch cost dominates a 20 ns operation).
+**15%** of a raw `Vec` (measured ratio **1.00–1.14×**), and the allocation-free
+`Engine::byte_at` / `Engine::read_into` collapse the old ~30 ns `Vec`-allocating
+1-byte `read` to ~2.4 ns, though a bare `raw_vec[i]` is still 3.9–5.9× faster (a
+safe, plan-dispatched call is not a bare load; the exact breakdown is in
+`docs/FRONTIER.md` §2.2).
 
 ## 6. Byte-exactness
 

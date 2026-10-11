@@ -26,7 +26,7 @@ const USAGE: &str = "\
 ekbloom — concealed-expansion codec CLI
 
 usage:
-  ekbloom create   <input> -o <out.ekb> [--profile <p>] [--machine 1|2] [--depth D] [--interval K] [--region-bytes R] [--max-physical-bytes B] [--key-hex H | --key-file F]
+  ekbloom create   <input> -o <out.ekb> [--profile <p>] [--machine auto|1|2|3] [--depth D] [--interval K] [--region-bytes R] [--max-physical-bytes B] [--key-hex H | --key-file F]
   ekbloom manifest <file.ekb> --profile <p> [--depth D] [--interval K] [--region-bytes R] [--max-physical-bytes B] [--key-hex H | --key-file F]
   ekbloom grow     <file.ekb> --profile <p> [--depth D] [--interval K] [--region-bytes R] [--max-physical-bytes B] [--key-hex H | --key-file F]
   ekbloom read     <file.ekb> --offset O --length L [-o <out.bin>] [--key-hex H | --key-file F]
@@ -42,8 +42,11 @@ profiles:
    default 4/4096; path uses --depth, default 4)
 
 machines:
-  --machine 1  OrANS-NL2 (default): expansion-only, V = N
+  --machine auto (default): try OrANS-RANS0; fall back to OrANS-Store when the
+                encoded core is not smaller than the source (never stores > raw)
+  --machine 1  OrANS-NL2: expansion-only, V = N
   --machine 2  OrANS-RANS0: order-0 range-ANS, compresses skewed sources (V < N)
+  --machine 3  OrANS-Store: verbatim identity, V = N, no model header
 
 keys:
   --key-hex H  64 hex characters (32 raw bytes) of the authentication key
@@ -369,9 +372,17 @@ fn cmd_create(parsed: &Parsed) -> Result<i32, CliError> {
     let profile = resolve_profile(parsed, false)?;
     let key = resolve_key(parsed)?;
     let max_physical_bytes = parsed.parse_u64("max-physical-bytes")?;
-    let machine_id = parsed.parse_u32("machine")?.unwrap_or(ekbloom::MACHINE_NL2);
 
     let source = fs::read(input)?;
+    // `--machine auto` (the default) selects the machine from the source: machine 2
+    // when order-0 rANS shrinks it, else machine 3 (verbatim), so the base
+    // representation never exceeds raw. An explicit id overrides the policy.
+    let machine_id = match parsed.option("machine").unwrap_or("auto") {
+        "auto" => manifest::select_machine(&source)?,
+        other => other
+            .parse::<u32>()
+            .map_err(|_| CliError::usage(format!("--machine expects auto|1|2|3, got '{other}'")))?,
+    };
     let body = match max_physical_bytes {
         Some(limit) => manifest::create_machine_within_budget(
             &source,
@@ -390,6 +401,7 @@ fn cmd_create(parsed: &Parsed) -> Result<i32, CliError> {
 
     println!("created {out}");
     println!("profile: {}", profile.label());
+    println!("machine: {machine_id}");
     if key.is_some() {
         println!("auth: keyed-blake3");
     }

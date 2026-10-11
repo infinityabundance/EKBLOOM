@@ -174,6 +174,46 @@ impl OpenObject {
         self.body.read(req)
     }
 
+    /// Read a single logical byte at `offset`.
+    ///
+    /// A file-backed single byte is exactly one bounded `pread`; the API performs
+    /// no `Vec` bookkeeping beyond the returned byte. Bounds/overflow semantics
+    /// match [`crate::reader::read`].
+    #[inline]
+    pub fn byte_at(&self, offset: u64) -> Result<u8> {
+        let bytes = self.body.read(ReadRequest { offset, length: 1 })?;
+        bytes
+            .first()
+            .copied()
+            .ok_or_else(|| EkbloomError::BadSection {
+                reason: "single-byte read returned no byte".to_string(),
+            })
+    }
+
+    /// Read `req` into `out`, which must be exactly `req.length` bytes long.
+    ///
+    /// Bounds/overflow semantics match [`crate::reader::read`], and the bytes are
+    /// byte-for-byte identical to it.
+    pub fn read_into(&self, req: ReadRequest, out: &mut [u8]) -> Result<()> {
+        if out.len() as u64 != req.length {
+            return Err(EkbloomError::InvalidArgument {
+                what: format!(
+                    "read_into destination length {} does not match request length {}",
+                    out.len(),
+                    req.length
+                ),
+            });
+        }
+        let bytes = self.body.read(req)?;
+        if bytes.len() != out.len() {
+            return Err(EkbloomError::BadSection {
+                reason: "read_into produced an unexpected length".to_string(),
+            });
+        }
+        out.copy_from_slice(&bytes);
+        Ok(())
+    }
+
     /// Whether a persisted tile set fully materialises the range, so a read is a
     /// bounded `pread` with no reconstruction.
     #[inline]

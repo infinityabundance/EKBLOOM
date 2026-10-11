@@ -9,7 +9,9 @@
 use ekbloom::bloom_path::PathBloom;
 use ekbloom::checkpoint::{CheckpointSet, SUPPORTED_INTERVALS};
 use ekbloom::history::History;
-use ekbloom::machine::{machine_by_id, state_log_with, OrMachine, MACHINE_NL2, MACHINE_RANS0, NL2};
+use ekbloom::machine::{
+    machine_by_id, state_log_with, OrMachine, MACHINE_NL2, MACHINE_RANS0, MACHINE_STORE, NL2,
+};
 use ekbloom::machine_rans::{Rans0, RansContext};
 use ekbloom::manifest::create_machine;
 use ekbloom::reader::read;
@@ -287,9 +289,11 @@ fn machine_one_is_unaffected() {
         assert_eq!(NL2.decode(&core, src.len() as u64).unwrap(), src);
         assert_eq!(machine_by_id(MACHINE_NL2).unwrap().machine_id(), 1);
     }
-    assert!(machine_by_id(3).is_none());
+    assert!(machine_by_id(MACHINE_STORE).is_some());
+    assert!(machine_by_id(4).is_none());
     assert_eq!(MACHINE_NL2, 1);
     assert_eq!(MACHINE_RANS0, 2);
+    assert_eq!(MACHINE_STORE, 3);
 }
 
 /// The reusable prepared decoder context must reproduce the authoritative

@@ -1,9 +1,13 @@
-# EKBLOOM — `OrANS-RANS0` (machine 2): the compressing machine
+# EKBLOOM — `OrANS-RANS0` (machine 2) and `OrANS-Store` (machine 3)
 
-Where the authoritative machine `OrANS-NL2` (`machine_id = 1`) is expansion-only
-(`V = N`), machine 2 is a **second, additive** machine adapter that *compresses*
-the visible representation: for skewed sources `V < N`. Machine 1 is unchanged in
-every respect (its semantics, wire behaviour and tests are bit-identical).
+The visible-representation machines. Where the authoritative machine `OrANS-NL2`
+(`machine_id = 1`) is expansion-only (`V = N`), machine 2 **compresses** skewed
+sources (`V < N`) and machine 3 is the **identity** codec (`V = N`, no model
+header, never larger than raw). Machine 1 is unchanged in every respect (its
+semantics, wire behaviour and tests are bit-identical).
+
+Machine 2's contract is the first half of this document; machine 3 and the `auto`
+representation policy that chooses between them are the second.
 
 This document freezes the machine-2 contract. The implementation lives in
 `src/machine_rans.rs`; the codec is exercised by `tests/machine_rans.rs`.
@@ -150,6 +154,47 @@ machine-1 delegate for back-compatibility. Every manifested builder
 (`History`, `CheckpointSet`, `PathBloom`, and the global/regional/contextual
 shells) has a machine-general `*_with` variant; the original signatures delegate
 to `NL2`, so all pre-existing behaviour is unchanged.
+
+## Machine 3 — `OrANS-Store` (`machine_id = 3`): the identity codec
+
+The machine-2 core never shrinks and always carries a 516-byte model header, so on
+uniform/random data it costs `N + 516` bytes — *more* than raw. Machine 3 removes
+that expansion entirely.
+
+**Definition.** `encode(source) = source` (a verbatim copy); genesis
+`Omega_0 = (0, 0)`; one step `reveal` returns `core[cursor]`, sets
+`state = u32::from(symbol)`, and advances `cursor` by one. The cursor equals the
+logical position (`p_i = i`), exactly as machine 1, so the general checkpoint /
+block / tile / bloom machinery (which rebases on the logical position) applies
+through the machine-general code paths. `peek` returns `core[cursor]` without
+advancing; `check_core` requires `logical_len <= core.len()`. Implementation:
+[`src/machine_store.rs`](../src/machine_store.rs); tests:
+[`tests/machine_store.rs`](../tests/machine_store.rs).
+
+**Guarantee.** `V = N` exactly — no model header, no expansion, no rounding. It
+implements `OrMachine` fully and works with the state log, history, checkpoints
+(power-of-two intervals pack to 2 bytes/entry because `cursor == j*K`), packed
+restarts, path blooms, tiles, blocks, regions and the bounded engine.
+
+## The `auto` representation policy
+
+`create --machine auto` (the CLI default) and `manifest::create_auto` try machine 2
+first; if the encoded core is **not** smaller than the source (`core_len >=
+source_len`) they use machine 3, so **EKBLOOM never stores more than raw for the
+base representation** (`V <= N` for every source). The chosen machine is recorded
+in the body (and therefore the `.ekb` header and `MANIFEST`) exactly as an explicit
+id. Explicit `--machine 1|2|3` overrides the policy.
+
+Measured by `examples/frontier.rs` (`evidence/bench/frontier.json`):
+
+| corpus | chosen machine | base bytes | raw bytes | base/raw |
+|---|---|---:|---:|---:|
+| uniform random | 3 (`OrANS-Store`) | 4,194,304 | 4,194,304 | **1.0000** |
+| skewed | 2 (`OrANS-RANS0`) | 830,013 | 4,194,304 | **0.198** |
+
+The seed-derived numbers differ slightly from the machine-2 table above because
+the generators differ. On uniform data the **base** footprint is exactly `N`;
+for skewed data machine 2 still wins (`V < N`).
 
 ## Reproduce
 

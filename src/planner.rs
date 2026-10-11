@@ -549,6 +549,138 @@ impl Planner {
         }
         Ok(out)
     }
+    /// **Allocation-free single-byte read** through the planned path.
+    ///
+    /// When the region is served by a resident hot surface this indexes it
+    /// directly; otherwise it replays the planned certified path (byte-exact vs
+    /// [`crate::reader::read`]).
+    #[inline]
+    pub fn byte_at(&self, body: &EkbloomBody, offset: u64) -> Result<u8> {
+        if offset >= body.logical_len {
+            return Err(EkbloomError::OutOfBounds {
+                offset,
+                length: 1,
+                logical_len: body.logical_len,
+            });
+        }
+        let region = self.plan.region_at(offset);
+        match (region.path, region.cert) {
+            (AccessPath::HotBytes, CertRef::PathBloom(pi)) => {
+                let shell = body
+                    .blooms
+                    .get(pi)
+                    .ok_or_else(|| EkbloomError::BadSection {
+                        reason: "planned path bloom index is out of range".to_string(),
+                    })?;
+                let hot =
+                    crate::fastpath::path_hot_of(shell, body.logical_len).ok_or_else(|| {
+                        EkbloomError::BadSection {
+                            reason: "planned path bloom is not usable".to_string(),
+                        }
+                    })?;
+                crate::fastpath::byte_at_hot(hot, offset)
+            }
+            (AccessPath::HotBytes, CertRef::TileSet(ti)) => {
+                let ts = body.tiles.get(ti).ok_or_else(|| EkbloomError::BadSection {
+                    reason: "planned tile set index is out of range".to_string(),
+                })?;
+                if let Some(surf) = ts.hot_surface() {
+                    if let Ok(idx) = usize::try_from(offset) {
+                        if let Some(&b) = surf.get(idx) {
+                            return Ok(b);
+                        }
+                    }
+                }
+                let bytes = ts.read_bounded(&body.core, &body.checkpoints, offset, 1)?;
+                bytes
+                    .first()
+                    .copied()
+                    .ok_or_else(|| EkbloomError::BadSection {
+                        reason: "single-byte tile read returned no byte".to_string(),
+                    })
+            }
+            _ => {
+                let bytes = self.read(body, ReadRequest { offset, length: 1 })?;
+                bytes
+                    .first()
+                    .copied()
+                    .ok_or_else(|| EkbloomError::BadSection {
+                        reason: "single-byte read returned no byte".to_string(),
+                    })
+            }
+        }
+    }
+
+    /// **Allocation-free range read**: writes exactly `req.length` bytes into
+    /// `out` (which must be exactly that long). Bounds and overflow semantics match
+    /// [`crate::reader::read`]; the bytes are byte-for-byte identical to it.
+    pub fn read_into(&self, body: &EkbloomBody, req: ReadRequest, out: &mut [u8]) -> Result<()> {
+        let end = req
+            .offset
+            .checked_add(req.length)
+            .ok_or(EkbloomError::Overflow { what: "read range" })?;
+        if end > body.logical_len {
+            return Err(EkbloomError::OutOfBounds {
+                offset: req.offset,
+                length: req.length,
+                logical_len: body.logical_len,
+            });
+        }
+        if req.length == 0 {
+            return Ok(());
+        }
+        if out.len() as u64 != req.length {
+            return Err(EkbloomError::InvalidArgument {
+                what: format!(
+                    "read_into destination length {} does not match request length {}",
+                    out.len(),
+                    req.length
+                ),
+            });
+        }
+        let first = req.offset >> self.plan.region_shift;
+        let last = (end - 1) >> self.plan.region_shift;
+        if first == last {
+            let region = self.plan.region_at(req.offset);
+            if let (AccessPath::HotBytes, CertRef::TileSet(ti)) = (region.path, region.cert) {
+                if let Some(ts) = body.tiles.get(ti) {
+                    if let Some(slice) = ts.read_hot(req.offset, req.length) {
+                        out.copy_from_slice(slice);
+                        return Ok(());
+                    }
+                }
+            }
+            if let (AccessPath::HotBytes, CertRef::PathBloom(pi)) = (region.path, region.cert) {
+                if let Some(shell) = body.blooms.get(pi) {
+                    if let Some(hot) = crate::fastpath::path_hot_of(shell, body.logical_len) {
+                        let a =
+                            usize::try_from(req.offset).map_err(|_| EkbloomError::Overflow {
+                                what: "read offset",
+                            })?;
+                        let b = a
+                            .checked_add(usize::try_from(req.length).map_err(|_| {
+                                EkbloomError::Overflow {
+                                    what: "read length",
+                                }
+                            })?)
+                            .ok_or(EkbloomError::Overflow { what: "read range" })?;
+                        if let Some(slice) = hot.get(a..b) {
+                            out.copy_from_slice(slice);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        let bytes = self.read(body, req)?;
+        if bytes.len() != out.len() {
+            return Err(EkbloomError::BadSection {
+                reason: "read_into produced an unexpected length".to_string(),
+            });
+        }
+        out.copy_from_slice(&bytes);
+        Ok(())
+    }
 }
 
 /// Serve one within-region request through the certified path recorded in the
