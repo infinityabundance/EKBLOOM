@@ -99,7 +99,8 @@ pub use engine::{
 pub use error::{EkbloomError, Result};
 pub use fastpath::{
     byte_at, byte_at_hot, copy_hot_sequential, cpu_features, gather_hot_1b, read_random_1b,
-    read_ranges, read_ranges_parallel, read_sequential, AlignedBuffer, CpuFeatures, CACHE_LINE,
+    read_ranges, read_ranges_parallel, read_sequential, AlignedBuffer, CpuFeatures, ResidentView,
+    CACHE_LINE,
 };
 pub use filesystem::{FileMeta, ObjectPhysical, OrFs, PhysicalReport};
 #[cfg(feature = "fuse")]

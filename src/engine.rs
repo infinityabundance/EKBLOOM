@@ -625,6 +625,30 @@ impl Engine {
         }
     }
 
+    /// The single certified **resident byte surface** covering the whole logical
+    /// object when the plan is uniformly one pure-copy path (a fully materialised
+    /// tile set or a certified whole-object path bloom), together with the logical
+    /// offset of the surface's first byte (`0` for every surface the engine
+    /// produces today). `None` for a mixed-path plan, where no single contiguous
+    /// resident slice covers the object, and for an empty object.
+    ///
+    /// This is the **one-time** resolution step for
+    /// [`crate::fastpath::ResidentView`]: it performs the plan dispatch — the
+    /// resident-index `match`, the tile/bloom index and the hot-surface
+    /// re-validation — exactly once, so the caller can then index the returned
+    /// slice with no per-call `Arc` deref, structure `match` or re-validation.
+    #[inline]
+    pub fn resident_surface<'a>(&self, body: &'a EkbloomBody) -> Option<(&'a [u8], u64)> {
+        match self.plan.hot {
+            HotIndex::TileSet(ti) => Some((body.tiles.get(ti)?.hot_surface()?, 0)),
+            HotIndex::PathBloom(pi) => {
+                let shell = body.blooms.get(pi)?;
+                Some((crate::fastpath::path_hot_of(shell, body.logical_len)?, 0))
+            }
+            HotIndex::None => None,
+        }
+    }
+
     /// **Allocation-free range read**: writes exactly `req.length` bytes into
     /// `out`, which must be exactly that long.
     ///

@@ -49,6 +49,7 @@
 //! available for callers and benchmarking.
 
 use crate::bloom::{supported_depth, BloomKind, BloomShell, Certification};
+use crate::engine::Engine;
 use crate::error::{EkbloomError, Result};
 use crate::manifest::EkbloomBody;
 use crate::reader;
@@ -208,6 +209,126 @@ pub fn byte_at(body: &EkbloomBody, offset: u64) -> Result<u8> {
         .ok_or_else(|| EkbloomError::BadSection {
             reason: "single-byte read returned no byte".to_string(),
         })
+}
+
+/// A borrowed, branch-lean view over one object's **certified resident byte
+/// surface** for one generation.
+///
+/// Obtained **once** from [`Engine::resident_surface`] through
+/// [`ResidentView::new`], it resolves the per-call dispatch — the
+/// `Arc<AccessPlan>` deref, the resident-index `match`, the tile/bloom index and
+/// the hot-surface re-validation — a single time. The caller can then read single
+/// bytes with [`ResidentView::get`] (one bounds check and a bare slice index) in a
+/// loop as tight as `sum += raw[i]`, with **no allocation, no dispatch and no
+/// re-validation** per byte.
+///
+/// Because it borrows the surface out of the [`EkbloomBody`] and the plan out of
+/// the [`Engine`], the view cannot outlive — or be used after mutation of — the
+/// certified data it references; the borrow checker enforces that the underlying
+/// generation is not swapped underneath it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentView<'a> {
+    /// The borrowed resident surface; `hot[i]` is the logical byte at `base + i`.
+    hot: &'a [u8],
+    /// The logical offset of `hot[0]`.
+    base: u64,
+}
+
+impl<'a> ResidentView<'a> {
+    /// Resolve and validate the resident surface for `body` under `engine` once.
+    ///
+    /// Succeeds only when the plan is uniformly one pure-copy path **and** the
+    /// surface covers the whole logical object. An **empty** object yields an
+    /// empty view (`len() == 0`). A mixed-path plan — no single contiguous resident
+    /// slice — is rejected with [`EkbloomError::BadSection`]; such callers keep
+    /// using [`Engine::byte_at`] / [`Engine::read_into`].
+    pub fn new(engine: &'a Engine, body: &'a EkbloomBody) -> Result<ResidentView<'a>> {
+        if body.logical_len == 0 {
+            return Ok(ResidentView { hot: &[], base: 0 });
+        }
+        let (hot, base) =
+            engine
+                .resident_surface(body)
+                .ok_or_else(|| EkbloomError::BadSection {
+                    reason: "engine plan does not expose a single whole-object resident surface"
+                        .to_string(),
+                })?;
+        if base != 0 || hot.len() as u64 != body.logical_len {
+            return Err(EkbloomError::BadSection {
+                reason: format!(
+                    "resident surface does not cover the logical object (base {base}, surface {} B, \
+                     logical {} B)",
+                    hot.len(),
+                    body.logical_len
+                ),
+            });
+        }
+        Ok(ResidentView { hot, base })
+    }
+
+    /// The logical byte at `offset`: **one** bounds check, then a bare slice index.
+    ///
+    /// This is the leanest safe single-byte read the engine offers. Like slice
+    /// indexing, it panics when `offset` is outside `[base, base + len)`; use
+    /// [`ResidentView::get_checked`] for a total (non-panicking) variant.
+    #[inline(always)]
+    pub fn get(&self, offset: u64) -> u8 {
+        self.hot[offset.wrapping_sub(self.base) as usize]
+    }
+
+    /// The logical byte at `offset`, or `None` when it is out of range.
+    #[inline(always)]
+    pub fn get_checked(&self, offset: u64) -> Option<u8> {
+        let idx = offset.checked_sub(self.base)?;
+        self.hot.get(usize::try_from(idx).ok()?).copied()
+    }
+
+    /// The number of logical bytes the view covers (from [`ResidentView::base`]).
+    #[inline(always)]
+    pub fn len(&self) -> u64 {
+        self.hot.len() as u64
+    }
+
+    /// Whether the view covers no bytes (an empty object).
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.hot.is_empty()
+    }
+
+    /// The logical offset of the first covered byte (`0` for every surface the
+    /// engine produces today).
+    #[inline(always)]
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// The borrowed resident surface itself, so a caller may also hand a plain
+    /// `&[u8]` to raw-fast code.
+    #[inline(always)]
+    pub fn surface(&self) -> &'a [u8] {
+        self.hot
+    }
+
+    /// Copy the `out.len()` logical bytes at `offset` into `out`.
+    ///
+    /// Returns `false`, leaving `out` untouched, when the range is out of range;
+    /// otherwise this is one bounds check and one `copy_from_slice`.
+    #[inline]
+    pub fn copy_range(&self, offset: u64, out: &mut [u8]) -> bool {
+        let Some(idx) = offset.checked_sub(self.base) else {
+            return false;
+        };
+        let Ok(start) = usize::try_from(idx) else {
+            return false;
+        };
+        match self.hot.get(start..start.saturating_add(out.len())) {
+            Some(src) if src.len() == out.len() => {
+                out.copy_from_slice(src);
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// The sequential fast-path primitive over an explicit `hot` symbol array.

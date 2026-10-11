@@ -41,7 +41,7 @@ const RES_1M: usize = 1 << 20;
 const RES_256M: usize = 256 << 20;
 /// Sequential sweeps per timing pass, and best-of-N passes, for the probe.
 const RES_SWEEPS: usize = 64;
-const RES_REPS: usize = 5;
+const RES_REPS: usize = 9;
 
 /// Deterministic LCG corpus.
 fn lcg(seed: u64, len: usize) -> Vec<u8> {
@@ -162,21 +162,31 @@ fn sweep_ns_per_op<F: FnMut(usize) -> u64>(offsets: &[usize], sweeps: usize, mut
 /// set: both sides read one byte per distinct cache line with no allocation, at
 /// equal residency. The `checked` column (`fastpath::byte_at_hot`, a plain
 /// bounds-checked + `Result` slice index) isolates the bounds cost from the engine
-/// dispatch/indirection.
+/// dispatch/indirection. The `resident` column is a **borrowed `ResidentView`**
+/// resolved once, read through the tight `view.get(i)` loop — the branch-lean
+/// surface with per-call dispatch removed.
 struct Residency {
     working_bytes: u64,
     machine: u32,
     raw_p50_ns: f64,
     checked_p50_ns: f64,
     ek_p50_ns: f64,
+    resident_p50_ns: f64,
+    surface_p50_ns: f64,
     ratio: f64,
+    resident_ratio: f64,
+    surface_ratio: f64,
     bounds_overhead_ns: f64,
     dispatch_overhead_ns: f64,
     within_15pct: bool,
+    resident_within_15pct: bool,
+    surface_within_15pct: bool,
 }
 
 /// Build a fully-resident body of `working_bytes` and compare an allocation-free
-/// `engine.byte_at` against a raw `Vec<u8>` index at equal residency.
+/// `engine.byte_at` against a raw `Vec<u8>` index at equal residency, plus a
+/// borrowed [`ekbloom::ResidentView`] obtained once and read through
+/// `view.get(i)`.
 fn measure_residency(working_bytes: usize) -> ekbloom::Result<Residency> {
     let source = lcg(0x1B17_0000_0000_0001 ^ working_bytes as u64, working_bytes);
     let n = source.len() as u64;
@@ -216,13 +226,35 @@ fn measure_residency(working_bytes: usize) -> ekbloom::Result<Residency> {
         .last()
         .and_then(|ts| ts.hot_surface())
         .expect("fully-resident tile set must expose its hot surface");
+    // ONE resolution call: the borrowed view borrows the same certified surface
+    // the engine's hot index points at, with the per-call dispatch removed.
+    let view = ekbloom::ResidentView::new(&engine, &body)?;
+    assert_eq!(view.len(), n);
+    assert_eq!(view.base(), 0);
+    assert_eq!(view.surface(), hot);
     let offsets = line_offsets(working_bytes);
 
-    // Byte-exactness before timing.
+    // Byte-exactness before timing: the view agrees with the raw source AND with
+    // the authoritative `reader::read` for `get`, `get_checked` and `copy_range`.
+    let mut probe = [0u8; 1];
     for &off in offsets.iter().take(64) {
         assert_eq!(engine.byte_at(&body, off as u64)?, raw[off]);
         assert_eq!(ekbloom::byte_at_hot(hot, off as u64)?, raw[off]);
+        assert_eq!(view.get(off as u64), raw[off]);
+        assert_eq!(view.get_checked(off as u64), Some(raw[off]));
+        let reference = ekbloom::read(
+            &body,
+            ReadRequest {
+                offset: off as u64,
+                length: 1,
+            },
+        )?;
+        assert_eq!(reference, vec![raw[off]]);
+        assert!(view.copy_range(off as u64, &mut probe));
+        assert_eq!(probe[0], raw[off]);
     }
+    assert!(view.get_checked(n).is_none());
+    assert!(!view.copy_range(n, &mut probe));
 
     // Fewer sweeps for the 256 MiB set so a full working-set pass stays bounded.
     let (sweeps, reps) = if working_bytes >= RES_256M {
@@ -233,26 +265,55 @@ fn measure_residency(working_bytes: usize) -> ekbloom::Result<Residency> {
     let mut best_raw = f64::INFINITY;
     let mut best_checked = f64::INFINITY;
     let mut best_ek = f64::INFINITY;
-    for _ in 0..reps {
-        best_raw = best_raw.min(sweep_ns_per_op(&offsets, sweeps, |off| u64::from(raw[off])));
+    let mut best_resident = f64::INFINITY;
+    let mut best_surface = f64::INFINITY;
+    // The borrowed slice itself: extracting it once makes the caller's loop a
+    // bare `sum += s[i]`, isolating what `view.get`'s method wrapper adds.
+    let surface = view.surface();
+    for rep in 0..reps {
+        // Alternate the order of the two compared loops so neither is systematically
+        // advantaged by warm-up (both are best-of-N minima, but at the clock floor
+        // the first-measured loop otherwise tends to win).
+        if rep % 2 == 0 {
+            best_raw = best_raw.min(sweep_ns_per_op(&offsets, sweeps, |off| u64::from(raw[off])));
+            best_resident = best_resident.min(sweep_ns_per_op(&offsets, sweeps, |off| {
+                u64::from(view.get(off as u64))
+            }));
+        } else {
+            best_resident = best_resident.min(sweep_ns_per_op(&offsets, sweeps, |off| {
+                u64::from(view.get(off as u64))
+            }));
+            best_raw = best_raw.min(sweep_ns_per_op(&offsets, sweeps, |off| u64::from(raw[off])));
+        }
         best_checked = best_checked.min(sweep_ns_per_op(&offsets, sweeps, |off| {
             u64::from(ekbloom::byte_at_hot(hot, off as u64).unwrap_or(0))
         }));
         best_ek = best_ek.min(sweep_ns_per_op(&offsets, sweeps, |off| {
             u64::from(engine.byte_at(&body, off as u64).unwrap_or(0))
         }));
+        best_surface = best_surface.min(sweep_ns_per_op(&offsets, sweeps, |off| {
+            u64::from(surface[off])
+        }));
     }
     let ratio = best_ek / best_raw.max(f64::MIN_POSITIVE);
+    let resident_ratio = best_resident / best_raw.max(f64::MIN_POSITIVE);
+    let surface_ratio = best_surface / best_raw.max(f64::MIN_POSITIVE);
     Ok(Residency {
         working_bytes: working_bytes as u64,
         machine,
         raw_p50_ns: best_raw,
         checked_p50_ns: best_checked,
         ek_p50_ns: best_ek,
+        resident_p50_ns: best_resident,
+        surface_p50_ns: best_surface,
         ratio,
+        resident_ratio,
+        surface_ratio,
         bounds_overhead_ns: best_checked - best_raw,
         dispatch_overhead_ns: best_ek - best_checked,
         within_15pct: ratio <= 1.15,
+        resident_within_15pct: resident_ratio <= 1.15,
+        surface_within_15pct: surface_ratio <= 1.15,
     })
 }
 
@@ -940,7 +1001,27 @@ fn render_json(
             finite(r.checked_p50_ns)
         );
         let _ = writeln!(s, "      \"ekbloom_p50_ns\": {:.4},", finite(r.ek_p50_ns));
+        let _ = writeln!(
+            s,
+            "      \"resident_p50_ns\": {:.4},",
+            finite(r.resident_p50_ns)
+        );
+        let _ = writeln!(
+            s,
+            "      \"surface_p50_ns\": {:.4},",
+            finite(r.surface_p50_ns)
+        );
         let _ = writeln!(s, "      \"ratio\": {:.4},", finite(r.ratio));
+        let _ = writeln!(
+            s,
+            "      \"resident_ratio\": {:.4},",
+            finite(r.resident_ratio)
+        );
+        let _ = writeln!(
+            s,
+            "      \"surface_ratio\": {:.4},",
+            finite(r.surface_ratio)
+        );
         let _ = writeln!(
             s,
             "      \"bounds_overhead_ns\": {:.4},",
@@ -951,7 +1032,17 @@ fn render_json(
             "      \"dispatch_overhead_ns\": {:.4},",
             finite(r.dispatch_overhead_ns)
         );
-        let _ = writeln!(s, "      \"within_15pct\": {}", r.within_15pct);
+        let _ = writeln!(s, "      \"within_15pct\": {},", r.within_15pct);
+        let _ = writeln!(
+            s,
+            "      \"resident_within_15pct\": {},",
+            r.resident_within_15pct
+        );
+        let _ = writeln!(
+            s,
+            "      \"surface_within_15pct\": {}",
+            r.surface_within_15pct
+        );
         let _ = write!(s, "    }}");
         if i + 1 < residency.len() {
             s.push(',');
@@ -1144,6 +1235,14 @@ fn main() -> ekbloom::Result<()> {
         println!(
             "      residual: bounds {:.3} ns + dispatch/indirection {:.3} ns",
             r.bounds_overhead_ns, r.dispatch_overhead_ns
+        );
+        println!(
+            "      resident view: {:.3} ns, ratio {:.3} (within 15%: {})",
+            r.resident_p50_ns, r.resident_ratio, r.resident_within_15pct
+        );
+        println!(
+            "      borrowed slice (view.surface()[i]): {:.3} ns, ratio {:.3} (within 15%: {})",
+            r.surface_p50_ns, r.surface_ratio, r.surface_within_15pct
         );
     }
     println!("\n== representation policy (base = core) ==");
