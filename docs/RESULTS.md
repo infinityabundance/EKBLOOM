@@ -221,6 +221,53 @@ and 49 GB/s in the depth-curve pass; all at 30 ns p50). The frontier is therefor
 built on 2× tolerance buckets, and the reported wins are the steps that survive
 that tolerance — not the last noisy percent.
 
+---
+
+## Hardware counters (`evidence/bench/perf.json`)
+
+Directive §25 asks for cache misses, cycles, instructions and memory bandwidth
+alongside the latency/throughput frontier. `scripts/container-perf.sh` wraps the
+deterministic driver `examples/perf_target.rs` in `perf stat` inside a container
+granted the capability `perf_event_open` needs. **Counters were available.** The
+first capability tried, `CAP_PERFMON`, was sufficient; `CAP_SYS_ADMIN` and
+`--privileged` are only fallbacks and were not needed. The host's
+`perf_event_paranoid` is `2`, which a non-privileged process cannot use —
+`CAP_PERFMON` is what bypasses that limit (the container still gets it, so the
+counters are real, not estimated). Provenance recorded in the JSON: `perf version
+6.1.187`, kernel `7.2.9-2-cachyos`, image `ekbloom-perf:1.99.0` (the pinned project
+image plus Debian's `linux-perf` package).
+
+Measured object: a deterministic 1 MiB LCG source manifested as `path(D=4)`;
+`perf stat -e cycles,instructions,cache-references,cache-misses,branches,branch-misses,context-switches,page-faults`
+around `perf_target <workload> <n> path4`. Bandwidth is `logical_bytes / seconds`
+from the driver's own wall clock for the measured loop.
+
+| workload | seconds | logical bytes | bandwidth | cycles | instructions | IPC | cache-misses | cache-miss rate | branch-misses | branch-miss rate |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `seq` | 1.727 | 125,829,120,000 | 72.9 GB/s | 9,011,243,798 | 6,077,944,756 | 0.674 | 634,271,023 | 8.04% | 577,983 | 0.111% |
+| `random-1b` | 3.190 | 2,097,152,000 | 0.66 GB/s | 16,624,179,298 | 81,981,348,446 | 4.93 | 296,285,496 | 9.91% | 89,154 | 0.00047% |
+| `range-4k` | 3.246 | 68,719,476,736 | 21.2 GB/s | 17,019,506,284 | 1,992,328,507 | 0.117 | 382,513,812 | 10.74% | 2,198,050 | 0.473% |
+
+What the counters show:
+
+- **The certified `path(D=4)` sequential read is a near-pure memory move.** IPC
+  0.67 at 72.9 GB/s means the loop is stalled on cache-line traffic, not on
+  execution — consistent with `read_sequential` being a single
+  `extend_from_slice` of the `hot` array. Branch misses are negligible (0.11%).
+- **`range-4k` is memcpy-bound.** IPC collapses to 0.12 (the lowest of the three)
+  while it still moves 21.2 GB/s, because each 4 KiB `extend_from_slice` issues
+  wide copies that retire few instructions per cycle.
+- **`random-1b` is instruction-bound, not memory-bound.** IPC 4.9 and an
+  almost-perfect branch prediction (0.00047% misses) show the limit is the
+  per-byte bounds check and `Vec::push`, which is why it moves only 0.66 GB/s of
+  logical bytes despite touching 296M cache lines.
+- **Cache-miss rates of 8–11%** reflect that a 1 MiB `hot` array is L2/L3-resident
+  on this host; even random single-byte access finds most lines in cache.
+
+The counter evidence corroborates, rather than replaces, the frontier above: the
+same path-bloom read that wins on latency and throughput is also the one that
+spends its cycles waiting on memory.
+
 ### Segmented history at N = 2^30 (bounded-memory build)
 
 `HistoryStore::build` streamed a procedural core over 1073741824 logical positions into 1 MiB segments (checkpoint interval 65536), writing exactly 4294967300 bytes of `u32` state projection (`4*(N+1)`) in 3.666 s while peak RSS stayed at 3067904 bytes (2.9 MiB) — far below the 4 GiB the full projection would occupy in RAM. A sampled recompute-and-compare pass over 1025 positions (stride 1048576) passed. Evidence: `evidence/bench/history-2p30.json`.
