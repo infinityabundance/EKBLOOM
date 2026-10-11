@@ -9,6 +9,11 @@
 #                                    depth / checkpoint-interval curves, cold
 #                                    starts and cache-resident throughput
 #                                    (the cache-resident corpus is ~64 KiB),
+#   evidence/bench/depth-metrics.json  per-depth path-bloom metrics (§10:
+#                                    D in {1,2,4,8,16,32}: build time, physical
+#                                    bytes, sequential throughput, 1b p50),
+#   evidence/bench/memory-tiers.json   the L1/L2/LLC/DRAM tier curve (O9),
+#   evidence/bench/adaptive.json       the adaptive-shell demonstration (O7),
 #   evidence/bench/cpu.json          CPU features + source provenance.
 #
 # The container caps memory (EKB_MEM_LIMIT, default 8 GiB) and CPUs; the 4 MiB and

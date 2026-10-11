@@ -5,13 +5,25 @@
 //!   frontier (one point per profile),
 //! - `evidence/bench/sweep-large.json` — the extended curves, budget frontier,
 //!   cold starts and cache-resident throughput over a ~4 MiB corpus,
+//! - `evidence/bench/depth-metrics.json` — the per-depth path-bloom metrics
+//!   table (`D` in `{1,2,4,8,16,32}`): construction time, physical bytes,
+//!   sequential throughput and random-1b p50,
+//! - `evidence/bench/memory-tiers.json` — the L1/L2/LLC/DRAM memory-tier curve
+//!   (O9),
+//! - `evidence/bench/adaptive.json` — the adaptive-shell demonstration (O7),
 //! - `evidence/bench/cpu.json` — the detected CPU features and a content hash of
 //!   the exact source used, so the numbers are attributable.
 //!
 //! Run it in the pinned container with `sh scripts/run-sweep.sh`.
 
-use ekbloom::sweep::{large_sweep, write_large_evidence_json};
-use ekbloom::{cpu_features, manifestation_sweep, write_evidence_json, SweepConfig};
+use ekbloom::sweep::{
+    depth_metrics, large_sweep, memory_tiers, write_depth_metrics_json, write_large_evidence_json,
+    write_memory_tiers_json, DEFAULT_MEMORY_TIERS,
+};
+use ekbloom::{
+    adapt_to_workload, cpu_features, create, manifestation_sweep, write_evidence_json,
+    ManifestationProfile, SweepConfig, Workload, WorkloadKind,
+};
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -29,6 +41,12 @@ const LARGE_SRC_SEED: u64 = 0xEB10_0000_DEAD_BEEF;
 
 /// Cache-resident corpus size (~64 KiB, fits private caches).
 const CACHE_SRC_LEN: usize = 64 * 1024;
+
+/// Adaptive demonstration corpus (~1 MiB).
+const ADAPT_SRC_LEN: usize = 1024 * 1024;
+
+/// Seed for the adaptive demonstration corpus.
+const ADAPT_SRC_SEED: u64 = 0xEB10_0000_AD49_7001;
 
 fn lcg_bytes(seed: u64, len: usize) -> Vec<u8> {
     let mut s = seed;
@@ -116,6 +134,116 @@ fn main() -> ekbloom::Result<()> {
         "cache-resident seq ({} KiB): {:.1} MB/s",
         CACHE_SRC_LEN / 1024,
         large.cache_resident_seq_bytes_per_s / 1e6
+    );
+
+    // --- per-depth metrics (§10) ----------------------------------------------
+    let depth = depth_metrics(&large_source, &large_cfg)?;
+    write_depth_metrics_json(&dir.join("depth-metrics.json"), &depth)?;
+    println!(
+        "depth metrics (path bloom, source_len={}):",
+        depth.source_len
+    );
+    for p in &depth.points {
+        println!(
+            "  D={:<2} phys={:>10} B build={:>12} ns seq={:>10.1} MB/s 1b p50={:>8.0} ns | {}",
+            p.depth,
+            p.physical_bytes,
+            p.build_ns,
+            p.seq_bytes_per_s / 1e6,
+            p.random_1b_ns_p50,
+            p.cache_note
+        );
+    }
+
+    // --- memory tiers (O9) -----------------------------------------------------
+    let tiers = memory_tiers(&DEFAULT_MEMORY_TIERS, &cfg)?;
+    write_memory_tiers_json(&dir.join("memory-tiers.json"), &tiers)?;
+    println!("memory tiers (path D=32):");
+    for t in &tiers.tiers {
+        println!(
+            "  {:<4} N={:>11} B phys={:>11} B seq={:>10.1} MB/s 1b p50={:>8.0} ns 4k p50={:>8.0} ns | {}",
+            t.tier,
+            t.corpus_bytes,
+            t.physical_bytes,
+            t.seq_bytes_per_s / 1e6,
+            t.random_1b_ns_p50,
+            t.random_4k_ns_p50,
+            t.cache_note
+        );
+    }
+
+    // --- adaptive shell demonstration (O7) ------------------------------------
+    let adapt_source = lcg_bytes(ADAPT_SRC_SEED, ADAPT_SRC_LEN);
+    let hot_prefix = 64 * 1024u64;
+    let sample: Vec<(u64, u64)> = {
+        let mut s = 0xAD47_0000_0000_0001u64;
+        (0..512)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (s % hot_prefix, 1u64)
+            })
+            .collect()
+    };
+    let workload = Workload {
+        kind: WorkloadKind::HotSet,
+        hot_prefix: Some(hot_prefix),
+        sample,
+    };
+    let mut adapt_body = create(&adapt_source, ManifestationProfile::Root)?;
+    let adapt = adapt_to_workload(&mut adapt_body, &workload, &cfg)?;
+
+    let mut aj = String::new();
+    aj.push_str("{\n");
+    let _ = writeln!(aj, "  \"kind\": \"{}\",", workload.kind.as_str());
+    let _ = writeln!(aj, "  \"hot_prefix\": {},", hot_prefix);
+    let _ = writeln!(aj, "  \"source_len\": {},", adapt_source.len());
+    let _ = writeln!(aj, "  \"built\": \"{}\",", adapt.built);
+    let _ = writeln!(
+        aj,
+        "  \"added_physical_bytes\": {},",
+        adapt.added_physical_bytes
+    );
+    let _ = writeln!(aj, "  \"before_generation\": {},", adapt.before_generation);
+    let _ = writeln!(aj, "  \"new_generation\": {},", adapt.new_generation);
+    let _ = writeln!(
+        aj,
+        "  \"before_ns_per_read\": {},",
+        adapt.before_ns_per_read
+    );
+    let _ = writeln!(aj, "  \"after_ns_per_read\": {},", adapt.after_ns_per_read);
+    let _ = writeln!(
+        aj,
+        "  \"before_bytes_per_s\": {},",
+        adapt.before_bytes_per_s
+    );
+    let _ = writeln!(aj, "  \"after_bytes_per_s\": {},", adapt.after_bytes_per_s);
+    let _ = writeln!(aj, "  \"improved\": {},", adapt.improved);
+    let _ = writeln!(aj, "  \"observed_reads\": {},", adapt.observed_reads);
+    let _ = writeln!(
+        aj,
+        "  \"observed_working_set_bytes\": {},",
+        adapt.observed_working_set_bytes
+    );
+    let _ = writeln!(aj, "  \"note\": \"{}\"", adapt.note);
+    aj.push_str("}\n");
+    std::fs::write(dir.join("adaptive.json"), aj)?;
+
+    println!(
+        "adaptive (O7, {}): built={} added={} B gen {} -> {}; {:.0} ns/read -> {:.0} ns/read; {}",
+        workload.kind.as_str(),
+        adapt.built,
+        adapt.added_physical_bytes,
+        adapt.before_generation,
+        adapt.new_generation,
+        adapt.before_ns_per_read,
+        adapt.after_ns_per_read,
+        if adapt.improved {
+            "IMPROVED"
+        } else {
+            "no change"
+        }
     );
     Ok(())
 }

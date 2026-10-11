@@ -1,0 +1,17 @@
+{
+  "kind": "hot-set",
+  "hot_prefix": 65536,
+  "source_len": 1048576,
+  "built": "exact path bloom P_32[j] (block-ordinal read surface)",
+  "added_physical_bytes": 1179883,
+  "before_generation": 1,
+  "new_generation": 2,
+  "before_ns_per_read": 52726.515869140625,
+  "after_ns_per_read": 6.9649658203125,
+  "before_bytes_per_s": 18965.789480227584,
+  "after_bytes_per_s": 143575722.52309096,
+  "improved": true,
+  "observed_reads": 8192,
+  "observed_working_set_bytes": 512,
+  "note": "observed hot-set workload over a 512 B working set; appended the exact path bloom at deepest depth D=32 (speed ceiling at the fewest added bytes: the hot array is N bytes at every depth, only the cold successor array shrinks)"
+}

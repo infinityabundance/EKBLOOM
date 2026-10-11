@@ -70,38 +70,38 @@ structures resident, whereas each file-backed call rebuilds them from disk.
 
 | profile | physical bytes | `E_V` | seq MB/s | 1b p50 | 1b p99 | 4k p50 | 64k MB/s |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| root | 2,097,152 | 1.00 | 602 | 1,570,139 | 3,310,007 | 1,690,134 | 36 |
-| sparse(K=1024) | 2,121,740 | 1.01 | 605 | 882 | 1,793 | 7,354 | 605 |
-| sparse(K=64) | 2,490,380 | 1.19 | 605 | 211 | 400 | 6,913 | 610 |
-| full | 10,485,764 | 5.00 | 733 | 50 | 120 | 6,352 | 647 |
-| bloom(D=4) | 2,629,852 | 1.25 | 605 | 1,569,869 | 3,315,387 | 1,691,075 | 36 |
-| regional(D=4,R=4096) | 22,546,752 | 10.75 | 604 | 1,568,737 | 3,319,074 | 1,690,004 | 36 |
-| path(D=4) | 6,291,691 | 3.00 | 66,765 | 30 | 41 | 70 | 34,774 |
-| path(D=8) | 5,243,115 | 2.50 | 66,588 | 30 | 40 | 70 | 35,907 |
-| max-speed | 14,704,891 | 7.01 | 69,757 | 30 | 41 | 70 | 40,324 |
+| root | 2,097,152 | 1.00 | 542.0 | 1,721,009 | 3,603,761 | 1,841,936 | 33 |
+| sparse(K=1024) | 2,121,740 | 1.01 | 597.7 | 931 | 1,874 | 7,734 | 573 |
+| sparse(K=64) | 2,490,380 | 1.19 | 598.5 | 150 | 341 | 7,064 | 578 |
+| full | 10,485,764 | 5.00 | 635.5 | 50 | 61 | 7,104 | 569 |
+| bloom(D=4) | 2,629,852 | 1.25 | 542.9 | 1,704,679 | 3,598,070 | 1,835,683 | 33 |
+| regional(D=4,R=4096) | 22,546,752 | 10.75 | 537.2 | 1,727,501 | 3,660,206 | 1,833,780 | 33 |
+| path(D=4) | 6,291,691 | 3.00 | 66,712.2 | 30 | 40 | 70 | 84,353 |
+| path(D=8) | 5,243,115 | 2.50 | 68,611.9 | 30 | 41 | 70 | 90,971 |
+| max-speed | 14,704,891 | 7.01 | 68,027.5 | 30 | 40 | 61 | 84,797 |
 
-Build times (wall-clock ns, from `sweep.json`): root `1,716,944`,
-sparse(K=1024) `4,820,355`, full `5,686,185`, path(D=4) `9,469,237`,
-regional(D=4,R=4096) `257,852,025`, max-speed `16,290,577` — manifestation cost
+Build times (wall-clock ns, from `sweep.json`): root `1,662,880`,
+sparse(K=1024) `4,874,598`, full `5,543,970`, path(D=4) `9,358,936`,
+regional(D=4,R=4096) `247,256,588`, max-speed `16,145,029` — manifestation cost
 is paid once, at build time.
 
 ### What the frontier shows
 
-- **Path blooms are the speed ceiling.** `path(D=4)` reaches ~66.8 GB/s
-  sequential (≈111× the `root` fallback) and ~30 ns single-byte latency, because
+- **Path blooms are the speed ceiling.** `path(D=4)` reaches ~66.7 GB/s
+  sequential (≈123× the `root` fallback) and ~30 ns single-byte latency, because
   the `hot` array is exactly the output surface (pure memory movement). Oddly,
   `path(D=8)` uses *fewer* physical bytes (2.50× vs 3.00×) with the same speed:
   fewer, larger blocks and a smaller `cold` array.
 - **`max-speed`** spends 7.01× to combine full history + sparse checkpoints +
-  a path bloom, giving the fastest sequential (69.8 GB/s) and 64k (40.3 GB/s).
-- **`full` history** buys O(1) positional state: 50 ns p50 vs ~1.57 ms at
+  a path bloom, giving the fastest sequential (68.0 GB/s) and 64k (84.8 GB/s).
+- **`full` history** buys O(1) positional state: 50 ns p50 vs ~1.72 ms at
   `root`, at 5.00× physical.
-- **`sparse(K=64)`** is the cheapest positional win: 1.19× for 211 ns p50.
+- **`sparse(K=64)`** is the cheapest positional win: 1.19× for 150 ns p50.
 - **`bloom(D=4)` and `regional(D=4,R=4096)` do not accelerate this corpus.**
   On this pseudorandom core the universal and regional state-keyed tables are
   correctly **rejected** (see the 65,536 research below), so their reads fall
-  back to authoritative replay: ~1.57 ms p50, identical to `root`. The regional
-  profile also costs the most space (10.75×, 257 ms to build). These are honest
+  back to authoritative replay: ~1.72 ms p50, identical to `root`. The regional
+  profile also costs the most space (10.75×, 247 ms to build). These are honest
   negative results, not hidden failures.
 
 ---
@@ -128,19 +128,119 @@ alternative**, not a fabricated success:
 
 ---
 
+## Per-depth metrics (§10) — `evidence/bench/depth-metrics.json`
+
+Every supported path-bloom depth has **identical, exact semantics**: the key is
+the **block ordinal `j`**, the cold successor is `cold[j] = x_{D*(j+1)}` (a final
+partial block stores `x_N`), and the bloom is **`exact-by-construction`** (never
+rejected). Only the footprint and the measured cost change with depth. Built by
+`ekbloom::sweep::depth_metrics` on the 4 MiB extended corpus.
+
+| `D` | key | successor | certified | physical bytes | `E_V` | build (ms) | seq MB/s | 1b p50 ns | cache note |
+|---:|---|---|---|---:|---:|---:|---:|---:|---|
+| 1 | block ordinal `j` | `x_{D*(j+1)}` | exact-by-construction | 25,166,059 | 6.000 | 22.56 | 64,825.3 | 30 | read surface `N=4 MiB` fits LLC (32 MiB) |
+| 2 | block ordinal `j` | `x_{D*(j+1)}` | exact-by-construction | 16,777,451 | 4.000 | 20.42 | 65,120.6 | 30 | same read surface |
+| 4 | block ordinal `j` | `x_{D*(j+1)}` | exact-by-construction | 12,583,147 | 3.000 | 19.51 | 65,870.4 | 30 | same read surface |
+| 8 | block ordinal `j` | `x_{D*(j+1)}` | exact-by-construction | 10,485,995 | 2.500 | 18.09 | 66,088.8 | 30 | same read surface |
+| 16 | block ordinal `j` | `x_{D*(j+1)}` | exact-by-construction | 9,437,419 | 2.250 | 17.66 | 66,198.9 | 30 | same read surface |
+| 32 | block ordinal `j` | `x_{D*(j+1)}` | exact-by-construction | 8,913,131 | 2.125 | 17.46 | 63,464.2 | 30 | same read surface |
+
+**Cache-behaviour note.** The path bloom's read surface is the `hot` array, which
+is exactly `N` bytes at *every* depth; only the cold successor array
+(`4*ceil(N/D)`) shrinks with depth. So all six rows have the same working set
+(4 MiB, LLC-resident here) and the same ~30 ns single-byte latency and ~64–66
+GB/s sequential throughput; deeper is strictly cheaper. Construction time falls
+mildly with depth (22.6 ms → 17.5 ms) because fewer cold successors are computed
+and stored. The data confirms the doc's claim that the path family's speed is set
+by the hot array, not by `D`.
+
+---
+
+## Memory-tier manifestation (O9) — `evidence/bench/memory-tiers.json`
+
+Built by `ekbloom::sweep::memory_tiers`: a deterministic LCG corpus sized to each
+cache tier, manifested as an exact depth-32 path bloom, then measured. The corpus
+is the intended working set (`N`), so this isolates the tier effect.
+
+| tier | target | corpus `N` | physical bytes | `E_V` | seq MB/s | 1b p50 ns | 1b p99 ns | 4k p50 ns |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| L1 | 32 KiB | 32,768 | 69,867 | 2.13 | 139,271.6 | 20 | 31 | 50 |
+| L2 | 1 MiB | 1,048,576 | 2,228,459 | 2.13 | 71,355.2 | 30 | 41 | 70 |
+| LLC | 32 MiB | 33,554,432 | 71,303,403 | 2.13 | 57,335.3 | 41 | 251 | 90 |
+| DRAM | 256 MiB | 268,435,456 | 570,425,579 | 2.13 | 18,273.7 | 120 | 241 | 251 |
+
+**Tier-vs-throughput curve.** Sequential throughput steps down **139 → 71 → 57 →
+18 GB/s** as the hot array moves L1 → L2 → LLC → DRAM; single-byte p50 rises
+**20 → 30 → 41 → 120 ns**. The curve **saturates between L2 and LLC** (~57–71
+GB/s): L2→LLC costs ~20% and stays bandwidth-bound, while the LLC→DRAM step is a
+cliff (57 → 18 GB/s, ~3.1×) — exactly the "the working set no longer fits the
+last-level cache" transition. Every tier spends the same `E_V = 2.13×`; the
+speed, not the space, is what the tier changes. The L1 tier (~139 GB/s, 20 ns) is
+the L1-resident control the earlier locality review (§4 of
+`docs/reviews/performance.md`) noted was missing.
+
+---
+
+## Adaptive / generative shells (O7) — `evidence/bench/adaptive.json`
+
+`ekbloom::adapt_to_workload` observes a workload over a body, then **appends** a
+new outward shell tailored to it as a **new generation**, and reports the
+measured before/after performance. On a synthetic **hot-set** workload (512
+single-byte reads concentrated on the 64 KiB prefix of a 1 MiB `root` body):
+
+| metric | before | after |
+|---|---:|---:|
+| generation | 1 | **2** |
+| physical bytes | 1,048,576 | 2,228,459 (added **1,179,883**) |
+| ns per read | 52,727 | **6.96** |
+| throughput | 19.0 kB/s | **143.6 MB/s** (≈7,570×) |
+
+The appended shell is an **exact path bloom `P_32[j]`** (block-ordinal read
+surface) — the additive structure that converts an offset-addressable read into
+pure memory movement. It is **additive / non-withdrawal**: `root`'s generation is
+retained and the new shell is appended as generation 2; `adapt_preserves_earlier_generations`
+shows an existing checkpoint set is untouched. The adapted body still passes
+`verify_deep` (the appended bloom and its linked certificate are checked). When
+the body *already* carries a certified path bloom the adapter appends nothing and
+honestly reports **no improvement** (`tests/adaptive.rs::adapt_is_a_no_op_when_the_read_surface_is_already_present`).
+Honest limitation: an exact *offset-addressable* path shell is whole-object by
+construction, so the tailoring here is the append decision and the depth
+(deepest = fewest added bytes at the ceiling), not the extent; see
+[`docs/ADAPTIVE.md`](ADAPTIVE.md).
+
+---
+
+## Parallel different-shell readers (O8)
+
+`ekbloom::read_shell(body, shell, offset, length)` serves a request through one
+**explicit** radial shell — an exact path bloom, a checkpoint restart, the full
+history, or authoritative machine replay. `EkbloomBody` is immutable and every
+reader takes `&EkbloomBody`, so independent consumers use **different** shells on
+the same body concurrently with **no coordination**, and every shell returns
+byte-identical output. `tests/adaptive.rs::parallel_different_shell_readers_are_byte_exact`
+runs four threads, one per shell, over disjoint ranges *plus* a shared range on a
+single body carrying all four shells, and asserts every result is byte-for-byte
+equal to the source, to `reader::read`, and to every other shell's result on the
+shared range. `read_shell_matches_reader_for_every_shell` additionally checks each
+shell against `reader::read` across boundary ranges. This is the O8 proof that
+shell choice is a per-consumer, coordination-free decision.
+
+---
+
 ## Reproduce
 
 ```sh
 sh scripts/container-reproduce.sh    # clean build + full release test suite
-sh scripts/run-sweep.sh              # rewrite evidence/bench/{sweep,sweep-large,cpu}.json
+sh scripts/run-sweep.sh              # rewrite evidence/bench/{sweep,sweep-large,depth-metrics,memory-tiers,adaptive,cpu}.json
 sh scripts/container-bench.sh        # Divan microbenchmarks (benches/ekbloom.rs)
 sh scripts/capture-environment.sh    # refresh evidence/environment.txt
 ```
 
 The correctness of every measured path is enforced by
-`tests/fastpath.rs::fast_paths_are_byte_exact_for_every_profile` and
-`tests/sweep.rs`-adjacent module tests: optimised reads are byte-for-byte
-identical to the authoritative reader across the whole frontier.
+`tests/fastpath.rs::fast_paths_are_byte_exact_for_every_profile`,
+`tests/adaptive.rs` (`read_shell` vs `reader::read`, parallel shells), and
+`tests/sweep_curves.rs`: optimised reads are byte-for-byte identical to the
+authoritative reader across the whole frontier.
 
 ---
 
@@ -168,13 +268,13 @@ and reproducible for a fixed seed.
 | target `M/N` | chosen profile | physical bytes | achieved `E_V` | seq MB/s | 1b p50 ns | 4k p50 ns |
 |---:|---|---:|---:|---:|---:|---:|
 | 0.5 | *(none fits)* | — | — | — | — | — |
-| 1 | `root` | 4,194,304 | 1.000 | 589.8 | 3,402,934 | 2,837,066 |
-| 2 | `sparse(K=256)` | 4,390,924 | 1.047 | 605.5 | 350 | 7,083 |
-| 4 | `path(D=32)` | 8,913,131 | 2.125 | 81,049 | 30 | 70 |
-| 8 | `path(D=32)` | 8,913,131 | 2.125 | 81,049 | 30 | 70 |
-| 16 | `path(D=32)` | 8,913,131 | 2.125 | 81,049 | 30 | 70 |
-| 32 | `path(D=32)` | 8,913,131 | 2.125 | 81,049 | 30 | 70 |
-| 64 | `path(D=32)` | 8,913,131 | 2.125 | 81,049 | 30 | 70 |
+| 1 | `root` | 4,194,304 | 1.000 | 601.6 | 3,359,303 | 2,721,801 |
+| 2 | `sparse(K=16)` | 7,340,044 | 1.750 | 606.4 | 151 | 6,783 |
+| 4 | `path(D=32)` | 8,913,131 | 2.125 | 81,013.7 | 30 | 70 |
+| 8 | `path(D=32)` | 8,913,131 | 2.125 | 81,013.7 | 30 | 70 |
+| 16 | `path(D=32)` | 8,913,131 | 2.125 | 81,013.7 | 30 | 70 |
+| 32 | `path(D=32)` | 8,913,131 | 2.125 | 81,013.7 | 30 | 70 |
+| 64 | `path(D=32)` | 8,913,131 | 2.125 | 81,013.7 | 30 | 70 |
 
 ### What the curves show
 
@@ -185,41 +285,42 @@ and reproducible for a fixed seed.
   smallest-depth member (`D = 32`) wins the tie. **More manifestation stops
   helping** past 2.125×; `full` (5×), `regional` (7–12×) and `max-speed` (7×)
   add bytes for no gain in sequential or 1-byte/4 KiB latency.
-- **Cheapest positional win:** `sparse(K=256)` at 1.047× cuts 1-byte p50 from
-  3.4 ms (`root`) to 350 ns. At `M/N = 2`, `sparse(K=16)` (1.75×) is also eligible
-  and its median latency is ~2× lower, but the two are within the selection
-  tolerance, so the smaller footprint (`K=256`) is reported. This is the rule’s
-  behaviour, not a measurement error.
+- **Cheapest positional win:** `sparse(K=16)` at 1.750× cuts 1-byte p50 from
+  3.36 ms (`root`) to 151 ns. A larger-interval set (`sparse(K=256)`, 1.047×)
+  also fits at this budget and is far smaller, but its median (~341 ns) is more
+  than a factor of two slower, so it is not a tie and loses the octave-space
+  comparison. This is the rule's behaviour, not a measurement error.
 - **Region-size curve** (`regional(D=4,R)`): every region is **rejected** on this
   pseudorandom core, so reads fall back to replay (~3.3 ms p50). Smaller regions
   cost *more*: `R = 256 → 11.9×`, `R = 65536 → 7.3×`, with the same (bad) speed.
   Regional is strictly dominated here.
 - **Depth curve** (`path(D)`): physical falls monotonically with depth
-  (`D = 1 → 6.00×`, `D = 4 → 3.00×`, `D = 8 → 2.50×`, `D = 16 → 2.25×`,
-  `D = 32 → 2.125×`) while 1-byte p50 stays at 30 ns throughout. Deeper is
-  cheaper at identical speed — the opposite of “more manifestation must cost
-  more”. The 64 KiB-range column is noisy (43–72 GB/s) across depths.
+  (`D = 1 → 6.00×`, `D = 2 → 4.00×`, `D = 4 → 3.00×`, `D = 8 → 2.50×`,
+  `D = 16 → 2.25×`, `D = 32 → 2.125×`) while 1-byte p50 stays at 30 ns
+  throughout. Deeper is cheaper at identical speed — the opposite of “more
+  manifestation must cost more”. The 64 KiB-range column is noisy (72–86 GB/s)
+  across depths.
 - **Checkpoint-interval curve** (`sparse(K)`): 1-byte p50 falls sharply then
-  plateaus — `K=65536 → 55,964 ns`, `K=4096 → 3,206`, `K=1024 → 1,302`,
-  `K=256 → 421`, `K=64 → 241`, `K=16 → 171`, `K=4 → 280`, `K=1 → 160`.
+  plateaus — `K=65536 → 55,304 ns`, `K=4096 → 2,986`, `K=1024 → 801`,
+  `K=256 → 341`, `K=64 → 231`, `K=16 → 241`, `K=4 → 260`, `K=1 → 150`.
   Below `K ≈ 64` the gain is within noise while the footprint keeps climbing
   (`K=4 = 4.00×`, `K=1 = 13.00×`): a clear plateau.
-- **Cold start** (open + first 4 KiB read, one sample, ns): `root` 3,615,531;
-  `sparse(K=1024)` 10,444,018; `sparse(K=64)` 10,499,282; `full` 10,800,254;
-  `path(D=4)` 21,029,051; `path(D=32)` 18,602,901; `max-speed` 35,059,796.
+- **Cold start** (open + first 4 KiB read, one sample, ns): `root` 2,849,490;
+  `sparse(K=1024)` 9,892,172; `sparse(K=64)` 10,359,817; `full` 9,899,566;
+  `path(D=4)` 19,928,804; `path(D=32)` 17,549,524; `max-speed` 34,128,793.
   Cold start is dominated by **building** the manifestation, not by the first
   read; `max-speed` pays the most to open.
 - **Cache-resident throughput:** a 64 KiB corpus encoded with `path(D=32)` reads
-  sequentially at **122 GB/s** (122,268,656,716 B/s), versus ~49–81 GB/s for the
-  4 MiB object — the small object lives in private caches, the large one is
+  sequentially at **121.8 GB/s** (121,761,082,242 B/s), versus ~54–86 GB/s for
+  the 4 MiB object — the small object lives in private caches, the large one is
   bound by memory bandwidth. This is the same path-bloom read; only the working
-  set differs.
+  set differs. See the O9 tier curve above for the full L1→DRAM ladder.
 
 **Noise honesty.** The path-depth and 64 KiB-range columns vary run-to-run by up
 to ~1.6× on this host (e.g. `path(D=32)` measured 81 GB/s in the frontier pass
-and 49 GB/s in the depth-curve pass; all at 30 ns p50). The frontier is therefore
-built on 2× tolerance buckets, and the reported wins are the steps that survive
-that tolerance — not the last noisy percent.
+and 63–67 GB/s in the depth-curve pass; all at 30 ns p50). The frontier is
+therefore built on 2× tolerance buckets, and the reported wins are the steps that
+survive that tolerance — not the last noisy percent.
 
 ---
 

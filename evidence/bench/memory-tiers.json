@@ -1,0 +1,54 @@
+{
+  "cpu": { "sse2": true, "avx2": true, "avx512f": true },
+  "source_hash": "ab1a01e50a844a483cc693039551ca675c397cc93e4264cb90f43f9458a88b3e",
+  "tiers": [
+    {
+      "tier": "L1",
+      "target_bytes": 32768,
+      "corpus_bytes": 32768,
+      "physical_bytes": 69867,
+      "seq_bytes_per_s": 139271616416.52277,
+      "random_1b_ns_p50": 20,
+      "random_1b_ns_p99": 31,
+      "random_4k_ns_p50": 50,
+      "samples": 256,
+      "cache_note": "hot array 32768 B fits L1 (32 KiB): L1-bandwidth bound"
+    },
+    {
+      "tier": "L2",
+      "target_bytes": 1048576,
+      "corpus_bytes": 1048576,
+      "physical_bytes": 2228459,
+      "seq_bytes_per_s": 71355212708.26909,
+      "random_1b_ns_p50": 30,
+      "random_1b_ns_p99": 41,
+      "random_4k_ns_p50": 70,
+      "samples": 256,
+      "cache_note": "hot array 1048576 B fits L2 (1 MiB): L2-bandwidth bound"
+    },
+    {
+      "tier": "LLC",
+      "target_bytes": 33554432,
+      "corpus_bytes": 33554432,
+      "physical_bytes": 71303403,
+      "seq_bytes_per_s": 57335332685.227776,
+      "random_1b_ns_p50": 41,
+      "random_1b_ns_p99": 251,
+      "random_4k_ns_p50": 90,
+      "samples": 256,
+      "cache_note": "hot array 33554432 B fits LLC (32 MiB): LLC-bandwidth bound"
+    },
+    {
+      "tier": "DRAM",
+      "target_bytes": 268435456,
+      "corpus_bytes": 268435456,
+      "physical_bytes": 570425579,
+      "seq_bytes_per_s": 18273655480.05908,
+      "random_1b_ns_p50": 120,
+      "random_1b_ns_p99": 241,
+      "random_4k_ns_p50": 251,
+      "samples": 256,
+      "cache_note": "hot array 268435456 B is DRAM-resident: memory-bandwidth bound"
+    }
+  ]
+}

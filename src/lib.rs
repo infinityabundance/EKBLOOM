@@ -20,6 +20,7 @@
 //! The public entry points are [`create`], [`manifest`], [`read`], [`verify`],
 //! [`grow`] and [`inspect`].
 
+pub mod adapt;
 pub mod asyncpub;
 pub mod bloom;
 pub mod bloom_context;
@@ -49,6 +50,10 @@ pub mod verify;
 pub mod worker;
 pub mod writer;
 
+pub use adapt::{
+    adapt_to_workload, available_shells, read_shell, AdaptReport, ShellChoice, Workload,
+    WorkloadKind,
+};
 pub use asyncpub::{append, detect_backend, publish, Backend};
 pub use bloom::{Bloom4Resume, BloomKind, BloomShell, Certificate, Certification, Outcome};
 pub use bloom_context::ContextBloom;
@@ -88,7 +93,9 @@ pub use simd::{
 };
 pub use state::Snapshot;
 pub use sweep::{
-    manifestation_sweep, sweep_profiles, write_evidence_json, SweepConfig, SweepPoint, SweepReport,
+    depth_metrics, manifestation_sweep, memory_tiers, sweep_profiles, write_depth_metrics_json,
+    write_evidence_json, write_memory_tiers_json, DepthMetrics, DepthPoint, MemoryTiersReport,
+    SweepConfig, SweepPoint, SweepReport, TierPoint,
 };
 pub use verify::{verify, verify_deep, CheckOutcome, VerificationReport};
 pub use worker::{available_parallelism, manifest_background, regional_parallel};

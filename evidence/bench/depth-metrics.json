@@ -1,0 +1,73 @@
+{
+  "cpu": { "sse2": true, "avx2": true, "avx512f": true },
+  "source_len": 4194304,
+  "source_hash": "03dd6dac13582d76329849ae5456aa50b1d9a7d44a016b79feaae13b8368eebf",
+  "points": [
+    {
+      "depth": 1,
+      "key_semantics": "block ordinal j",
+      "successor_semantics": "cold[j] = x_{D*(j+1)}",
+      "certification": "exact-by-construction",
+      "physical_bytes": 25166059,
+      "build_ns": 22563251,
+      "seq_bytes_per_s": 64825295720.30855,
+      "random_1b_ns_p50": 30,
+      "cache_note": "hot array 4194304 B fits LLC (32 MiB): LLC-bandwidth bound"
+    },
+    {
+      "depth": 2,
+      "key_semantics": "block ordinal j",
+      "successor_semantics": "cold[j] = x_{D*(j+1)}",
+      "certification": "exact-by-construction",
+      "physical_bytes": 16777451,
+      "build_ns": 20418981,
+      "seq_bytes_per_s": 65120570190.65386,
+      "random_1b_ns_p50": 30,
+      "cache_note": "hot array 4194304 B fits LLC (32 MiB): LLC-bandwidth bound"
+    },
+    {
+      "depth": 4,
+      "key_semantics": "block ordinal j",
+      "successor_semantics": "cold[j] = x_{D*(j+1)}",
+      "certification": "exact-by-construction",
+      "physical_bytes": 12583147,
+      "build_ns": 19506213,
+      "seq_bytes_per_s": 65870433970.912865,
+      "random_1b_ns_p50": 30,
+      "cache_note": "hot array 4194304 B fits LLC (32 MiB): LLC-bandwidth bound"
+    },
+    {
+      "depth": 8,
+      "key_semantics": "block ordinal j",
+      "successor_semantics": "cold[j] = x_{D*(j+1)}",
+      "certification": "exact-by-construction",
+      "physical_bytes": 10485995,
+      "build_ns": 18088161,
+      "seq_bytes_per_s": 66088848709.02491,
+      "random_1b_ns_p50": 30,
+      "cache_note": "hot array 4194304 B fits LLC (32 MiB): LLC-bandwidth bound"
+    },
+    {
+      "depth": 16,
+      "key_semantics": "block ordinal j",
+      "successor_semantics": "cold[j] = x_{D*(j+1)}",
+      "certification": "exact-by-construction",
+      "physical_bytes": 9437419,
+      "build_ns": 17655983,
+      "seq_bytes_per_s": 66198894003.034294,
+      "random_1b_ns_p50": 30,
+      "cache_note": "hot array 4194304 B fits LLC (32 MiB): LLC-bandwidth bound"
+    },
+    {
+      "depth": 32,
+      "key_semantics": "block ordinal j",
+      "successor_semantics": "cold[j] = x_{D*(j+1)}",
+      "certification": "exact-by-construction",
+      "physical_bytes": 8913131,
+      "build_ns": 17455408,
+      "seq_bytes_per_s": 63464239645.63072,
+      "random_1b_ns_p50": 30,
+      "cache_note": "hot array 4194304 B fits LLC (32 MiB): LLC-bandwidth bound"
+    }
+  ]
+}

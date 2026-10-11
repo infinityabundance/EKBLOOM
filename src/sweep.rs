@@ -898,6 +898,313 @@ pub fn write_large_evidence_json(path: &Path, report: &LargeSweepReport) -> Resu
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Per-depth metrics (§10) and memory-tier manifestation (O9).
+// ---------------------------------------------------------------------------
+
+/// Exact key semantics of every path bloom: the key is the block ordinal `j`.
+pub const PATH_KEY_SEMANTICS: &str = "block ordinal j";
+/// Successor semantics of every path bloom: `cold[j] = x_{D*(j+1)}` (a final
+/// partial block stores `x_N`).
+pub const PATH_SUCCESSOR_SEMANTICS: &str = "cold[j] = x_{D*(j+1)}";
+/// Certification of every path bloom: exact by construction, never rejected.
+pub const PATH_CERTIFICATION: &str = "exact-by-construction";
+
+/// Nominal L1 data-cache size (bytes) targeted by [`DEFAULT_MEMORY_TIERS`].
+pub const TIER_L1_BYTES: u64 = 32 * 1024;
+/// Nominal L2 cache size (bytes) targeted by [`DEFAULT_MEMORY_TIERS`].
+pub const TIER_L2_BYTES: u64 = 1024 * 1024;
+/// Nominal last-level cache size (bytes) targeted by [`DEFAULT_MEMORY_TIERS`].
+pub const TIER_LLC_BYTES: u64 = 32 * 1024 * 1024;
+/// DRAM-resident corpus size (bytes) targeted by [`DEFAULT_MEMORY_TIERS`]; an
+/// order of magnitude beyond the LLC so the working set cannot be cache-resident.
+pub const TIER_DRAM_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The default memory-tier ladder (label, nominal cache size, corpus bytes).
+pub const DEFAULT_MEMORY_TIERS: [(&str, u64, usize); 4] = [
+    ("L1", TIER_L1_BYTES, TIER_L1_BYTES as usize),
+    ("L2", TIER_L2_BYTES, TIER_L2_BYTES as usize),
+    ("LLC", TIER_LLC_BYTES, TIER_LLC_BYTES as usize),
+    ("DRAM", TIER_DRAM_BYTES, TIER_DRAM_BYTES as usize),
+];
+
+/// A one-line cache-behaviour note for a working set of `working_set` bytes.
+fn cache_note(working_set: u64) -> String {
+    if working_set == 0 {
+        "empty working set".to_string()
+    } else if working_set <= TIER_L1_BYTES {
+        format!("hot array {working_set} B fits L1 (32 KiB): L1-bandwidth bound")
+    } else if working_set <= TIER_L2_BYTES {
+        format!("hot array {working_set} B fits L2 (1 MiB): L2-bandwidth bound")
+    } else if working_set <= TIER_LLC_BYTES {
+        format!("hot array {working_set} B fits LLC (32 MiB): LLC-bandwidth bound")
+    } else {
+        format!("hot array {working_set} B is DRAM-resident: memory-bandwidth bound")
+    }
+}
+
+/// One row of the per-depth metrics table: fixed semantics plus the measured
+/// construction cost and read speeds for a path bloom at depth `D`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DepthPoint {
+    /// Path-bloom depth `D`.
+    pub depth: u16,
+    /// Exact key semantics (constant across depths).
+    pub key_semantics: String,
+    /// Successor semantics (constant across depths).
+    pub successor_semantics: String,
+    /// Certification status (constant across depths).
+    pub certification: String,
+    /// Manifested physical bytes.
+    pub physical_bytes: u64,
+    /// Wall-clock construction time in nanoseconds.
+    pub build_ns: u64,
+    /// Sequential read throughput (bytes/s).
+    pub seq_bytes_per_s: f64,
+    /// Median single-byte random read latency (ns).
+    pub random_1b_ns_p50: f64,
+    /// Cache-behaviour note for this depth's read surface.
+    pub cache_note: String,
+}
+
+/// Per-depth metrics over the supported path-bloom depths (§10).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DepthMetrics {
+    /// Detected CPU features.
+    pub cpu: CpuFeatures,
+    /// Source length in bytes.
+    pub source_len: u64,
+    /// BLAKE3 hash of the exact source.
+    pub source_hash: [u8; 32],
+    /// One point per supported depth, in `SUPPORTED_DEPTHS` order.
+    pub points: Vec<DepthPoint>,
+}
+
+/// Measure construction time and read speed for the exact path bloom at every
+/// supported depth (`D` in `{1,2,4,8,16,32}`).
+///
+/// Every row has identical, exact semantics (`key = block ordinal j`,
+/// `cold[j] = x_{D*(j+1)}`, certified by construction); only the manifested
+/// footprint and the measured cost change with depth.
+pub fn depth_metrics(source: &[u8], cfg: &SweepConfig) -> Result<DepthMetrics> {
+    let cpu = fastpath::cpu_features();
+    let mut points = Vec::with_capacity(SUPPORTED_DEPTHS.len());
+    for &depth in SUPPORTED_DEPTHS.iter() {
+        let p = measure(source, ManifestationProfile::Path { depth }, cfg)?;
+        points.push(DepthPoint {
+            depth,
+            key_semantics: PATH_KEY_SEMANTICS.to_string(),
+            successor_semantics: PATH_SUCCESSOR_SEMANTICS.to_string(),
+            certification: PATH_CERTIFICATION.to_string(),
+            physical_bytes: p.physical_bytes,
+            build_ns: p.build_ns,
+            seq_bytes_per_s: finite(p.seq_bytes_per_s),
+            random_1b_ns_p50: finite(p.random_1b_ns_p50),
+            cache_note: cache_note(p.visible_bytes),
+        });
+    }
+    Ok(DepthMetrics {
+        cpu,
+        source_len: source.len() as u64,
+        source_hash: *blake3::hash(source).as_bytes(),
+        points,
+    })
+}
+
+/// Write a [`DepthMetrics`] report as pretty JSON to `path`, creating parents.
+pub fn write_depth_metrics_json(path: &Path, report: &DepthMetrics) -> Result<()> {
+    let mut s = String::new();
+    s.push_str("{\n");
+    let _ = writeln!(
+        s,
+        "  \"cpu\": {{ \"sse2\": {}, \"avx2\": {}, \"avx512f\": {} }},",
+        report.cpu.sse2, report.cpu.avx2, report.cpu.avx512f
+    );
+    let _ = writeln!(s, "  \"source_len\": {},", report.source_len);
+    let _ = writeln!(s, "  \"source_hash\": \"{}\",", hex32(&report.source_hash));
+    s.push_str("  \"points\": [\n");
+    for (i, p) in report.points.iter().enumerate() {
+        s.push_str("    {\n");
+        let _ = writeln!(s, "      \"depth\": {},", p.depth);
+        let _ = writeln!(
+            s,
+            "      \"key_semantics\": \"{}\",",
+            json_escape(&p.key_semantics)
+        );
+        let _ = writeln!(
+            s,
+            "      \"successor_semantics\": \"{}\",",
+            json_escape(&p.successor_semantics)
+        );
+        let _ = writeln!(
+            s,
+            "      \"certification\": \"{}\",",
+            json_escape(&p.certification)
+        );
+        let _ = writeln!(s, "      \"physical_bytes\": {},", p.physical_bytes);
+        let _ = writeln!(s, "      \"build_ns\": {},", p.build_ns);
+        let _ = writeln!(
+            s,
+            "      \"seq_bytes_per_s\": {},",
+            finite(p.seq_bytes_per_s)
+        );
+        let _ = writeln!(
+            s,
+            "      \"random_1b_ns_p50\": {},",
+            finite(p.random_1b_ns_p50)
+        );
+        let _ = writeln!(
+            s,
+            "      \"cache_note\": \"{}\"",
+            json_escape(&p.cache_note)
+        );
+        s.push_str(if i + 1 == report.points.len() {
+            "    }\n"
+        } else {
+            "    },\n"
+        });
+    }
+    s.push_str("  ]\n}\n");
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(path, s)?;
+    Ok(())
+}
+
+/// One row of the memory-tier curve: a path-bloom corpus sized to a cache tier
+/// (`label`, nominal cache size) and its measured sequential + random-1b speed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TierPoint {
+    /// Tier label (`"L1"`, `"L2"`, `"LLC"`, `"DRAM"`).
+    pub tier: String,
+    /// Nominal cache size targeted by this tier, in bytes.
+    pub target_bytes: u64,
+    /// Actual corpus length `N` in bytes.
+    pub corpus_bytes: u64,
+    /// Manifested physical bytes (a depth-32 exact path bloom).
+    pub physical_bytes: u64,
+    /// Sequential read throughput (bytes/s).
+    pub seq_bytes_per_s: f64,
+    /// Median single-byte random read latency (ns).
+    pub random_1b_ns_p50: f64,
+    /// 99th-percentile single-byte random read latency (ns).
+    pub random_1b_ns_p99: f64,
+    /// Median 4 KiB random range read latency (ns).
+    pub random_4k_ns_p50: f64,
+    /// Number of single-byte samples.
+    pub samples: u64,
+    /// Cache-behaviour note for this tier's working set.
+    pub cache_note: String,
+}
+
+/// The measured memory-tier curve (O9).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryTiersReport {
+    /// Detected CPU features.
+    pub cpu: CpuFeatures,
+    /// BLAKE3 hash of the subject corpus (the largest DRAM-tier corpus).
+    pub source_hash: [u8; 32],
+    /// One point per tier, in the order supplied.
+    pub tiers: Vec<TierPoint>,
+}
+
+/// Build an exact depth-32 path bloom for a deterministic LCG corpus of each
+/// `(label, nominal_bytes)` tier and measure its sequential + random-1b speed.
+///
+/// The corpus is sized to the *nominal cache size* of the tier (L1 32 KiB, L2
+/// 1 MiB, LLC 32 MiB, DRAM 256 MiB by default), so the path-bloom hot array is
+/// the intended working set. Each body is dropped before the next tier is built,
+/// so peak memory stays at one tier.
+pub fn memory_tiers(tiers: &[(&str, u64, usize)], cfg: &SweepConfig) -> Result<MemoryTiersReport> {
+    let cpu = fastpath::cpu_features();
+    let mut points = Vec::with_capacity(tiers.len());
+    let mut source_hash = [0u8; 32];
+    for &(label, target_bytes, corpus_bytes) in tiers {
+        let source = lcg_bytes(cfg.seed ^ 0x00C0_FFEE_1234_5678, corpus_bytes);
+        source_hash = *blake3::hash(&source).as_bytes();
+        let p = measure(&source, ManifestationProfile::Path { depth: 32 }, cfg)?;
+        points.push(TierPoint {
+            tier: label.to_string(),
+            target_bytes,
+            corpus_bytes: p.visible_bytes,
+            physical_bytes: p.physical_bytes,
+            seq_bytes_per_s: finite(p.seq_bytes_per_s),
+            random_1b_ns_p50: finite(p.random_1b_ns_p50),
+            random_1b_ns_p99: finite(p.random_1b_ns_p99),
+            random_4k_ns_p50: finite(p.random_4k_ns_p50),
+            samples: p.samples,
+            cache_note: cache_note(p.visible_bytes),
+        });
+    }
+    Ok(MemoryTiersReport {
+        cpu,
+        source_hash,
+        tiers: points,
+    })
+}
+
+/// Write a [`MemoryTiersReport`] as pretty JSON to `path`, creating parents.
+pub fn write_memory_tiers_json(path: &Path, report: &MemoryTiersReport) -> Result<()> {
+    let mut s = String::new();
+    s.push_str("{\n");
+    let _ = writeln!(
+        s,
+        "  \"cpu\": {{ \"sse2\": {}, \"avx2\": {}, \"avx512f\": {} }},",
+        report.cpu.sse2, report.cpu.avx2, report.cpu.avx512f
+    );
+    let _ = writeln!(s, "  \"source_hash\": \"{}\",", hex32(&report.source_hash));
+    s.push_str("  \"tiers\": [\n");
+    for (i, p) in report.tiers.iter().enumerate() {
+        s.push_str("    {\n");
+        let _ = writeln!(s, "      \"tier\": \"{}\",", json_escape(&p.tier));
+        let _ = writeln!(s, "      \"target_bytes\": {},", p.target_bytes);
+        let _ = writeln!(s, "      \"corpus_bytes\": {},", p.corpus_bytes);
+        let _ = writeln!(s, "      \"physical_bytes\": {},", p.physical_bytes);
+        let _ = writeln!(
+            s,
+            "      \"seq_bytes_per_s\": {},",
+            finite(p.seq_bytes_per_s)
+        );
+        let _ = writeln!(
+            s,
+            "      \"random_1b_ns_p50\": {},",
+            finite(p.random_1b_ns_p50)
+        );
+        let _ = writeln!(
+            s,
+            "      \"random_1b_ns_p99\": {},",
+            finite(p.random_1b_ns_p99)
+        );
+        let _ = writeln!(
+            s,
+            "      \"random_4k_ns_p50\": {},",
+            finite(p.random_4k_ns_p50)
+        );
+        let _ = writeln!(s, "      \"samples\": {},", p.samples);
+        let _ = writeln!(
+            s,
+            "      \"cache_note\": \"{}\"",
+            json_escape(&p.cache_note)
+        );
+        s.push_str(if i + 1 == report.tiers.len() {
+            "    }\n"
+        } else {
+            "    },\n"
+        });
+    }
+    s.push_str("  ]\n}\n");
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(path, s)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,6 +1291,79 @@ mod tests {
             text.matches('}').count(),
             "unbalanced braces"
         );
+        assert!(!text.contains("NaN") && !text.contains("inf"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn depth_metrics_cover_all_depths_and_shrink_with_depth() {
+        let src = lcg(0x0DEF_0000_0001, 64 * 1024);
+        let cfg = SweepConfig {
+            iterations: 2,
+            seed: 3,
+        };
+        let m = depth_metrics(&src, &cfg).unwrap();
+        assert_eq!(m.points.len(), SUPPORTED_DEPTHS.len());
+        assert_eq!(m.source_len, src.len() as u64);
+        let mut prev = u64::MAX;
+        for (i, p) in m.points.iter().enumerate() {
+            assert_eq!(p.depth, SUPPORTED_DEPTHS[i]);
+            assert_eq!(p.key_semantics, PATH_KEY_SEMANTICS);
+            assert_eq!(p.successor_semantics, PATH_SUCCESSOR_SEMANTICS);
+            assert_eq!(p.certification, PATH_CERTIFICATION);
+            assert!(p.physical_bytes > 0);
+            assert!(
+                p.physical_bytes <= prev,
+                "depth {} physical {} exceeds previous {}",
+                p.depth,
+                p.physical_bytes,
+                prev
+            );
+            prev = p.physical_bytes;
+            assert!(p.seq_bytes_per_s.is_finite() && p.seq_bytes_per_s > 0.0);
+            assert!(p.random_1b_ns_p50.is_finite());
+            assert!(!p.cache_note.is_empty());
+        }
+    }
+
+    #[test]
+    fn memory_tiers_are_finite_and_positive() {
+        let cfg = SweepConfig {
+            iterations: 2,
+            seed: 5,
+        };
+        let tiers = [
+            ("L1", 16 * 1024u64, 16 * 1024usize),
+            ("L2ish", 128 * 1024u64, 128 * 1024usize),
+        ];
+        let m = memory_tiers(&tiers, &cfg).unwrap();
+        assert_eq!(m.tiers.len(), 2);
+        for t in &m.tiers {
+            assert!(t.corpus_bytes > 0);
+            assert!(t.physical_bytes >= t.corpus_bytes);
+            assert!(t.seq_bytes_per_s.is_finite() && t.seq_bytes_per_s > 0.0);
+            assert!(t.random_1b_ns_p50.is_finite());
+            assert!(t.random_4k_ns_p50.is_finite());
+            assert!(t.samples > 0);
+            assert!(!t.cache_note.is_empty());
+        }
+    }
+
+    #[test]
+    fn depth_metrics_json_is_well_formed() {
+        let src = lcg(7, 8192);
+        let cfg = SweepConfig {
+            iterations: 1,
+            seed: 1,
+        };
+        let m = depth_metrics(&src, &cfg).unwrap();
+        let dir = std::env::temp_dir().join(format!("ekbloom-depth-{}", std::process::id()));
+        let path = dir.join("depth-metrics.json");
+        write_depth_metrics_json(&path, &m).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"depth\""));
+        assert!(text.contains("\"cache_note\""));
+        assert_eq!(text.matches('{').count(), text.matches('}').count());
         assert!(!text.contains("NaN") && !text.contains("inf"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
