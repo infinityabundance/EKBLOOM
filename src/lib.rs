@@ -45,6 +45,7 @@ pub mod machine_rans;
 pub mod manifest;
 pub mod metrics;
 pub mod model_search;
+pub mod prefix;
 pub mod reader;
 pub mod recovery;
 pub mod region_adapt;
@@ -90,6 +91,10 @@ pub use manifest::{
 pub use metrics::{now_ns, percentiles, Percentiles};
 pub use model_search::{
     canonical_state_only_counterexample, sufficiency_sweep, AbstractCounterexample, SufficiencyRow,
+};
+pub use prefix::{
+    block_summary, prefix_scan, reconstruct_blocks, reconstruct_scalar, state_at_via_prefix,
+    Affine, LinMap,
 };
 pub use reader::{
     inspect_file, open, open_authenticated, open_bytes_authenticated, read, read_file, FileBody,
