@@ -65,7 +65,9 @@ pub use history::History;
 pub use history_store::{current_rss_bytes, peak_rss_bytes, HistoryStore, StoreConfig};
 pub use machine::{machine_by_id, OrMachine, MACHINE_NL2, NL2};
 pub use manifest::{
-    create, grow, inspect, manifest, ComponentReport, EkbloomBody, ManifestationReport,
+    create, create_within_budget, estimate_physical_bytes, grow, inspect, manifest,
+    manifest_within_budget, select_profile_within_budget, ComponentReport, EkbloomBody,
+    ManifestationReport,
 };
 pub use metrics::{now_ns, percentiles, Percentiles};
 pub use model_search::{

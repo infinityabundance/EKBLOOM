@@ -17,7 +17,7 @@ use ekbloom::manifest;
 use ekbloom::metrics::{now_ns, percentiles};
 use ekbloom::{
     read_random_1b, read_ranges, read_sequential, Counterexample, EkbloomError,
-    ManifestationProfile, ManifestationReport, ReadRequest,
+    ManifestationBudget, ManifestationProfile, ManifestationReport, ReadRequest,
 };
 use ekbloom::{reader, recovery, verify, writer};
 
@@ -26,9 +26,9 @@ const USAGE: &str = "\
 ekbloom — concealed-expansion codec CLI
 
 usage:
-  ekbloom create   <input> -o <out.ekb> [--profile <p>] [--depth D] [--interval K] [--region-bytes R] [--key-hex H | --key-file F]
-  ekbloom manifest <file.ekb> --profile <p> [--depth D] [--interval K] [--region-bytes R] [--key-hex H | --key-file F]
-  ekbloom grow     <file.ekb> --profile <p> [--depth D] [--interval K] [--region-bytes R] [--key-hex H | --key-file F]
+  ekbloom create   <input> -o <out.ekb> [--profile <p>] [--depth D] [--interval K] [--region-bytes R] [--max-physical-bytes B] [--key-hex H | --key-file F]
+  ekbloom manifest <file.ekb> --profile <p> [--depth D] [--interval K] [--region-bytes R] [--max-physical-bytes B] [--key-hex H | --key-file F]
+  ekbloom grow     <file.ekb> --profile <p> [--depth D] [--interval K] [--region-bytes R] [--max-physical-bytes B] [--key-hex H | --key-file F]
   ekbloom read     <file.ekb> --offset O --length L [-o <out.bin>] [--key-hex H | --key-file F]
   ekbloom inspect  <file.ekb> [--json] [--key-hex H | --key-file F]
   ekbloom verify   <file.ekb> [--deep] [--key-hex H | --key-file F]
@@ -49,6 +49,9 @@ keys:
   printed. Without a key the default unkeyed behaviour is unchanged.
 
 notes:
+  --max-physical-bytes B is a hard ceiling on total manifested physical bytes;
+  create/manifest/grow reject (nonzero exit) when the chosen profile's build would
+  exceed it, leaving the object/file unchanged.
   certify runs the requested certifications over the object's core and writes
   nothing; a Rejected verdict is a research outcome, not a process error.
 ";
@@ -361,9 +364,19 @@ fn cmd_create(parsed: &Parsed) -> Result<i32, CliError> {
         .ok_or_else(|| CliError::usage("create requires -o <out.ekb>"))?;
     let profile = resolve_profile(parsed, false)?;
     let key = resolve_key(parsed)?;
+    let max_physical_bytes = parsed.parse_u64("max-physical-bytes")?;
 
     let source = fs::read(input)?;
-    let body = manifest::create(&source, profile)?;
+    let body = match max_physical_bytes {
+        Some(limit) => manifest::create_within_budget(
+            &source,
+            profile,
+            &ManifestationBudget {
+                maximum_physical_bytes: limit,
+            },
+        )?,
+        None => manifest::create(&source, profile)?,
+    };
     match &key {
         Some(key) => writer::write_body_authenticated(Path::new(out), &body, key)?,
         None => writer::write_body(Path::new(out), &body)?,
@@ -383,16 +396,26 @@ fn cmd_manifest(parsed: &Parsed, grow: bool) -> Result<i32, CliError> {
     let path = parsed.positional(0, "file.ekb")?;
     let profile = resolve_profile(parsed, true)?;
     let key = resolve_key(parsed)?;
+    let max_physical_bytes = parsed.parse_u64("max-physical-bytes")?;
     let path = Path::new(path);
 
     let mut body = match &key {
         Some(key) => reader::open_authenticated(path, key)?,
         None => reader::open(path)?,
     };
+    let budget = max_physical_bytes.map(|limit| ManifestationBudget {
+        maximum_physical_bytes: limit,
+    });
     if grow {
-        manifest::grow(&mut body, profile)?;
+        match &budget {
+            Some(budget) => manifest::manifest_within_budget(&mut body, profile, budget)?,
+            None => manifest::grow(&mut body, profile)?,
+        }
     } else {
-        manifest::manifest(&mut body, profile)?;
+        match &budget {
+            Some(budget) => manifest::manifest_within_budget(&mut body, profile, budget)?,
+            None => manifest::manifest(&mut body, profile)?,
+        }
     }
     let generation = match &key {
         Some(key) => writer::append_generation_authenticated(path, &body, key)?,

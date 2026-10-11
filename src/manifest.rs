@@ -37,7 +37,7 @@ use crate::error::{EkbloomError, Result};
 use crate::history::History;
 use crate::machine::{machine_by_id, OrMachine, MACHINE_NL2};
 use crate::state::Snapshot;
-use crate::ManifestationProfile;
+use crate::{ManifestationBudget, ManifestationProfile};
 
 /// The manifested operational body.
 ///
@@ -330,6 +330,283 @@ pub fn grow(body: &mut EkbloomBody, profile: ManifestationProfile) -> Result<()>
     manifest(body, profile)
 }
 
+// ---------------------------------------------------------------------------
+// Physical-byte budget enforcement.
+//
+// The accounting identities below mirror [`EkbloomBody::physical_bytes`] and the
+// per-structure payload layouts (`history`, `checkpoint`, `bloom`, `bloom_path`,
+// `bloom_global`, `bloom_region`). The estimate is deliberately conservative: it
+// never under-estimates, so a budget check built on it can only over-reject, never
+// admit an over-budget body; the authoritative runtime check uses the real
+// `physical_bytes()` after building.
+// ---------------------------------------------------------------------------
+
+/// Fixed path-bloom payload prefix: `depth u16`, `logical_len u64`, `nblocks u64`.
+const PATH_PAYLOAD_PREFIX_BYTES: u64 = 2 + 8 + 8;
+/// Fixed universal-bloom payload prefix: `depth u16`, `table_len u64`,
+/// `present_len u64`, `status u32`.
+const UNIVERSAL_PAYLOAD_PREFIX_BYTES: u64 = 2 + 8 + 8 + 4;
+/// Universal bloom presence bitmask size (`65536 / 8`).
+const UNIVERSAL_PRESENT_BYTES: u64 = 65536 / 8;
+/// Universal bloom table slot count (the full 16-bit state domain).
+const UNIVERSAL_TABLE_SLOTS: u64 = 65536;
+/// Fixed regional-bloom payload prefix: `depth u16`, `logical_start u64`,
+/// `logical_len u64`, `table_offset u64`, `entries u64`, `status u32`,
+/// `table_len u64`.
+const REGIONAL_PAYLOAD_PREFIX_BYTES: u64 = 2 + 8 + 8 + 8 + 8 + 4 + 8;
+/// Per-entry regional record width beyond the depth bytes: `key u16` `++`
+/// `next u32`. The full record is `depth + 6` bytes.
+const REGIONAL_PER_ENTRY_EXTRA: u64 = 2 + 4;
+/// Packed resume-point width (`u32` state `++` `u64` cursor).
+const CHECKPOINT_ENTRY_BYTES: u64 = 12;
+
+/// Certificate wire size for `kind`: the fixed receipt header plus the four
+/// length-prefixed strings, both 32-byte content hashes, and the trailing
+/// receipt hash. Derived from the exact [`Certificate::to_bytes`] layout.
+fn certificate_bytes(kind: BloomKind) -> u64 {
+    let (key_domain, context_def, method, verified_domain) = certificate_fields(kind);
+    // kind u32 + depth u16 + machine_id u32 + generation u64 + status u32
+    // + core_hash[32] + bloom_hash[32] + receipt_hash[32] + 4 string lengths.
+    const FIXED: u64 = 4 + 2 + 4 + 8 + 4 + 32 + 32 + 32 + 4 * 8;
+    let strings =
+        (key_domain.len() + context_def.len() + method.len() + verified_domain.len()) as u64;
+    FIXED.saturating_add(strings)
+}
+
+/// `4 * (N + 1)`: the full non-withdrawal `u32` state projection.
+fn history_bytes(logical_len: u64) -> u64 {
+    logical_len.saturating_add(1).saturating_mul(4)
+}
+
+/// `12 * (floor(N / K) + 1)`: packed resume points for interval `K`.
+fn checkpoint_bytes(logical_len: u64, interval: u32) -> u64 {
+    if interval == 0 {
+        return u64::MAX;
+    }
+    let k = u64::from(interval);
+    (logical_len / k)
+        .saturating_add(1)
+        .saturating_mul(CHECKPOINT_ENTRY_BYTES)
+}
+
+/// Universal `T_D[x]` payload: prefix `++` presence mask `++` `65536 * (D + 4)`.
+/// **Exact** for every supported depth.
+fn universal_bloom_bytes(depth: u16) -> u64 {
+    if depth == 0 {
+        return u64::MAX;
+    }
+    let entry = u64::from(depth).saturating_add(4);
+    UNIVERSAL_PAYLOAD_PREFIX_BYTES
+        .saturating_add(UNIVERSAL_PRESENT_BYTES)
+        .saturating_add(UNIVERSAL_TABLE_SLOTS.saturating_mul(entry))
+}
+
+/// Exact path `P_D[j]` payload: prefix `++` `N` hot bytes `++` `4 * ceil(N/D)`
+/// cold successors. **Exact** for every supported depth.
+fn path_bloom_bytes(logical_len: u64, depth: u16) -> u64 {
+    if depth == 0 {
+        return u64::MAX;
+    }
+    let blocks = logical_len.div_ceil(u64::from(depth));
+    PATH_PAYLOAD_PREFIX_BYTES
+        .saturating_add(logical_len)
+        .saturating_add(blocks.saturating_mul(4))
+}
+
+/// Conservative upper bound for the regional family: one shell per region, each
+/// with at most `min(region_bytes, 65536)` state-keyed entries (`+6` bytes per
+/// entry) plus its prefix and certificate. Entries are distinct 16-bit keys drawn
+/// from windows inside the region, so this over-counts but never under-counts.
+fn regional_bloom_bytes(logical_len: u64, depth: u16, region_bytes: u32) -> u64 {
+    if depth == 0 || region_bytes == 0 {
+        return u64::MAX;
+    }
+    let rb = u64::from(region_bytes);
+    let regions = logical_len.div_ceil(rb);
+    if regions == 0 {
+        return 0;
+    }
+    let entries = rb.min(UNIVERSAL_TABLE_SLOTS);
+    let table = entries.saturating_mul(u64::from(depth).saturating_add(REGIONAL_PER_ENTRY_EXTRA));
+    let per_region = REGIONAL_PAYLOAD_PREFIX_BYTES
+        .saturating_add(table)
+        .saturating_add(certificate_bytes(BloomKind::Regional));
+    regions.saturating_mul(per_region)
+}
+
+/// Static estimate of the physical bytes a fresh body manifesting exactly
+/// `profile` for a source of `source_len` bytes would occupy, **without building
+/// it**.
+///
+/// Every term is derived from the exact accounting identities used by
+/// [`EkbloomBody::physical_bytes`]: the `N`-byte core, the `4*(N+1)` history
+/// projection, the `12*(floor(N/K)+1)` checkpoint sets, the exact `Path` and
+/// `Universal` bloom payloads, `MaxSpeed`'s history/checkpoint/path combination,
+/// and the per-kind certificate records. The regional table is the only *bounded*
+/// term (see [`regional_bloom_bytes`]). Arithmetic saturates, so the estimate can
+/// never wrap to a smaller value; it is a hard upper bound and therefore a safe
+/// pre-filter for a physical-byte budget.
+pub fn estimate_physical_bytes(source_len: u64, profile: ManifestationProfile) -> u64 {
+    let core = source_len;
+    match profile {
+        ManifestationProfile::Root => core,
+        ManifestationProfile::Sparse { interval } => {
+            core.saturating_add(checkpoint_bytes(source_len, interval))
+        }
+        ManifestationProfile::Dense { interval } => core
+            .saturating_add(history_bytes(source_len))
+            .saturating_add(checkpoint_bytes(source_len, interval)),
+        ManifestationProfile::Full => core.saturating_add(history_bytes(source_len)),
+        ManifestationProfile::Bloom { depth } => core
+            .saturating_add(universal_bloom_bytes(depth))
+            .saturating_add(certificate_bytes(BloomKind::Universal)),
+        ManifestationProfile::Regional {
+            depth,
+            region_bytes,
+        } => core.saturating_add(regional_bloom_bytes(source_len, depth, region_bytes)),
+        ManifestationProfile::Path { depth } => core
+            .saturating_add(path_bloom_bytes(source_len, depth))
+            .saturating_add(certificate_bytes(BloomKind::Path)),
+        ManifestationProfile::MaxSpeed => core
+            .saturating_add(history_bytes(source_len))
+            .saturating_add(checkpoint_bytes(source_len, 1024))
+            .saturating_add(path_bloom_bytes(source_len, 4))
+            .saturating_add(certificate_bytes(BloomKind::Path)),
+    }
+}
+
+/// Static speed tier of a profile, lowest = fastest, taken from the measured
+/// ordering in `docs/RESULTS.md`: path blooms are the speed ceiling; `max-speed`
+/// combines them with the full history; `full` buys O(1) positional state;
+/// sparse checkpoints are cheaper positional wins (smaller interval = faster);
+/// universal/regional blooms did not accelerate the release corpus and fall back
+/// to authoritative replay, like `root`.
+fn speed_rank(profile: ManifestationProfile) -> (u8, u64) {
+    match profile {
+        ManifestationProfile::MaxSpeed => (0, 0),
+        ManifestationProfile::Path { .. } => (1, 0),
+        ManifestationProfile::Full => (2, 0),
+        ManifestationProfile::Dense { .. } => (2, 0),
+        ManifestationProfile::Sparse { interval } => (3, u64::from(interval)),
+        ManifestationProfile::Bloom { .. } => (4, 0),
+        ManifestationProfile::Regional { .. } => (4, 0),
+        ManifestationProfile::Root => (4, 0),
+    }
+}
+
+/// Whether `(a, ea)` is preferred over `(b, eb)`: faster tier first, then the
+/// smaller estimate, then the lexicographically smaller label.
+fn faster_profile(a: ManifestationProfile, ea: u64, b: ManifestationProfile, eb: u64) -> bool {
+    let ra = speed_rank(a);
+    let rb = speed_rank(b);
+    if ra != rb {
+        return ra < rb;
+    }
+    if ea != eb {
+        return ea < eb;
+    }
+    a.label() < b.label()
+}
+
+/// Build a fresh body from `source`, refusing (with
+/// [`EkbloomError::AllocationTooLarge`]) any profile whose manifested physical
+/// bytes would exceed `budget`.
+///
+/// The [`estimate_physical_bytes`] pre-filter avoids building an obviously
+/// oversized body; the built body is then re-checked against the *actual*
+/// accounting, so a conservative estimate can never let an over-budget body
+/// escape. Transactional: on rejection no body is returned.
+pub fn create_within_budget(
+    source: &[u8],
+    profile: ManifestationProfile,
+    budget: &ManifestationBudget,
+) -> Result<EkbloomBody> {
+    let limit = budget.maximum_physical_bytes;
+    let estimated = estimate_physical_bytes(source.len() as u64, profile);
+    if estimated > limit {
+        return Err(EkbloomError::AllocationTooLarge {
+            requested: estimated,
+            limit,
+        });
+    }
+    let body = create(source, profile)?;
+    let actual = body.physical_bytes();
+    if actual > limit {
+        return Err(EkbloomError::AllocationTooLarge {
+            requested: actual,
+            limit,
+        });
+    }
+    Ok(body)
+}
+
+/// Apply `profile` to `body` only if the resulting total physical bytes stay
+/// within `budget`; otherwise return [`EkbloomError::AllocationTooLarge`] and
+/// leave `body` **exactly** as it was.
+///
+/// Transactional: the profile is applied to a scratch clone first and the clone is
+/// committed only when its `physical_bytes()` is within budget, so a rejected call
+/// can never leave a partially-applied generation behind.
+pub fn manifest_within_budget(
+    body: &mut EkbloomBody,
+    profile: ManifestationProfile,
+    budget: &ManifestationBudget,
+) -> Result<()> {
+    let limit = budget.maximum_physical_bytes;
+    let mut scratch = body.clone();
+    manifest(&mut scratch, profile)?;
+    let total = scratch.physical_bytes();
+    if total > limit {
+        return Err(EkbloomError::AllocationTooLarge {
+            requested: total,
+            limit,
+        });
+    }
+    *body = scratch;
+    Ok(())
+}
+
+/// Choose the **fastest** candidate profile whose estimated physical bytes fit
+/// `budget`, returning the chosen profile and its estimated bytes.
+///
+/// Candidates are pre-filtered with [`estimate_physical_bytes`]; the fastest
+/// fitting profile (per the `docs/RESULTS.md` ordering, ties broken by the smaller
+/// estimate and then the label) is returned. When nothing fits, returns
+/// [`EkbloomError::AllocationTooLarge`] with `requested` set to the smallest
+/// candidate estimate.
+pub fn select_profile_within_budget(
+    source_len: u64,
+    budget: &ManifestationBudget,
+    candidates: &[ManifestationProfile],
+) -> Result<(ManifestationProfile, u64)> {
+    let limit = budget.maximum_physical_bytes;
+    let mut best: Option<(ManifestationProfile, u64)> = None;
+    let mut min_estimate = u64::MAX;
+    for &candidate in candidates {
+        let estimate = estimate_physical_bytes(source_len, candidate);
+        min_estimate = min_estimate.min(estimate);
+        if estimate > limit {
+            continue;
+        }
+        match best {
+            None => best = Some((candidate, estimate)),
+            Some((chosen, chosen_bytes)) => {
+                if faster_profile(candidate, estimate, chosen, chosen_bytes) {
+                    best = Some((candidate, estimate));
+                }
+            }
+        }
+    }
+    best.ok_or(EkbloomError::AllocationTooLarge {
+        requested: if candidates.is_empty() {
+            0
+        } else {
+            min_estimate
+        },
+        limit,
+    })
+}
+
 /// Build a full history only when one is not already manifested.
 fn history_if_absent(body: &EkbloomBody, generation: u64) -> Result<Option<History>> {
     if body.history.is_some() {
@@ -350,9 +627,11 @@ fn push_bloom(body: &mut EkbloomBody, shell: BloomShell) {
     body.certificates.push(certificate);
 }
 
-/// Build the certification record describing `shell`.
-fn make_certificate(shell: &BloomShell, machine_id: u32, core_hash: [u8; 32]) -> Certificate {
-    let (key_domain, context_def, method, verified_domain) = match shell.kind {
+/// The fixed `(key_domain, context_def, method, verified_domain)` descriptive
+/// strings for a bloom kind. Shared by [`make_certificate`] and the static
+/// physical-byte estimate so the two can never drift apart.
+fn certificate_fields(kind: BloomKind) -> (&'static str, &'static str, &'static str, &'static str) {
+    match kind {
         BloomKind::Path => (
             "block-ordinal",
             "block-index",
@@ -377,7 +656,12 @@ fn make_certificate(shell: &BloomShell, machine_id: u32, core_hash: [u8; 32]) ->
             "state-universe-scan",
             "observed-window-states",
         ),
-    };
+    }
+}
+
+/// Build the certification record describing `shell`.
+fn make_certificate(shell: &BloomShell, machine_id: u32, core_hash: [u8; 32]) -> Certificate {
+    let (key_domain, context_def, method, verified_domain) = certificate_fields(shell.kind);
     let mut certificate = Certificate {
         kind: shell.kind,
         depth: shell.depth,

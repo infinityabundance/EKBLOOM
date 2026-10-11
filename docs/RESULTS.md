@@ -271,3 +271,31 @@ spends its cycles waiting on memory.
 ### Segmented history at N = 2^30 (bounded-memory build)
 
 `HistoryStore::build` streamed a procedural core over 1073741824 logical positions into 1 MiB segments (checkpoint interval 65536), writing exactly 4294967300 bytes of `u32` state projection (`4*(N+1)`) in 3.666 s while peak RSS stayed at 3067904 bytes (2.9 MiB) — far below the 4 GiB the full projection would occupy in RAM. A sampled recompute-and-compare pass over 1025 positions (stride 1048576) passed. Evidence: `evidence/bench/history-2p30.json`.
+
+---
+
+## Budget enforcement (hard caps)
+
+`ManifestationBudget { maximum_physical_bytes }` is now a real ceiling, not a
+label. `manifest::create_within_budget`, `manifest_within_budget` and
+`select_profile_within_budget` reject any profile whose manifested physical bytes
+would exceed the budget with `EkbloomError::AllocationTooLarge { requested, limit }`
+(`requested` = would-be physical bytes, `limit` = the budget). Enforcement is
+**transactional**: `create_within_budget` pre-filters with
+`estimate_physical_bytes` and then re-checks the built body's real
+`physical_bytes()`; `manifest_within_budget` applies the generation to a scratch
+clone and commits only when the clone's total is within budget, so a rejected call
+leaves the body byte-for-byte and generation-for-generation unchanged. The CLI
+accepts `--max-physical-bytes B` on `create`/`manifest`/`grow` and exits nonzero
+without writing on rejection.
+
+`estimate_physical_bytes` is exact for `root`, `sparse`, `dense`, `full`, `bloom`,
+`path` and `max-speed` (all derived from the same accounting identities as
+`physical_bytes()`); the regional family is a conservative upper bound (at most
+`min(region_bytes, 65536)` keys per region). It never under-estimates, so it is a
+safe pre-filter; the runtime check is authoritative. `select_profile_within_budget`
+pre-filters candidates by that estimate and returns the fastest one that fits,
+using the measured ordering documented above — `max-speed` > `path` (tie broken by
+the smaller/deeper bloom) > `full` > `sparse` (smaller interval = faster) >
+`root`/`bloom`/`regional` — so a path bloom wins whenever it fits, matching
+"path blooms are the speed ceiling".
