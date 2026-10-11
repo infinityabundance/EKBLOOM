@@ -53,6 +53,7 @@ pub mod region_adapt;
 pub mod simd;
 pub mod state;
 pub mod sweep;
+pub mod tiles;
 pub mod verify;
 pub mod worker;
 pub mod writer;
@@ -118,6 +119,7 @@ pub use sweep::{
     write_evidence_json, write_memory_tiers_json, DepthMetrics, DepthPoint, MemoryTiersReport,
     SweepConfig, SweepPoint, SweepReport, TierPoint,
 };
+pub use tiles::{DirectoryKind, TileAdaptReport, TileDirectory, TileSet, RADIX_GROUP_SHIFT};
 pub use verify::{verify, verify_deep, CheckOutcome, VerificationReport};
 pub use worker::{available_parallelism, manifest_background, regional_parallel};
 pub use writer::{

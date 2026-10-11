@@ -336,6 +336,7 @@ fn open_selected(
         checkpoints,
         blooms,
         certificates,
+        tiles: Vec::new(),
         generation: selected.generation,
         profiles: manifest.profiles,
     })

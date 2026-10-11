@@ -37,6 +37,7 @@ use crate::error::{EkbloomError, Result};
 use crate::history::History;
 use crate::machine::{machine_by_id, OrMachine, MACHINE_NL2};
 use crate::state::Snapshot;
+use crate::tiles::TileSet;
 use crate::{ManifestationBudget, ManifestationProfile};
 
 /// The manifested operational body.
@@ -65,6 +66,8 @@ pub struct EkbloomBody {
     pub blooms: Vec<BloomShell>,
     /// Certification records for the manifested blooms.
     pub certificates: Vec<Certificate>,
+    /// Selective hot-region byte tiles, in manifestation order (append-only).
+    pub tiles: Vec<TileSet>,
     /// Monotonic manifestation generation (incremented by every `manifest`).
     pub generation: u64,
     /// Human-readable labels of the profiles applied, in order.
@@ -93,6 +96,9 @@ impl EkbloomBody {
         }
         for c in &self.certificates {
             total = total.saturating_add(c.to_bytes().len() as u64);
+        }
+        for t in &self.tiles {
+            total = total.saturating_add(t.physical_bytes());
         }
         total
     }
@@ -243,6 +249,7 @@ pub fn create_machine(
         checkpoints: Vec::new(),
         blooms: Vec::new(),
         certificates: Vec::new(),
+        tiles: Vec::new(),
         generation: 0,
         profiles: Vec::new(),
     };
@@ -757,6 +764,13 @@ pub fn inspect(body: &EkbloomBody) -> ManifestationReport {
             name: format!("certificate[{i}] {}", c.kind.as_str()),
             kind: "certificate".to_string(),
             bytes: c.to_bytes().len() as u64,
+        });
+    }
+    for (i, t) in body.tiles.iter().enumerate() {
+        components.push(ComponentReport {
+            name: format!("tiles[{i}] shift={}", t.tile_shift),
+            kind: "tiles".to_string(),
+            bytes: t.physical_bytes(),
         });
     }
 

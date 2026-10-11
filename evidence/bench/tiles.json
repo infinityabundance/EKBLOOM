@@ -1,0 +1,147 @@
+{
+  "corpus_bytes": 4194304,
+  "corpus_seed": 16938038201776218150,
+  "hot_bytes": 65536,
+  "hot_regions": 1024,
+  "hot_region_len": 64,
+  "window_bytes": 4096,
+  "samples": 512,
+  "cold_samples": 64,
+  "root_physical_bytes": 4194304,
+  "whole_object_added_bytes": 4718827,
+  "budget_bytes": 8913131,
+  "rows": [
+    {
+      "name": "ekbloom whole-object P_32",
+      "added_physical_bytes": 4718827,
+      "directory_bytes": 0,
+      "hot_ns_p50": 80.0,
+      "hot_ns_p99": 110.0,
+      "cold_ns_p50": 40.0,
+      "hot_read_bytes": 2097152,
+      "hot_bytes_per_added_byte": 0.4444,
+      "note": "existing adaptive shell (path P_32, exact path bloom P_32[j] (block-ordinal read surface)); whole-object output surface"
+    },
+    {
+      "name": "ekbloom tiles 1 KiB flat",
+      "added_physical_bytes": 81920,
+      "directory_bytes": 16384,
+      "hot_ns_p50": 80.0,
+      "hot_ns_p99": 101.0,
+      "cold_ns_p50": 10913885.0,
+      "hot_read_bytes": 2097152,
+      "hot_bytes_per_added_byte": 25.6000,
+      "note": "64 tiles of 64 selected; 65536 tile B + 16384 dir B"
+    },
+    {
+      "name": "ekbloom tiles 1 KiB two-level-radix",
+      "added_physical_bytes": 66048,
+      "directory_bytes": 512,
+      "hot_ns_p50": 110.0,
+      "hot_ns_p99": 131.0,
+      "cold_ns_p50": 12417620.0,
+      "hot_read_bytes": 2097152,
+      "hot_bytes_per_added_byte": 31.7519,
+      "note": "64 tiles of 64 selected; 65536 tile B + 512 dir B"
+    },
+    {
+      "name": "ekbloom tiles 4 KiB flat",
+      "added_physical_bytes": 69632,
+      "directory_bytes": 4096,
+      "hot_ns_p50": 110.0,
+      "hot_ns_p99": 131.0,
+      "cold_ns_p50": 12209503.0,
+      "hot_read_bytes": 2097152,
+      "hot_bytes_per_added_byte": 30.1176,
+      "note": "16 tiles of 16 selected; 65536 tile B + 4096 dir B"
+    },
+    {
+      "name": "ekbloom tiles 4 KiB two-level-radix",
+      "added_physical_bytes": 65856,
+      "directory_bytes": 320,
+      "hot_ns_p50": 110.0,
+      "hot_ns_p99": 130.0,
+      "cold_ns_p50": 12220803.0,
+      "hot_read_bytes": 2097152,
+      "hot_bytes_per_added_byte": 31.8445,
+      "note": "16 tiles of 16 selected; 65536 tile B + 320 dir B"
+    },
+    {
+      "name": "ekbloom tiles 16 KiB flat",
+      "added_physical_bytes": 66560,
+      "directory_bytes": 1024,
+      "hot_ns_p50": 100.0,
+      "hot_ns_p99": 200.0,
+      "cold_ns_p50": 12039816.0,
+      "hot_read_bytes": 2097152,
+      "hot_bytes_per_added_byte": 31.5077,
+      "note": "4 tiles of 4 selected; 65536 tile B + 1024 dir B"
+    },
+    {
+      "name": "ekbloom tiles 16 KiB two-level-radix",
+      "added_physical_bytes": 65808,
+      "directory_bytes": 272,
+      "hot_ns_p50": 100.0,
+      "hot_ns_p99": 190.0,
+      "cold_ns_p50": 11284486.0,
+      "hot_read_bytes": 2097152,
+      "hot_bytes_per_added_byte": 31.8677,
+      "note": "4 tiles of 4 selected; 65536 tile B + 272 dir B"
+    },
+    {
+      "name": "ekbloom tiles 64 KiB flat",
+      "added_physical_bytes": 65792,
+      "directory_bytes": 256,
+      "hot_ns_p50": 81.0,
+      "hot_ns_p99": 110.0,
+      "cold_ns_p50": 11572424.0,
+      "hot_read_bytes": 2097152,
+      "hot_bytes_per_added_byte": 31.8755,
+      "note": "1 tiles of 1 selected; 65536 tile B + 256 dir B"
+    },
+    {
+      "name": "ekbloom tiles 64 KiB two-level-radix",
+      "added_physical_bytes": 65796,
+      "directory_bytes": 260,
+      "hot_ns_p50": 100.0,
+      "hot_ns_p99": 361.0,
+      "cold_ns_p50": 12201748.0,
+      "hot_read_bytes": 2097152,
+      "hot_bytes_per_added_byte": 31.8735,
+      "note": "1 tiles of 1 selected; 65536 tile B + 260 dir B"
+    },
+    {
+      "name": "ekbloom regional table (prev)",
+      "added_physical_bytes": 1653834,
+      "directory_bytes": 0,
+      "hot_ns_p50": 58008.0,
+      "hot_ns_p99": 61696.0,
+      "cold_ns_p50": 431.0,
+      "hot_read_bytes": 2097152,
+      "hot_bytes_per_added_byte": 1.2681,
+      "note": "997 of 1024 regions certified/materialised at D=4"
+    },
+    {
+      "name": "raw-vec",
+      "added_physical_bytes": 0,
+      "directory_bytes": 0,
+      "hot_ns_p50": 110.0,
+      "hot_ns_p99": 751.0,
+      "cold_ns_p50": 210.0,
+      "hot_read_bytes": 2097152,
+      "hot_bytes_per_added_byte": 0.0000,
+      "note": "conventional direct-access baseline"
+    },
+    {
+      "name": "raw-file",
+      "added_physical_bytes": 0,
+      "directory_bytes": 0,
+      "hot_ns_p50": 261.0,
+      "hot_ns_p99": 982.0,
+      "cold_ns_p50": 190.0,
+      "hot_read_bytes": 2097152,
+      "hot_bytes_per_added_byte": 0.0000,
+      "note": "conventional direct-access baseline"
+    }
+  ]
+}
