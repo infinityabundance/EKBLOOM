@@ -42,6 +42,7 @@ pub mod fuse;
 pub mod handle;
 pub mod history;
 pub mod history_store;
+pub mod kernels;
 pub mod machine;
 pub mod machine_rans;
 pub mod manifest;
@@ -92,6 +93,10 @@ pub use fuse::{mount, OrFsMount};
 pub use handle::{ObjectCache, OpenObject, ReadDirectory};
 pub use history::History;
 pub use history_store::{current_rss_bytes, peak_rss_bytes, HistoryStore, StoreConfig};
+pub use kernels::{
+    block_start_states, kernel_a_scalar, kernel_a_scalar_windows, kernel_a_simd_windows,
+    kernel_a_table, kernel_a_unrolled, kernel_b_simd, kernel_b_threads, window_start_states,
+};
 pub use machine::{machine_by_id, state_log_with, OrMachine, MACHINE_NL2, MACHINE_RANS0, NL2};
 pub use machine_rans::{Rans0, RANS0};
 pub use manifest::{
@@ -105,7 +110,10 @@ pub use model_search::{
 };
 pub use packed::{state_from_hot, PackedHistory, PackedRestarts};
 pub use planner::{
-    AccessPath, AccessPlan, CertRef, CostModel, Planner, RegionPlan, PLANNER_REGION_BYTES,
+    plan_benefits, region_benefit, AccessObservation, AccessObserver, AccessPath, AccessPlan,
+    BackgroundPlanner, BackgroundPlannerConfig, BenefitModel, BenefitPlan, CertRef, CostModel,
+    Planner, PlannerReader, PlannerStats, Publication, PublishedBody, RegionBenefit, RegionPlan,
+    ResidencyCache, PLANNER_REGION_BYTES,
 };
 pub use prefix::{
     block_summary, prefix_scan, reconstruct_blocks, reconstruct_scalar, state_at_via_prefix,
@@ -123,7 +131,8 @@ pub use region_adapt::{
 };
 pub use simd::{
     avx2_available, avx512_available, gather_bytes, gather_bytes_avx512, gather_bytes_prefetch,
-    gather_bytes_scalar, sse_available,
+    gather_bytes_scalar, nl2_step, nl2_windows16_avx2, nl2_windows_avx2_available, sse_available,
+    NL2_WINDOW_LANES,
 };
 pub use state::Snapshot;
 pub use sweep::{

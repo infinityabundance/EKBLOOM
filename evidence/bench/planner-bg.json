@@ -1,0 +1,124 @@
+{
+  "generated_by": "examples/planner_bg.rs (sh scripts/run-planner-bg.sh)",
+  "logical_len": 4194304,
+  "region_bytes": 65536,
+  "window_regions": 8,
+  "windows": 6,
+  "reads_per_phase": 1024,
+  "reads_total": 12288,
+  "initial_physical_bytes": 4980748,
+  "final_physical_bytes": 8129932,
+  "adaptations": 6,
+  "bytes_spent": 3149184,
+  "regions_manifested": 768,
+  "planner_epochs": 38,
+  "certifications_failed": 0,
+  "committed_core_hash_stable": true,
+  "committed_tiles_initial": 0,
+  "committed_tiles_final": 6,
+  "committed_history_touched": false,
+  "read_path_shared_locks": 44,
+  "read_path_locks_note": "shared-lock acquisitions are O(epochs) (planner snapshot + reader refresh), never O(reads); PlannerReader::read touches only its cached Arc",
+  "cold_p50_ns": 301,
+  "cold_p99_ns": 581,
+  "warm_p50_ns": 130,
+  "warm_p99_ns": 281,
+  "timeline": [
+    {
+      "phase": "cold",
+      "window": 0,
+      "hot_fraction": 0.0000,
+      "p50_ns": 301,
+      "p99_ns": 124402,
+      "version": 0
+    },
+    {
+      "phase": "warm",
+      "window": 0,
+      "hot_fraction": 1.0000,
+      "p50_ns": 140,
+      "p99_ns": 281,
+      "version": 1
+    },
+    {
+      "phase": "cold",
+      "window": 1,
+      "hot_fraction": 0.0000,
+      "p50_ns": 331,
+      "p99_ns": 581,
+      "version": 1
+    },
+    {
+      "phase": "warm",
+      "window": 1,
+      "hot_fraction": 1.0000,
+      "p50_ns": 120,
+      "p99_ns": 270,
+      "version": 2
+    },
+    {
+      "phase": "cold",
+      "window": 2,
+      "hot_fraction": 0.0000,
+      "p50_ns": 291,
+      "p99_ns": 551,
+      "version": 2
+    },
+    {
+      "phase": "warm",
+      "window": 2,
+      "hot_fraction": 1.0000,
+      "p50_ns": 120,
+      "p99_ns": 270,
+      "version": 3
+    },
+    {
+      "phase": "cold",
+      "window": 3,
+      "hot_fraction": 0.0000,
+      "p50_ns": 280,
+      "p99_ns": 551,
+      "version": 3
+    },
+    {
+      "phase": "warm",
+      "window": 3,
+      "hot_fraction": 1.0000,
+      "p50_ns": 120,
+      "p99_ns": 310,
+      "version": 4
+    },
+    {
+      "phase": "cold",
+      "window": 4,
+      "hot_fraction": 0.0000,
+      "p50_ns": 280,
+      "p99_ns": 501,
+      "version": 4
+    },
+    {
+      "phase": "warm",
+      "window": 4,
+      "hot_fraction": 1.0000,
+      "p50_ns": 150,
+      "p99_ns": 441,
+      "version": 5
+    },
+    {
+      "phase": "cold",
+      "window": 5,
+      "hot_fraction": 0.0000,
+      "p50_ns": 391,
+      "p99_ns": 701,
+      "version": 5
+    },
+    {
+      "phase": "warm",
+      "window": 5,
+      "hot_fraction": 1.0000,
+      "p50_ns": 130,
+      "p99_ns": 270,
+      "version": 6
+    }
+  ]
+}

@@ -33,7 +33,10 @@
 //! no map, no allocation. A read that stays inside one region (the common case)
 //! performs exactly one branch.
 
-use std::sync::Arc;
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use crate::bloom::{BloomKind, Certification};
 use crate::checkpoint::CheckpointSet;
@@ -41,7 +44,9 @@ use crate::court::CourtConfig;
 use crate::error::{EkbloomError, Result};
 use crate::machine::{machine_by_id, MACHINE_NL2};
 use crate::manifest::EkbloomBody;
-use crate::ReadRequest;
+use crate::region_adapt::AccessTrace;
+use crate::tiles::{DirectoryKind, TileSet};
+use crate::{ManifestationBudget, ReadRequest};
 
 /// Default planner region size (bytes). Regions are power-of-two aligned so the
 /// region of a logical offset is a single shift and mask.
@@ -656,4 +661,759 @@ fn read_via_machine(body: &EkbloomBody, offset: u64, length: u64, out: &mut Vec<
         out.push(machine.reveal(&body.core, &mut omega)?);
     }
     Ok(())
+}
+
+// ===========================================================================
+// §4 — Workload-directed background manifestation planner
+// ===========================================================================
+//
+// Three separable pieces, exactly as the directive requires:
+//
+// 1. **Lightweight observation.** [`AccessObserver`] keeps *sharded* relaxed
+//    counters — a read increments one atomic in its own thread's shard, never a
+//    central lock, and never once *per byte*: a request contributes one increment
+//    per region it touches. `snapshot` sums the shards off the read path.
+// 2. **A benefit heuristic.** [`plan_benefits`] ranks regions by
+//    `G_r = q_r (L_current - L_hot) - C_build / T` and selects the best under a
+//    byte budget; it is a pure, deterministic function (fixed seed, ordered ties).
+// 3. **Atomic generation publication.** [`Publication`] holds an `Arc<PublishedBody>`
+//    behind an RW cell plus a version counter. A reader keeps its own `Arc` and
+//    reads it with **no lock at all**; it only re-takes the shared (never exclusive)
+//    publication lock when the version changes — the RCU snapshot discipline of
+//    `handle.rs`. A partially built region is never observable: a new
+//    `PublishedBody` is fully constructed and certified *before* the swap, and
+//    committed structures are only ever appended to (non-withdrawal). Cache
+//    residency is a separate field that may change without deleting a committed
+//    manifestation.
+
+/// One observation window's per-region access counts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccessObservation {
+    /// Region size in bytes (power of two).
+    pub region_bytes: u64,
+    /// Logical length the regions cover.
+    pub logical_len: u64,
+    /// Observed request count per region.
+    pub counts: Vec<u64>,
+}
+
+impl AccessObservation {
+    /// Total observed requests in the window.
+    pub fn total_requests(&self) -> u64 {
+        self.counts.iter().sum()
+    }
+
+    /// First logical position of region `r`.
+    pub fn region_start(&self, r: usize) -> u64 {
+        (r as u64).saturating_mul(self.region_bytes)
+    }
+
+    /// Logical length of region `r` (the final region may be short).
+    pub fn region_len(&self, r: usize) -> u64 {
+        self.region_bytes
+            .min(self.logical_len.saturating_sub(self.region_start(r)))
+    }
+}
+
+/// A cache-line-padded atomic counter, so shards do not false-share.
+#[repr(align(64))]
+struct CountCell(AtomicU64);
+
+/// Signatures for the per-thread shard ticket.
+static NEXT_TICKET: AtomicU64 = AtomicU64::new(0);
+
+/// Lock-free, sharded access counters.
+///
+/// `observe` is the only hot-path operation: it takes no lock and performs one
+/// relaxed `fetch_add` per touched region in the calling thread's shard. Threads
+/// are assigned a stable shard from a global ticket, so concurrent observes from
+/// different threads land in different cache lines.
+pub struct AccessObserver {
+    region_shift: u8,
+    logical_len: u64,
+    regions: usize,
+    shards: usize,
+    counters: Vec<CountCell>,
+}
+
+impl AccessObserver {
+    /// Create an observer over `logical_len` bytes in power-of-two regions.
+    pub fn new(logical_len: u64, region_bytes: u64, shards: usize) -> Result<AccessObserver> {
+        if region_bytes == 0 || !region_bytes.is_power_of_two() {
+            return Err(EkbloomError::InvalidArgument {
+                what: format!(
+                    "observer region_bytes {region_bytes} must be a non-zero power of two"
+                ),
+            });
+        }
+        let shards = shards.max(1);
+        let regions = if logical_len == 0 {
+            0
+        } else {
+            usize::try_from(logical_len.div_ceil(region_bytes)).map_err(|_| {
+                EkbloomError::Overflow {
+                    what: "observer region count",
+                }
+            })?
+        };
+        let cells = shards.checked_mul(regions).ok_or(EkbloomError::Overflow {
+            what: "observer counter count",
+        })?;
+        let mut counters = Vec::with_capacity(cells);
+        for _ in 0..cells {
+            counters.push(CountCell(AtomicU64::new(0)));
+        }
+        Ok(AccessObserver {
+            region_shift: region_bytes.trailing_zeros() as u8,
+            logical_len,
+            regions,
+            shards,
+            counters,
+        })
+    }
+
+    /// Region size in bytes.
+    #[inline]
+    pub fn region_bytes(&self) -> u64 {
+        1u64 << self.region_shift
+    }
+
+    /// Number of regions.
+    #[inline]
+    pub fn region_count(&self) -> usize {
+        self.regions
+    }
+
+    /// Number of shards.
+    #[inline]
+    pub fn shards(&self) -> usize {
+        self.shards
+    }
+
+    /// Record one request over `[offset, offset + length)`. One relaxed increment
+    /// per touched region; **no lock and no per-byte work**.
+    pub fn observe(&self, offset: u64, length: u64) -> Result<()> {
+        if self.regions == 0 || length == 0 {
+            return Ok(());
+        }
+        let end = offset.checked_add(length).ok_or(EkbloomError::Overflow {
+            what: "observe range",
+        })?;
+        if end > self.logical_len {
+            return Err(EkbloomError::OutOfBounds {
+                offset,
+                length,
+                logical_len: self.logical_len,
+            });
+        }
+        let shard = self.shard() * self.regions;
+        let first = (offset >> self.region_shift) as usize;
+        let last = (((end - 1) >> self.region_shift) as usize).min(self.regions - 1);
+        for r in first..=last {
+            self.counters[shard + r].0.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Sum the shards into one observation window (off the read path).
+    pub fn snapshot(&self) -> AccessObservation {
+        let mut counts = vec![0u64; self.regions];
+        for s in 0..self.shards {
+            let base = s * self.regions;
+            for (r, slot) in counts.iter_mut().enumerate() {
+                *slot = slot.saturating_add(self.counters[base + r].0.load(Ordering::Relaxed));
+            }
+        }
+        AccessObservation {
+            region_bytes: self.region_bytes(),
+            logical_len: self.logical_len,
+            counts,
+        }
+    }
+
+    /// Zero every counter (start a fresh observation window).
+    pub fn reset(&self) {
+        for cell in &self.counters {
+            cell.0.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// The calling thread's stable shard index.
+    fn shard(&self) -> usize {
+        thread_local! {
+            static TICKET: Cell<usize> = const { Cell::new(usize::MAX) };
+        }
+        let ticket = TICKET.with(|c| {
+            let mut v = c.get();
+            if v == usize::MAX {
+                v = NEXT_TICKET.fetch_add(1, Ordering::Relaxed) as usize;
+                c.set(v);
+            }
+            v
+        });
+        ticket % self.shards
+    }
+}
+
+/// The benefit heuristic's constants (`G_r = q_r(L_current - L_hot) - C_build/T`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BenefitModel {
+    /// Latency per request when the region is **not** manifested (ns).
+    pub l_current_ns: f64,
+    /// Latency per request once the region is manifested hot (ns).
+    pub l_hot_ns: f64,
+    /// Build cost per manifested byte (ns/byte).
+    pub build_ns_per_byte: f64,
+    /// Amortisation horizon `T`, in observation windows.
+    pub horizon_windows: f64,
+}
+
+impl BenefitModel {
+    /// A model ordered from the measured planner court numbers (`planner.json`:
+    /// cold restart ≈ 230 ns, hot bytes ≈ 90 ns) — only the ordering matters.
+    pub fn measured_default() -> BenefitModel {
+        BenefitModel {
+            l_current_ns: 230.0,
+            l_hot_ns: 90.0,
+            build_ns_per_byte: 0.6,
+            horizon_windows: 8.0,
+        }
+    }
+}
+
+impl Default for BenefitModel {
+    fn default() -> BenefitModel {
+        BenefitModel::measured_default()
+    }
+}
+
+/// The benefit of manifesting one region.
+///
+/// `G = q * (L_current - L_hot) - C_build / T`. Increasing `requests` or the
+/// latency saving raises `G`; increasing the build cost lowers it.
+pub fn region_benefit(model: &BenefitModel, requests: u64, manifest_bytes: u64) -> f64 {
+    let saved = (model.l_current_ns - model.l_hot_ns).max(0.0);
+    let horizon = model.horizon_windows.max(1.0);
+    requests as f64 * saved - (model.build_ns_per_byte * manifest_bytes as f64) / horizon
+}
+
+/// One region's evaluated benefit and selection verdict.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RegionBenefit {
+    /// Region ordinal.
+    pub region: u64,
+    /// First logical position.
+    pub start: u64,
+    /// Region length in bytes.
+    pub len: u64,
+    /// Observed requests in the window.
+    pub requests: u64,
+    /// Per-request latency saving `L_current - L_hot` (ns).
+    pub latency_saved_ns: f64,
+    /// Amortised build cost `C_build / T` (ns).
+    pub build_cost_ns: f64,
+    /// The benefit `G_r` (ns per window).
+    pub benefit: f64,
+    /// Bytes manifesting this region would add.
+    pub bytes: u64,
+    /// Whether the budgeted greedy selection chose it.
+    pub selected: bool,
+}
+
+/// The output of [`plan_benefits`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct BenefitPlan {
+    /// Region size in bytes.
+    pub region_bytes: u64,
+    /// The byte budget the selection respected.
+    pub budget_bytes: u64,
+    /// Bytes the selected regions would add.
+    pub total_bytes: u64,
+    /// One entry per region, in region order.
+    pub entries: Vec<RegionBenefit>,
+    /// Selected region ordinals, highest benefit first.
+    pub selected_regions: Vec<u64>,
+}
+
+impl BenefitPlan {
+    /// Whether nothing was selected.
+    pub fn is_empty(&self) -> bool {
+        self.selected_regions.is_empty()
+    }
+}
+
+/// Evaluate `G_r` for every region and greedily select the best under `budget_bytes`.
+///
+/// Only regions with a strictly positive benefit are eligible, ranked by benefit
+/// (ties broken by region ordinal), so a region whose build cost is not amortised
+/// is never selected. The result is a pure function of its inputs.
+pub fn plan_benefits(
+    obs: &AccessObservation,
+    bytes_per_region: u64,
+    model: &BenefitModel,
+    budget_bytes: u64,
+) -> BenefitPlan {
+    let latent_saved = (model.l_current_ns - model.l_hot_ns).max(0.0);
+    let mut entries: Vec<RegionBenefit> = Vec::with_capacity(obs.counts.len());
+    for (r, &requests) in obs.counts.iter().enumerate() {
+        let len = obs.region_len(r);
+        let bytes = bytes_per_region.min(len).max(1);
+        let build_cost_ns = model.build_ns_per_byte * bytes as f64;
+        entries.push(RegionBenefit {
+            region: r as u64,
+            start: obs.region_start(r),
+            len,
+            requests,
+            latency_saved_ns: latent_saved,
+            build_cost_ns,
+            benefit: region_benefit(model, requests, bytes),
+            bytes,
+            selected: false,
+        });
+    }
+
+    let mut order: Vec<usize> = (0..entries.len())
+        .filter(|&i| entries[i].benefit > 0.0)
+        .collect();
+    order.sort_by(|&a, &b| {
+        entries[b]
+            .benefit
+            .partial_cmp(&entries[a].benefit)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+
+    let mut used = 0u64;
+    let mut selected = Vec::new();
+    for i in order {
+        if used.saturating_add(entries[i].bytes) <= budget_bytes {
+            used = used.saturating_add(entries[i].bytes);
+            entries[i].selected = true;
+            selected.push(entries[i].region);
+        }
+    }
+
+    BenefitPlan {
+        region_bytes: obs.region_bytes,
+        budget_bytes,
+        total_bytes: used,
+        entries,
+        selected_regions: selected,
+    }
+}
+
+/// Which regions are currently resident hot, tracked **separately** from the
+/// committed body: residency may change without deleting a committed
+/// manifestation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResidencyCache {
+    /// Region ordinals currently resident.
+    pub hot_regions: Vec<u64>,
+    /// Committed physical bytes at the time of the update.
+    pub resident_bytes: u64,
+}
+
+/// A certified, committed body plus its read plan, published atomically.
+///
+/// Construction is complete (plan built, structures certified) before the value is
+/// ever visible through a [`Publication`].
+pub struct PublishedBody {
+    body: EkbloomBody,
+    planner: Planner,
+    residency: ResidencyCache,
+    version: u64,
+}
+
+fn publication_plan_cfg() -> CourtConfig {
+    CourtConfig {
+        reps: 1,
+        interleave: false,
+        seed: 0x0B16_0000_0000_0001,
+    }
+}
+
+impl PublishedBody {
+    /// Build a published body (and its O(1) read plan) from a committed body.
+    pub fn new(body: EkbloomBody) -> Result<PublishedBody> {
+        let plan = AccessPlan::plan(&body, &publication_plan_cfg())?;
+        Ok(PublishedBody {
+            planner: Planner::new(plan),
+            body,
+            residency: ResidencyCache::default(),
+            version: 0,
+        })
+    }
+
+    fn with_residency(mut self, residency: ResidencyCache, version: u64) -> PublishedBody {
+        self.residency = residency;
+        self.version = version;
+        self
+    }
+
+    /// The committed body (append-only across generations).
+    #[inline]
+    pub fn body(&self) -> &EkbloomBody {
+        &self.body
+    }
+
+    /// The current cache residency (may change without touching committed bytes).
+    #[inline]
+    pub fn residency(&self) -> &ResidencyCache {
+        &self.residency
+    }
+
+    /// The committed generation.
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.body.generation
+    }
+
+    /// The publication version of this snapshot.
+    #[inline]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// The read plan.
+    #[inline]
+    pub fn plan(&self) -> &AccessPlan {
+        self.planner.plan()
+    }
+
+    /// Read through the pre-certified plan (no search, no lock).
+    #[inline]
+    pub fn read(&self, req: ReadRequest) -> Result<Vec<u8>> {
+        self.planner.read(&self.body, req)
+    }
+}
+
+/// An RCU-style publication cell holding the current [`PublishedBody`].
+///
+/// The lock guards only the pointer swap. A reader keeps its own `Arc` and reads
+/// it lock-free; it takes the *shared* lock at most once per generation change.
+pub struct Publication {
+    current: RwLock<Arc<PublishedBody>>,
+    version: AtomicU64,
+    reader_locks: AtomicU64,
+}
+
+impl Publication {
+    /// Wrap a committed body as an initial publication (version 0).
+    pub fn new(body: EkbloomBody) -> Result<Arc<Publication>> {
+        let published = PublishedBody::new(body)?;
+        Ok(Arc::new(Publication {
+            current: RwLock::new(Arc::new(published)),
+            version: AtomicU64::new(0),
+            reader_locks: AtomicU64::new(0),
+        }))
+    }
+
+    /// The current generation version.
+    #[inline]
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    /// Clone the current snapshot (takes the shared publication lock once).
+    #[inline]
+    pub fn load(&self) -> Arc<PublishedBody> {
+        self.reader_locks.fetch_add(1, Ordering::Relaxed);
+        let guard = self
+            .current
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&guard)
+    }
+
+    /// Number of shared-lock acquisitions taken by [`Publication::load`].
+    #[inline]
+    pub fn reader_lock_acquisitions(&self) -> u64 {
+        self.reader_locks.load(Ordering::Relaxed)
+    }
+
+    /// Publish a freshly built, certified body with a new cache residency.
+    ///
+    /// The new [`PublishedBody`] is fully constructed and planned *before* the
+    /// swap, so no partially built region is ever visible. Returns the new version.
+    pub fn publish(&self, body: EkbloomBody, residency: ResidencyCache) -> Result<u64> {
+        let version = self.version.load(Ordering::Acquire).saturating_add(1);
+        let published = Arc::new(PublishedBody::new(body)?.with_residency(residency, version));
+        {
+            let mut guard = self
+                .current
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = published;
+        }
+        self.version.store(version, Ordering::Release);
+        Ok(version)
+    }
+}
+
+/// A latency-critical reader over a [`Publication`].
+///
+/// It caches the current `Arc<PublishedBody>` and reads it with **no lock**.
+/// [`PlannerReader::refresh`] checks the version with one acquire load and only
+/// takes the shared publication lock when a new generation has appeared.
+pub struct PlannerReader {
+    publication: Arc<Publication>,
+    cached: Arc<PublishedBody>,
+    cached_version: u64,
+}
+
+impl PlannerReader {
+    /// Open a reader over `publication`, caching the current snapshot.
+    pub fn new(publication: Arc<Publication>) -> PlannerReader {
+        let cached = publication.load();
+        let cached_version = publication.version();
+        PlannerReader {
+            publication,
+            cached,
+            cached_version,
+        }
+    }
+
+    /// Adopt the newest published generation if one exists. When the generation is
+    /// unchanged this is a single atomic load and **no lock**.
+    #[inline]
+    pub fn refresh(&mut self) {
+        let version = self.publication.version();
+        if version != self.cached_version {
+            self.cached = self.publication.load();
+            self.cached_version = version;
+        }
+    }
+
+    /// Read through the cached certified plan (no lock, no search).
+    #[inline]
+    pub fn read(&self, req: ReadRequest) -> Result<Vec<u8>> {
+        self.cached.read(req)
+    }
+
+    /// The version of the cached snapshot.
+    #[inline]
+    pub fn cached_version(&self) -> u64 {
+        self.cached_version
+    }
+
+    /// The cached snapshot.
+    #[inline]
+    pub fn current(&self) -> &PublishedBody {
+        &self.cached
+    }
+}
+
+/// Configuration for the background planner thread.
+#[derive(Clone, Debug)]
+pub struct BackgroundPlannerConfig {
+    /// Sleep between planning epochs.
+    pub interval: Duration,
+    /// Planner/observer region size in bytes (power of two).
+    pub region_bytes: u64,
+    /// Tile size shift used when manifesting hot regions.
+    pub tile_shift: u8,
+    /// Directory kind used when manifesting hot tiles.
+    pub directory_kind: DirectoryKind,
+    /// Hard physical-byte budget for the manifested body.
+    pub budget: ManifestationBudget,
+    /// The benefit heuristic's model.
+    pub model: BenefitModel,
+    /// Stop after this many successful adaptations (`0` = unbounded).
+    pub max_adaptations: u64,
+}
+
+impl Default for BackgroundPlannerConfig {
+    fn default() -> BackgroundPlannerConfig {
+        BackgroundPlannerConfig {
+            interval: Duration::from_millis(25),
+            region_bytes: PLANNER_REGION_BYTES,
+            tile_shift: 12,
+            directory_kind: DirectoryKind::TwoLevelRadix,
+            budget: ManifestationBudget {
+                maximum_physical_bytes: u64::MAX,
+            },
+            model: BenefitModel::measured_default(),
+            max_adaptations: 0,
+        }
+    }
+}
+
+/// Cumulative planner statistics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlannerStats {
+    /// Planning epochs run.
+    pub epochs: u64,
+    /// Successful adaptations (new certified generations published).
+    pub adaptations: u64,
+    /// Manifested bytes spent across all adaptations.
+    pub bytes_spent: u64,
+    /// Tiles materialised across all adaptations.
+    pub regions_manifested: u64,
+    /// Adaptations skipped because certification failed.
+    pub certifications_failed: u64,
+}
+
+#[derive(Default)]
+struct PlannerStatsInner {
+    epochs: AtomicU64,
+    adaptations: AtomicU64,
+    bytes_spent: AtomicU64,
+    regions_manifested: AtomicU64,
+    certifications_failed: AtomicU64,
+}
+
+impl PlannerStatsInner {
+    fn snapshot(&self) -> PlannerStats {
+        PlannerStats {
+            epochs: self.epochs.load(Ordering::Relaxed),
+            adaptations: self.adaptations.load(Ordering::Relaxed),
+            bytes_spent: self.bytes_spent.load(Ordering::Relaxed),
+            regions_manifested: self.regions_manifested.load(Ordering::Relaxed),
+            certifications_failed: self.certifications_failed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A background planner thread.
+///
+/// Each epoch it snapshots the observation, evaluates the benefit heuristic,
+/// manifests the selected regions into a **clone** of the committed body (so
+/// committed history is never modified), certifies the result, and publishes it
+/// atomically. Publication is additive: a committed manifestation is never
+/// deleted, and residency is tracked separately.
+pub struct BackgroundPlanner {
+    stop: Arc<AtomicBool>,
+    inner: Arc<PlannerStatsInner>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BackgroundPlanner {
+    /// Spawn the planner over `publication`, reading observations from `observer`.
+    pub fn spawn(
+        publication: Arc<Publication>,
+        observer: Arc<AccessObserver>,
+        cfg: BackgroundPlannerConfig,
+    ) -> BackgroundPlanner {
+        let stop = Arc::new(AtomicBool::new(false));
+        let inner = Arc::new(PlannerStatsInner::default());
+        let stop_thread = Arc::clone(&stop);
+        let inner_thread = Arc::clone(&inner);
+        let join = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                std::thread::sleep(cfg.interval);
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                inner_thread.epochs.fetch_add(1, Ordering::Relaxed);
+
+                let obs = observer.snapshot();
+                if obs.counts.is_empty() {
+                    continue;
+                }
+                let committed = publication.load();
+                let headroom = cfg
+                    .budget
+                    .maximum_physical_bytes
+                    .saturating_sub(committed.body().physical_bytes());
+                let plan = plan_benefits(&obs, cfg.region_bytes, &cfg.model, headroom);
+                if plan.is_empty() {
+                    continue;
+                }
+
+                // Only manifest regions that are not already resident hot: this is
+                // the "incremental physical bytes" the heuristic compares against.
+                let current_plan = committed.plan();
+                let selected: Vec<u64> = plan
+                    .selected_regions
+                    .iter()
+                    .copied()
+                    .filter(|&r| {
+                        let start = plan.entries[r as usize].start;
+                        current_plan.path_for(start) != AccessPath::HotBytes
+                    })
+                    .collect();
+                if selected.is_empty() {
+                    continue;
+                }
+
+                let mut regions = Vec::with_capacity(selected.len());
+                let mut counts = Vec::with_capacity(selected.len());
+                for &r in &selected {
+                    let entry = &plan.entries[r as usize];
+                    regions.push((entry.start, entry.len));
+                    counts.push(entry.requests);
+                }
+                let trace = AccessTrace { regions, counts };
+
+                // Build from the *committed* body; additive only.
+                let mut candidate = committed.body().clone();
+                let before = candidate.physical_bytes();
+                match TileSet::manifest_hot_tiles(
+                    &mut candidate,
+                    &trace,
+                    cfg.tile_shift,
+                    cfg.directory_kind,
+                    &cfg.budget,
+                ) {
+                    Ok(report) if report.certified && report.tiles_selected > 0 => {
+                        // Non-withdrawal: the candidate is a superset of the committed
+                        // body; assert the committed bytes were only added to.
+                        debug_assert!(candidate.physical_bytes() >= before);
+                        inner_thread.adaptations.fetch_add(1, Ordering::Relaxed);
+                        inner_thread
+                            .bytes_spent
+                            .fetch_add(report.added_physical_bytes, Ordering::Relaxed);
+                        inner_thread
+                            .regions_manifested
+                            .fetch_add(report.tiles_selected, Ordering::Relaxed);
+                        let residency = ResidencyCache {
+                            hot_regions: selected.clone(),
+                            resident_bytes: candidate.physical_bytes(),
+                        };
+                        let _ = publication.publish(candidate, residency);
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        inner_thread
+                            .certifications_failed
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                let done = inner_thread.adaptations.load(Ordering::Relaxed);
+                if cfg.max_adaptations != 0 && done >= cfg.max_adaptations {
+                    break;
+                }
+            }
+        });
+        BackgroundPlanner {
+            stop,
+            inner,
+            join: Some(join),
+        }
+    }
+
+    /// Signal the planner to stop and join it.
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+
+    /// A snapshot of the planner's cumulative statistics.
+    pub fn stats(&self) -> PlannerStats {
+        self.inner.snapshot()
+    }
+
+    /// The shared stop flag (for external coordination).
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
+    }
+}
+
+impl Drop for BackgroundPlanner {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }

@@ -366,6 +366,161 @@ unsafe fn gather_bytes_avx512_impl(hot: &[u8], offsets: &[u64], out: &mut Vec<u8
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// NL2 reconstruction windows (directive §6): vector across independent windows.
+// ---------------------------------------------------------------------------
+//
+// A single `OrANS-NL2` restart window is a *serial* dependent chain: symbol `s_i`
+// depends on `s_{i-1}` and `s_{i-2}`, so there is no intra-window vectorisation.
+// The available parallelism is **across independent windows**: one 16-bit lane per
+// window, sixteen windows per AVX2 register (or eight per SSE register). The
+// per-step map `s = S(h) ^ l ^ r` is reused exactly as written, with `S` in its
+// `GF(2)`-linear form `h ^ (h<<1) ^ (h<<3)` so it lowers to shifts and XORs.
+
+/// Number of 16-bit NL2 restart windows reconstructed per AVX2 register.
+pub const NL2_WINDOW_LANES: usize = 16;
+
+/// One `OrANS-NL2` step: reveal `r` from state `x`, returning `(symbol, next)`.
+///
+/// This is the exact §1 step with `S` inlined (`S(v) = v ^ (v<<1) ^ (v<<3)`),
+/// which is also what makes the step vectorisable across windows.
+#[inline(always)]
+pub fn nl2_step(x: u16, r: u8) -> (u8, u16) {
+    let h = (x >> 8) as u8;
+    let l = (x & 0xFF) as u8;
+    let s = (h ^ (h << 1) ^ (h << 3)) ^ l ^ r;
+    (s, (u16::from(l) << 8) | u16::from(s))
+}
+
+/// Whether the AVX2 NL2 window kernel is usable on this machine.
+pub fn nl2_windows_avx2_available() -> bool {
+    avx2_available()
+}
+
+/// Validate a batched window layout: `cols`/`out` hold `windows * window_len`
+/// step-major bytes.
+fn validate_windows(
+    windows: usize,
+    cols_len: usize,
+    window_len: usize,
+    out_len: usize,
+) -> Result<()> {
+    let expected = windows
+        .checked_mul(window_len)
+        .ok_or(EkbloomError::Overflow {
+            what: "window batch length",
+        })?;
+    if cols_len != expected || out_len != expected {
+        return Err(EkbloomError::InvalidArgument {
+            what: format!("window batch expects {expected} bytes (cols={cols_len}, out={out_len})"),
+        });
+    }
+    Ok(())
+}
+
+/// Reconstruct `window_len` symbols for each of exactly [`NL2_WINDOW_LANES`]
+/// independent windows, using AVX2 when available and a scalar reference
+/// otherwise.
+///
+/// `cols` and `out` use the same step-major layout: byte `i` of lane `k` is
+/// `cols[i * 16 + k]`. `states` holds each window's 16-bit start state (mutated
+/// in place to the end state). Byte-for-byte identical to the scalar reference
+/// for every input, and identical to the scalar fallback when AVX2 is absent.
+pub fn nl2_windows16_avx2(
+    states: &mut [u16],
+    cols: &[u8],
+    window_len: usize,
+    out: &mut [u8],
+) -> Result<()> {
+    if states.len() != NL2_WINDOW_LANES {
+        return Err(EkbloomError::InvalidArgument {
+            what: format!(
+                "nl2_windows16_avx2 expects {} states, got {}",
+                NL2_WINDOW_LANES,
+                states.len()
+            ),
+        });
+    }
+    validate_windows(states.len(), cols.len(), window_len, out.len())?;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2_available() {
+            let mut xs = [0u16; NL2_WINDOW_LANES];
+            xs.copy_from_slice(states);
+            // SAFETY: `avx2_available()` proved AVX2 is present at runtime and the
+            // callee is `#[target_feature(enable = "avx2")]`; `validate_windows`
+            // proved `cols`/`out` are exactly `window_len * 16` bytes, so every
+            // unaligned 128/256-bit load and store stays in bounds; `xs` is a fixed
+            // 16-element array loaded/stored as one 256-bit value.
+            unsafe { nl2_windows16_avx2_impl(&mut xs, cols, window_len, out) };
+            states.copy_from_slice(&xs);
+            return Ok(());
+        }
+    }
+
+    // Scalar reference with the identical step-major layout (equal residency).
+    for i in 0..window_len {
+        let base = i * NL2_WINDOW_LANES;
+        for k in 0..NL2_WINDOW_LANES {
+            let (s, next) = nl2_step(states[k], cols[base + k]);
+            states[k] = next;
+            out[base + k] = s;
+        }
+    }
+    Ok(())
+}
+
+/// AVX2 implementation of [`nl2_windows16_avx2`].
+///
+/// # Safety
+///
+/// The caller must ensure AVX2 is available at runtime (checked in
+/// `nl2_windows16_avx2`) and that `cols`/`out` are exactly `window_len * 16`
+/// bytes. Under those preconditions every unaligned load/store is in bounds.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn nl2_windows16_avx2_impl(
+    states: &mut [u16; NL2_WINDOW_LANES],
+    cols: &[u8],
+    window_len: usize,
+    out: &mut [u8],
+) {
+    use std::arch::x86_64::*;
+
+    let mask = _mm256_set1_epi16(0xFF);
+    let mut x = _mm256_loadu_si256(states.as_ptr() as *const __m256i);
+    for i in 0..window_len {
+        let base = i * NL2_WINDOW_LANES;
+        // SAFETY (per the function contract): `base + 16 <= cols.len()` because
+        // `cols.len() == window_len * 16`; a 16-byte unaligned load cannot fault.
+        let r8 = _mm_loadu_si128(cols.as_ptr().add(base) as *const __m128i);
+        let r = _mm256_cvtepu8_epi16(r8);
+
+        let h = _mm256_srli_epi16::<8>(x);
+        let l = _mm256_and_si256(x, mask);
+        // S(h) = h ^ (h<<1) ^ (h<<3), masked back to 8 bits per lane.
+        let sbox = _mm256_xor_si256(
+            _mm256_xor_si256(h, _mm256_slli_epi16::<1>(h)),
+            _mm256_slli_epi16::<3>(h),
+        );
+        let sbox = _mm256_and_si256(sbox, mask);
+        let s = _mm256_xor_si256(_mm256_xor_si256(sbox, l), r);
+        x = _mm256_or_si256(_mm256_slli_epi16::<8>(l), s);
+
+        // Compact the sixteen 16-bit symbols to sixteen bytes: packus halves each
+        // 128-bit lane, then interleave the two lanes' low quads.
+        let packed = _mm256_packus_epi16(s, s);
+        let compact = _mm_unpacklo_epi64(
+            _mm256_castsi256_si128(packed),
+            _mm256_extracti128_si256::<1>(packed),
+        );
+        // SAFETY (per the function contract): `base + 16 <= out.len()`.
+        _mm_storeu_si128(out.as_mut_ptr().add(base) as *mut __m128i, compact);
+    }
+    _mm256_storeu_si256(states.as_mut_ptr() as *mut __m256i, x);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,5 +588,69 @@ mod tests {
             assert!(want.is_empty() && got.is_empty());
             assert_eq!(err_scalar.to_string(), err_avx2.to_string());
         }
+    }
+
+    /// Scalar reference with the same step-major layout as the vector kernel.
+    fn windows_scalar(states: &mut [u16], cols: &[u8], window_len: usize, out: &mut [u8]) {
+        for i in 0..window_len {
+            let base = i * NL2_WINDOW_LANES;
+            for k in 0..NL2_WINDOW_LANES {
+                let (s, next) = nl2_step(states[k], cols[base + k]);
+                states[k] = next;
+                out[base + k] = s;
+            }
+        }
+    }
+
+    #[test]
+    fn nl2_window_kernel_matches_scalar_and_machine() {
+        for len in [1usize, 2, 3, 7, 16, 17, 32, 64, 100] {
+            let mut s = 0x9E37_79B9_7F4A_7C15u64;
+            let mut states = [0u16; NL2_WINDOW_LANES];
+            for x in states.iter_mut() {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *x = (s >> 33) as u16;
+            }
+            let cols: Vec<u8> = (0..len * NL2_WINDOW_LANES)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (s >> 33) as u8
+                })
+                .collect();
+
+            let mut want = vec![0u8; len * NL2_WINDOW_LANES];
+            let mut want_states = states;
+            windows_scalar(&mut want_states, &cols, len, &mut want);
+
+            let mut got = vec![0u8; len * NL2_WINDOW_LANES];
+            let mut got_states = states;
+            nl2_windows16_avx2(&mut got_states, &cols, len, &mut got).unwrap();
+            assert_eq!(got, want, "len {len}");
+            assert_eq!(got_states, want_states, "end states len {len}");
+
+            // And against the authoritative authority step-by-step.
+            for k in 0..NL2_WINDOW_LANES {
+                let mut x = states[k];
+                for i in 0..len {
+                    let (s, next) = nl2_step(x, cols[i * NL2_WINDOW_LANES + k]);
+                    assert_eq!(got[i * NL2_WINDOW_LANES + k], s);
+                    x = next;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nl2_window_kernel_rejects_bad_shapes() {
+        let mut states = [0u16; NL2_WINDOW_LANES];
+        let cols = [0u8; 32];
+        let mut out = [0u8; 32];
+        assert!(nl2_windows16_avx2(&mut states, &cols, 3, &mut out).is_err());
+        let mut short = [0u16; NL2_WINDOW_LANES - 1];
+        assert!(nl2_windows16_avx2(&mut short, &cols, 2, &mut out).is_err());
     }
 }
