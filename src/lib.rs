@@ -24,6 +24,7 @@ pub mod adapt;
 #[cfg(feature = "io-uring")]
 pub mod async_io;
 pub mod asyncpub;
+pub mod baseline;
 pub mod bloom;
 pub mod bloom_context;
 pub mod bloom_global;
@@ -57,6 +58,10 @@ pub use adapt::{
     WorkloadKind,
 };
 pub use asyncpub::{append, detect_backend, publish, Backend};
+pub use baseline::{
+    measure_baseline, measure_body, write_baselines_json, Baseline, BaselineKind, BaselinePoint,
+    BaselineReport, Capabilities, DEFAULT_INDEX_BLOCK,
+};
 pub use bloom::{Bloom4Resume, BloomKind, BloomShell, Certificate, Certification, Outcome};
 pub use bloom_context::ContextBloom;
 pub use bloom_global::{Counterexample, GlobalBloom, GlobalCertification};

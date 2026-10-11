@@ -1,0 +1,135 @@
+{
+  "cpu": { "sse2": true, "avx2": true, "avx512f": true },
+  "source_len": 1048576,
+  "source_seed": 16938038201667162113,
+  "iterations": 64,
+  "sweep_seed": 11400714819323198485,
+  "points": [
+    {
+      "name": "raw-vec",
+      "class": "baseline",
+      "physical_bytes": 1048576,
+      "construction_ns": 128260,
+      "seq_bytes_per_s": 67962954448.6,
+      "random_1b_ns_p50": 30.0,
+      "random_1b_ns_p99": 40.0,
+      "random_4k_ns_p50": 60.0,
+      "samples": 256,
+      "retained_capabilities": {
+        "verifiable_encoded_history": false,
+        "exact_checkpoint_restart": false,
+        "per_position_state": false,
+        "adaptive_shells": false,
+        "concealment": false
+      }
+    },
+    {
+      "name": "raw-file",
+      "class": "baseline",
+      "physical_bytes": 1048576,
+      "construction_ns": 150851,
+      "seq_bytes_per_s": 41984131969.2,
+      "random_1b_ns_p50": 120.0,
+      "random_1b_ns_p99": 141.0,
+      "random_4k_ns_p50": 181.0,
+      "samples": 256,
+      "retained_capabilities": {
+        "verifiable_encoded_history": false,
+        "exact_checkpoint_restart": false,
+        "per_position_state": false,
+        "adaptive_shells": false,
+        "concealment": false
+      }
+    },
+    {
+      "name": "predecoded",
+      "class": "baseline",
+      "physical_bytes": 1048576,
+      "construction_ns": 29385,
+      "seq_bytes_per_s": 64787339271.9,
+      "random_1b_ns_p50": 30.0,
+      "random_1b_ns_p99": 31.0,
+      "random_4k_ns_p50": 60.0,
+      "samples": 256,
+      "retained_capabilities": {
+        "verifiable_encoded_history": false,
+        "exact_checkpoint_restart": false,
+        "per_position_state": false,
+        "adaptive_shells": false,
+        "concealment": false
+      }
+    },
+    {
+      "name": "indexed-array",
+      "class": "baseline",
+      "physical_bytes": 1050624,
+      "construction_ns": 83176,
+      "seq_bytes_per_s": 66788546132.7,
+      "random_1b_ns_p50": 30.0,
+      "random_1b_ns_p99": 31.0,
+      "random_4k_ns_p50": 60.0,
+      "samples": 256,
+      "retained_capabilities": {
+        "verifiable_encoded_history": false,
+        "exact_checkpoint_restart": false,
+        "per_position_state": false,
+        "adaptive_shells": false,
+        "concealment": false
+      }
+    },
+    {
+      "name": "ekbloom Root",
+      "class": "ekbloom",
+      "physical_bytes": 1048576,
+      "construction_ns": 964190,
+      "seq_bytes_per_s": 594909528.9,
+      "random_1b_ns_p50": 948400.0,
+      "random_1b_ns_p99": 1668103.0,
+      "random_4k_ns_p50": 927371.0,
+      "samples": 256,
+      "retained_capabilities": {
+        "verifiable_encoded_history": true,
+        "exact_checkpoint_restart": false,
+        "per_position_state": false,
+        "adaptive_shells": false,
+        "concealment": false
+      }
+    },
+    {
+      "name": "ekbloom Path{D=4}",
+      "class": "ekbloom",
+      "physical_bytes": 3145963,
+      "construction_ns": 6002304,
+      "seq_bytes_per_s": 72528403926.6,
+      "random_1b_ns_p50": 30.0,
+      "random_1b_ns_p99": 40.0,
+      "random_4k_ns_p50": 60.0,
+      "samples": 256,
+      "retained_capabilities": {
+        "verifiable_encoded_history": true,
+        "exact_checkpoint_restart": false,
+        "per_position_state": false,
+        "adaptive_shells": true,
+        "concealment": true
+      }
+    },
+    {
+      "name": "ekbloom Full",
+      "class": "ekbloom",
+      "physical_bytes": 5242884,
+      "construction_ns": 2954806,
+      "seq_bytes_per_s": 634519180.3,
+      "random_1b_ns_p50": 50.0,
+      "random_1b_ns_p99": 60.0,
+      "random_4k_ns_p50": 5581.0,
+      "samples": 256,
+      "retained_capabilities": {
+        "verifiable_encoded_history": true,
+        "exact_checkpoint_restart": false,
+        "per_position_state": true,
+        "adaptive_shells": true,
+        "concealment": true
+      }
+    }
+  ]
+}
