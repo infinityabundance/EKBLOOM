@@ -410,6 +410,35 @@ impl TileSet {
         self.data.get(off..end)
     }
 
+    /// The contiguous decoded output surface, present exactly when this tile set
+    /// materialises the **whole** object: every tile slot is present, so the tile
+    /// blob is the authoritative decode laid out in logical order (`data[i] ==
+    /// s_i`). This is the branch-lean hot index — a fully resident read becomes a
+    /// single slice copy with no directory arithmetic, approaching a raw
+    /// `Vec<u8>` index.
+    #[inline]
+    pub fn hot_surface(&self) -> Option<&[u8]> {
+        if self.present == self.directory.tiles()
+            && !self.data.is_empty()
+            && self.data.len() as u64 == self.logical_len
+        {
+            Some(&self.data)
+        } else {
+            None
+        }
+    }
+
+    /// Serve `[offset, offset + len)` directly from the resident output surface
+    /// when the whole object is materialised, or `None` otherwise (the caller
+    /// falls back to [`TileSet::read_bounded`]).
+    #[inline]
+    pub fn read_hot(&self, offset: u64, len: u64) -> Option<&[u8]> {
+        let surf = self.hot_surface()?;
+        let a = usize::try_from(offset).ok()?;
+        let b = a.checked_add(usize::try_from(len).ok()?)?;
+        surf.get(a..b)
+    }
+
     /// Byte-exact read of `[offset, offset + len)`.
     ///
     /// Materialised tile fragments are copied directly; a fragment whose tile is
@@ -449,6 +478,21 @@ impl TileSet {
         }
         if len == 0 {
             return Ok(Vec::new());
+        }
+        // Branch-lean resident path: a fully-materialised set exposes the whole
+        // decoded output as one contiguous surface, so the read is one slice copy
+        // with no directory arithmetic and no machine work.
+        if let Some(surf) = self.hot_surface() {
+            let a = usize::try_from(offset).map_err(|_| oob(offset, len, self.logical_len))?;
+            let b = a
+                .checked_add(usize::try_from(len).map_err(|_| oob(offset, len, self.logical_len))?)
+                .ok_or(EkbloomError::Overflow {
+                    what: "tile read range",
+                })?;
+            let slice = surf
+                .get(a..b)
+                .ok_or_else(|| oob(offset, len, self.logical_len))?;
+            return Ok(slice.to_vec());
         }
         let machine = machine_by_id(self.machine_id).ok_or(EkbloomError::UnknownMachine {
             id: self.machine_id,

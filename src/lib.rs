@@ -34,6 +34,7 @@ pub mod bloom_path;
 pub mod bloom_region;
 pub mod checkpoint;
 pub mod court;
+pub mod engine;
 pub mod error;
 pub mod fastpath;
 pub mod filesystem;
@@ -71,7 +72,7 @@ pub use adapt::{
 pub use asyncpub::{append, detect_backend, publish, Backend};
 pub use baseline::{
     measure_baseline, measure_body, write_baselines_json, Baseline, BaselineKind, BaselinePoint,
-    BaselineReport, Capabilities, DEFAULT_INDEX_BLOCK, DEFAULT_LRU_BLOCK,
+    BaselineReport, Capabilities, HotBlockCache, DEFAULT_INDEX_BLOCK, DEFAULT_LRU_BLOCK,
 };
 pub use blocks::{
     parse_block_index_prefix, BlockIndex, BlockIndexPrefix, BLOCK_INDEX_MAGIC,
@@ -86,7 +87,13 @@ pub use checkpoint::CheckpointSet;
 pub use court::Workload as CourtWorkload;
 pub use court::{
     calibrate_clock_ghz, collect_environment, default_working_sets, lcg_bytes, loop_overhead_ns,
-    write_court_json, Candidate, Court, CourtConfig, CourtEnv, CourtReport, Dist, ParetoPoint, Row,
+    spread_offsets, write_court_json, Candidate, Court, CourtConfig, CourtEnv, CourtReport, Dist,
+    ParetoPoint, Row,
+};
+pub use engine::{
+    AccessPlan as EngineAccessPlan, BoundedEngine, Engine, Path as EnginePath,
+    RegionPath as EngineRegionPath, StructureRef, ENGINE_REGION_BYTES, MAX_ENGINE_REGION_BYTES,
+    MIN_ENGINE_REGION_BYTES,
 };
 pub use error::{EkbloomError, Result};
 pub use fastpath::{

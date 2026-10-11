@@ -41,6 +41,12 @@ fuse = ["dep:fuser"]
 proptest = "1.5"
 divan = "0.1"
 
+# Competitor codecs, used ONLY for measurement (examples/tests/benches). They are
+# never part of the shipped `ekbloom` codec: the library itself depends on them
+# nowhere. `lz4_flex` is pure Rust; `zstd` links the bundled C library via `cc`.
+lz4_flex = "0.11"
+zstd = "0.13"
+
 # Loom model-checking, enabled only by `RUSTFLAGS="--cfg loom"`. This is a
 # *target-gated normal dependency*, not a dev-dependency: `src/filesystem.rs`
 # itself selects `loom::sync::Mutex` under `#[cfg(loom)]` so the real `OrFs`

@@ -1,0 +1,848 @@
+//! Unified bounded-access engine — **one** certified read planner over **all**
+//! manifested structures.
+//!
+//! The [`crate::planner`] module introduced a per-region certified dispatch over
+//! the structures it knew about. This module generalises that into a single
+//! bounded-access engine with an explicit, honest contract:
+//!
+//! * [`Engine::plan`] is the **offline** step. It partitions the logical space
+//!   into power-of-two regions and, for each region, chooses the cheapest
+//!   **certified bounded** path among the five available classes:
+//!
+//!   | [`Path`] | structure | positional bound |
+//!   |---|---|---|
+//!   | [`Path::HotTile`] | a persisted exact [`crate::tiles::TileSet`] covering the region | `0` |
+//!   | [`Path::DirectStorage`] | a certified whole-object path bloom's `hot` output surface | `0` |
+//!   | [`Path::PackedRestart`] | a checkpoint set (`K`-bounded replay) | `K - 1` |
+//!   | [`Path::BlockRestart`] | a block index (fixed-size block restart) | `B - 1` |
+//!   | [`Path::AffineSummary`] | the full state history (O(1) position state) | `0` |
+//!
+//! * [`Engine::read`] is the **latency-critical** step: a single shift, a flat
+//!   index and one `match` — **no search, no lock, no per-read planning**. Every
+//!   byte it returns is byte-for-byte identical to [`crate::reader::read`], on
+//!   both machines.
+//!
+//! * [`Engine::worst_case_steps`] is the **explicit guarantee**: the maximum
+//!   number of machine steps needed to *position* at any logical offset (the
+//!   skip/replay), independent of the requested length. Because the engine only
+//!   ever selects paths whose positioning is bounded by a structure parameter
+//!   (`K - 1`, `B - 1`, or `0`), a cold read at any offset is never `O(prefix)`.
+//!   If no certified bounded path can cover some region, [`Engine::plan`] fails
+//!   rather than silently falling back to an unbounded genesis replay.
+//!
+//! # Budget
+//!
+//! The [`ManifestationBudget`] is a **strict cap on the retained bytes the plan
+//! relies on** (the authoritative core plus the distinct structures it
+//! references). Planning is **transactional**: it either returns a plan whose
+//! retained footprint is within budget, or it returns an error and no engine —
+//! there is no partial or over-budget plan. Under a tight budget the engine
+//! admits cheaper structures first and drops expensive ones it cannot retain.
+
+use std::sync::Arc;
+
+use crate::adapt::Workload;
+use crate::bloom::{BloomKind, Certification};
+use crate::error::{EkbloomError, Result};
+use crate::machine::{machine_by_id, MACHINE_NL2};
+use crate::manifest::EkbloomBody;
+use crate::planner::CostModel;
+use crate::tiles::TileSet;
+use crate::{ManifestationBudget, ReadRequest};
+
+/// Default engine region size (bytes): one region per 4 KiB read, so the common
+/// read is served by exactly one path with no loop.
+pub const ENGINE_REGION_BYTES: u64 = 4096;
+/// Smallest accepted engine region size.
+pub const MIN_ENGINE_REGION_BYTES: u64 = 4096;
+/// Largest accepted engine region size.
+pub const MAX_ENGINE_REGION_BYTES: u64 = 1 << 20;
+
+/// The classes of certified bounded access path the engine chooses between.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Path {
+    /// A persisted exact byte tile set fully covering the region.
+    HotTile,
+    /// A checkpoint restart with `K`-bounded machine replay.
+    PackedRestart,
+    /// An independently restartable block index (bounded positional replay).
+    BlockRestart,
+    /// The full state history: an O(1) per-position state (machine 1).
+    AffineSummary,
+    /// A direct output surface stored whole in the body (a certified path bloom).
+    DirectStorage,
+}
+
+impl Path {
+    /// Stable, human-readable label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Path::HotTile => "hot-tile",
+            Path::PackedRestart => "packed-restart",
+            Path::BlockRestart => "block-restart",
+            Path::AffineSummary => "affine-summary",
+            Path::DirectStorage => "direct-storage",
+        }
+    }
+
+    /// Deterministic preference order for equal-cost ties.
+    fn rank(self) -> u8 {
+        match self {
+            Path::HotTile => 0,
+            Path::DirectStorage => 1,
+            Path::BlockRestart => 2,
+            Path::PackedRestart => 3,
+            Path::AffineSummary => 4,
+        }
+    }
+}
+
+/// A reference to the certified structure that justifies a region's path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StructureRef {
+    /// Index into `body.blooms` of the certified whole-object path bloom.
+    PathBloom(usize),
+    /// Index into `body.tiles` of the region-covering tile set.
+    TileSet(usize),
+    /// Index into `body.checkpoints` of the restart set.
+    Checkpoint(usize),
+    /// Index into `body.blocks` of the block-restart index.
+    BlockIndex(usize),
+    /// The complete state history.
+    History,
+}
+
+impl StructureRef {
+    /// Deterministic tie-break rank.
+    fn rank(self) -> u8 {
+        match self {
+            StructureRef::PathBloom(_) => 0,
+            StructureRef::TileSet(_) => 1,
+            StructureRef::BlockIndex(_) => 2,
+            StructureRef::Checkpoint(_) => 3,
+            StructureRef::History => 4,
+        }
+    }
+
+    /// Stable, human-readable label.
+    pub fn label(self) -> &'static str {
+        match self {
+            StructureRef::PathBloom(_) => "path-bloom",
+            StructureRef::TileSet(_) => "tile-set",
+            StructureRef::Checkpoint(_) => "checkpoint",
+            StructureRef::BlockIndex(_) => "block-index",
+            StructureRef::History => "history",
+        }
+    }
+}
+
+/// The planned disposition of one logical region.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegionPath {
+    /// First logical position of the region.
+    pub start: u64,
+    /// One past the last logical position of the region.
+    pub end: u64,
+    /// The chosen (cheapest certified bounded) path.
+    pub path: Path,
+    /// Expected cost in nanoseconds for a region-sized request.
+    pub expected_cost_ns: f64,
+    /// Worst-case machine steps to *position* at any offset in the region.
+    pub positional_steps: u64,
+    /// The certified structure backing the path.
+    pub structure: StructureRef,
+}
+
+/// An immutable, pre-certified access plan: one bounded [`Path`] per region,
+/// plus the worst-case positioning guarantee and the retained footprint.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccessPlan {
+    region_bytes: u64,
+    region_shift: u8,
+    logical_len: u64,
+    regions: Vec<RegionPath>,
+    worst_case_steps: u64,
+    retained_bytes: u64,
+    budget_bytes: u64,
+    structures: Vec<StructureRef>,
+}
+
+impl AccessPlan {
+    /// The chosen path for the region containing `offset` — one shift and a flat
+    /// index, i.e. `O(1)` with no search.
+    #[inline]
+    pub fn path_for(&self, offset: u64) -> Path {
+        self.region_at(offset).path
+    }
+
+    /// The certified structure backing `offset`'s region.
+    #[inline]
+    pub fn structure_for(&self, offset: u64) -> StructureRef {
+        self.region_at(offset).structure
+    }
+
+    /// The worst-case positioning work (machine steps) for any request.
+    #[inline]
+    pub fn worst_case_steps(&self) -> u64 {
+        self.worst_case_steps
+    }
+
+    /// The retained bytes the plan relies on (core plus referenced structures).
+    #[inline]
+    pub fn retained_bytes(&self) -> u64 {
+        self.retained_bytes
+    }
+
+    /// The budget ceiling the plan was built under.
+    #[inline]
+    pub fn budget_bytes(&self) -> u64 {
+        self.budget_bytes
+    }
+
+    /// The number of planned regions.
+    #[inline]
+    pub fn region_count(&self) -> usize {
+        self.regions.len()
+    }
+
+    /// The logical length the plan covers.
+    #[inline]
+    pub fn logical_len(&self) -> u64 {
+        self.logical_len
+    }
+
+    /// The region size in bytes (a power of two).
+    #[inline]
+    pub fn region_bytes(&self) -> u64 {
+        self.region_bytes
+    }
+
+    /// Every region plan, in offset order.
+    #[inline]
+    pub fn regions(&self) -> &[RegionPath] {
+        &self.regions
+    }
+
+    /// The distinct structures the plan references, in first-use order.
+    #[inline]
+    pub fn structures(&self) -> &[StructureRef] {
+        &self.structures
+    }
+
+    /// The region covering `offset`, saturating to the last region.
+    #[inline]
+    fn region_at(&self, offset: u64) -> &RegionPath {
+        let idx = if self.regions.is_empty() {
+            0
+        } else {
+            usize::try_from(offset >> self.region_shift)
+                .unwrap_or(usize::MAX)
+                .min(self.regions.len() - 1)
+        };
+        &self.regions[idx]
+    }
+
+    /// The chosen-path distribution, in fixed path order.
+    pub fn distribution(&self) -> Vec<(Path, usize)> {
+        const PATHS: [Path; 5] = [
+            Path::HotTile,
+            Path::PackedRestart,
+            Path::BlockRestart,
+            Path::AffineSummary,
+            Path::DirectStorage,
+        ];
+        let mut out = Vec::new();
+        for p in PATHS {
+            let count = self.regions.iter().filter(|r| r.path == p).count();
+            if count > 0 {
+                out.push((p, count));
+            }
+        }
+        out
+    }
+
+    /// Whether every region's path is backed by a certified structure. Because the
+    /// engine only admits certified structures, this is always `true`; it is
+    /// exposed so callers and tests can pin the invariant.
+    pub fn all_certified(&self) -> bool {
+        self.regions.iter().all(|r| match r.path {
+            Path::HotTile => matches!(r.structure, StructureRef::TileSet(_)),
+            Path::PackedRestart => matches!(r.structure, StructureRef::Checkpoint(_)),
+            Path::BlockRestart => matches!(r.structure, StructureRef::BlockIndex(_)),
+            Path::AffineSummary => matches!(r.structure, StructureRef::History),
+            Path::DirectStorage => matches!(r.structure, StructureRef::PathBloom(_)),
+        })
+    }
+}
+
+/// The unified bounded-access engine: an immutable [`AccessPlan`] behind an
+/// `Arc`, served with no search and no lock.
+#[derive(Clone)]
+pub struct Engine {
+    plan: Arc<AccessPlan>,
+}
+
+/// The engine is the *bounded* engine; this alias is provided for callers that
+/// prefer the descriptive name.
+pub type BoundedEngine = Engine;
+
+/// One admitted candidate structure with its bounded cost.
+#[derive(Clone, Copy, Debug)]
+struct Candidate {
+    structure: StructureRef,
+    path: Path,
+    steps: u64,
+    bytes: u64,
+}
+
+impl Engine {
+    /// **Offline**: choose the cheapest certified bounded path per region under a
+    /// strict physical budget, directed by `workload` (region size).
+    pub fn plan(
+        body: &EkbloomBody,
+        budget: &ManifestationBudget,
+        workload: &Workload,
+    ) -> Result<Engine> {
+        Self::plan_with(
+            body,
+            budget,
+            region_bytes_for(workload),
+            CostModel::measured_default(),
+        )
+    }
+
+    /// [`Engine::plan`] with an explicit region size (power of two) and cost model,
+    /// used by tests and by callers with a calibrated model.
+    pub fn plan_with(
+        body: &EkbloomBody,
+        budget: &ManifestationBudget,
+        region_bytes: u64,
+        model: CostModel,
+    ) -> Result<Engine> {
+        if region_bytes == 0 || !region_bytes.is_power_of_two() {
+            return Err(EkbloomError::InvalidArgument {
+                what: format!("engine region_bytes {region_bytes} must be a non-zero power of two"),
+            });
+        }
+        let region_shift = region_bytes.trailing_zeros() as u8;
+        let n = body.logical_len;
+        let core_bytes = body.core.len() as u64;
+        let budget_bytes = budget.maximum_physical_bytes;
+
+        if n == 0 {
+            return Ok(Engine {
+                plan: Arc::new(AccessPlan {
+                    region_bytes,
+                    region_shift,
+                    logical_len: 0,
+                    regions: Vec::new(),
+                    worst_case_steps: 0,
+                    retained_bytes: core_bytes,
+                    budget_bytes,
+                    structures: Vec::new(),
+                }),
+            });
+        }
+
+        // Admission: cheapest-by-bytes first, up to the allowance left after the
+        // always-retained core. This is the strict, transactional budget step.
+        let mut candidates = enumerate(body);
+        candidates.sort_by(|a, b| {
+            a.bytes
+                .cmp(&b.bytes)
+                .then(a.steps.cmp(&b.steps))
+                .then(a.path.rank().cmp(&b.path.rank()))
+                .then(a.structure.rank().cmp(&b.structure.rank()))
+        });
+        let allowance = budget_bytes.saturating_sub(core_bytes);
+        let mut admitted: Vec<Candidate> = Vec::new();
+        let mut admitted_bytes = 0u64;
+        for c in candidates {
+            if admitted_bytes.saturating_add(c.bytes) <= allowance {
+                admitted_bytes = admitted_bytes.saturating_add(c.bytes);
+                admitted.push(c);
+            }
+        }
+
+        let region_count = n.div_ceil(region_bytes);
+        let mut regions: Vec<RegionPath> = Vec::new();
+        let mut worst = 0u64;
+        let mut used: Vec<StructureRef> = Vec::new();
+        let mut retained = core_bytes;
+        for r in 0..region_count {
+            let start = r.saturating_mul(region_bytes);
+            let end = start.saturating_add(region_bytes).min(n);
+            let len = end.saturating_sub(start);
+
+            let mut best: Option<(Candidate, f64)> = None;
+            for c in &admitted {
+                if !covers(body, c.structure, start, end) {
+                    continue;
+                }
+                let cost = path_cost(&model, c.path, c.steps, len);
+                let take = match &best {
+                    Some((bc, bcost)) => {
+                        cost < *bcost
+                            || (cost == *bcost
+                                && (c.steps, c.path.rank(), c.structure.rank())
+                                    < (bc.steps, bc.path.rank(), bc.structure.rank()))
+                    }
+                    None => true,
+                };
+                if take {
+                    best = Some((*c, cost));
+                }
+            }
+
+            let Some((c, cost)) = best else {
+                return Err(EkbloomError::InvalidArgument {
+                    what: format!(
+                        "no certified bounded path covers region [{start}, {end}) within the \
+                         {budget_bytes}-byte budget (core {core_bytes} B); manifest a bounded \
+                         structure or raise the budget"
+                    ),
+                });
+            };
+            if !used.contains(&c.structure) {
+                used.push(c.structure);
+                retained = retained.saturating_add(c.bytes);
+            }
+            worst = worst.max(c.steps);
+            regions.push(RegionPath {
+                start,
+                end,
+                path: c.path,
+                expected_cost_ns: cost,
+                positional_steps: c.steps,
+                structure: c.structure,
+            });
+        }
+
+        Ok(Engine {
+            plan: Arc::new(AccessPlan {
+                region_bytes,
+                region_shift,
+                logical_len: n,
+                regions,
+                worst_case_steps: worst,
+                retained_bytes: retained,
+                budget_bytes,
+                structures: used,
+            }),
+        })
+    }
+
+    /// Wrap an already-built plan (e.g. reconstructed from a persisted body).
+    pub fn from_plan(plan: AccessPlan) -> Engine {
+        Engine {
+            plan: Arc::new(plan),
+        }
+    }
+
+    /// **Latency-critical**: dispatch `req` to the pre-certified path — no search,
+    /// no lock. Bounds and overflow semantics match [`crate::reader::read`], and
+    /// the bytes are byte-for-byte identical to it on both machines.
+    #[inline]
+    pub fn read(&self, body: &EkbloomBody, req: ReadRequest) -> Result<Vec<u8>> {
+        let end = req
+            .offset
+            .checked_add(req.length)
+            .ok_or(EkbloomError::Overflow { what: "read range" })?;
+        if end > body.logical_len {
+            return Err(oob(req.offset, req.length, body.logical_len));
+        }
+        if req.length == 0 {
+            return Ok(Vec::new());
+        }
+        // Hot single-region fast path: a resident output surface (a fully
+        // materialised tile set or a path bloom) is a single contiguous copy with
+        // no intermediate buffer — this is the branch-lean path the frontier's
+        // hot-index ratio measures.
+        let shift = self.plan.region_shift;
+        let first = (req.offset >> shift) as usize;
+        if first == ((end - 1) >> shift) as usize {
+            if let Some(region) = self.plan.regions.get(first) {
+                match (region.path, region.structure) {
+                    (Path::HotTile, StructureRef::TileSet(ti)) => {
+                        if let Some(ts) = body.tiles.get(ti) {
+                            if let Some(slice) = ts.read_hot(req.offset, req.length) {
+                                return Ok(slice.to_vec());
+                            }
+                        }
+                    }
+                    (Path::DirectStorage, StructureRef::PathBloom(pi)) => {
+                        if let Some(shell) = body.blooms.get(pi) {
+                            if let Some(hot) = crate::fastpath::path_hot_of(shell, body.logical_len)
+                            {
+                                if let (Ok(a), Ok(l)) =
+                                    (usize::try_from(req.offset), usize::try_from(req.length))
+                                {
+                                    if let Some(b) = a.checked_add(l) {
+                                        if let Some(slice) = hot.get(a..b) {
+                                            return Ok(slice.to_vec());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.read_counted(body, req).map(|(bytes, _)| bytes)
+    }
+
+    /// [`Engine::read`], reporting the exact number of machine steps performed
+    /// (positioning skip plus reveal). Lets the [`Engine::worst_case_steps`] bound
+    /// be checked mechanically.
+    pub fn read_counted(&self, body: &EkbloomBody, req: ReadRequest) -> Result<(Vec<u8>, u64)> {
+        let end = req
+            .offset
+            .checked_add(req.length)
+            .ok_or(EkbloomError::Overflow { what: "read range" })?;
+        if end > body.logical_len {
+            return Err(EkbloomError::OutOfBounds {
+                offset: req.offset,
+                length: req.length,
+                logical_len: body.logical_len,
+            });
+        }
+        if req.length == 0 {
+            return Ok((Vec::new(), 0));
+        }
+
+        let shift = self.plan.region_shift;
+        let first = (req.offset >> shift) as usize;
+        let last = ((end - 1) >> shift) as usize;
+        if first == last {
+            let region = self
+                .plan
+                .regions
+                .get(first)
+                .ok_or_else(|| bad("engine plan has no region for the request"))?;
+            return dispatch_owned(body, region, req.offset, req.length);
+        }
+
+        // A request spanning regions is split at each boundary; segments append
+        // into one buffer. Consecutive regions served by the *same* certified
+        // structure are dispatched **once**: every path here is offset-addressable
+        // over the whole object (a hot-tile surface, a checkpoint, a block index,
+        // the history), so grouping by structure is byte-exact and removes the
+        // per-region split cost from an unaligned read.
+        let mut out = Vec::with_capacity(usize::try_from(req.length).map_err(|_| {
+            EkbloomError::Overflow {
+                what: "read length",
+            }
+        })?);
+        let mut steps = 0u64;
+        let mut pos = req.offset;
+        while pos < end {
+            let idx = (pos >> shift) as usize;
+            let region = self
+                .plan
+                .regions
+                .get(idx)
+                .ok_or_else(|| bad("engine plan has no region for the request"))?;
+            let mut stop = region.end.min(body.logical_len).max(pos.saturating_add(1));
+            while stop < end {
+                let nidx = (stop >> shift) as usize;
+                let next = self
+                    .plan
+                    .regions
+                    .get(nidx)
+                    .ok_or_else(|| bad("engine plan has no region for the request"))?;
+                if next.structure != region.structure || next.path != region.path {
+                    break;
+                }
+                stop = next.end.min(body.logical_len).max(stop.saturating_add(1));
+            }
+            let seg_end = stop.min(end);
+            let st = dispatch_into(body, region, pos, seg_end - pos, &mut out)?;
+            steps = steps.saturating_add(st);
+            pos = seg_end;
+        }
+        Ok((out, steps))
+    }
+
+    /// **The explicit guarantee**: the worst-case positioning work (machine steps)
+    /// for any request, independent of the requested length.
+    #[inline]
+    pub fn worst_case_steps(&self) -> u64 {
+        self.plan.worst_case_steps
+    }
+
+    /// The shared plan.
+    #[inline]
+    pub fn plan_ref(&self) -> &AccessPlan {
+        &self.plan
+    }
+
+    /// A clone of the shared plan handle.
+    #[inline]
+    pub fn plan_arc(&self) -> Arc<AccessPlan> {
+        Arc::clone(&self.plan)
+    }
+}
+
+/// The region size derived from a workload: at least the largest sampled request
+/// length, rounded up to a power of two and clamped to the engine's range.
+fn region_bytes_for(workload: &Workload) -> u64 {
+    let mut target = ENGINE_REGION_BYTES;
+    for &(_, len) in &workload.sample {
+        target = target.max(len);
+    }
+    let target = target.clamp(1, MAX_ENGINE_REGION_BYTES);
+    target
+        .next_power_of_two()
+        .clamp(MIN_ENGINE_REGION_BYTES, MAX_ENGINE_REGION_BYTES)
+}
+
+/// Enumerate every certified, bounded structure a body carries.
+fn enumerate(body: &EkbloomBody) -> Vec<Candidate> {
+    let n = body.logical_len;
+    let mut out = Vec::new();
+
+    // DirectStorage: the first certified whole-object path bloom with a usable
+    // direct output surface.
+    for (i, shell) in body.blooms.iter().enumerate() {
+        if shell.kind == BloomKind::Path
+            && shell.status == Certification::Certified
+            && shell.logical_len == n
+            && crate::fastpath::path_hot_of(shell, n).is_some()
+        {
+            out.push(Candidate {
+                structure: StructureRef::PathBloom(i),
+                path: Path::DirectStorage,
+                steps: 0,
+                bytes: shell.physical_bytes(),
+            });
+            break;
+        }
+    }
+
+    // AffineSummary: the complete state history (machine 1 only).
+    if body.machine_id == MACHINE_NL2 {
+        if let Some(history) = &body.history {
+            if history.logical_len == n {
+                out.push(Candidate {
+                    structure: StructureRef::History,
+                    path: Path::AffineSummary,
+                    steps: 0,
+                    bytes: history.physical_bytes(),
+                });
+            }
+        }
+    }
+
+    // PackedRestart: every usable checkpoint set.
+    for (i, cp) in body.checkpoints.iter().enumerate() {
+        if cp.interval != 0 && cp.restart_point(0).is_some() {
+            out.push(Candidate {
+                structure: StructureRef::Checkpoint(i),
+                path: Path::PackedRestart,
+                steps: u64::from(cp.interval).saturating_sub(1),
+                bytes: cp.physical_bytes(),
+            });
+        }
+    }
+
+    // BlockRestart: every block index that covers the object with the body's machine.
+    for (i, block) in body.blocks.iter().enumerate() {
+        if block.machine_id() == body.machine_id
+            && block.logical_len() == n
+            && block.block_bytes != 0
+        {
+            out.push(Candidate {
+                structure: StructureRef::BlockIndex(i),
+                path: Path::BlockRestart,
+                steps: u64::from(block.block_bytes).saturating_sub(1),
+                bytes: block.physical_bytes(),
+            });
+        }
+    }
+
+    // HotTile: every tile set indexing the whole object.
+    for (i, ts) in body.tiles.iter().enumerate() {
+        if ts.logical_len == n && ts.tile_size() > 0 {
+            out.push(Candidate {
+                structure: StructureRef::TileSet(i),
+                path: Path::HotTile,
+                steps: 0,
+                bytes: ts.physical_bytes(),
+            });
+        }
+    }
+
+    out
+}
+
+/// Whether the structure fully covers `[start, end)`.
+fn covers(body: &EkbloomBody, structure: StructureRef, start: u64, end: u64) -> bool {
+    if start >= end {
+        return false;
+    }
+    match structure {
+        StructureRef::PathBloom(_) => true,
+        StructureRef::History => true,
+        StructureRef::Checkpoint(i) => body
+            .checkpoints
+            .get(i)
+            .is_some_and(|cp| cp.interval != 0 && cp.restart_point(start).is_some()),
+        StructureRef::BlockIndex(i) => body
+            .blocks
+            .get(i)
+            .is_some_and(|block| block.block_of(start).is_some()),
+        StructureRef::TileSet(i) => body
+            .tiles
+            .get(i)
+            .is_some_and(|ts| tile_set_covers(ts, start, end)),
+    }
+}
+
+/// Whether `ts` materialises every tile intersecting `[start, end)`.
+fn tile_set_covers(ts: &TileSet, start: u64, end: u64) -> bool {
+    if ts.logical_len == 0 || ts.tile_size() == 0 {
+        return false;
+    }
+    let shift = ts.tile_shift;
+    let first = start >> shift;
+    let last = (end - 1) >> shift;
+    (first..=last).all(|tile| ts.tile_bytes_at(tile).is_some())
+}
+
+/// The documented per-path cost model (nanoseconds), using the same constants as
+/// the planner.
+fn path_cost(model: &CostModel, path: Path, steps: u64, len: u64) -> f64 {
+    let l = len as f64;
+    match path {
+        Path::HotTile | Path::DirectStorage => model.hot_lookup_ns + model.copy_ns_per_byte * l,
+        Path::PackedRestart | Path::BlockRestart => {
+            model.restart_ns + (steps as f64 / 2.0) * model.step_ns + model.reveal_ns * l
+        }
+        Path::AffineSummary => model.state_ns + model.reveal_ns * l,
+    }
+}
+
+/// Serve one within-region request through the certified path recorded in the
+/// plan, returning an owned buffer and the machine steps performed.
+fn dispatch_owned(
+    body: &EkbloomBody,
+    region: &RegionPath,
+    offset: u64,
+    length: u64,
+) -> Result<(Vec<u8>, u64)> {
+    let mut out = Vec::new();
+    let steps = dispatch_into(body, region, offset, length, &mut out)?;
+    Ok((out, steps))
+}
+
+/// Serve one segment through the certified path recorded in the plan, appending
+/// the bytes into `out` and returning the machine steps performed. The hot
+/// (tile / direct-storage) and restart paths append **directly** into `out` so an
+/// unaligned read costs exactly one allocation, like a raw slice copy.
+fn dispatch_into(
+    body: &EkbloomBody,
+    region: &RegionPath,
+    offset: u64,
+    length: u64,
+    out: &mut Vec<u8>,
+) -> Result<u64> {
+    match (region.path, region.structure) {
+        (Path::HotTile, StructureRef::TileSet(ti)) => {
+            let ts = body
+                .tiles
+                .get(ti)
+                .ok_or_else(|| bad("engine planned tile set index is out of range"))?;
+            // Branch-lean resident path: a fully-materialised set exposes its
+            // decoded output as one contiguous surface, so the read is a slice.
+            if let Some(slice) = ts.read_hot(offset, length) {
+                out.extend_from_slice(slice);
+                return Ok(length);
+            }
+            let bytes = ts.read_bounded(&body.core, &body.checkpoints, offset, length)?;
+            out.extend_from_slice(&bytes);
+            Ok(length)
+        }
+        (Path::DirectStorage, StructureRef::PathBloom(pi)) => {
+            let shell = body
+                .blooms
+                .get(pi)
+                .ok_or_else(|| bad("engine planned path bloom index is out of range"))?;
+            let hot = crate::fastpath::path_hot_of(shell, body.logical_len)
+                .ok_or_else(|| bad("engine planned path bloom is not usable"))?;
+            let a = usize::try_from(offset).map_err(|_| oob(offset, length, body.logical_len))?;
+            let b = a
+                .checked_add(usize::try_from(length).map_err(|_| EkbloomError::Overflow {
+                    what: "read length",
+                })?)
+                .ok_or(EkbloomError::Overflow { what: "read range" })?;
+            let slice = hot
+                .get(a..b)
+                .ok_or_else(|| oob(offset, length, body.logical_len))?;
+            out.extend_from_slice(slice);
+            Ok(length)
+        }
+        (Path::PackedRestart, StructureRef::Checkpoint(ci)) => {
+            let cp = body
+                .checkpoints
+                .get(ci)
+                .ok_or_else(|| bad("engine planned checkpoint index is out of range"))?;
+            let machine = machine_by_id(body.machine_id).ok_or(EkbloomError::UnknownMachine {
+                id: body.machine_id,
+            })?;
+            let skip = offset % u64::from(cp.interval);
+            let mut omega = cp.restore_with(machine, &body.core, offset)?;
+            let ctx = crate::machine::prepare(machine, &body.core)?;
+            ctx.decode_into(&body.core, &mut omega, length, out)?;
+            Ok(skip.saturating_add(length))
+        }
+        (Path::BlockRestart, StructureRef::BlockIndex(bi)) => {
+            let block = body
+                .blocks
+                .get(bi)
+                .ok_or_else(|| bad("engine planned block index is out of range"))?;
+            let (bytes, steps) = block.read_range_counted(&body.core, offset, length)?;
+            out.extend_from_slice(&bytes);
+            Ok(steps)
+        }
+        (Path::AffineSummary, StructureRef::History) => {
+            let history = body
+                .history
+                .as_ref()
+                .ok_or_else(|| bad("engine planned history is absent"))?;
+            let machine = machine_by_id(body.machine_id).ok_or(EkbloomError::UnknownMachine {
+                id: body.machine_id,
+            })?;
+            let ctx = crate::machine::prepare(machine, &body.core)?;
+            if let Ok(cap) = usize::try_from(length) {
+                out.reserve(cap);
+            }
+            for k in 0..length {
+                let pos = offset + k;
+                let mut omega = history
+                    .snapshot_at(pos)
+                    .ok_or_else(|| bad("history does not cover the requested position"))?;
+                out.push(ctx.reveal(&body.core, &mut omega)?);
+            }
+            Ok(length)
+        }
+        _ => Err(bad("engine planned path and structure are inconsistent")),
+    }
+}
+
+/// A structural error.
+fn bad(reason: impl Into<String>) -> EkbloomError {
+    EkbloomError::BadSection {
+        reason: reason.into(),
+    }
+}
+
+/// Bounds/overflow error mirroring [`crate::reader::read`].
+fn oob(offset: u64, length: u64, logical_len: u64) -> EkbloomError {
+    EkbloomError::OutOfBounds {
+        offset,
+        length,
+        logical_len,
+    }
+}

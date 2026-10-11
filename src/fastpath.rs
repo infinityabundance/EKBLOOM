@@ -215,7 +215,10 @@ fn certified_path_hot(body: &EkbloomBody) -> Option<&[u8]> {
 
 /// Extract the `hot` slice from a `Path` shell payload, applying the same
 /// strict structural checks as [`crate::bloom_path::PathBloom::from_shell`].
-fn path_hot_of(shell: &BloomShell, logical_len: u64) -> Option<&[u8]> {
+///
+/// Crate-visible so the bounded engine ([`crate::engine`]) can slice a
+/// pre-certified path bloom's output surface without re-scanning the body.
+pub(crate) fn path_hot_of(shell: &BloomShell, logical_len: u64) -> Option<&[u8]> {
     if !supported_depth(shell.depth) {
         return None;
     }

@@ -122,6 +122,150 @@ fn corrupt_lru(block: u64) -> EkbloomError {
     }
 }
 
+/// A conventional byte-budgeted **hot-block cache** over decoded fixed-size
+/// blocks.
+///
+/// The frontier measurement gives every indexed codec (block-indexed LZ4,
+/// chunked Zstandard) the same "keep the popular blocks resident" ability an
+/// ordinary cache provides, so the comparison is cache-for-cache and
+/// budget-for-budget fair. Eviction is least-recently-used; resident bytes stay
+/// within `budget_bytes` with the single exception that the most recently loaded
+/// block is always admitted (so a block larger than the whole budget is still
+/// served).
+#[derive(Debug, Default)]
+pub struct HotBlockCache {
+    block_bytes: u64,
+    budget_bytes: u64,
+    resident: BTreeMap<u64, Vec<u8>>,
+    recency: Vec<u64>,
+    resident_bytes: u64,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+impl HotBlockCache {
+    /// A cache of `block_bytes`-sized decoded blocks bounded by `budget_bytes`.
+    pub fn new(block_bytes: u64, budget_bytes: u64) -> HotBlockCache {
+        HotBlockCache {
+            block_bytes,
+            budget_bytes,
+            ..HotBlockCache::default()
+        }
+    }
+
+    /// The block size this cache holds.
+    #[inline]
+    pub fn block_bytes(&self) -> u64 {
+        self.block_bytes
+    }
+
+    /// The resident-byte budget.
+    #[inline]
+    pub fn budget_bytes(&self) -> u64 {
+        self.budget_bytes
+    }
+
+    /// The bytes currently resident.
+    #[inline]
+    pub fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
+    }
+
+    /// Cache hits.
+    #[inline]
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    /// Cache misses.
+    #[inline]
+    pub fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    /// LRU evictions.
+    #[inline]
+    pub fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    /// Hit fraction over the requests seen (`0.0` when none).
+    #[inline]
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits.saturating_add(self.misses);
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
+
+    /// Move `block` to the most-recently-used end of the recency list.
+    fn touch(&mut self, block: u64) {
+        if let Some(pos) = self.recency.iter().position(|&b| b == block) {
+            self.recency.remove(pos);
+        }
+        self.recency.push(block);
+    }
+
+    /// Insert decoded `data` for `block`, evicting LRU blocks to fit the budget.
+    pub fn insert(&mut self, block: u64, data: Vec<u8>) {
+        match self.resident.remove(&block) {
+            Some(old) => self.resident_bytes = self.resident_bytes.saturating_sub(old.len() as u64),
+            None => {
+                if let Some(pos) = self.recency.iter().position(|&b| b == block) {
+                    self.recency.remove(pos);
+                }
+            }
+        }
+        self.resident_bytes = self.resident_bytes.saturating_add(data.len() as u64);
+        self.resident.insert(block, data);
+        self.touch(block);
+        // Evict least-recently-used blocks until within budget; always keep the
+        // just-inserted block.
+        while self.resident_bytes > self.budget_bytes && self.resident.len() > 1 {
+            let Some(&victim) = self.recency.first() else {
+                break;
+            };
+            self.recency.remove(0);
+            if let Some(evicted) = self.resident.remove(&victim) {
+                self.resident_bytes = self.resident_bytes.saturating_sub(evicted.len() as u64);
+                self.evictions = self.evictions.saturating_add(1);
+            }
+        }
+    }
+
+    /// The resident block `block`, if cached, marking it most-recently-used.
+    pub fn get(&mut self, block: u64) -> Option<&[u8]> {
+        if self.resident.contains_key(&block) {
+            self.hits = self.hits.saturating_add(1);
+            self.touch(block);
+            self.resident.get(&block).map(Vec::as_slice)
+        } else {
+            None
+        }
+    }
+
+    /// Cache-on-read: return the resident block, else decode it with `fill`
+    /// (recorded as a miss), insert it, and return it.
+    pub fn get_or_load<F: FnOnce() -> Option<Vec<u8>>>(
+        &mut self,
+        block: u64,
+        fill: F,
+    ) -> Option<&[u8]> {
+        if self.resident.contains_key(&block) {
+            self.hits = self.hits.saturating_add(1);
+            self.touch(block);
+            return self.resident.get(&block).map(Vec::as_slice);
+        }
+        self.misses = self.misses.saturating_add(1);
+        let data = fill()?;
+        self.insert(block, data);
+        self.resident.get(&block).map(Vec::as_slice)
+    }
+}
+
 /// Mutable LRU-cache state (interior mutability so reads keep the `&self` API).
 #[derive(Debug, Default)]
 struct LruState {

@@ -196,6 +196,32 @@ pub fn lcg_bytes(seed: u64, len: usize) -> Vec<u8> {
     out
 }
 
+/// Deterministic, reproducible sample offsets for a fixed-length range workload:
+/// `count` offsets uniformly spread in `[0, logical_len - len]`, so every offset
+/// admits a `len`-byte request inside the object.
+///
+/// Uses a SplitMix64 step so a seed reproduces the exact sample on any host — the
+/// frontier harness needs the *same* offsets across contenders and reruns for the
+/// comparison to be honest.
+pub fn spread_offsets(seed: u64, count: usize, logical_len: u64, len: u64) -> Vec<u64> {
+    let hi = logical_len.saturating_sub(len.max(1));
+    let mut s = seed;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        out.push(if hi == 0 {
+            0
+        } else {
+            z % (hi.saturating_add(1))
+        });
+    }
+    out
+}
+
 /// Estimate the core frequency in GHz from a dependent add chain.
 ///
 /// A dependent `x = x + 1` chain retires at (roughly) one iteration per cycle on
