@@ -2,7 +2,8 @@
 
 Reviewer: "Performance/Format engineer" subagent.
 Date: 2026-10-10 (rev 1); **revision 2: 2026-10-11 adds an executed Divan AVX2-gather
-experiment.**
+experiment**; **revision 3: 2026-10-11 adds a full layout/SIMD pass (§9/§23) — all
+experiments implemented, measured and recorded in [`docs/LAYOUT.md`](../LAYOUT.md)**.
 Repo: `<repo-root>` (single crate `ekbloom`).
 Scope: directive §23 — investigate locality/SIMD on the certified path-bloom hot
 path, and record the findings honestly. Related deliverable: the fully-safe,
@@ -198,7 +199,29 @@ tested directly with an executed AVX2 gather micro-benchmark: **it does not win
 (~7% slower), so the scalar loop remains the default** and `fastpath` is unchanged.
 Hot/cold separation and the resulting ≈111× sequential / ≈52,000× single-byte
 advantage over machine replay are supported by `evidence/bench/sweep.json`. The
-file-backed `FileBody` realises the same hot path through bounded, safe `pread`
+The file-backed `FileBody` realises the same hot path through bounded, safe `pread`
 windows (no mapping, and no `unsafe` outside the isolated, feature-gated
 `src/simd.rs`). The one open measurement gap remains the absence of an L1-resident
 control for the path hot path in the committed sweep.
+
+---
+
+## Revision 3 pointer — layout & SIMD pass (§9/§23)
+
+A second, broader experiment pass is recorded in full in **[`docs/LAYOUT.md`](../LAYOUT.md)**
+with raw Divan medians and keep/reject decisions for each of:
+
+1. a 16-byte `Bloom4Resume` entry variant (512 KiB → 1 MiB at 65536 entries) — **KEEP as
+   an available, non-default layout**;
+2. 64-byte cache-line alignment of the hot array (`fastpath::AlignedBuffer`) — **REJECT**
+   (sequential identical; random-1b median Δ within noise and unusable without a per-read
+   copy);
+3. software prefetch (`simd::gather_bytes_prefetch`) — **REJECT** (~+21% slower);
+4. AVX-512 gather (`simd::gather_bytes_avx512`) — **REJECT** (~+7.8% slower than scalar,
+   ~+13% slower than AVX2), confirming the "wider is not automatically better" warning;
+5. parallel regional reads (`fastpath::read_ranges_parallel`) — **REJECT** for small
+   workloads (256 KiB: 2.9 µs at 1 thread → 61.6 µs at 8).
+
+No default read path changed. The AVX2 gather remains unwired as in revision 2; note that
+in revision 3's runs AVX2 measured marginally *faster* than scalar (~5%), which is machine
+sensitivity and does not alter the decision.

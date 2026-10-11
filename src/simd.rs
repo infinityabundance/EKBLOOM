@@ -18,13 +18,21 @@
 //! AVX2 is unavailable at runtime, or when the hot array is too large for 32-bit
 //! gather indices.
 //!
-//! # Why this is the only `unsafe` in the crate
+//! The module also carries two further §23 experiments, both measured in
+//! `benches/ekbloom.rs` and `docs/LAYOUT.md` and neither wired into the default
+//! path: [`gather_bytes_prefetch`] (a scalar gather that issues an `_mm_prefetch`
+//! for a later random offset) and [`gather_bytes_avx512`] (an `avx512f` gather
+//! using `_mm512_i32gather_epi32`).
 //!
-//! x86 SIMD intrinsics (`_mm256_i32gather_epi32`, `_mm256_loadu_si256`, ...) are
-//! `unsafe` by nature. The unsafety is confined to **one** function,
-//! `gather_bytes_avx2`, guarded by `#[cfg(target_arch = "x86_64")]` and a
-//! runtime `is_x86_feature_detected!("avx2")` check, with a single `// SAFETY:`
-//! justification. No other module contains `unsafe`.
+//! # Why this is the crate's only `unsafe` module
+//!
+//! x86 SIMD intrinsics (`_mm256_i32gather_epi32`, `_mm512_i32gather_epi32`,
+//! `_mm_prefetch`, `_mm256_loadu_si256`, ...) are `unsafe` by nature. The
+//! unsafety is confined to three functions in this module — `gather_bytes_avx2`,
+//! `gather_bytes_prefetch_sse` and `gather_bytes_avx512_impl` — each guarded by
+//! `#[cfg(target_arch = "x86_64")]` and a runtime `is_x86_feature_detected!`
+//! check, each with a single `// SAFETY:` justification. No other module contains
+//! `unsafe`.
 
 use crate::error::{EkbloomError, Result};
 
@@ -40,6 +48,33 @@ pub fn avx2_available() -> bool {
 /// Whether AVX2 gather is usable on this machine.
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 pub fn avx2_available() -> bool {
+    false
+}
+
+/// Whether the SSE prefetch hint is usable on this machine.
+///
+/// `_mm_prefetch` needs only SSE, which is baseline on every x86_64 CPU; the
+/// runtime check keeps the module total and honest on exotic targets.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub fn sse_available() -> bool {
+    std::is_x86_feature_detected!("sse")
+}
+
+/// Whether the SSE prefetch hint is usable on this machine.
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+pub fn sse_available() -> bool {
+    false
+}
+
+/// Whether AVX-512 Foundation gather is usable on this machine.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub fn avx512_available() -> bool {
+    std::is_x86_feature_detected!("avx512f")
+}
+
+/// Whether AVX-512 Foundation gather is usable on this machine.
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+pub fn avx512_available() -> bool {
     false
 }
 
@@ -174,6 +209,156 @@ unsafe fn gather_bytes_avx2(hot: &[u8], offsets: &[u64], out: &mut Vec<u8>) -> R
     }
 
     // Scalar tail (fewer than eight offsets remain).
+    while i < n {
+        out.push(hot[offsets[i] as usize]);
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Scalar gather with a software prefetch of a later offset's cache line.
+///
+/// Byte-for-byte equal to [`gather_bytes_scalar`]. This is the §23 prefetch-ahead
+/// experiment: while reading offset `i`, it issues an `_mm_prefetch` for offset
+/// `i + AHEAD`, so the out-of-order engine overlaps the latency of a distant
+/// random load. On non-x86 or without SSE it is exactly [`gather_bytes_scalar`].
+pub fn gather_bytes_prefetch(hot: &[u8], offsets: &[u64], out: &mut Vec<u8>) -> Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if sse_available() {
+            // SAFETY: guarded by the runtime `sse_available()` check just above;
+            // `gather_bytes_prefetch_sse` is compiled with `#[target_feature(enable
+            // = "sse")]`, which is its own precondition.
+            unsafe { gather_bytes_prefetch_sse(hot, offsets, out)? };
+            return Ok(());
+        }
+    }
+    gather_bytes_scalar(hot, offsets, out)
+}
+
+/// Prefetch distance (in offsets) for [`gather_bytes_prefetch`].
+const PREFETCH_AHEAD: usize = 8;
+
+/// SSE prefetch-ahead scalar gather implementation.
+///
+/// # Safety
+///
+/// The caller must ensure SSE is available at runtime (checked in
+/// [`gather_bytes_prefetch`]). `_mm_prefetch` is a non-faulting advisory hint, and
+/// this function only issues it for indices that are already proven `< hot.len()`;
+/// every consuming load is the same checked `hot[idx]` as the scalar reference.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse")]
+unsafe fn gather_bytes_prefetch_sse(hot: &[u8], offsets: &[u64], out: &mut Vec<u8>) -> Result<()> {
+    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+
+    validate_offsets(hot.len(), offsets)?;
+    out.reserve(offsets.len());
+
+    let len = hot.len();
+    let base = hot.as_ptr();
+    for (i, &o) in offsets.iter().enumerate() {
+        if let Some(&ahead) = offsets.get(i + PREFETCH_AHEAD) {
+            let idx = ahead as usize;
+            if idx < len {
+                // SAFETY: `idx < len` proves `base.add(idx)` is in-bounds within the
+                // `hot` allocation; `_mm_prefetch` only reads the address operand and
+                // cannot fault, and is purely advisory.
+                _mm_prefetch::<_MM_HINT_T0>(base.add(idx) as *const i8);
+            }
+        }
+        out.push(hot[o as usize]);
+    }
+    Ok(())
+}
+
+/// AVX-512 Foundation gather when available and safe; otherwise AVX2/scalar.
+///
+/// Byte-for-byte equal to [`gather_bytes_scalar`] for every input. This is the
+/// §23 AVX-512 experiment: `_mm512_i32gather_epi32` gathers sixteen 4-byte lanes
+/// with 32-bit indices, then `_mm512_cvtepi32_epi8` compacts the sixteen low bytes
+/// into one 128-bit store. It is measured in `benches/ekbloom.rs`; it is **not**
+/// wired into the default path.
+pub fn gather_bytes_avx512(hot: &[u8], offsets: &[u64], out: &mut Vec<u8>) -> Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // `_mm512_i32gather_epi32` indexes with 32-bit signed lanes, so the hot
+        // array must fit in `i32` range for the vector path to be applicable.
+        if avx512_available() && hot.len() <= i32::MAX as usize {
+            // SAFETY: guarded by the runtime `avx512_available()` check just above,
+            // and `gather_bytes_avx512_impl` is compiled with `#[target_feature(
+            // enable = "avx512f")]`, which is the function's own precondition.
+            unsafe { gather_bytes_avx512_impl(hot, offsets, out)? };
+            return Ok(());
+        }
+    }
+    gather_bytes(hot, offsets, out)
+}
+
+/// AVX-512 gather implementation.
+///
+/// Processes offsets in groups of sixteen with the same page-safety reasoning as
+/// the AVX2 path ([`gather_bytes_avx2`]): a group is gathered only when every
+/// index leaves four readable bytes (`index + 4 <= hot.len()`); boundary groups,
+/// the scalar tail, and arrays shorter than four bytes use the scalar loop.
+///
+/// # Safety
+///
+/// The caller must ensure AVX-512F is available at runtime (checked in
+/// [`gather_bytes_avx512`]) and that `hot.len() <= i32::MAX as usize`. Under those
+/// preconditions every intrinsic below operates on fully in-bounds memory:
+/// offsets are validated before any gather; the 64-byte load and the 16-byte store
+/// use unaligned intrinsics; and each gathered dword is proven in-bounds by the
+/// `index + 4 <= hot.len()` guard.
+// The AVX-512 intrinsics used here were only stabilized in Rust 1.89, while the
+// crate's declared `rust-version = 1.75` metadata predates that. Rather than
+// raise the crate MSRV (Cargo.toml is outside this module's ownership) or drop a
+// required §23 experiment, the MSRV lint is explicitly silenced for this one
+// isolated, runtime-gated function; the crate is built with the pinned 1.99
+// toolchain.
+#[allow(clippy::incompatible_msrv)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn gather_bytes_avx512_impl(hot: &[u8], offsets: &[u64], out: &mut Vec<u8>) -> Result<()> {
+    use std::arch::x86_64::*;
+
+    validate_offsets(hot.len(), offsets)?;
+
+    let len = hot.len();
+    let n = offsets.len();
+    out.reserve(n);
+
+    let last_safe = len.saturating_sub(4);
+    let base = hot.as_ptr() as *const i32;
+
+    let mut i = 0usize;
+    while i + 16 <= n {
+        let group = &offsets[i..i + 16];
+        let safe = len >= 4 && group.iter().all(|&o| (o as usize) <= last_safe);
+        if safe {
+            let mut idx = [0i32; 16];
+            for (k, &o) in group.iter().enumerate() {
+                idx[k] = o as i32;
+            }
+            // SAFETY: `idx` holds sixteen in-bounds byte offsets (each `<= len - 4`),
+            // so each of the sixteen 4-byte gathers reads entirely within `hot`; the
+            // 64-byte load, the conversion and the 16-byte store use unaligned or
+            // register-only intrinsics.
+            let vidx = _mm512_loadu_si512(idx.as_ptr() as *const __m512i);
+            let gathered = _mm512_i32gather_epi32::<1>(vidx, base);
+            let masked = _mm512_and_si512(gathered, _mm512_set1_epi32(0xFF));
+            let bytes = _mm512_cvtepi32_epi8(masked);
+            let mut buf = [0u8; 16];
+            _mm_storeu_si128(buf.as_mut_ptr() as *mut __m128i, bytes);
+            out.extend_from_slice(&buf);
+        } else {
+            for &o in group {
+                out.push(hot[o as usize]);
+            }
+        }
+        i += 16;
+    }
+
     while i < n {
         out.push(hot[offsets[i] as usize]);
         i += 1;

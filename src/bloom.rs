@@ -376,6 +376,83 @@ pub fn unpack_block(bytes: &[u8]) -> Result<(Vec<u8>, u32)> {
     Ok((symbols, state))
 }
 
+/// Packed size of the 16-byte path entry variant [`Bloom4Resume`]: four symbol
+/// bytes ++ a little-endian `u32` successor state ++ a little-endian `u64` cursor.
+///
+/// This is the size tradeoff recorded in `docs/DESIGN.md` §3 and measured in
+/// `docs/LAYOUT.md`: at `65536` entries the default `D + 4` entry with `D = 4`
+/// occupies `65536 * 8 = 512 KiB`, while this variant occupies
+/// `65536 * 16 = 1 MiB`. The extra `u64` cursor promotes the entry from a
+/// state-only record to a *complete resumable state* (state ++ cursor).
+pub const BLOOM4_RESUME_PACKED_LEN: usize = 16;
+
+/// The `Bloom4Resume` entry variant from `docs/DESIGN.md` §3: `4` symbol bytes,
+/// a `u32` successor state, and a `u64` cursor, packed little-endian with no
+/// native padding relied upon.
+///
+/// It sits *alongside* the default `D + 4` transition/path entry
+/// ([`pack_block`]/[`unpack_block`]); it does not replace it. It is an available
+/// layout for callers that want a self-contained resumable path entry, and it is
+/// what the §9 packing experiment in `docs/LAYOUT.md` measures against the
+/// 8-byte reference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Bloom4Resume {
+    /// The four authoritative symbols of the block.
+    pub symbols: [u8; 4],
+    /// The successor machine state word `x`.
+    pub next_state: u32,
+    /// The backing cursor `p`.
+    pub cursor: u64,
+}
+
+impl Bloom4Resume {
+    /// Packed wire size, `16` bytes.
+    pub const PACKED_LEN: usize = BLOOM4_RESUME_PACKED_LEN;
+
+    /// Construct an entry.
+    #[inline]
+    pub const fn new(symbols: [u8; 4], next_state: u32, cursor: u64) -> Self {
+        Self {
+            symbols,
+            next_state,
+            cursor,
+        }
+    }
+
+    /// Pack into the fixed 16-byte little-endian form.
+    #[inline]
+    pub fn pack(&self) -> [u8; Self::PACKED_LEN] {
+        let mut out = [0u8; Self::PACKED_LEN];
+        out[0..4].copy_from_slice(&self.symbols);
+        out[4..8].copy_from_slice(&self.next_state.to_le_bytes());
+        out[8..16].copy_from_slice(&self.cursor.to_le_bytes());
+        out
+    }
+
+    /// Unpack from the fixed 16-byte little-endian form.
+    ///
+    /// Strict bounds check: fewer than [`Self::PACKED_LEN`] bytes is rejected with
+    /// [`EkbloomError::Truncated`] (and never reads a partial field). Bytes beyond
+    /// the first 16 are ignored, matching [`unpack_block`]'s inference style.
+    pub fn unpack(bytes: &[u8]) -> Result<Self> {
+        let b = bytes
+            .get(..Self::PACKED_LEN)
+            .ok_or(EkbloomError::Truncated {
+                needed: Self::PACKED_LEN as u64,
+                available: bytes.len() as u64,
+            })?;
+        let mut symbols = [0u8; 4];
+        symbols.copy_from_slice(&b[0..4]);
+        let next_state = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+        let cursor = u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
+        Ok(Self {
+            symbols,
+            next_state,
+            cursor,
+        })
+    }
+}
+
 /// Append a `u64`-length-prefixed UTF-8 string.
 fn push_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u64).to_le_bytes());

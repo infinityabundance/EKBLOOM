@@ -31,6 +31,17 @@
 //! The implementation is entirely safe Rust: only checked arithmetic, safe
 //! slices and iterators are used.
 //!
+//! # Layout and parallelism experiments (`docs/LAYOUT.md`)
+//!
+//! Alongside the default fast paths this module exposes the deliverables of the
+//! §23 performance pass, each measured before being kept or rejected (see
+//! `docs/LAYOUT.md`): [`AlignedBuffer`] and the [`copy_hot_sequential`] /
+//! [`gather_hot_1b`] primitives (64-byte cache-line alignment), and
+//! [`read_ranges_parallel`] (disjoint ranges split across scoped threads, output
+//! identical to [`read_ranges`]). `read_ranges_parallel` is the only function here
+//! that spawns threads; it is safe (no `unsafe`) and is byte-exact to the
+//! sequential path.
+//!
 //! A runtime-detected AVX2 gather for the random single-byte path was implemented
 //! and measured (see [`crate::simd`] and `docs/reviews/performance.md`); it was
 //! **slower** than this scalar loop on the reference machine, so it is deliberately
@@ -85,6 +96,99 @@ fn oob(offset: u64, length: u64, logical_len: u64) -> EkbloomError {
         length,
         logical_len,
     }
+}
+
+/// Cache-line size in bytes, used by the §23 64-byte alignment experiment.
+pub const CACHE_LINE: usize = 64;
+
+/// A byte buffer whose live slice begins on a 64-byte ([`CACHE_LINE`]) boundary.
+///
+/// Built with the **safe** over-allocate-and-slice technique: a `Vec<u8>` of
+/// `src.len() + CACHE_LINE` bytes is allocated, the first 64-byte-aligned offset
+/// inside it is computed, and the payload is copied there. No `unsafe` and no
+/// allocator-alignment assumption is used, so this is correct on every target and
+/// allocation size.
+///
+/// This is the alignment experiment of `docs/LAYOUT.md` (§23): the certified
+/// path-bloom hot array is a plain `Vec<u8>` sub-slice, so this type is how an
+/// aligned variant of that array is realised and measured. It is **not** wired
+/// into the default read path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AlignedBuffer {
+    buf: Vec<u8>,
+    start: usize,
+    len: usize,
+}
+
+impl AlignedBuffer {
+    /// Copy `src` into a new 64-byte-aligned buffer.
+    pub fn from_slice(src: &[u8]) -> Self {
+        let mut buf = vec![0u8; src.len() + CACHE_LINE];
+        let base = buf.as_ptr() as usize;
+        let start = (CACHE_LINE - (base % CACHE_LINE)) % CACHE_LINE;
+        buf[start..start + src.len()].copy_from_slice(src);
+        AlignedBuffer {
+            buf,
+            start,
+            len: src.len(),
+        }
+    }
+
+    /// The aligned payload slice.
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf[self.start..self.start + self.len]
+    }
+
+    /// Whether the payload pointer is genuinely 64-byte aligned.
+    #[inline]
+    pub fn is_aligned(&self) -> bool {
+        self.as_slice().as_ptr() as usize % CACHE_LINE == 0
+    }
+
+    /// A view starting `offset` bytes into the payload, of length `len`.
+    ///
+    /// Used to build a deliberately misaligned control over the *same* underlying
+    /// allocation. Returns `None` when the requested range is out of bounds.
+    pub fn view(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        let start = self.start.checked_add(offset)?;
+        let end = start.checked_add(len)?;
+        self.buf.get(start..end)
+    }
+}
+
+/// The sequential fast-path primitive over an explicit `hot` symbol array.
+///
+/// This is exactly what [`read_sequential`] does once a certified path bloom is
+/// found, split out so the §23 alignment/throughput experiments can drive it on
+/// an arbitrary (aligned or unaligned) slice.
+#[inline]
+pub fn copy_hot_sequential(hot: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(hot);
+}
+
+/// The random single-byte fast-path primitive over an explicit `hot` array.
+///
+/// Bounds and overflow semantics are identical to [`read_random_1b`]: an offset
+/// that overflows `u64` is [`EkbloomError::Overflow`], and an offset at or past
+/// `hot.len()` is [`EkbloomError::OutOfBounds`].
+pub fn gather_hot_1b(hot: &[u8], offsets: &[u64], out: &mut Vec<u8>) -> Result<()> {
+    let logical_len = hot.len() as u64;
+    out.reserve(offsets.len());
+    for &offset in offsets {
+        let end = offset
+            .checked_add(1)
+            .ok_or(EkbloomError::Overflow { what: "read range" })?;
+        if end > logical_len {
+            return Err(oob(offset, 1, logical_len));
+        }
+        let idx = usize::try_from(offset).map_err(|_| oob(offset, 1, logical_len))?;
+        match hot.get(idx) {
+            Some(&byte) => out.push(byte),
+            None => return Err(oob(offset, 1, logical_len)),
+        }
+    }
+    Ok(())
 }
 
 /// The authoritative `hot` symbol array of the first certified path bloom that
@@ -253,6 +357,65 @@ pub fn read_ranges(body: &EkbloomBody, ranges: &[(u64, u64)], out: &mut Vec<u8>)
         out.extend_from_slice(&bytes);
     }
     Ok(())
+}
+
+/// Read many `(offset, length)` ranges across up to `threads` scoped threads and
+/// return the concatenation in the same order as [`read_ranges`].
+///
+/// The ranges are split into `threads` contiguous, index-ordered chunks; each
+/// chunk is read independently (reads are pure and the body is immutable) and the
+/// per-chunk results are concatenated in chunk order. The output is therefore
+/// **byte-for-byte identical** to the sequential [`read_ranges`] for every input.
+///
+/// Errors are reported in chunk order: because each chunk validates before it
+/// produces output, a bad range yields an `Err` and that chunk contributes no
+/// partial bytes. `threads` is clamped into `1..=ranges.len()`; `threads == 1`
+/// (or an empty `ranges`) runs entirely on the caller's thread and is exactly
+/// [`read_ranges`]. A worker panic is surfaced as [`EkbloomError::InvalidArgument`].
+pub fn read_ranges_parallel(
+    body: &EkbloomBody,
+    ranges: &[(u64, u64)],
+    threads: usize,
+) -> Result<Vec<u8>> {
+    if ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    let threads = threads.max(1).min(ranges.len());
+    if threads == 1 {
+        let mut out = Vec::new();
+        read_ranges(body, ranges, &mut out)?;
+        return Ok(out);
+    }
+
+    let chunk = ranges.len().div_ceil(threads);
+    let parts: Result<Vec<Vec<u8>>> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        let mut lo = 0usize;
+        while lo < ranges.len() {
+            let hi = (lo + chunk).min(ranges.len());
+            let slice = &ranges[lo..hi];
+            handles.push(scope.spawn(move || {
+                let mut out = Vec::new();
+                read_ranges(body, slice, &mut out)?;
+                Ok::<Vec<u8>, EkbloomError>(out)
+            }));
+            lo = hi;
+        }
+        let mut joined = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let part = handle.join().map_err(|_| EkbloomError::InvalidArgument {
+                what: "range read worker panicked".to_string(),
+            })??;
+            joined.push(part);
+        }
+        Ok::<Vec<Vec<u8>>, EkbloomError>(joined)
+    });
+
+    let mut out = Vec::new();
+    for part in parts? {
+        out.extend_from_slice(&part);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

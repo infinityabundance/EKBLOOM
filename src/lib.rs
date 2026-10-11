@@ -50,14 +50,17 @@ pub mod worker;
 pub mod writer;
 
 pub use asyncpub::{append, detect_backend, publish, Backend};
-pub use bloom::{BloomKind, BloomShell, Certificate, Certification, Outcome};
+pub use bloom::{Bloom4Resume, BloomKind, BloomShell, Certificate, Certification, Outcome};
 pub use bloom_context::ContextBloom;
 pub use bloom_global::{Counterexample, GlobalBloom, GlobalCertification};
 pub use bloom_path::PathBloom;
 pub use bloom_region::{RegionCertification, RegionDescriptor};
 pub use checkpoint::CheckpointSet;
 pub use error::{EkbloomError, Result};
-pub use fastpath::{cpu_features, read_random_1b, read_ranges, read_sequential, CpuFeatures};
+pub use fastpath::{
+    copy_hot_sequential, cpu_features, gather_hot_1b, read_random_1b, read_ranges,
+    read_ranges_parallel, read_sequential, AlignedBuffer, CpuFeatures, CACHE_LINE,
+};
 pub use filesystem::{FileMeta, ObjectPhysical, OrFs, PhysicalReport};
 #[cfg(feature = "fuse")]
 pub use fuse::{mount, OrFsMount};
@@ -79,7 +82,10 @@ pub use reader::{
 pub use recovery::{
     recover, scan_generations, truncate_to_valid, GenerationRecord, RecoveryReport,
 };
-pub use simd::{avx2_available, gather_bytes, gather_bytes_scalar};
+pub use simd::{
+    avx2_available, avx512_available, gather_bytes, gather_bytes_avx512, gather_bytes_prefetch,
+    gather_bytes_scalar, sse_available,
+};
 pub use state::Snapshot;
 pub use sweep::{
     manifestation_sweep, sweep_profiles, write_evidence_json, SweepConfig, SweepPoint, SweepReport,

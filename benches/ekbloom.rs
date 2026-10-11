@@ -5,8 +5,12 @@
 //! - `read_sequential`: `root` vs `path4` vs `path8`,
 //! - `read_random_1b`: `root` vs `full` vs `path4`,
 //! - `read_ranges` (4 KiB ranges): `root` vs `full` vs `path4`,
-//! - `simd_gather_scalar` vs `simd_gather_avx2`: the §23 random single-byte
-//!   gather experiment (100k offsets over the 1 MiB `hot` array).
+//! - `simd_gather_scalar` vs `simd_gather_avx2` vs `simd_gather_prefetch` vs
+//!   `simd_gather_avx512`: the §23 random single-byte gather experiments
+//!   (100k offsets over the 1 MiB `hot` array),
+//! - `seq_aligned`/`seq_unaligned` and `random_1b_aligned`/`random_1b_unaligned`:
+//!   the §23 64-byte cache-line alignment experiment,
+//! - `parallel_ranges_4k_t1..t8`: the §23 parallel regional-read scaling sweep.
 //!
 //! Inputs are ~1 MiB and are built once (cached in `OnceLock`s) so the
 //! measured work is the read itself, not manifestation. Run with
@@ -17,9 +21,12 @@
 //! exact path bloom (`path4`/`path8`) under the same workload.
 
 use divan::black_box;
-use ekbloom::simd::{gather_bytes, gather_bytes_scalar};
+use ekbloom::simd::{
+    gather_bytes, gather_bytes_avx512, gather_bytes_prefetch, gather_bytes_scalar,
+};
 use ekbloom::{
-    create, read_random_1b, read_ranges, read_sequential, EkbloomBody, ManifestationProfile,
+    copy_hot_sequential, create, gather_hot_1b, read_random_1b, read_ranges, read_ranges_parallel,
+    read_sequential, AlignedBuffer, EkbloomBody, ManifestationProfile, CACHE_LINE,
 };
 use std::sync::OnceLock;
 
@@ -240,6 +247,143 @@ fn simd_gather_avx2(bencher: divan::Bencher) {
     bencher.bench_local(|| {
         out.clear();
         gather_bytes(hot, black_box(&offs), &mut out).unwrap();
+        black_box(out.len())
+    });
+}
+
+// --- SIMD gather experiment: software prefetch (§23) ------------------------
+//
+// The scalar loop with an `_mm_prefetch` of offset `i + 8` issued while reading
+// offset `i`, against the plain scalar reference.
+
+#[divan::bench]
+fn simd_gather_prefetch(bencher: divan::Bencher) {
+    let hot = source();
+    let offs = offsets(100_000);
+    let mut out = Vec::with_capacity(offs.len());
+    bencher.bench_local(|| {
+        out.clear();
+        gather_bytes_prefetch(hot, black_box(&offs), &mut out).unwrap();
+        black_box(out.len())
+    });
+}
+
+// --- SIMD gather experiment: AVX-512 (§23) ----------------------------------
+//
+// `gather_bytes_avx512` uses `_mm512_i32gather_epi32` + `_mm512_cvtepi32_epi8`
+// when AVX-512F is available, otherwise it falls back to the AVX2/scalar path.
+// On an AVX-512-less machine it therefore measures the AVX2 path again.
+
+#[divan::bench]
+fn simd_gather_avx512(bencher: divan::Bencher) {
+    let hot = source();
+    let offs = offsets(100_000);
+    let mut out = Vec::with_capacity(offs.len());
+    bencher.bench_local(|| {
+        out.clear();
+        gather_bytes_avx512(hot, black_box(&offs), &mut out).unwrap();
+        black_box(out.len())
+    });
+}
+
+// --- cache-line alignment experiment (§23) ----------------------------------
+//
+// One `AlignedBuffer` holds a padded copy of the corpus. `view(0, ..)` is the
+// 64-byte-aligned hot array; `view(8, ..)` is the same bytes shifted by 8, so it
+// is provably 8 (mod 64) misaligned. Both cover `SRC_LEN` bytes.
+
+fn aligned_hot() -> &'static AlignedBuffer {
+    static CELL: OnceLock<AlignedBuffer> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let padded = lcg_bytes(0xA11C_0BEE, SRC_LEN + CACHE_LINE);
+        AlignedBuffer::from_slice(&padded)
+    })
+}
+
+#[divan::bench]
+fn seq_aligned(bencher: divan::Bencher) {
+    let buf = aligned_hot();
+    let hot = buf.view(0, SRC_LEN).unwrap();
+    assert!(hot.as_ptr() as usize % CACHE_LINE == 0);
+    let mut out = Vec::with_capacity(SRC_LEN);
+    bencher.bench_local(|| {
+        out.clear();
+        copy_hot_sequential(black_box(hot), &mut out);
+        black_box(out.len())
+    });
+}
+
+#[divan::bench]
+fn seq_unaligned(bencher: divan::Bencher) {
+    let buf = aligned_hot();
+    let hot = buf.view(8, SRC_LEN).unwrap();
+    assert!(hot.as_ptr() as usize % CACHE_LINE != 0);
+    let mut out = Vec::with_capacity(SRC_LEN);
+    bencher.bench_local(|| {
+        out.clear();
+        copy_hot_sequential(black_box(hot), &mut out);
+        black_box(out.len())
+    });
+}
+
+#[divan::bench]
+fn random_1b_aligned(bencher: divan::Bencher) {
+    let buf = aligned_hot();
+    let hot = buf.view(0, SRC_LEN).unwrap();
+    let offs = offsets(100_000);
+    let mut out = Vec::with_capacity(offs.len());
+    bencher.bench_local(|| {
+        out.clear();
+        gather_hot_1b(black_box(hot), black_box(&offs), &mut out).unwrap();
+        black_box(out.len())
+    });
+}
+
+#[divan::bench]
+fn random_1b_unaligned(bencher: divan::Bencher) {
+    let buf = aligned_hot();
+    let hot = buf.view(8, SRC_LEN).unwrap();
+    let offs = offsets(100_000);
+    let mut out = Vec::with_capacity(offs.len());
+    bencher.bench_local(|| {
+        out.clear();
+        gather_hot_1b(black_box(hot), black_box(&offs), &mut out).unwrap();
+        black_box(out.len())
+    });
+}
+
+// --- parallel regional-read scaling (§23) -----------------------------------
+//
+// 64 disjoint 4 KiB ranges over the ~1 MiB object, read with 1, 2, 4 and 8
+// scoped threads. Compare against the sequential `ranges_4k_path4` above.
+
+const PARALLEL_RANGES: usize = 64;
+
+#[divan::bench]
+fn parallel_ranges_4k_t1(bencher: divan::Bencher) {
+    parallel_ranges_4k(bencher, 1);
+}
+
+#[divan::bench]
+fn parallel_ranges_4k_t2(bencher: divan::Bencher) {
+    parallel_ranges_4k(bencher, 2);
+}
+
+#[divan::bench]
+fn parallel_ranges_4k_t4(bencher: divan::Bencher) {
+    parallel_ranges_4k(bencher, 4);
+}
+
+#[divan::bench]
+fn parallel_ranges_4k_t8(bencher: divan::Bencher) {
+    parallel_ranges_4k(bencher, 8);
+}
+
+fn parallel_ranges_4k(bencher: divan::Bencher, threads: usize) {
+    let body = path4();
+    let ranges = ranges_4k(PARALLEL_RANGES);
+    bencher.bench_local(|| {
+        let out = read_ranges_parallel(body, black_box(&ranges), threads).unwrap();
         black_box(out.len())
     });
 }
