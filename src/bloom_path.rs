@@ -31,7 +31,7 @@
 
 use crate::bloom::{supported_depth, BloomKind, BloomShell, Certification};
 use crate::error::{EkbloomError, Result};
-use crate::machine::{state_log, OrMachine, NL2};
+use crate::machine::{state_log_with, OrMachine, NL2};
 
 /// Fixed size of the path payload prefix: `depth u16`, `logical_len u64`,
 /// `nblocks u64`.
@@ -54,20 +54,31 @@ pub struct PathBloom {
 impl PathBloom {
     /// Build the exact path bloom for `core` producing `logical_len` symbols at
     /// `depth`, and return it as a `Path` [`BloomShell`] tagged with `generation`
-    /// and the BLAKE3 hash of `core`.
+    /// and the BLAKE3 hash of `core`, using the authoritative machine 1.
     ///
     /// Rejects an unsupported `depth` with [`EkbloomError::BadDepth`] and a short
     /// `core` with [`EkbloomError::CoreTooShort`].
     pub fn build(core: &[u8], logical_len: u64, depth: u16, generation: u64) -> Result<BloomShell> {
+        Self::build_with(&NL2, core, logical_len, depth, generation)
+    }
+
+    /// Machine-general [`PathBloom::build`].
+    pub fn build_with(
+        machine: &dyn OrMachine,
+        core: &[u8],
+        logical_len: u64,
+        depth: u16,
+        generation: u64,
+    ) -> Result<BloomShell> {
         if !supported_depth(depth) {
             return Err(EkbloomError::BadDepth {
                 depth: u32::from(depth),
             });
         }
         // Authoritative decode: `hot` is the manifested output surface.
-        let hot = NL2.decode(core, logical_len)?;
+        let hot = machine.decode(core, logical_len)?;
         // Cold successors come from the machine state log.
-        let states = state_log(core, logical_len)?;
+        let states = state_log_with(machine, core, logical_len)?;
 
         let d = u64::from(depth);
         let nblocks = logical_len.div_ceil(d);
@@ -285,6 +296,7 @@ impl PathBloom {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::machine::state_log;
 
     fn lcg(seed: u64, len: usize) -> Vec<u8> {
         let mut s = seed;

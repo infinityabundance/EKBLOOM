@@ -16,7 +16,7 @@
 use crate::bloom::{supported_depth, BloomKind, BloomShell, Certification, Outcome};
 use crate::bloom_key::key_from_state;
 use crate::error::{EkbloomError, Result};
-use crate::machine::{state_log, OrMachine, NL2};
+use crate::machine::{state_log, state_log_with, OrMachine, NL2};
 use crate::state::Snapshot;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
@@ -198,13 +198,30 @@ pub fn build_global_shell(
     depth: u16,
     generation: u64,
 ) -> Result<BloomShell> {
+    build_global_shell_with(&NL2, core, logical_len, depth, generation)
+}
+
+/// Machine-general [`build_global_shell`].
+///
+/// The outcome at each window is taken from the authoritative decode and state
+/// log (`decoded[i..i+D]` and `states[i+D]`), which is exact for any machine
+/// (identical to replaying the `D` steps for machine 1).
+pub fn build_global_shell_with(
+    machine: &dyn OrMachine,
+    core: &[u8],
+    logical_len: u64,
+    depth: u16,
+    generation: u64,
+) -> Result<BloomShell> {
     if !supported_depth(depth) {
         return Err(EkbloomError::BadDepth {
             depth: u32::from(depth),
         });
     }
-    NL2.check_core(core, logical_len)?;
-    let states = state_log(core, logical_len)?;
+    machine.check_core(core, logical_len)?;
+    let states = state_log_with(machine, core, logical_len)?;
+    let decoded = machine.decode(core, logical_len)?;
+    let width = usize::from(depth);
     let windows = window_count(logical_len, u64::from(depth))?;
 
     let mut table: Vec<Outcome> = vec![placeholder(depth); TABLE_SLOTS];
@@ -215,8 +232,25 @@ pub fn build_global_shell(
             if let Some(slot) = present.get_mut(key) {
                 *slot = true;
             }
+            let end = i.checked_add(width).ok_or(EkbloomError::Overflow {
+                what: "global window end",
+            })?;
+            let symbols = decoded
+                .get(i..end)
+                .ok_or(EkbloomError::Truncated {
+                    needed: end as u64,
+                    available: decoded.len() as u64,
+                })?
+                .to_vec();
+            let next_state = *states.get(end).ok_or(EkbloomError::Truncated {
+                needed: (end + 1) as u64,
+                available: states.len() as u64,
+            })?;
             if let Some(entry) = table.get_mut(key) {
-                *entry = outcome_at(core, x, i as u64, depth)?;
+                *entry = Outcome {
+                    symbols,
+                    next_state,
+                };
             }
         }
     }

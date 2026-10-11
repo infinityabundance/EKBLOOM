@@ -20,7 +20,7 @@ use crate::bloom_path::PathBloom;
 use crate::bloom_region::RegionTable;
 use crate::checkpoint::CheckpointSet;
 use crate::error::{EkbloomError, Result};
-use crate::machine::{machine_by_id, state_log, OrMachine};
+use crate::machine::{machine_by_id, state_log_with, OrMachine};
 use crate::manifest::EkbloomBody;
 use crate::state::Snapshot;
 use std::collections::BTreeMap;
@@ -110,12 +110,12 @@ fn run(body: &EkbloomBody, deep: bool) -> Result<VerificationReport> {
         .filter(|symbols| symbols.len() as u64 == body.logical_len);
 
     // State log, used by checkpoint and bloom checks.
-    let logs = state_log(&body.core, body.logical_len).ok();
+    let logs = state_log_with(machine, &body.core, body.logical_len).ok();
 
     // History.
     if let Some(history) = &body.history {
-        let passed =
-            history.logical_len == body.logical_len && history.verify_against(&body.core).is_ok();
+        let passed = history.logical_len == body.logical_len
+            && history.verify_against_with(machine, &body.core).is_ok();
         checks.push(check(
             "history",
             passed,
@@ -129,7 +129,7 @@ fn run(body: &EkbloomBody, deep: bool) -> Result<VerificationReport> {
 
     // Checkpoints.
     for (idx, cp) in body.checkpoints.iter().enumerate() {
-        checks.push(check_checkpoint(body, cp, logs.as_deref(), idx));
+        checks.push(check_checkpoint(body, cp, idx, machine));
     }
 
     // Blooms.
@@ -155,39 +155,48 @@ fn run(body: &EkbloomBody, deep: bool) -> Result<VerificationReport> {
 fn check_checkpoint(
     body: &EkbloomBody,
     cp: &CheckpointSet,
-    logs: Option<&[u32]>,
     idx: usize,
+    machine: &'static dyn OrMachine,
 ) -> CheckOutcome {
     let name = format!("checkpoints[{idx}] K={}", cp.interval);
-    let Some(logs) = logs else {
-        return check(name, false, "state log unavailable");
-    };
     if cp.count != cp.resume.len() as u64 {
         return check(name, false, "count does not match stored resume points");
     }
     let k = u64::from(cp.interval);
-    let mut ordinal = 0u64;
-    while ordinal < cp.count {
-        let pos = match ordinal.checked_mul(k) {
-            Some(pos) => pos,
+    let mut omega = match machine.init(&body.core) {
+        Ok(omega) => omega,
+        Err(e) => return check(name, false, format!("genesis failed: {e}")),
+    };
+    let mut pos = 0u64;
+    for ordinal in 0..cp.count {
+        let target = match ordinal.checked_mul(k) {
+            Some(target) => target,
             None => return check(name, false, "ordinal overflow"),
         };
-        if pos > body.logical_len {
-            return check(name, false, format!("ordinal {pos} exceeds logical length"));
+        if target > body.logical_len {
+            return check(
+                name,
+                false,
+                format!("ordinal {target} exceeds logical length"),
+            );
         }
-        let want = Snapshot::new(logs[pos as usize], pos);
-        match cp.restore(&body.core, pos) {
-            Ok(got) if got == want => {}
+        while pos < target {
+            if let Err(e) = machine.reveal(&body.core, &mut omega) {
+                return check(name, false, format!("replay failed: {e}"));
+            }
+            pos += 1;
+        }
+        match cp.restore_with(machine, &body.core, target) {
+            Ok(got) if got == omega => {}
             Ok(got) => {
                 return check(
                     name,
                     false,
-                    format!("restart at {pos} restored {got:?}, expected {want:?}"),
+                    format!("restart at {target} restored {got:?}, expected {omega:?}"),
                 )
             }
-            Err(e) => return check(name, false, format!("restart at {pos} failed: {e}")),
+            Err(e) => return check(name, false, format!("restart at {target} failed: {e}")),
         }
-        ordinal += 1;
     }
     check(
         name,
@@ -501,14 +510,18 @@ fn check_deep_symbols(
     };
 
     if let Some(history) = &body.history {
+        let mut omega = match machine.init(&body.core) {
+            Ok(omega) => omega,
+            Err(e) => return check("deep_symbols", false, format!("genesis failed: {e}")),
+        };
         for (pos, &want) in decoded.iter().enumerate() {
-            let Some(mut omega) = history.snapshot_at(pos as u64) else {
+            if history.state_at(pos as u64) != Some(omega.state) {
                 return check(
                     "deep_symbols",
                     false,
-                    format!("history has no position {pos}"),
+                    format!("history state {pos} disagrees with the machine"),
                 );
-            };
+            }
             match machine.reveal(&body.core, &mut omega) {
                 Ok(symbol) if symbol == want => {}
                 Ok(symbol) => {
@@ -521,11 +534,18 @@ fn check_deep_symbols(
                 Err(e) => return check("deep_symbols", false, e.to_string()),
             }
         }
+        if history.state_at(decoded.len() as u64) != Some(omega.state) {
+            return check(
+                "deep_symbols",
+                false,
+                "history terminal state disagrees with the machine".to_string(),
+            );
+        }
     }
 
     for (idx, cp) in body.checkpoints.iter().enumerate() {
         for (pos, &want) in decoded.iter().enumerate() {
-            let mut omega = match cp.restore(&body.core, pos as u64) {
+            let mut omega = match cp.restore_with(machine, &body.core, pos as u64) {
                 Ok(omega) => omega,
                 Err(e) => {
                     return check(

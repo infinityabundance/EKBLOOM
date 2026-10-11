@@ -7,11 +7,14 @@
 //! advances at most `K-1` steps, so [`CheckpointSet::max_replay_steps`] is
 //! `K-1` and [`CheckpointSet::restore`] never performs more than that.
 //!
-//! For the sole v0.3 machine `OrANS-NL2` (`machine_id = 1`) the cursor equals
-//! the logical position, so a checkpoint at slot `j` carries `cursor = j*K`.
+//! For a machine whose cursor equals the logical position (`OrANS-NL2`,
+//! `machine_id = 1`) the cursor equals the logical position, so a checkpoint at
+//! slot `j` carries `cursor = j*K`. A cursor-divergent machine (e.g. machine 2)
+//! instead stores the true backing cursor; the logical position remains implicit
+//! as `j*K`, and the cursor-equality invariant is only enforced for machine 1.
 
 use crate::error::{EkbloomError, Result};
-use crate::machine::{OrMachine, NL2};
+use crate::machine::{OrMachine, MACHINE_NL2, NL2};
 use crate::state::Snapshot;
 
 /// Checkpoint intervals supported by the frozen contract, densest last.
@@ -37,19 +40,29 @@ impl CheckpointSet {
     ///
     /// Rejects an unsupported interval with [`EkbloomError::BadInterval`].
     pub fn build(core: &[u8], logical_len: u64, interval: u32) -> Result<CheckpointSet> {
+        Self::build_with(&NL2, core, logical_len, interval)
+    }
+
+    /// Machine-general [`CheckpointSet::build`].
+    pub fn build_with(
+        machine: &dyn OrMachine,
+        core: &[u8],
+        logical_len: u64,
+        interval: u32,
+    ) -> Result<CheckpointSet> {
         if !Self::supported_interval(interval) {
             return Err(EkbloomError::BadInterval { interval });
         }
-        NL2.check_core(core, logical_len)?;
+        machine.check_core(core, logical_len)?;
 
         let k = u64::from(interval);
         let mut resume = Vec::new();
-        let mut omega = NL2.init();
+        let mut omega = machine.init(core)?;
         resume.push(omega);
 
         let mut i: u64 = 0;
         while i < logical_len {
-            NL2.reveal(core, &mut omega)?;
+            machine.reveal(core, &mut omega)?;
             i += 1;
             if i.is_multiple_of(k) {
                 resume.push(omega);
@@ -84,6 +97,11 @@ impl CheckpointSet {
     /// Restore `Omega_i` exactly by advancing at most `K-1` steps from the
     /// covering checkpoint. The number of steps taken is exactly `i % K`.
     pub fn restore(&self, core: &[u8], i: u64) -> Result<Snapshot> {
+        self.restore_with(&NL2, core, i)
+    }
+
+    /// Machine-general [`CheckpointSet::restore`].
+    pub fn restore_with(&self, machine: &dyn OrMachine, core: &[u8], i: u64) -> Result<Snapshot> {
         let k = u64::from(self.interval);
         let j = i / k;
         let idx = usize::try_from(j).map_err(|_| EkbloomError::InvalidArgument {
@@ -96,22 +114,25 @@ impl CheckpointSet {
                 what: format!("checkpoint position {i} out of range"),
             })?;
 
-        // The covering checkpoint must sit at the implicit position `j*K`.
-        let expected_cursor = j.checked_mul(k).ok_or(EkbloomError::Overflow {
-            what: "checkpoint cursor",
-        })?;
-        if omega.cursor != expected_cursor {
-            return Err(EkbloomError::BadSection {
-                reason: format!(
-                    "checkpoint cursor {} does not match implicit position {expected_cursor}",
-                    omega.cursor
-                ),
-            });
+        // For a cursor==position machine the covering checkpoint must sit at the
+        // implicit position `j*K`; other machines carry an independent cursor.
+        if machine.machine_id() == MACHINE_NL2 {
+            let expected_cursor = j.checked_mul(k).ok_or(EkbloomError::Overflow {
+                what: "checkpoint cursor",
+            })?;
+            if omega.cursor != expected_cursor {
+                return Err(EkbloomError::BadSection {
+                    reason: format!(
+                        "checkpoint cursor {} does not match implicit position {expected_cursor}",
+                        omega.cursor
+                    ),
+                });
+            }
         }
 
         let steps = i % k;
         for _ in 0..steps {
-            NL2.reveal(core, &mut omega)?;
+            machine.reveal(core, &mut omega)?;
         }
         Ok(omega)
     }
@@ -150,6 +171,14 @@ impl CheckpointSet {
     /// [`EkbloomError::Truncated`] and inconsistency with
     /// [`EkbloomError::BadSection`].
     pub fn from_bytes(bytes: &[u8]) -> Result<CheckpointSet> {
+        Self::from_bytes_with(&NL2, bytes)
+    }
+
+    /// Machine-general [`CheckpointSet::from_bytes`].
+    ///
+    /// The `cursor == j*K` invariant is only enforced for machine 1; a
+    /// cursor-divergent machine stores the true backing cursor verbatim.
+    pub fn from_bytes_with(machine: &dyn OrMachine, bytes: &[u8]) -> Result<CheckpointSet> {
         if bytes.len() < HEADER_LEN {
             return Err(EkbloomError::Truncated {
                 needed: HEADER_LEN as u64,
@@ -190,20 +219,23 @@ impl CheckpointSet {
         let count_usize = usize::try_from(count).map_err(|_| EkbloomError::Overflow {
             what: "checkpoint count",
         })?;
+        let enforce_cursor = machine.machine_id() == MACHINE_NL2;
         let mut resume = Vec::with_capacity(count_usize);
         let mut off = HEADER_LEN;
         for j in 0..count {
             let s = Snapshot::unpack(&bytes[off..off + Snapshot::PACKED_LEN])?;
-            let expected_cursor = j.checked_mul(k).ok_or(EkbloomError::Overflow {
-                what: "checkpoint cursor",
-            })?;
-            if s.cursor != expected_cursor {
-                return Err(EkbloomError::BadSection {
-                    reason: format!(
-                        "checkpoint {j} cursor {} does not match implicit position {expected_cursor}",
-                        s.cursor
-                    ),
-                });
+            if enforce_cursor {
+                let expected_cursor = j.checked_mul(k).ok_or(EkbloomError::Overflow {
+                    what: "checkpoint cursor",
+                })?;
+                if s.cursor != expected_cursor {
+                    return Err(EkbloomError::BadSection {
+                        reason: format!(
+                            "checkpoint {j} cursor {} does not match implicit position {expected_cursor}",
+                            s.cursor
+                        ),
+                    });
+                }
             }
             resume.push(s);
             off += Snapshot::PACKED_LEN;

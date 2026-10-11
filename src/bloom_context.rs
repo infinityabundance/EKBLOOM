@@ -16,7 +16,7 @@ use crate::bloom::{supported_depth, BloomKind, BloomShell, Certification, Outcom
 use crate::bloom_global::Counterexample;
 use crate::bloom_key::key_from_state;
 use crate::error::{EkbloomError, Result};
-use crate::machine::{state_log, OrMachine, NL2};
+use crate::machine::{state_log_with, OrMachine, NL2};
 use crate::state::Snapshot;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
@@ -58,13 +58,23 @@ struct KeyState {
 /// to a single outcome. The construction is exact, so `conflicts` is zero and the
 /// status is [`Certification::Certified`] for well-formed inputs.
 pub fn certify_context(core: &[u8], logical_len: u64, depth: u16) -> Result<ContextCertification> {
+    certify_context_with(&NL2, core, logical_len, depth)
+}
+
+/// Machine-general [`certify_context`].
+pub fn certify_context_with(
+    machine: &dyn OrMachine,
+    core: &[u8],
+    logical_len: u64,
+    depth: u16,
+) -> Result<ContextCertification> {
     if !supported_depth(depth) {
         return Err(EkbloomError::BadDepth {
             depth: u32::from(depth),
         });
     }
-    NL2.check_core(core, logical_len)?;
-    let states = state_log(core, logical_len)?;
+    machine.check_core(core, logical_len)?;
+    let states = state_log_with(machine, core, logical_len)?;
     let d = u64::from(depth);
     let windows = window_count(logical_len, d)?;
     let width = usize::from(depth);
@@ -79,7 +89,7 @@ pub fn certify_context(core: &[u8], logical_len: u64, depth: u16) -> Result<Cont
                 available: core.len() as u64,
             })?
             .to_vec();
-        let out = outcome_at(core, x, i as u64, depth)?;
+        let out = outcome_at(machine, core, x, i as u64, depth)?;
         match map.entry((state, ctx)) {
             Entry::Vacant(e) => {
                 e.insert(KeyState {
@@ -148,14 +158,26 @@ pub fn build_context_shell(
     depth: u16,
     generation: u64,
 ) -> Result<BloomShell> {
+    build_context_shell_with(&NL2, core, logical_len, depth, generation)
+}
+
+/// Machine-general [`build_context_shell`].
+pub fn build_context_shell_with(
+    machine: &dyn OrMachine,
+    core: &[u8],
+    logical_len: u64,
+    depth: u16,
+    generation: u64,
+) -> Result<BloomShell> {
     let bloom = ContextBloom {
         depth,
-        entries: build_entries(core, logical_len, depth)?,
+        entries: build_entries(machine, core, logical_len, depth)?,
     };
     Ok(bloom.to_shell(generation, *blake3::hash(core).as_bytes()))
 }
 
 fn build_entries(
+    machine: &dyn OrMachine,
     core: &[u8],
     logical_len: u64,
     depth: u16,
@@ -165,8 +187,8 @@ fn build_entries(
             depth: u32::from(depth),
         });
     }
-    NL2.check_core(core, logical_len)?;
-    let states = state_log(core, logical_len)?;
+    machine.check_core(core, logical_len)?;
+    let states = state_log_with(machine, core, logical_len)?;
     let windows = window_count(logical_len, u64::from(depth))?;
     let width = usize::from(depth);
 
@@ -180,7 +202,7 @@ fn build_entries(
                 available: core.len() as u64,
             })?
             .to_vec();
-        let out = outcome_at(core, x, i as u64, depth)?;
+        let out = outcome_at(machine, core, x, i as u64, depth)?;
         map.entry((state, ctx)).or_insert(out);
     }
     Ok(map
@@ -321,11 +343,17 @@ fn window_count(logical_len: u64, depth: u64) -> Result<usize> {
 }
 
 /// Reveal `depth` symbols from `(state, cursor)` and capture the successor state.
-fn outcome_at(core: &[u8], state: u32, cursor: u64, depth: u16) -> Result<Outcome> {
+fn outcome_at(
+    machine: &dyn OrMachine,
+    core: &[u8],
+    state: u32,
+    cursor: u64,
+    depth: u16,
+) -> Result<Outcome> {
     let mut omega = Snapshot::new(state, cursor);
     let mut symbols = Vec::with_capacity(usize::from(depth));
     for _ in 0..depth {
-        symbols.push(NL2.reveal(core, &mut omega)?);
+        symbols.push(machine.reveal(core, &mut omega)?);
     }
     Ok(Outcome {
         symbols,

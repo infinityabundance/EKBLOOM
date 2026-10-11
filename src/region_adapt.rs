@@ -40,7 +40,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::bloom::{BloomKind, BloomShell, Certificate, Certification, Outcome};
 use crate::checkpoint::CheckpointSet;
 use crate::error::{EkbloomError, Result};
-use crate::machine::{machine_by_id, state_log, OrMachine, NL2};
+use crate::machine::{machine_by_id, state_log, OrMachine, MACHINE_NL2, NL2};
 use crate::manifest::EkbloomBody;
 use crate::metrics::now_ns;
 use crate::state::Snapshot;
@@ -675,6 +675,9 @@ fn read_into(body: &EkbloomBody, offset: u64, length: u64, out: &mut Vec<u8>) ->
 /// source: the nearest checkpoint (bounded), the full history (O(1)), or the
 /// authoritative machine from `Omega_0`.
 fn seed_snapshot(body: &EkbloomBody, pos: u64) -> Result<Snapshot> {
+    let machine = machine_by_id(body.machine_id).ok_or(EkbloomError::UnknownMachine {
+        id: body.machine_id,
+    })?;
     let mut best: Option<(u64, &CheckpointSet)> = None;
     for cp in &body.checkpoints {
         if cp.interval == 0 || cp.restart_point(pos).is_none() {
@@ -690,20 +693,19 @@ fn seed_snapshot(body: &EkbloomBody, pos: u64) -> Result<Snapshot> {
         }
     }
     if let Some((_, cp)) = best {
-        return cp.restore(&body.core, pos);
+        return cp.restore_with(machine, &body.core, pos);
     }
-    if let Some(history) = &body.history {
-        if history.logical_len == body.logical_len {
-            if let Some(snapshot) = history.snapshot_at(pos) {
-                return Ok(snapshot);
+    if body.machine_id == MACHINE_NL2 {
+        if let Some(history) = &body.history {
+            if history.logical_len == body.logical_len {
+                if let Some(snapshot) = history.snapshot_at(pos) {
+                    return Ok(snapshot);
+                }
             }
         }
     }
-    let machine = machine_by_id(body.machine_id).ok_or(EkbloomError::UnknownMachine {
-        id: body.machine_id,
-    })?;
     machine.check_core(&body.core, body.logical_len)?;
-    let mut omega = machine.init();
+    let mut omega = machine.init(&body.core)?;
     let mut i = 0u64;
     while i < pos {
         machine.reveal(&body.core, &mut omega)?;

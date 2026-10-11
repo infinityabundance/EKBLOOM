@@ -26,7 +26,7 @@ const USAGE: &str = "\
 ekbloom — concealed-expansion codec CLI
 
 usage:
-  ekbloom create   <input> -o <out.ekb> [--profile <p>] [--depth D] [--interval K] [--region-bytes R] [--max-physical-bytes B] [--key-hex H | --key-file F]
+  ekbloom create   <input> -o <out.ekb> [--profile <p>] [--machine 1|2] [--depth D] [--interval K] [--region-bytes R] [--max-physical-bytes B] [--key-hex H | --key-file F]
   ekbloom manifest <file.ekb> --profile <p> [--depth D] [--interval K] [--region-bytes R] [--max-physical-bytes B] [--key-hex H | --key-file F]
   ekbloom grow     <file.ekb> --profile <p> [--depth D] [--interval K] [--region-bytes R] [--max-physical-bytes B] [--key-hex H | --key-file F]
   ekbloom read     <file.ekb> --offset O --length L [-o <out.bin>] [--key-hex H | --key-file F]
@@ -40,6 +40,10 @@ profiles:
   root, sparse, dense, full, bloom4, bloom8, bloom16, bloom32, regional, path, max-speed
   (sparse/dense use --interval, default 1024; regional uses --depth/--region-bytes,
    default 4/4096; path uses --depth, default 4)
+
+machines:
+  --machine 1  OrANS-NL2 (default): expansion-only, V = N
+  --machine 2  OrANS-RANS0: order-0 range-ANS, compresses skewed sources (V < N)
 
 keys:
   --key-hex H  64 hex characters (32 raw bytes) of the authentication key
@@ -365,17 +369,19 @@ fn cmd_create(parsed: &Parsed) -> Result<i32, CliError> {
     let profile = resolve_profile(parsed, false)?;
     let key = resolve_key(parsed)?;
     let max_physical_bytes = parsed.parse_u64("max-physical-bytes")?;
+    let machine_id = parsed.parse_u32("machine")?.unwrap_or(ekbloom::MACHINE_NL2);
 
     let source = fs::read(input)?;
     let body = match max_physical_bytes {
-        Some(limit) => manifest::create_within_budget(
+        Some(limit) => manifest::create_machine_within_budget(
             &source,
             profile,
+            machine_id,
             &ManifestationBudget {
                 maximum_physical_bytes: limit,
             },
         )?,
-        None => manifest::create(&source, profile)?,
+        None => manifest::create_machine(&source, profile, machine_id)?,
     };
     match &key {
         Some(key) => writer::write_body_authenticated(Path::new(out), &body, key)?,

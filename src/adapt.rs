@@ -498,7 +498,7 @@ fn read_shell_machine(body: &EkbloomBody, offset: u64, end: u64) -> Result<Vec<u
         id: body.machine_id,
     })?;
     machine.check_core(&body.core, body.logical_len)?;
-    let mut omega = machine.init();
+    let mut omega = machine.init(&body.core)?;
     let mut pos = 0u64;
     while pos < offset {
         machine.reveal(&body.core, &mut omega)?;

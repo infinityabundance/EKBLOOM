@@ -20,7 +20,7 @@
 //! for additional positions without ever rewriting earlier committed states.
 
 use crate::error::{EkbloomError, Result};
-use crate::machine::{state_log, OrMachine, NL2};
+use crate::machine::{state_log_with, OrMachine, NL2};
 use crate::state::Snapshot;
 
 /// Fixed wire-header size: `u64` generation, `u64` logical_len, `u64` core_len,
@@ -45,9 +45,19 @@ pub struct History {
 
 impl History {
     /// Build the full state projection for `core` producing `logical_len`
-    /// symbols, tagged with `generation`.
+    /// symbols, tagged with `generation`, using the authoritative machine 1.
     pub fn build(core: &[u8], logical_len: u64, generation: u64) -> Result<History> {
-        let states = state_log(core, logical_len)?;
+        Self::build_with(&NL2, core, logical_len, generation)
+    }
+
+    /// Machine-general [`History::build`].
+    pub fn build_with(
+        machine: &dyn OrMachine,
+        core: &[u8],
+        logical_len: u64,
+        generation: u64,
+    ) -> Result<History> {
+        let states = state_log_with(machine, core, logical_len)?;
         Ok(History {
             generation,
             logical_len,
@@ -79,6 +89,11 @@ impl History {
     /// Also confirms `core` has the recorded length and hash, so a tampered
     /// core is rejected even before the (symbol-equivalent) state comparison.
     pub fn verify_against(&self, core: &[u8]) -> Result<()> {
+        self.verify_against_with(&NL2, core)
+    }
+
+    /// Machine-general [`History::verify_against`].
+    pub fn verify_against_with(&self, machine: &dyn OrMachine, core: &[u8]) -> Result<()> {
         if core.len() as u64 != self.core_len {
             return Err(EkbloomError::BadSection {
                 reason: format!(
@@ -93,7 +108,7 @@ impl History {
                 reason: "core hash mismatch".to_string(),
             });
         }
-        let expected = state_log(core, self.logical_len)?;
+        let expected = state_log_with(machine, core, self.logical_len)?;
         if expected.len() != self.states.len() {
             return Err(EkbloomError::BadSection {
                 reason: format!(
@@ -209,6 +224,16 @@ impl History {
     /// [`History::generation`] by one. Errors with
     /// [`EkbloomError::InvalidArgument`] when `new_logical_len < self.logical_len`.
     pub fn extend(&mut self, core: &[u8], new_logical_len: u64) -> Result<()> {
+        self.extend_with(&NL2, core, new_logical_len)
+    }
+
+    /// Machine-general [`History::extend`].
+    pub fn extend_with(
+        &mut self,
+        machine: &dyn OrMachine,
+        core: &[u8],
+        new_logical_len: u64,
+    ) -> Result<()> {
         if new_logical_len < self.logical_len {
             return Err(EkbloomError::InvalidArgument {
                 what: format!(
@@ -220,7 +245,7 @@ impl History {
         if new_logical_len == self.logical_len {
             return Ok(());
         }
-        NL2.check_core(core, new_logical_len)?;
+        machine.check_core(core, new_logical_len)?;
 
         let committed = self.logical_len;
         let committed_len = usize::try_from(committed).map_err(|_| EkbloomError::Overflow {
@@ -234,7 +259,7 @@ impl History {
         // Non-withdrawal: the already-committed core prefix must be unchanged so
         // the appended tail continues the same projection. Recompute the prefix
         // projection and require an exact match with the committed states.
-        let prefix = state_log(&core[..committed_len], committed)?;
+        let prefix = state_log_with(machine, &core[..committed_len], committed)?;
         if prefix != self.states {
             return Err(EkbloomError::BadSection {
                 reason: "existing core prefix changed".to_string(),
@@ -249,7 +274,7 @@ impl History {
         let mut tail: Vec<u32> = Vec::new();
         let mut i = committed;
         while i < new_logical_len {
-            NL2.reveal(core, &mut omega)?;
+            machine.reveal(core, &mut omega)?;
             tail.push(omega.state);
             i += 1;
         }
@@ -283,6 +308,7 @@ fn read_u64(bytes: &[u8], off: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::machine::state_log;
 
     fn lcg(seed: u64, len: usize) -> Vec<u8> {
         let mut s = seed;

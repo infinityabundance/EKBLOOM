@@ -21,7 +21,7 @@ use crate::checkpoint::CheckpointSet;
 use crate::error::{EkbloomError, Result};
 use crate::format::{self, SectionKind};
 use crate::history::History;
-use crate::machine::machine_by_id;
+use crate::machine::{machine_by_id, MACHINE_NL2};
 use crate::manifest::{ComponentReport, EkbloomBody, ManifestationReport};
 use crate::state::Snapshot;
 use crate::ReadRequest;
@@ -190,7 +190,14 @@ fn open_selected(
             let payload = format::section_payload(bytes, section);
             match section.kind {
                 SectionKind::HistoryFull => history = Some(History::from_bytes(payload)?),
-                SectionKind::Checkpoints => checkpoints.push(CheckpointSet::from_bytes(payload)?),
+                SectionKind::Checkpoints => {
+                    let machine = machine_by_id(scan.header.core_machine_id).ok_or(
+                        EkbloomError::UnknownMachine {
+                            id: scan.header.core_machine_id,
+                        },
+                    )?;
+                    checkpoints.push(CheckpointSet::from_bytes_with(machine, payload)?);
+                }
                 SectionKind::BloomGlobal
                 | SectionKind::BloomContext
                 | SectionKind::BloomRegion
@@ -414,7 +421,7 @@ fn read_via_checkpoint(body: &EkbloomBody, offset: u64, length: u64) -> Result<O
     let machine = machine_by_id(body.machine_id).ok_or(EkbloomError::UnknownMachine {
         id: body.machine_id,
     })?;
-    let mut omega = cp.restore(&body.core, offset)?;
+    let mut omega = cp.restore_with(machine, &body.core, offset)?;
     let mut out = Vec::with_capacity(length as usize);
     for _ in 0..length {
         out.push(machine.reveal(&body.core, &mut omega)?);
@@ -428,6 +435,11 @@ fn read_via_history(body: &EkbloomBody, offset: u64, end: u64) -> Result<Option<
         return Ok(None);
     };
     if history.logical_len != body.logical_len {
+        return Ok(None);
+    }
+    // The history state-only projection is directly resumable only for a
+    // cursor==position machine; other machines fall through to replay.
+    if body.machine_id != MACHINE_NL2 {
         return Ok(None);
     }
     let machine = machine_by_id(body.machine_id).ok_or(EkbloomError::UnknownMachine {
@@ -451,7 +463,7 @@ fn read_via_machine(body: &EkbloomBody, offset: u64, end: u64) -> Result<Vec<u8>
         id: body.machine_id,
     })?;
     machine.check_core(&body.core, body.logical_len)?;
-    let mut omega = machine.init();
+    let mut omega = machine.init(&body.core)?;
     let mut pos = 0u64;
     while pos < offset {
         machine.reveal(&body.core, &mut omega)?;
@@ -1038,6 +1050,10 @@ impl FileBody {
 
         let core_offset = format::CORE_OFFSET;
         let core_len = header.core_len;
+        let machine =
+            machine_by_id(header.core_machine_id).ok_or(EkbloomError::UnknownMachine {
+                id: header.core_machine_id,
+            })?;
 
         let mut history: Option<FileHistory> = None;
         let mut checkpoints: Vec<FileCheckpoint> = Vec::new();
@@ -1054,7 +1070,7 @@ impl FileBody {
                         history = Some(parse_history(&file, off, len, physical_len)?)
                     }
                     SectionKind::Checkpoints => {
-                        checkpoints.push(parse_checkpoint(&file, off, len, physical_len)?)
+                        checkpoints.push(parse_checkpoint(&file, off, len, physical_len, machine)?)
                     }
                     SectionKind::BloomGlobal
                     | SectionKind::BloomContext
@@ -1303,6 +1319,12 @@ impl FileBody {
         end: u64,
         out: &mut Vec<u8>,
     ) -> Result<bool> {
+        // The checkpoint fast path rebases the core window at the implicit
+        // position `j*K`, which is only valid when the cursor equals the logical
+        // position. Cursor-divergent machines replay authoritatively instead.
+        if self.machine_id != MACHINE_NL2 {
+            return Ok(false);
+        }
         let mut best: Option<(u64, &FileCheckpoint)> = None;
         for cp in &self.checkpoints {
             if cp.interval == 0 {
@@ -1389,6 +1411,10 @@ impl FileBody {
         if history.logical_len != self.logical_len {
             return Ok(false);
         }
+        // Only a cursor==position machine can rebase the state-only projection.
+        if self.machine_id != MACHINE_NL2 {
+            return Ok(false);
+        }
         let count = history
             .logical_len
             .checked_add(1)
@@ -1441,17 +1467,24 @@ impl FileBody {
         let machine = machine_by_id(self.machine_id).ok_or(EkbloomError::UnknownMachine {
             id: self.machine_id,
         })?;
-        if self.logical_len > self.core_len {
+        if self.machine_id == MACHINE_NL2 && self.logical_len > self.core_len {
             return Err(EkbloomError::CoreTooShort {
                 needed: self.logical_len,
                 available: self.core_len,
             });
         }
-        let core = self.read_core(0, end)?;
+        // Machine 1 consumes one core byte per symbol, so `[0, end)` suffices.
+        // A cursor-divergent machine may need bytes past `end`, so read the whole
+        // core (the read is still bounded by the file size).
+        let core = if self.machine_id == MACHINE_NL2 {
+            self.read_core(0, end)?
+        } else {
+            self.read_core(0, self.core_len)?
+        };
         if let Ok(n) = usize::try_from(end - offset) {
             out.reserve(n);
         }
-        let mut omega = machine.init();
+        let mut omega = machine.init(&core)?;
         let mut pos = 0u64;
         while pos < offset {
             machine.reveal(&core, &mut omega)?;
@@ -1775,6 +1808,7 @@ fn parse_checkpoint(
     payload_offset: u64,
     payload_len: u64,
     total: u64,
+    machine: &'static dyn crate::machine::OrMachine,
 ) -> Result<FileCheckpoint> {
     if payload_len < CHECKPOINT_HEADER_LEN as u64 {
         return Err(EkbloomError::Truncated {
@@ -1808,7 +1842,7 @@ fn parse_checkpoint(
             available: payload_len,
         });
     }
-    validate_checkpoint_entries(file, payload_offset, count, k, total)?;
+    validate_checkpoint_entries(file, payload_offset, count, k, total, machine)?;
     Ok(FileCheckpoint {
         interval,
         count,
@@ -1817,13 +1851,18 @@ fn parse_checkpoint(
 }
 
 /// Validate every resume point's implicit cursor using bounded batch reads.
+///
+/// The `cursor == j*K` invariant is only enforced for machine 1; other machines
+/// store the true backing cursor verbatim.
 fn validate_checkpoint_entries(
     file: &File,
     payload_offset: u64,
     count: u64,
     k: u64,
     total: u64,
+    machine: &'static dyn crate::machine::OrMachine,
 ) -> Result<()> {
+    let enforce_cursor = machine.machine_id() == MACHINE_NL2;
     let batch = CHECKPOINT_VALIDATE_BATCH as usize;
     let mut buf = vec![0u8; batch.saturating_mul(Snapshot::PACKED_LEN)];
     let mut j = 0u64;
@@ -1840,15 +1879,17 @@ fn validate_checkpoint_entries(
         for e in 0..n {
             let lo = (e as usize) * Snapshot::PACKED_LEN;
             let s = Snapshot::unpack(&buf[lo..lo + Snapshot::PACKED_LEN])?;
-            let expected = (j + e).checked_mul(k).ok_or(EkbloomError::Overflow {
-                what: "checkpoint cursor",
-            })?;
-            if s.cursor != expected {
-                return Err(bad(format!(
-                    "checkpoint {} cursor {} does not match implicit position {expected}",
-                    j + e,
-                    s.cursor
-                )));
+            if enforce_cursor {
+                let expected = (j + e).checked_mul(k).ok_or(EkbloomError::Overflow {
+                    what: "checkpoint cursor",
+                })?;
+                if s.cursor != expected {
+                    return Err(bad(format!(
+                        "checkpoint {} cursor {} does not match implicit position {expected}",
+                        j + e,
+                        s.cursor
+                    )));
+                }
             }
         }
         j += n;

@@ -41,6 +41,7 @@ pub mod fuse;
 pub mod history;
 pub mod history_store;
 pub mod machine;
+pub mod machine_rans;
 pub mod manifest;
 pub mod metrics;
 pub mod model_search;
@@ -79,11 +80,12 @@ pub use filesystem::{FileMeta, ObjectPhysical, OrFs, PhysicalReport};
 pub use fuse::{mount, OrFsMount};
 pub use history::History;
 pub use history_store::{current_rss_bytes, peak_rss_bytes, HistoryStore, StoreConfig};
-pub use machine::{machine_by_id, OrMachine, MACHINE_NL2, NL2};
+pub use machine::{machine_by_id, state_log_with, OrMachine, MACHINE_NL2, MACHINE_RANS0, NL2};
+pub use machine_rans::{Rans0, RANS0};
 pub use manifest::{
-    create, create_within_budget, estimate_physical_bytes, grow, inspect, manifest,
-    manifest_within_budget, select_profile_within_budget, ComponentReport, EkbloomBody,
-    ManifestationReport,
+    create, create_machine, create_machine_within_budget, create_within_budget,
+    estimate_physical_bytes, grow, inspect, manifest, manifest_within_budget,
+    select_profile_within_budget, ComponentReport, EkbloomBody, ManifestationReport,
 };
 pub use metrics::{now_ns, percentiles, Percentiles};
 pub use model_search::{

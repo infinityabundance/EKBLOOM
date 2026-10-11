@@ -29,9 +29,9 @@
 //! | `MaxSpeed` | `Full` history + `Sparse{1024}` + a depth-4 path bloom |
 
 use crate::bloom::{BloomKind, BloomShell, Certificate, Certification};
-use crate::bloom_global::build_global_shell;
+use crate::bloom_global::build_global_shell_with;
 use crate::bloom_path::PathBloom;
-use crate::bloom_region::build_regional;
+use crate::bloom_region::build_regional_with;
 use crate::checkpoint::CheckpointSet;
 use crate::error::{EkbloomError, Result};
 use crate::history::History;
@@ -135,7 +135,9 @@ impl EkbloomBody {
             });
         }
         if let Some(h) = &self.history {
-            if h.logical_len == self.logical_len {
+            // The state-only projection is only directly resumable for a
+            // cursor==position machine (machine 1); other machines replay.
+            if self.machine_id == MACHINE_NL2 && h.logical_len == self.logical_len {
                 if let Some(snapshot) = h.snapshot_at(i) {
                     return Ok(snapshot);
                 }
@@ -143,7 +145,7 @@ impl EkbloomBody {
         }
         let machine = self.machine()?;
         machine.check_core(&self.core, self.logical_len)?;
-        let mut omega = machine.init();
+        let mut omega = machine.init(&self.core)?;
         let mut pos = 0u64;
         while pos < i {
             machine.reveal(&self.core, &mut omega)?;
@@ -218,8 +220,17 @@ fn derive_object_id(core_hash: &[u8; 32]) -> [u8; 16] {
 /// The core is `machine.encode(source)`; `core_hash` and `object_id` are derived
 /// deterministically, and the requested profile is applied via [`manifest`].
 pub fn create(source: &[u8], profile: ManifestationProfile) -> Result<EkbloomBody> {
+    create_machine(source, profile, MACHINE_NL2)
+}
+
+/// Build a fresh body from `source` with the machine selected by `machine_id`.
+pub fn create_machine(
+    source: &[u8],
+    profile: ManifestationProfile,
+    machine_id: u32,
+) -> Result<EkbloomBody> {
     let machine =
-        machine_by_id(MACHINE_NL2).ok_or(EkbloomError::UnknownMachine { id: MACHINE_NL2 })?;
+        machine_by_id(machine_id).ok_or(EkbloomError::UnknownMachine { id: machine_id })?;
     let core = machine.encode(source)?;
     let core_hash = *blake3::hash(&core).as_bytes();
     let mut body = EkbloomBody {
@@ -245,6 +256,9 @@ pub fn create(source: &[u8], profile: ManifestationProfile) -> Result<EkbloomBod
 /// appended. All fallible structures are built before any mutation, so a failed
 /// call leaves `body` unchanged.
 pub fn manifest(body: &mut EkbloomBody, profile: ManifestationProfile) -> Result<()> {
+    let machine = machine_by_id(body.machine_id).ok_or(EkbloomError::UnknownMachine {
+        id: body.machine_id,
+    })?;
     let next_generation = body
         .generation
         .checked_add(1)
@@ -256,13 +270,13 @@ pub fn manifest(body: &mut EkbloomBody, profile: ManifestationProfile) -> Result
         ManifestationProfile::Root => {}
 
         ManifestationProfile::Sparse { interval } => {
-            let cp = CheckpointSet::build(&body.core, body.logical_len, interval)?;
+            let cp = CheckpointSet::build_with(machine, &body.core, body.logical_len, interval)?;
             body.checkpoints.push(cp);
         }
 
         ManifestationProfile::Dense { interval } => {
-            let cp = CheckpointSet::build(&body.core, body.logical_len, interval)?;
-            let history = history_if_absent(body, next_generation)?;
+            let cp = CheckpointSet::build_with(machine, &body.core, body.logical_len, interval)?;
+            let history = history_if_absent(machine, body, next_generation)?;
             body.checkpoints.push(cp);
             if let Some(h) = history {
                 body.history = Some(h);
@@ -270,14 +284,20 @@ pub fn manifest(body: &mut EkbloomBody, profile: ManifestationProfile) -> Result
         }
 
         ManifestationProfile::Full => {
-            let history = history_if_absent(body, next_generation)?;
+            let history = history_if_absent(machine, body, next_generation)?;
             if let Some(h) = history {
                 body.history = Some(h);
             }
         }
 
         ManifestationProfile::Bloom { depth } => {
-            let shell = build_global_shell(&body.core, body.logical_len, depth, next_generation)?;
+            let shell = build_global_shell_with(
+                machine,
+                &body.core,
+                body.logical_len,
+                depth,
+                next_generation,
+            )?;
             push_bloom(body, shell);
         }
 
@@ -285,7 +305,8 @@ pub fn manifest(body: &mut EkbloomBody, profile: ManifestationProfile) -> Result
             depth,
             region_bytes,
         } => {
-            let shells = build_regional(
+            let shells = build_regional_with(
+                machine,
                 &body.core,
                 body.logical_len,
                 depth,
@@ -298,7 +319,13 @@ pub fn manifest(body: &mut EkbloomBody, profile: ManifestationProfile) -> Result
         }
 
         ManifestationProfile::Path { depth } => {
-            let mut shell = PathBloom::build(&body.core, body.logical_len, depth, next_generation)?;
+            let mut shell = PathBloom::build_with(
+                machine,
+                &body.core,
+                body.logical_len,
+                depth,
+                next_generation,
+            )?;
             // A path bloom is exact by construction, so it may be used directly.
             shell.status = Certification::Certified;
             push_bloom(body, shell);
@@ -307,9 +334,10 @@ pub fn manifest(body: &mut EkbloomBody, profile: ManifestationProfile) -> Result
         ManifestationProfile::MaxSpeed => {
             // The fastest verified configuration: full history (O(1) state),
             // sparse restarts, and an exact depth-4 path bloom.
-            let history = history_if_absent(body, next_generation)?;
-            let cp = CheckpointSet::build(&body.core, body.logical_len, 1024)?;
-            let mut path = PathBloom::build(&body.core, body.logical_len, 4, next_generation)?;
+            let history = history_if_absent(machine, body, next_generation)?;
+            let cp = CheckpointSet::build_with(machine, &body.core, body.logical_len, 1024)?;
+            let mut path =
+                PathBloom::build_with(machine, &body.core, body.logical_len, 4, next_generation)?;
             path.status = Certification::Certified;
 
             if let Some(h) = history {
@@ -521,6 +549,16 @@ pub fn create_within_budget(
     profile: ManifestationProfile,
     budget: &ManifestationBudget,
 ) -> Result<EkbloomBody> {
+    create_machine_within_budget(source, profile, MACHINE_NL2, budget)
+}
+
+/// Machine-general [`create_within_budget`].
+pub fn create_machine_within_budget(
+    source: &[u8],
+    profile: ManifestationProfile,
+    machine_id: u32,
+    budget: &ManifestationBudget,
+) -> Result<EkbloomBody> {
     let limit = budget.maximum_physical_bytes;
     let estimated = estimate_physical_bytes(source.len() as u64, profile);
     if estimated > limit {
@@ -529,7 +567,7 @@ pub fn create_within_budget(
             limit,
         });
     }
-    let body = create(source, profile)?;
+    let body = create_machine(source, profile, machine_id)?;
     let actual = body.physical_bytes();
     if actual > limit {
         return Err(EkbloomError::AllocationTooLarge {
@@ -608,11 +646,16 @@ pub fn select_profile_within_budget(
 }
 
 /// Build a full history only when one is not already manifested.
-fn history_if_absent(body: &EkbloomBody, generation: u64) -> Result<Option<History>> {
+fn history_if_absent(
+    machine: &dyn OrMachine,
+    body: &EkbloomBody,
+    generation: u64,
+) -> Result<Option<History>> {
     if body.history.is_some() {
         Ok(None)
     } else {
-        Ok(Some(History::build(
+        Ok(Some(History::build_with(
+            machine,
             &body.core,
             body.logical_len,
             generation,

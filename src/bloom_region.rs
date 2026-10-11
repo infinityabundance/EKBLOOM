@@ -19,8 +19,7 @@ use crate::bloom::{supported_depth, BloomKind, BloomShell, Certification, Outcom
 use crate::bloom_global::Counterexample;
 use crate::bloom_key::key_from_state;
 use crate::error::{EkbloomError, Result};
-use crate::machine::{state_log, OrMachine, NL2};
-use crate::state::Snapshot;
+use crate::machine::{state_log_with, OrMachine, NL2};
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 
@@ -92,7 +91,18 @@ pub fn certify_regional(
     depth: u16,
     region_bytes: u32,
 ) -> Result<RegionCertification> {
-    let builds = build_regions(core, logical_len, depth, region_bytes)?;
+    certify_regional_with(&NL2, core, logical_len, depth, region_bytes)
+}
+
+/// Machine-general [`certify_regional`].
+pub fn certify_regional_with(
+    machine: &dyn OrMachine,
+    core: &[u8],
+    logical_len: u64,
+    depth: u16,
+    region_bytes: u32,
+) -> Result<RegionCertification> {
+    let builds = build_regions(machine, core, logical_len, depth, region_bytes)?;
     let mut certified_regions: u64 = 0;
     let mut conflicts: u64 = 0;
     let mut physical_bytes: u64 = 0;
@@ -127,7 +137,19 @@ pub fn build_regional(
     region_bytes: u32,
     generation: u64,
 ) -> Result<Vec<BloomShell>> {
-    let builds = build_regions(core, logical_len, depth, region_bytes)?;
+    build_regional_with(&NL2, core, logical_len, depth, region_bytes, generation)
+}
+
+/// Machine-general [`build_regional`].
+pub fn build_regional_with(
+    machine: &dyn OrMachine,
+    core: &[u8],
+    logical_len: u64,
+    depth: u16,
+    region_bytes: u32,
+    generation: u64,
+) -> Result<Vec<BloomShell>> {
+    let builds = build_regions(machine, core, logical_len, depth, region_bytes)?;
     let core_hash = *blake3::hash(core).as_bytes();
     let mut offset: u64 = 0;
     let mut out = Vec::with_capacity(builds.len());
@@ -168,6 +190,7 @@ pub fn build_regional(
 }
 
 fn build_regions(
+    machine: &dyn OrMachine,
     core: &[u8],
     logical_len: u64,
     depth: u16,
@@ -183,11 +206,12 @@ fn build_regions(
             what: "region_bytes must be non-zero".to_string(),
         });
     }
-    NL2.check_core(core, logical_len)?;
+    machine.check_core(core, logical_len)?;
     if logical_len == 0 {
         return Ok(Vec::new());
     }
-    let states = state_log(core, logical_len)?;
+    let states = state_log_with(machine, core, logical_len)?;
+    let decoded = machine.decode(core, logical_len)?;
     let rb = u64::from(region_bytes);
     let d = u64::from(depth);
     let nregions = logical_len.div_ceil(rb);
@@ -207,7 +231,26 @@ fn build_regions(
         let mut map: BTreeMap<u16, KeyState> = BTreeMap::new();
         for (i, &x) in states.iter().enumerate().skip(start_idx).take(windows) {
             let key = key_from_state(x);
-            let outcome = outcome_at(core, x, i as u64, depth)?;
+            let end = i
+                .checked_add(usize::from(depth))
+                .ok_or(EkbloomError::Overflow {
+                    what: "regional window end",
+                })?;
+            let symbols = decoded
+                .get(i..end)
+                .ok_or(EkbloomError::Truncated {
+                    needed: end as u64,
+                    available: decoded.len() as u64,
+                })?
+                .to_vec();
+            let next_state = *states.get(end).ok_or(EkbloomError::Truncated {
+                needed: (end + 1) as u64,
+                available: states.len() as u64,
+            })?;
+            let outcome = Outcome {
+                symbols,
+                next_state,
+            };
             match map.entry(key) {
                 Entry::Vacant(e) => {
                     e.insert(KeyState {
@@ -269,19 +312,6 @@ fn window_count(logical_len: u64, depth: u64) -> Result<usize> {
     }
     usize::try_from(logical_len - depth + 1).map_err(|_| EkbloomError::Overflow {
         what: "regional window count",
-    })
-}
-
-/// Reveal `depth` symbols from `(state, cursor)` and capture the successor state.
-fn outcome_at(core: &[u8], state: u32, cursor: u64, depth: u16) -> Result<Outcome> {
-    let mut omega = Snapshot::new(state, cursor);
-    let mut symbols = Vec::with_capacity(usize::from(depth));
-    for _ in 0..depth {
-        symbols.push(NL2.reveal(core, &mut omega)?);
-    }
-    Ok(Outcome {
-        symbols,
-        next_state: omega.state,
     })
 }
 

@@ -120,6 +120,35 @@ simultaneously, no conventional baseline provides any of that, and EKBLOOM's
 extra retained bytes are the price of that combination. EKBLOOM is **not** a
 faster array and **not** a smaller one; it is a richer one.
 
+## Machine 2 (`OrANS-RANS0`) vs `raw` on skewed data
+
+The rows above are machine 1 (`OrANS-NL2`), which is expansion-only (`V = N`).
+The additive machine 2 (`machine_id = 2`, see [`CODEC.md`](CODEC.md)) compresses
+skewed sources, so the space relationship is finally reversed — with the read
+semantics stated honestly for each row.
+
+| structure | class | retained bytes (skewed `N = 16,384`) | `V/N` | read semantics |
+|---|---|---:|---:|---|
+| `raw` | baseline | 16,384 | 1.000 | O(1) positional slice (`memcpy`) |
+| `ekbloom Root (machine 2)` | ekbloom | 8,371 | **0.511** | decode/replay from `Ω₀` (O(offset) machine work) |
+| `ekbloom Path{D=4} (machine 2)` | ekbloom | 8,371 + 16,384 ≈ 24,755 | 1.511 | exact O(1) symbol slice (path `hot` array) |
+
+Measured by `tests/machine_rans.rs` on the English-like skewed generator
+(18-symbol weighted alphabet): `core.len() = 8,371` for `source.len() = 16,384`
+(`V/N = 0.511`), roundtrip exact. Uniform random data is *not* compressed
+(`V/N ≈ 1.015` for `N = 32,768`): order-0 modelling cannot beat entropy, so
+machine 2 only wins on skewed data.
+
+**Honest verdict (machine 2).** `ekbloom Root (machine 2)` is genuinely
+**0.51×** the raw array for skewed data — a real space win, and the first time an
+EKBLOOM row beats `raw` on bytes. The win is *not* free of semantics: that row's
+reads are decode-based (O(offset) machine work per read), not O(1) slices. At
+**equal O(1)-slice read semantics** — `Path{D=4} (machine 2)`, whose `hot` array
+is still the raw output — the win is consumed by that array (`1.51× N`), exactly
+as with machine 1. So machine 2 earns the reviewer-requested `V < N`, and the
+trade is stated plainly: compressed storage at decode-read cost, or raw-speed
+reads at raw-or-larger size.
+
 ## Reproduce
 
 ```sh
