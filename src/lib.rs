@@ -46,6 +46,7 @@ pub mod kernels;
 pub mod machine;
 pub mod machine_rans;
 pub mod manifest;
+pub mod mapped;
 pub mod metrics;
 pub mod model_search;
 pub mod packed;
@@ -104,6 +105,7 @@ pub use manifest::{
     estimate_physical_bytes, grow, inspect, manifest, manifest_within_budget,
     select_profile_within_budget, ComponentReport, EkbloomBody, ManifestationReport,
 };
+pub use mapped::{thp_anonymous_probe, HugePageReport, MapMode, MappedSurface};
 pub use metrics::{now_ns, percentiles, Percentiles};
 pub use model_search::{
     canonical_state_only_counterexample, sufficiency_sweep, AbstractCounterexample, SufficiencyRow,

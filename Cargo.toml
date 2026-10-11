@@ -19,6 +19,12 @@ path = "src/main.rs"
 blake3 = "1.5"
 crc32fast = "1.4"
 
+# Raw read-only mmap/madvise/munmap for `src/mapped.rs` (the third sanctioned
+# `unsafe` boundary). Small, standard, already present transitively; exposes the
+# exact `MAP_POPULATE`/`MADV_POPULATE_READ`/`MADV_HUGEPAGE` flags the directive
+# requires (unlike the deliberately-dropped `memmap2`).
+libc = "0.2"
+
 # Async I/O publication backend. Optional; a synchronous fallback is always built.
 io-uring = { version = "0.7", optional = true }
 

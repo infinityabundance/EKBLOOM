@@ -1,0 +1,336 @@
+{
+  "corpus_seed": 16938038201776218150,
+  "tile_shift": 21,
+  "seq_chunk_bytes": 1048576,
+  "seq_reps": 3,
+  "rand1b_samples": 262144,
+  "range4k_samples": 65536,
+  "sizes_bytes": [1048576, 16777216, 67108864, 268435456],
+  "container_flags": "--cap-drop=ALL --security-opt=no-new-privileges (Docker default seccomp)",
+  "thp_anonymous_probe": {
+        "anon_huge_bytes": 4194304,
+        "kernel_page_bytes": 4096
+  },
+  "results": [
+    {
+      "size_bytes": 1048576,
+      "mapping_physical_bytes": 1048576,
+      "modes": {
+      "pread": {
+        "seq_gbps": 37.326,
+        "seq_p50_ns_per_mib_chunk": 28042,
+        "rand1b_p50_ns": 130,
+        "rand1b_p99_ns": 221,
+        "range4k_p50_ns": 210,
+        "first_sweep_minor_faults": 258,
+        "first_sweep_major_faults": 0
+      },
+      "resident": {
+        "seq_gbps": 70.960,
+        "seq_p50_ns_per_mib_chunk": 14737,
+        "rand1b_p50_ns": 20,
+        "rand1b_p99_ns": 31,
+        "range4k_p50_ns": 60,
+        "first_sweep_minor_faults": 0,
+        "first_sweep_major_faults": 0
+      },
+      "mmap": {
+        "seq_gbps": 72.380,
+        "seq_p50_ns_per_mib_chunk": 14437,
+        "rand1b_p50_ns": 30,
+        "rand1b_p99_ns": 40,
+        "range4k_p50_ns": 70,
+        "first_sweep_minor_faults": 14,
+        "first_sweep_major_faults": 0
+      },
+      "mmap_huge": {
+        "seq_gbps": 72.782,
+        "seq_p50_ns_per_mib_chunk": 14347,
+        "rand1b_p50_ns": 30,
+        "rand1b_p99_ns": 40,
+        "range4k_p50_ns": 61,
+        "first_sweep_minor_faults": 15,
+        "first_sweep_major_faults": 0
+      }
+      },
+      "prefault_variants": {
+      "mmap_populate": {
+        "seq_gbps": 72.884,
+        "seq_p50_ns_per_mib_chunk": 14337,
+        "rand1b_p50_ns": 30,
+        "rand1b_p99_ns": 40,
+        "range4k_p50_ns": 61,
+        "first_sweep_minor_faults": 0,
+        "first_sweep_major_faults": 0
+      },
+      "mmap_populate_read": {
+        "seq_gbps": 72.782,
+        "seq_p50_ns_per_mib_chunk": 14376,
+        "rand1b_p50_ns": 30,
+        "rand1b_p99_ns": 40,
+        "range4k_p50_ns": 61,
+        "first_sweep_minor_faults": 0,
+        "first_sweep_major_faults": 0
+      }
+      },
+      "advisories": {
+        "populate": true,
+        "populate_read": true,
+        "huge_page": true
+      },
+      "huge_page_report": {
+        "advised": true,
+        "anon_huge_bytes": 0,
+        "file_pmd_mapped_bytes": 0,
+        "kernel_page_bytes": 4096
+      },
+      "plain_mapping_huge_page_report": {
+        "advised": false,
+        "anon_huge_bytes": 0,
+        "file_pmd_mapped_bytes": 0,
+        "kernel_page_bytes": 4096
+      },
+      "verdict": "mmap 1.94x pread sequential / 4.33x lower rand-1b p50; huge pages NOT delivered (THP inactive for this file mapping) — REJECT"
+    },
+    {
+      "size_bytes": 16777216,
+      "mapping_physical_bytes": 16777216,
+      "modes": {
+      "pread": {
+        "seq_gbps": 29.114,
+        "seq_p50_ns_per_mib_chunk": 35767,
+        "rand1b_p50_ns": 130,
+        "rand1b_p99_ns": 270,
+        "range4k_p50_ns": 220,
+        "first_sweep_minor_faults": 0,
+        "first_sweep_major_faults": 0
+      },
+      "resident": {
+        "seq_gbps": 71.880,
+        "seq_p50_ns_per_mib_chunk": 14507,
+        "rand1b_p50_ns": 30,
+        "rand1b_p99_ns": 31,
+        "range4k_p50_ns": 80,
+        "first_sweep_minor_faults": 0,
+        "first_sweep_major_faults": 0
+      },
+      "mmap": {
+        "seq_gbps": 73.709,
+        "seq_p50_ns_per_mib_chunk": 13866,
+        "rand1b_p50_ns": 30,
+        "rand1b_p99_ns": 40,
+        "range4k_p50_ns": 80,
+        "first_sweep_minor_faults": 5,
+        "first_sweep_major_faults": 0
+      },
+      "mmap_huge": {
+        "seq_gbps": 79.834,
+        "seq_p50_ns_per_mib_chunk": 12985,
+        "rand1b_p50_ns": 30,
+        "rand1b_p99_ns": 41,
+        "range4k_p50_ns": 80,
+        "first_sweep_minor_faults": 0,
+        "first_sweep_major_faults": 0
+      }
+      },
+      "prefault_variants": {
+      "mmap_populate": {
+        "seq_gbps": 80.297,
+        "seq_p50_ns_per_mib_chunk": 13004,
+        "rand1b_p50_ns": 30,
+        "rand1b_p99_ns": 60,
+        "range4k_p50_ns": 80,
+        "first_sweep_minor_faults": 0,
+        "first_sweep_major_faults": 0
+      },
+      "mmap_populate_read": {
+        "seq_gbps": 76.462,
+        "seq_p50_ns_per_mib_chunk": 13575,
+        "rand1b_p50_ns": 30,
+        "rand1b_p99_ns": 40,
+        "range4k_p50_ns": 80,
+        "first_sweep_minor_faults": 0,
+        "first_sweep_major_faults": 0
+      }
+      },
+      "advisories": {
+        "populate": true,
+        "populate_read": true,
+        "huge_page": true
+      },
+      "huge_page_report": {
+        "advised": true,
+        "anon_huge_bytes": 0,
+        "file_pmd_mapped_bytes": 16777216,
+        "kernel_page_bytes": 4096
+      },
+      "plain_mapping_huge_page_report": {
+        "advised": false,
+        "anon_huge_bytes": 0,
+        "file_pmd_mapped_bytes": 16777216,
+        "kernel_page_bytes": 4096
+      },
+      "verdict": "mmap 2.53x pread sequential / 4.33x lower rand-1b p50; plain mapping already file-THP backed (16777216 B FilePmdMapped), MADV_HUGEPAGE has no effect — REJECT"
+    },
+    {
+      "size_bytes": 67108864,
+      "mapping_physical_bytes": 67108864,
+      "modes": {
+      "pread": {
+        "seq_gbps": 33.740,
+        "seq_p50_ns_per_mib_chunk": 31259,
+        "rand1b_p50_ns": 130,
+        "rand1b_p99_ns": 281,
+        "range4k_p50_ns": 331,
+        "first_sweep_minor_faults": 0,
+        "first_sweep_major_faults": 0
+      },
+      "resident": {
+        "seq_gbps": 63.572,
+        "seq_p50_ns_per_mib_chunk": 16121,
+        "rand1b_p50_ns": 30,
+        "rand1b_p99_ns": 110,
+        "range4k_p50_ns": 90,
+        "first_sweep_minor_faults": 0,
+        "first_sweep_major_faults": 0
+      },
+      "mmap": {
+        "seq_gbps": 53.482,
+        "seq_p50_ns_per_mib_chunk": 19777,
+        "rand1b_p50_ns": 30,
+        "rand1b_p99_ns": 121,
+        "range4k_p50_ns": 100,
+        "first_sweep_minor_faults": 29,
+        "first_sweep_major_faults": 0
+      },
+      "mmap_huge": {
+        "seq_gbps": 75.122,
+        "seq_p50_ns_per_mib_chunk": 13906,
+        "rand1b_p50_ns": 30,
+        "rand1b_p99_ns": 120,
+        "range4k_p50_ns": 100,
+        "first_sweep_minor_faults": 0,
+        "first_sweep_major_faults": 0
+      }
+      },
+      "prefault_variants": {
+      "mmap_populate": {
+        "seq_gbps": 66.138,
+        "seq_p50_ns_per_mib_chunk": 15799,
+        "rand1b_p50_ns": 30,
+        "rand1b_p99_ns": 111,
+        "range4k_p50_ns": 90,
+        "first_sweep_minor_faults": 0,
+        "first_sweep_major_faults": 0
+      },
+      "mmap_populate_read": {
+        "seq_gbps": 71.449,
+        "seq_p50_ns_per_mib_chunk": 14657,
+        "rand1b_p50_ns": 30,
+        "rand1b_p99_ns": 50,
+        "range4k_p50_ns": 150,
+        "first_sweep_minor_faults": 0,
+        "first_sweep_major_faults": 0
+      }
+      },
+      "advisories": {
+        "populate": true,
+        "populate_read": true,
+        "huge_page": true
+      },
+      "huge_page_report": {
+        "advised": true,
+        "anon_huge_bytes": 0,
+        "file_pmd_mapped_bytes": 67108864,
+        "kernel_page_bytes": 4096
+      },
+      "plain_mapping_huge_page_report": {
+        "advised": false,
+        "anon_huge_bytes": 0,
+        "file_pmd_mapped_bytes": 67108864,
+        "kernel_page_bytes": 4096
+      },
+      "verdict": "mmap 1.59x pread sequential / 4.33x lower rand-1b p50; plain mapping already file-THP backed (67108864 B FilePmdMapped), MADV_HUGEPAGE has no effect — REJECT"
+    },
+    {
+      "size_bytes": 268435456,
+      "mapping_physical_bytes": 268435456,
+      "modes": {
+      "pread": {
+        "seq_gbps": 28.632,
+        "seq_p50_ns_per_mib_chunk": 35706,
+        "rand1b_p50_ns": 210,
+        "rand1b_p99_ns": 351,
+        "range4k_p50_ns": 481,
+        "first_sweep_minor_faults": 0,
+        "first_sweep_major_faults": 0
+      },
+      "resident": {
+        "seq_gbps": 37.134,
+        "seq_p50_ns_per_mib_chunk": 27742,
+        "rand1b_p50_ns": 110,
+        "rand1b_p99_ns": 251,
+        "range4k_p50_ns": 271,
+        "first_sweep_minor_faults": 0,
+        "first_sweep_major_faults": 0
+      },
+      "mmap": {
+        "seq_gbps": 41.053,
+        "seq_p50_ns_per_mib_chunk": 25457,
+        "rand1b_p50_ns": 120,
+        "rand1b_p99_ns": 251,
+        "range4k_p50_ns": 260,
+        "first_sweep_minor_faults": 125,
+        "first_sweep_major_faults": 0
+      },
+      "mmap_huge": {
+        "seq_gbps": 40.175,
+        "seq_p50_ns_per_mib_chunk": 25868,
+        "rand1b_p50_ns": 120,
+        "rand1b_p99_ns": 251,
+        "range4k_p50_ns": 260,
+        "first_sweep_minor_faults": 0,
+        "first_sweep_major_faults": 0
+      }
+      },
+      "prefault_variants": {
+      "mmap_populate": {
+        "seq_gbps": 40.458,
+        "seq_p50_ns_per_mib_chunk": 25868,
+        "rand1b_p50_ns": 110,
+        "rand1b_p99_ns": 250,
+        "range4k_p50_ns": 251,
+        "first_sweep_minor_faults": 0,
+        "first_sweep_major_faults": 0
+      },
+      "mmap_populate_read": {
+        "seq_gbps": 41.777,
+        "seq_p50_ns_per_mib_chunk": 25057,
+        "rand1b_p50_ns": 110,
+        "rand1b_p99_ns": 251,
+        "range4k_p50_ns": 251,
+        "first_sweep_minor_faults": 0,
+        "first_sweep_major_faults": 0
+      }
+      },
+      "advisories": {
+        "populate": true,
+        "populate_read": true,
+        "huge_page": true
+      },
+      "huge_page_report": {
+        "advised": true,
+        "anon_huge_bytes": 0,
+        "file_pmd_mapped_bytes": 268435456,
+        "kernel_page_bytes": 4096
+      },
+      "plain_mapping_huge_page_report": {
+        "advised": false,
+        "anon_huge_bytes": 0,
+        "file_pmd_mapped_bytes": 268435456,
+        "kernel_page_bytes": 4096
+      },
+      "verdict": "mmap 1.43x pread sequential / 1.75x lower rand-1b p50; plain mapping already file-THP backed (268435456 B FilePmdMapped), MADV_HUGEPAGE has no effect — REJECT"
+    }
+  ]
+}

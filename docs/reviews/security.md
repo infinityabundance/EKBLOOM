@@ -5,9 +5,10 @@ Scope: untrusted-input handling on the `.ekb` read path — `format`, `reader`,
 `filesystem` index parsing, and publication races. Adversarial method:
 read the parsers, then craft concrete byte images and feed them to
 `open_bytes`/`from_bytes`/`verify`, asserting a clean `Err` (never panic, never
-OOM). The crate's `unsafe` is confined to exactly **two** sanctioned modules —
-`src/simd.rs` (the feature-gated AVX2/AVX-512 gathers) and `src/async_io.rs`
-(the `io-uring` submission-queue pushes); each is independently reviewed below.
+OOM). The crate's `unsafe` is confined to exactly **three** sanctioned modules —
+`src/simd.rs` (the feature-gated AVX2/AVX-512 gathers), `src/async_io.rs`
+(the `io-uring` submission-queue pushes), and `src/mapped.rs` (the read-only
+`mmap`/`madvise`/`munmap` mapped surface); each is independently reviewed below.
 Every `unsafe` block carries a `// SAFETY:` justification; other `unsafe`
 mentions in the tree are prose. All tooling ran via
 `scripts/container-verify.sh` (8 GiB cap).
@@ -458,4 +459,74 @@ with the guard removed, and to pass with it restored.
 * `scripts/container-fuzz.sh` now lists the whole fuzz surface and runs **all
   six** targets, including `fuzz_packed` and `fuzz_tiles` (verified: 40,000 runs
   each, no crash artifacts).
+
+## Unsafe review (`src/mapped.rs`) — verdict **SAFE**
+
+First independent review of the crate's *third* `unsafe` module: a read-only
+memory-mapped surface over an immutable output file. The module's **safe** public
+API is `MappedSurface { open, open_with, read, read_into, len, is_empty,
+physical_bytes, mode, advised, huge_page_report, sample_huge_pages }` and
+`thp_anonymous_probe`. `unsafe` is confined to the raw `libc` calls and the two
+slice/pointer views they justify.
+
+### Exact `unsafe` inventory (grep)
+
+`grep -rn unsafe src/` finds `unsafe` *code* in exactly three modules:
+`src/simd.rs`, `src/async_io.rs`, and `src/mapped.rs`. In `src/mapped.rs` the
+blocks are: one `mmap(PROT_READ, MAP_PRIVATE[|MAP_POPULATE])`, one `munmap` in
+`Drop`, one `madvise` per applied advisory (`MADV_HUGEPAGE` /
+`MADV_POPULATE_READ`), one `slice::from_raw_parts` in `read_into`, one volatile
+`read` in the huge-page touch probe, one `mmap`/`madvise`/volatile-`write`/
+`munmap` set in `thp_anonymous_probe`, one `sysconf`, and `unsafe impl Send/Sync`
+for `MappedSurface`. Every block carries a `// SAFETY:` justification.
+`tests/mmap.rs::unsafe_is_confined_to_three_sanctioned_modules` asserts the set
+of modules containing `unsafe` code is exactly `{simd.rs, async_io.rs,
+mapped.rs}`.
+
+### SAFETY argument
+
+* **`mmap`.** Called with `PROT_READ` and `MAP_PRIVATE`, a valid length `> 0`,
+  and an fd open read-only for the call; the result is checked against
+  `MAP_FAILED` before the base is stored. The mapping outlives the descriptor
+  (the kernel pins the inode), so closing `file` cannot invalidate it.
+* **`munmap`.** `base`/`map_len` are exactly the values from a successful `mmap`,
+  stored privately, never mutated, and unmapped once in `Drop` (sole owner).
+* **`from_raw_parts`.** Guarded by `offset.checked_add(len)? <= file_len <=
+  map_len` (checked-add `Overflow`, else `OutOfBounds`) **before** the slice is
+  formed; a zero-length read returns early. The mapping is never written through
+  this type, so the bytes are readable for its lifetime, and the slice is copied
+  into `out` immediately (no reference escapes).
+* **`madvise`.** Only changes policy for the live `base`/`map_len` range; it
+  never frees or moves the mapping, so a failure is recorded (`advised = false`),
+  not fatal.
+* **volatile touch.** `off < map_len`; used only to materialise huge pages.
+* **`Send`/`Sync`.** Sound because the mapping is read-only and all output is
+  copied into caller-owned memory.
+
+### Adversarial attempts (executable)
+
+* **map + truncate.** A file mapped then `set_len(0)` would make an unfaulted
+  page `SIGBUS`. Defence: the module never opens the mapped file for writing,
+  and the invariant forbids truncating/rewriting a mapped inode; publication is
+  rename-then-retain. `missing_and_truncated_files_error_cleanly` pins that an
+  empty/`set_len(0)` file is rejected at `open`.
+* **map + replace.** Atomically renaming a new generation over the path does not
+  affect a live mapping (the inode is retained).
+  `old_generation_is_retained_while_a_mapping_is_alive` reads the old bytes after
+  a replace **and** after an unlink; `concurrent_readers_are_never_torn…` runs 4
+  readers across 64 published generations with no tear.
+* **read past end.** `read(n,1)` / `read(n-1,2)` / `read(n+1,0)` return
+  `OutOfBounds` with no output; `read(u64::MAX,2)` returns `Overflow`. No
+  over-read, no panic.
+* **untrusted inputs.** The module is not referenced by `reader`/`verify`/
+  `recovery`, so it is never reached from the `.ekb` parser.
+
+### Result
+
+`sh scripts/container-verify.sh` is GREEN (fmt, clippy `-D warnings`, full
+suite; `tests/mmap.rs` 7/7). `sh scripts/run-mmap.sh` runs unprivileged under
+Docker's **default** seccomp profile (`--cap-drop=ALL
+--security-opt=no-new-privileges`; no relaxation, no capability), writes
+`evidence/bench/mmap.json`. **Verdict: SAFE — no memory-safety, lifetime, or
+use-after-unmap defect found.**
  

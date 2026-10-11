@@ -175,6 +175,7 @@ dependencies = [
  "divan",
  "fuser",
  "io-uring",
+ "libc",
  "loom",
  "proptest",
 ]
