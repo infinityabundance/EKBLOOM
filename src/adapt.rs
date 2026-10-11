@@ -47,7 +47,7 @@ use crate::bloom_path::PathBloom;
 use crate::checkpoint::CheckpointSet;
 use crate::error::{EkbloomError, Result};
 use crate::fastpath;
-use crate::machine::machine_by_id;
+use crate::machine::{machine_by_id, prepare};
 use crate::manifest::{manifest, EkbloomBody};
 use crate::metrics::now_ns;
 use crate::{ManifestationProfile, ReadRequest};
@@ -465,9 +465,8 @@ fn read_shell_checkpoint(body: &EkbloomBody, offset: u64, length: u64) -> Result
         what: "checkpoint read length",
     })?;
     let mut out = Vec::with_capacity(cap);
-    for _ in 0..length {
-        out.push(machine.reveal(&body.core, &mut omega)?);
-    }
+    let ctx = prepare(machine, &body.core)?;
+    ctx.decode_into(&body.core, &mut omega, length, &mut out)?;
     Ok(out)
 }
 
@@ -482,12 +481,13 @@ fn read_shell_history(body: &EkbloomBody, offset: u64, end: u64) -> Result<Vec<u
         id: body.machine_id,
     })?;
     let mut out = Vec::with_capacity((end - offset) as usize);
+    let ctx = prepare(machine, &body.core)?;
     let mut pos = offset;
     while pos < end {
         let Some(mut omega) = history.snapshot_at(pos) else {
             return Err(unavailable(ShellChoice::History));
         };
-        out.push(machine.reveal(&body.core, &mut omega)?);
+        out.push(ctx.reveal(&body.core, &mut omega)?);
         pos += 1;
     }
     Ok(out)
@@ -498,17 +498,11 @@ fn read_shell_machine(body: &EkbloomBody, offset: u64, end: u64) -> Result<Vec<u
         id: body.machine_id,
     })?;
     machine.check_core(&body.core, body.logical_len)?;
+    let ctx = prepare(machine, &body.core)?;
     let mut omega = machine.init(&body.core)?;
-    let mut pos = 0u64;
-    while pos < offset {
-        machine.reveal(&body.core, &mut omega)?;
-        pos += 1;
-    }
+    ctx.skip(&body.core, &mut omega, offset)?;
     let mut out = Vec::with_capacity((end - offset) as usize);
-    while pos < end {
-        out.push(machine.reveal(&body.core, &mut omega)?);
-        pos += 1;
-    }
+    ctx.decode_into(&body.core, &mut omega, end - offset, &mut out)?;
     Ok(out)
 }
 

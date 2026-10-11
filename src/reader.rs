@@ -21,7 +21,7 @@ use crate::checkpoint::CheckpointSet;
 use crate::error::{EkbloomError, Result};
 use crate::format::{self, SectionKind};
 use crate::history::History;
-use crate::machine::{machine_by_id, MACHINE_NL2};
+use crate::machine::{machine_by_id, prepare, MACHINE_NL2};
 use crate::manifest::{ComponentReport, EkbloomBody, ManifestationReport};
 use crate::state::Snapshot;
 use crate::tiles::{
@@ -437,10 +437,9 @@ fn read_via_checkpoint(body: &EkbloomBody, offset: u64, length: u64) -> Result<O
         id: body.machine_id,
     })?;
     let mut omega = cp.restore_with(machine, &body.core, offset)?;
+    let ctx = crate::machine::prepare(machine, &body.core)?;
     let mut out = Vec::with_capacity(length as usize);
-    for _ in 0..length {
-        out.push(machine.reveal(&body.core, &mut omega)?);
-    }
+    ctx.decode_into(&body.core, &mut omega, length, &mut out)?;
     Ok(Some(out))
 }
 
@@ -460,13 +459,14 @@ fn read_via_history(body: &EkbloomBody, offset: u64, end: u64) -> Result<Option<
     let machine = machine_by_id(body.machine_id).ok_or(EkbloomError::UnknownMachine {
         id: body.machine_id,
     })?;
+    let ctx = crate::machine::prepare(machine, &body.core)?;
     let mut out = Vec::with_capacity((end - offset) as usize);
     let mut pos = offset;
     while pos < end {
         let Some(mut omega) = history.snapshot_at(pos) else {
             return Ok(None);
         };
-        out.push(machine.reveal(&body.core, &mut omega)?);
+        out.push(ctx.reveal(&body.core, &mut omega)?);
         pos += 1;
     }
     Ok(Some(out))
@@ -478,17 +478,11 @@ fn read_via_machine(body: &EkbloomBody, offset: u64, end: u64) -> Result<Vec<u8>
         id: body.machine_id,
     })?;
     machine.check_core(&body.core, body.logical_len)?;
+    let ctx = crate::machine::prepare(machine, &body.core)?;
     let mut omega = machine.init(&body.core)?;
-    let mut pos = 0u64;
-    while pos < offset {
-        machine.reveal(&body.core, &mut omega)?;
-        pos += 1;
-    }
+    ctx.skip(&body.core, &mut omega, offset)?;
     let mut out = Vec::with_capacity((end - offset) as usize);
-    while pos < end {
-        out.push(machine.reveal(&body.core, &mut omega)?);
-        pos += 1;
-    }
+    ctx.decode_into(&body.core, &mut omega, end - offset, &mut out)?;
     Ok(out)
 }
 
@@ -1738,12 +1732,6 @@ impl FileBody {
         end: u64,
         out: &mut Vec<u8>,
     ) -> Result<bool> {
-        // The checkpoint fast path rebases the core window at the implicit
-        // position `j*K`, which is only valid when the cursor equals the logical
-        // position. Cursor-divergent machines replay authoritatively instead.
-        if self.machine_id != MACHINE_NL2 {
-            return Ok(false);
-        }
         let mut best: Option<(u64, &FileCheckpoint)> = None;
         for cp in &self.checkpoints {
             if cp.interval == 0 {
@@ -1790,6 +1778,25 @@ impl FileBody {
         let mut entry = [0u8; Snapshot::PACKED_LEN];
         read_exact_at_len(&self.file, &mut entry, entry_off, self.physical_len)?;
         let omega = Snapshot::unpack(&entry)?;
+        let machine = machine_by_id(self.machine_id).ok_or(EkbloomError::UnknownMachine {
+            id: self.machine_id,
+        })?;
+
+        if self.machine_id != MACHINE_NL2 {
+            // Cursor-divergent machine (e.g. machine 2): the checkpoint carries
+            // the true backing cursor, and reconstruction is bounded by the
+            // interval (`<= K - 1` replay steps) but needs the whole core because
+            // the cursor does not match the logical position. This is still a
+            // bounded-step, byte-exact reconstruction.
+            let core = self.read_core(0, self.core_len)?;
+            let ctx = prepare(machine, &core)?;
+            let steps = offset.saturating_sub(expected_cursor);
+            let mut local = omega;
+            ctx.skip(&core, &mut local, steps)?;
+            ctx.decode_into(&core, &mut local, length, out)?;
+            return Ok(true);
+        }
+
         if omega.cursor != expected_cursor {
             return Err(bad(format!(
                 "checkpoint cursor {} does not match implicit position {expected_cursor}",
@@ -1801,23 +1808,11 @@ impl FileBody {
         // window starts at `j*K`; the local cursor is rebased to 0 so `reveal`
         // indexes the window correctly.
         let core = self.read_core(expected_cursor, end)?;
-        let steps =
-            usize::try_from(offset - expected_cursor).map_err(|_| EkbloomError::Overflow {
-                what: "checkpoint replay",
-            })?;
-        let machine = machine_by_id(self.machine_id).ok_or(EkbloomError::UnknownMachine {
-            id: self.machine_id,
-        })?;
+        let steps = offset - expected_cursor;
+        let ctx = prepare(machine, &core)?;
         let mut local = Snapshot::new(omega.state, 0);
-        for _ in 0..steps {
-            machine.reveal(&core, &mut local)?;
-        }
-        if let Ok(n) = usize::try_from(length) {
-            out.reserve(n);
-        }
-        for _ in 0..length {
-            out.push(machine.reveal(&core, &mut local)?);
-        }
+        ctx.skip(&core, &mut local, steps)?;
+        ctx.decode_into(&core, &mut local, length, out)?;
         Ok(true)
     }
 
@@ -1847,6 +1842,7 @@ impl FileBody {
             id: self.machine_id,
         })?;
         let core = self.read_core(offset, end)?;
+        let ctx = prepare(machine, &core)?;
 
         let span = end - offset;
         let state_bytes = span.checked_mul(4).ok_or(EkbloomError::Overflow {
@@ -1876,7 +1872,7 @@ impl FileBody {
             ]);
             // Rebase the cursor onto the window starting at `offset`.
             let mut omega = Snapshot::new(state, i);
-            out.push(machine.reveal(&core, &mut omega)?);
+            out.push(ctx.reveal(&core, &mut omega)?);
         }
         Ok(true)
     }
@@ -1900,20 +1896,10 @@ impl FileBody {
         } else {
             self.read_core(0, self.core_len)?
         };
-        if let Ok(n) = usize::try_from(end - offset) {
-            out.reserve(n);
-        }
+        let ctx = prepare(machine, &core)?;
         let mut omega = machine.init(&core)?;
-        let mut pos = 0u64;
-        while pos < offset {
-            machine.reveal(&core, &mut omega)?;
-            pos += 1;
-        }
-        while pos < end {
-            out.push(machine.reveal(&core, &mut omega)?);
-            pos += 1;
-        }
-        Ok(())
+        ctx.skip(&core, &mut omega, offset)?;
+        ctx.decode_into(&core, &mut omega, end - offset, out)
     }
 }
 

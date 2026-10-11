@@ -17,9 +17,9 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use ekbloom::{
-    adapt_to_workload, create, manifest_hot_regions, read_ranges, verify_deep, AccessTrace,
-    Baseline, BaselineKind, DirectoryKind, ManifestationBudget, ManifestationProfile, ReadRequest,
-    RegionReader, SweepConfig, TileSet, Workload, WorkloadKind,
+    adapt_to_workload, bounded_seed_steps, create, grow, manifest_hot_regions, read_ranges,
+    verify_deep, AccessTrace, Baseline, BaselineKind, DirectoryKind, ManifestationBudget,
+    ManifestationProfile, ReadRequest, RegionReader, SweepConfig, TileSet, Workload, WorkloadKind,
 };
 
 /// Deterministic corpus size (4 MiB).
@@ -42,6 +42,8 @@ const COLD_SAMPLES: usize = 64;
 const COLD_BASE: u64 = SRC_LEN as u64 / 2;
 /// Tile shifts exercised: 1 KiB, 4 KiB, 16 KiB, 64 KiB.
 const TILE_SHIFTS: [u8; 4] = [10, 12, 14, 16];
+/// Checkpoint interval for the bounded cold reconstruction experiment.
+const COLD_K: u32 = 1024;
 
 /// Deterministic LCG corpus (identical generator to the other harnesses).
 fn lcg_bytes(seed: u64, len: usize) -> Vec<u8> {
@@ -106,6 +108,18 @@ impl Row {
             self.hot_read_bytes as f64 / self.added_bytes as f64
         }
     }
+}
+
+/// Before/after cold-reconstruction measurement (genesis replay vs bounded).
+struct ColdReport {
+    interval: u32,
+    restart_bytes: u64,
+    seed_steps_bound: u64,
+    genesis_p50: f64,
+    genesis_p99: f64,
+    bounded_p50: f64,
+    bounded_p99: f64,
+    speedup: f64,
 }
 
 fn main() -> ekbloom::Result<()> {
@@ -255,6 +269,112 @@ fn main() -> ekbloom::Result<()> {
     }
     rows.extend(tile_rows);
 
+    // ---- (e) bounded cold reconstruction (before/after) ----------------------
+    // A tile set with a bounded cold-restart checkpoint set: absent (cold)
+    // fragments are seeded from the nearest checkpoint instead of replaying the
+    // machine from `Omega_0`.
+    let mut cold_body = create(&source, ManifestationProfile::Root)?;
+    TileSet::manifest_hot_tiles(
+        &mut cold_body,
+        &trace,
+        12,
+        DirectoryKind::TwoLevelRadix,
+        &budget,
+    )?;
+    grow(
+        &mut cold_body,
+        ManifestationProfile::Sparse { interval: COLD_K },
+    )?;
+    assert!(verify_deep(&cold_body)?.ok, "bounded cold body must verify");
+    let cold_tiles =
+        cold_body
+            .tiles
+            .last()
+            .ok_or_else(|| ekbloom::EkbloomError::InvalidArgument {
+                what: "no tile set was manifested".to_string(),
+            })?;
+    let cold_added = cold_body.physical_bytes() - root_phys;
+    let restart_bytes: u64 = cold_body
+        .checkpoints
+        .iter()
+        .map(|cp| cp.physical_bytes())
+        .sum();
+
+    // Byte-exactness: the bounded path equals the genesis path for every sample.
+    for &(off, len) in &cold_sample {
+        let bounded = cold_tiles.read_bounded(&cold_body.core, &cold_body.checkpoints, off, len)?;
+        let genesis = cold_tiles.read(&cold_body.core, off, len)?;
+        assert_eq!(bounded, genesis, "bounded != genesis at ({off},{len})");
+        assert_eq!(
+            bounded,
+            &source[off as usize..(off + len) as usize],
+            "bounded cold read ({off},{len}) must be byte-exact"
+        );
+    }
+
+    for _ in 0..2 {
+        for &(off, len) in &hot_sample {
+            let _ = cold_tiles.read_bounded(&cold_body.core, &cold_body.checkpoints, off, len)?;
+        }
+        for &(off, len) in &cold_sample {
+            let _ = cold_tiles.read_bounded(&cold_body.core, &cold_body.checkpoints, off, len)?;
+        }
+    }
+    let cold_hot = time_reads(&hot_sample, |off, len| {
+        cold_tiles
+            .read_bounded(&cold_body.core, &cold_body.checkpoints, off, len)
+            .map(|v| v.len())
+            .unwrap_or(0)
+    });
+    let cold_genesis = time_reads(&cold_sample, |off, len| {
+        cold_tiles
+            .read(&cold_body.core, off, len)
+            .map(|v| v.len())
+            .unwrap_or(0)
+    });
+    let cold_bounded = time_reads(&cold_sample, |off, len| {
+        cold_tiles
+            .read_bounded(&cold_body.core, &cold_body.checkpoints, off, len)
+            .map(|v| v.len())
+            .unwrap_or(0)
+    });
+    let max_cold = cold_offsets.iter().copied().max().unwrap_or(0);
+    let seed_steps_bound = bounded_seed_steps(&cold_body.checkpoints, max_cold);
+    let cold_speedup = if cold_bounded.0 == 0.0 {
+        0.0
+    } else {
+        cold_genesis.0 / cold_bounded.0
+    };
+    println!(
+        "bounded cold (K={COLD_K}): genesis p50={:.0} ns -> bounded p50={:.0} ns ({:.0}x); \
+         restart={restart_bytes} B; <= {seed_steps_bound} seed steps",
+        cold_genesis.0, cold_bounded.0, cold_speedup
+    );
+    rows.push(Row {
+        name: format!("ekbloom tiles 4 KiB radix + K={COLD_K}"),
+        added_bytes: cold_added,
+        directory_bytes: cold_tiles.directory_bytes(),
+        hot_p50: cold_hot.0,
+        hot_p99: cold_hot.1,
+        cold_p50: cold_bounded.0,
+        hot_read_bytes: hot_sample.iter().map(|&(_, l)| l).sum(),
+        note: format!(
+            "bounded cold reconstruction from the nearest checkpoint: cold p50 {:.0} ns \
+             (genesis replay {:.0} ns, {:.0}x); {restart_bytes} restart B; <= {seed_steps_bound} seed steps",
+            cold_bounded.0, cold_genesis.0, cold_speedup
+        ),
+    });
+    let cold_report = ColdReport {
+        interval: COLD_K,
+        restart_bytes,
+        seed_steps_bound,
+        genesis_p50: cold_genesis.0,
+        genesis_p99: cold_genesis.1,
+        bounded_p50: cold_bounded.0,
+        bounded_p99: cold_bounded.1,
+        speedup: cold_speedup,
+    };
+
     // ---- (d) previous regional transition table ------------------------------
     let mut regional = create(&source, ManifestationProfile::Root)?;
     let rreport = manifest_hot_regions(&mut regional, &trace, &budget, &cfg)?;
@@ -341,7 +461,14 @@ fn main() -> ekbloom::Result<()> {
         );
     }
 
-    let json = render_json(&trace, budget_cap, root_phys, p32_added, &rows);
+    let json = render_json(
+        &trace,
+        budget_cap,
+        root_phys,
+        p32_added,
+        &rows,
+        &cold_report,
+    );
     let out = Path::new("evidence/bench/tiles.json");
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
@@ -357,6 +484,7 @@ fn render_json(
     root_phys: u64,
     p32_added: u64,
     rows: &[Row],
+    cold: &ColdReport,
 ) -> String {
     let mut s = String::new();
     s.push_str("{\n");
@@ -393,7 +521,17 @@ fn render_json(
             s.push_str("    },\n");
         }
     }
-    s.push_str("  ]\n}\n");
+    s.push_str("  ],\n");
+    let _ = writeln!(s, "  \"cold_reconstruction\": {{");
+    let _ = writeln!(s, "    \"checkpoint_interval\": {},", cold.interval);
+    let _ = writeln!(s, "    \"restart_bytes\": {},", cold.restart_bytes);
+    let _ = writeln!(s, "    \"seed_steps_bound\": {},", cold.seed_steps_bound);
+    let _ = writeln!(s, "    \"genesis_ns_p50\": {:.1},", cold.genesis_p50);
+    let _ = writeln!(s, "    \"genesis_ns_p99\": {:.1},", cold.genesis_p99);
+    let _ = writeln!(s, "    \"bounded_ns_p50\": {:.1},", cold.bounded_p50);
+    let _ = writeln!(s, "    \"bounded_ns_p99\": {:.1},", cold.bounded_p99);
+    let _ = writeln!(s, "    \"speedup\": {:.3}", cold.speedup);
+    s.push_str("  }\n}\n");
     s
 }
 

@@ -10,7 +10,7 @@ use ekbloom::bloom_path::PathBloom;
 use ekbloom::checkpoint::{CheckpointSet, SUPPORTED_INTERVALS};
 use ekbloom::history::History;
 use ekbloom::machine::{machine_by_id, state_log_with, OrMachine, MACHINE_NL2, MACHINE_RANS0, NL2};
-use ekbloom::machine_rans::Rans0;
+use ekbloom::machine_rans::{Rans0, RansContext};
 use ekbloom::manifest::create_machine;
 use ekbloom::reader::read;
 use ekbloom::state::Snapshot;
@@ -290,4 +290,60 @@ fn machine_one_is_unaffected() {
     assert!(machine_by_id(3).is_none());
     assert_eq!(MACHINE_NL2, 1);
     assert_eq!(MACHINE_RANS0, 2);
+}
+
+/// The reusable prepared decoder context must reproduce the authoritative
+/// per-symbol symbol/state sequence for every source category, byte-for-byte.
+#[test]
+fn prepared_context_matches_per_symbol_reveal() {
+    let cases: Vec<Vec<u8>> = vec![
+        Vec::new(),
+        vec![0x5A],
+        (0u8..=255).collect(),
+        vec![7u8; 300],
+        (0..1024u32)
+            .map(|i| if i % 2 == 0 { 0xAA } else { 0x55 })
+            .collect(),
+        skewed(4096),
+        lcg(0xABCD_1234_5678_9ABC, 4096),
+    ];
+    for src in cases {
+        let core = RANS0.encode(&src).unwrap();
+        let n = src.len() as u64;
+
+        // Prepared bulk decode equals the source.
+        let prepared = RANS0.decode(&core, n).unwrap();
+        assert_eq!(prepared, src);
+
+        // Per-symbol authoritative reveal reproduces the same symbols, and the
+        // prepared context (built once) reproduces the same symbol AND state
+        // sequence as the per-symbol path.
+        let mut omega = RANS0.init(&core).unwrap();
+        let mut per_symbol = Vec::with_capacity(src.len());
+        let mut states = vec![omega];
+        for _ in 0..n {
+            per_symbol.push(RANS0.reveal(&core, &mut omega).unwrap());
+            states.push(omega);
+        }
+        assert_eq!(per_symbol, prepared);
+
+        let ctx = RansContext::from_core(&core).unwrap();
+        let mut omega = RANS0.init(&core).unwrap();
+        for (i, &expect) in src.iter().enumerate() {
+            assert_eq!(ctx.peek(&core, &omega).unwrap(), expect, "peek at {i}");
+            assert_eq!(
+                ctx.reveal(&core, &mut omega).unwrap(),
+                expect,
+                "reveal at {i}"
+            );
+            assert_eq!(omega, states[i + 1], "state mismatch at {i}");
+        }
+
+        // The overridden state log matches the per-symbol state sequence exactly.
+        let log = state_log_with(&RANS0, &core, n).unwrap();
+        for (i, s) in states.iter().enumerate() {
+            assert_eq!(s.state, log[i], "state-log mismatch at {i}");
+        }
+        assert_eq!(log[0], RANS0.init(&core).unwrap().state);
+    }
 }

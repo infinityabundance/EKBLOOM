@@ -7,7 +7,7 @@
 //! [`crate::machine_rans`].
 
 use crate::error::{EkbloomError, Result};
-use crate::machine_rans::RANS0;
+use crate::machine_rans::{RansContext, RANS0};
 use crate::state::Snapshot;
 
 /// Machine identifier for `OrANS-NL2`.
@@ -167,6 +167,81 @@ impl OrMachine for Nl2 {
             });
         }
         Ok(())
+    }
+}
+
+/// A prepared, validated decoder context for one core.
+///
+/// It is built once per bulk decode and then reveals symbols without repeating
+/// per-symbol setup. For a machine whose `reveal` is already a single cheap step
+/// (machine 1) it simply delegates back to the machine; for a machine whose step
+/// needs a parsed model header (machine 2) it carries the validated frequencies,
+/// prefix sums and the direct `4096`-entry symbol table so the parse is paid
+/// **once** rather than once per symbol.
+///
+/// The revealed state/cursor sequence is identical to calling `OrMachine::reveal`
+/// repeatedly, so every byte-exactness oracle in the crate still holds.
+pub enum Prepared<'a> {
+    /// Delegates each step to the machine's own `reveal`/`peek` (machine 1).
+    Delegated(&'a dyn OrMachine),
+    /// A prepared `OrANS-RANS0` decoder context (machine 2).
+    Rans(Box<RansContext>),
+}
+
+impl Prepared<'_> {
+    /// Reveal one symbol, advancing `omega` by one machine step.
+    #[inline]
+    pub fn reveal(&self, core: &[u8], omega: &mut Snapshot) -> Result<u8> {
+        match self {
+            Prepared::Delegated(machine) => machine.reveal(core, omega),
+            Prepared::Rans(ctx) => ctx.reveal(core, omega),
+        }
+    }
+
+    /// The symbol that would be revealed next, without advancing.
+    #[inline]
+    pub fn peek(&self, core: &[u8], omega: &Snapshot) -> Result<u8> {
+        match self {
+            Prepared::Delegated(machine) => machine.peek(core, omega),
+            Prepared::Rans(ctx) => ctx.peek(core, omega),
+        }
+    }
+
+    /// Advance `omega` by exactly `n` reveal steps, discarding the symbols.
+    pub fn skip(&self, core: &[u8], omega: &mut Snapshot, n: u64) -> Result<()> {
+        for _ in 0..n {
+            self.reveal(core, omega)?;
+        }
+        Ok(())
+    }
+
+    /// Reveal `n` symbols from `omega`, appending them to `out`.
+    pub fn decode_into(
+        &self,
+        core: &[u8],
+        omega: &mut Snapshot,
+        n: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        if let Ok(cap) = usize::try_from(n) {
+            out.reserve(cap);
+        }
+        for _ in 0..n {
+            out.push(self.reveal(core, omega)?);
+        }
+        Ok(())
+    }
+}
+
+/// Build a reusable [`Prepared`] decoder context for `core` with `machine`.
+///
+/// Dispatches on the machine identifier: machine 2 parses and validates its model
+/// header once and builds the direct symbol table, while any other machine (in
+/// particular machine 1) keeps its own per-step `reveal` semantics unchanged.
+pub fn prepare<'a>(machine: &'a dyn OrMachine, core: &[u8]) -> Result<Prepared<'a>> {
+    match machine.machine_id() {
+        MACHINE_RANS0 => Ok(Prepared::Rans(Box::new(RansContext::from_core(core)?))),
+        _ => Ok(Prepared::Delegated(machine)),
     }
 }
 

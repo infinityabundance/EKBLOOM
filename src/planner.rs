@@ -534,7 +534,9 @@ fn dispatch_owned(
                 let ts = body.tiles.get(ti).ok_or_else(|| EkbloomError::BadSection {
                     reason: "planned tile set index is out of range".to_string(),
                 })?;
-                ts.read(&body.core, offset, length)
+                // Bounded cold path: absent tiles are seeded from the nearest
+                // checkpoint restart rather than replayed from genesis.
+                ts.read_bounded(&body.core, &body.checkpoints, offset, length)
             }
             _ => crate::reader::read(body, ReadRequest { offset, length }),
         },
@@ -573,7 +575,7 @@ fn dispatch_into(
                 let ts = body.tiles.get(ti).ok_or_else(|| EkbloomError::BadSection {
                     reason: "planned tile set index is out of range".to_string(),
                 })?;
-                let bytes = ts.read(&body.core, offset, length)?;
+                let bytes = ts.read_bounded(&body.core, &body.checkpoints, offset, length)?;
                 out.extend_from_slice(&bytes);
                 Ok(())
             }
@@ -618,9 +620,8 @@ fn read_via_checkpoint(
         id: body.machine_id,
     })?;
     let mut omega = cp.restore_with(machine, &body.core, offset)?;
-    for _ in 0..length {
-        out.push(machine.reveal(&body.core, &mut omega)?);
-    }
+    let ctx = crate::machine::prepare(machine, &body.core)?;
+    ctx.decode_into(&body.core, &mut omega, length, out)?;
     Ok(())
 }
 
@@ -635,12 +636,13 @@ fn read_via_history(body: &EkbloomBody, offset: u64, length: u64, out: &mut Vec<
     let machine = machine_by_id(body.machine_id).ok_or(EkbloomError::UnknownMachine {
         id: body.machine_id,
     })?;
+    let ctx = crate::machine::prepare(machine, &body.core)?;
     for k in 0..length {
         let pos = offset + k;
         let Some(mut omega) = history.snapshot_at(pos) else {
             return read_via_machine(body, offset, length, out);
         };
-        out.push(machine.reveal(&body.core, &mut omega)?);
+        out.push(ctx.reveal(&body.core, &mut omega)?);
     }
     Ok(())
 }
@@ -651,16 +653,10 @@ fn read_via_machine(body: &EkbloomBody, offset: u64, length: u64, out: &mut Vec<
         id: body.machine_id,
     })?;
     machine.check_core(&body.core, body.logical_len)?;
+    let ctx = crate::machine::prepare(machine, &body.core)?;
     let mut omega = machine.init(&body.core)?;
-    let mut pos = 0u64;
-    while pos < offset {
-        machine.reveal(&body.core, &mut omega)?;
-        pos += 1;
-    }
-    for _ in 0..length {
-        out.push(machine.reveal(&body.core, &mut omega)?);
-    }
-    Ok(())
+    ctx.skip(&body.core, &mut omega, offset)?;
+    ctx.decode_into(&body.core, &mut omega, length, out)
 }
 
 // ===========================================================================

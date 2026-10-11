@@ -108,6 +108,38 @@ Roundtrip is exact for every shape tested (empty, 1 byte, all 256 byte values,
 repeating, alternating, skewed text, pseudorandom), and the state log, history,
 checkpoint sets and path blooms are byte-exact against the machine for machine 2.
 
+## Ready decode context (throughput)
+
+`reveal` used to re-parse and re-validate the 512-byte model header **per
+symbol**. A `machine_rans::RansContext` — the validated frequencies, the derived
+prefix sums, and a direct `4096`-entry slot→symbol table — is now built **once**
+per bulk decode and reused; `machine::prepare(machine, core)` hands every
+sequential/block decoder, history/state-log construction, tile
+reconstruction/certification and bloom builder the same prepared context (machine
+1 keeps its own per-step `reveal`, bit-identical).
+
+Measured by `examples/rans.rs` (`evidence/bench/rans.json`, 512 KiB corpus,
+median of 3):
+
+| corpus | `V/N` | prepared decode | per-symbol rebuild | speedup |
+|---|---:|---:|---:|---:|
+| skewed (English-like) | 0.478 | 2,379,740 ns | 392,550,970 ns | **165×** |
+| uniform (LCG bytes) | 1.001 | 2,010,661 ns | 230,329,629 ns | **115×** |
+
+Run-to-run the prepared/per-symbol ratio stays in the low hundreds (≈115–190×
+across runs).
+
+`RansContext::from_core` costs ~0.4–0.7 µs; the speedup is exactly the per-symbol
+header parse and 4096-entry table build that is no longer repeated. Decode output
+is byte-exact against the per-symbol path in both rows (`prepared_exact = true`),
+and the machine's state/cursor sequence is unchanged.
+
+**Honest bound.** The measured `per-symbol rebuild` column rebuilds the *full*
+`RansContext` (header parse **plus** table) each step, whereas the pre-fix code
+parsed only the header (a strict subset of that work), so the reported speedup is
+an **upper bound**. The direction is unchanged: the per-symbol header parse
+dominates either way.
+
 ## Trait generalisation
 
 `OrMachine::init` now takes the core (`fn init(&self, core: &[u8]) -> Result<Snapshot>`),
@@ -124,4 +156,5 @@ to `NL2`, so all pre-existing behaviour is unchanged.
 ```sh
 sh scripts/container-verify.sh          # fmt + clippy -D warnings + full suite
 sh scripts/container-test.sh --test machine_rans -- --nocapture
+sh scripts/run-rans.sh                  # writes evidence/bench/rans.json
 ```

@@ -54,6 +54,7 @@ impl CheckpointSet {
             return Err(EkbloomError::BadInterval { interval });
         }
         machine.check_core(core, logical_len)?;
+        let ctx = crate::machine::prepare(machine, core)?;
 
         let k = u64::from(interval);
         let mut resume = Vec::new();
@@ -62,7 +63,7 @@ impl CheckpointSet {
 
         let mut i: u64 = 0;
         while i < logical_len {
-            machine.reveal(core, &mut omega)?;
+            ctx.reveal(core, &mut omega)?;
             i += 1;
             if i.is_multiple_of(k) {
                 resume.push(omega);
@@ -131,8 +132,11 @@ impl CheckpointSet {
         }
 
         let steps = i % k;
-        for _ in 0..steps {
-            machine.reveal(core, &mut omega)?;
+        if steps > 0 {
+            let ctx = crate::machine::prepare(machine, core)?;
+            for _ in 0..steps {
+                ctx.reveal(core, &mut omega)?;
+            }
         }
         Ok(omega)
     }

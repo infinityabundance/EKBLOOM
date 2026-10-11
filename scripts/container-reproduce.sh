@@ -20,4 +20,9 @@ docker_run cargo build --release --locked
 echo "== tests =="
 docker_run cargo test --release --locked
 
+echo "== validate evidence JSON =="
+# Every committed evidence artifact must parse; this fails the build on malformed
+# JSON so a corrupt benchmark record cannot be published.
+sh "$PROJECT_DIR/scripts/validate-evidence.sh"
+
 echo "== reproduce complete =="

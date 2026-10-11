@@ -27,9 +27,15 @@ use std::collections::BTreeMap;
 /// `table_offset u64`, `entries u64`, `status u32`, `table_len u64`.
 const REGION_PREFIX_LEN: usize = 2 + 8 + 8 + 8 + 8 + 4 + 8;
 
-/// Per-entry record width for depth `D`: `key u16` ++ `symbols[D]` ++ `next u32`.
-const fn region_record_len(depth: u16) -> usize {
-    2 + depth as usize + 4
+/// Bytes a cursor-divergent machine (`OrANS-RANS0`) appends to each region
+/// record: the complete successor cursor `u64`. A cursor==position machine
+/// (`OrANS-NL2`) stores none, so its records stay compact.
+pub const REGION_CURSOR_BYTES: usize = 8;
+
+/// Per-entry record width for depth `D`: `key u16` ++ `symbols[D]` ++ `next u32`
+/// ++ `[next_cursor u64]` when `cursor_bytes == REGION_CURSOR_BYTES`.
+const fn region_record_len(depth: u16, cursor_bytes: usize) -> usize {
+    2 + depth as usize + 4 + cursor_bytes
 }
 
 /// A single region's placement and certification summary.
@@ -108,7 +114,7 @@ pub fn certify_regional_with(
     let mut physical_bytes: u64 = 0;
     let mut first_counterexample: Option<Counterexample> = None;
     for build in &builds {
-        let table_len = region_table_len(depth, build.table.len())?;
+        let table_len = region_table_len(depth, build.table.len(), 0)?;
         conflicts = conflicts.saturating_add(build.conflicts);
         if build.conflicts == 0 {
             certified_regions = certified_regions.saturating_add(1);
@@ -155,7 +161,7 @@ pub fn build_regional_with(
     let mut out = Vec::with_capacity(builds.len());
     for build in &builds {
         let entries = build.table.len() as u64;
-        let table_len = region_table_len(depth, build.table.len())?;
+        let table_len = region_table_len(depth, build.table.len(), 0)?;
         let status = if build.conflicts == 0 {
             Certification::Certified
         } else {
@@ -297,8 +303,8 @@ fn build_regions(
     Ok(out)
 }
 
-fn region_table_len(depth: u16, entries: usize) -> Result<u64> {
-    let per = region_record_len(depth) as u64;
+fn region_table_len(depth: u16, entries: usize, cursor_bytes: usize) -> Result<u64> {
+    let per = region_record_len(depth, cursor_bytes) as u64;
     (entries as u64)
         .checked_mul(per)
         .ok_or(EkbloomError::Overflow {
@@ -330,6 +336,9 @@ pub struct RegionTable {
     pub status: Certification,
     /// Sorted `(key, outcome)` records.
     pub entries: Vec<(u16, Outcome)>,
+    /// Trailing cursor bytes per record (`0` for a cursor==position machine,
+    /// [`REGION_CURSOR_BYTES`] for a cursor-divergent one).
+    pub cursor_bytes: usize,
 }
 
 impl RegionTable {
@@ -375,14 +384,41 @@ impl RegionTable {
         let count = usize::try_from(entries_len).map_err(|_| EkbloomError::Overflow {
             what: "regional entry count",
         })?;
-        let expected_len = region_table_len(depth, count)?;
-        if table_len != expected_len {
+        // The record width is self-describing through `table_len`: an empty table
+        // carries no cursor; otherwise `table_len / entries` is either the base
+        // width (cursor==position) or the base width plus a `u64` cursor
+        // (cursor-divergent). No extra prefix field is needed, so machine-1
+        // payloads are byte-identical to the pre-cursor format.
+        let base = region_record_len(depth, 0) as u64;
+        let with_cursor = region_record_len(depth, REGION_CURSOR_BYTES) as u64;
+        let entries_u64 = entries_len;
+        let cursor_bytes = if count == 0 {
+            if table_len != 0 {
+                return Err(bad("empty regional table has a non-zero length"));
+            }
+            0
+        } else if table_len
+            == entries_u64
+                .checked_mul(base)
+                .ok_or(EkbloomError::Overflow {
+                    what: "regional table length",
+                })?
+        {
+            0
+        } else if table_len
+            == entries_u64
+                .checked_mul(with_cursor)
+                .ok_or(EkbloomError::Overflow {
+                    what: "regional table length",
+                })?
+        {
+            REGION_CURSOR_BYTES
+        } else {
             return Err(bad(
                 "regional table length is inconsistent with depth/entries",
             ));
-        }
-
-        let record = region_record_len(depth);
+        };
+        let record = region_record_len(depth, cursor_bytes);
         let need = REGION_PREFIX_LEN
             .checked_add(record.checked_mul(count).ok_or(EkbloomError::Overflow {
                 what: "regional payload length",
@@ -400,6 +436,9 @@ impl RegionTable {
             let key = le_u16(take(p, &mut off, 2)?);
             let symbols = take(p, &mut off, width)?.to_vec();
             let next_state = le_u32(take(p, &mut off, 4)?);
+            if cursor_bytes != 0 {
+                let _next_cursor = take(p, &mut off, cursor_bytes)?;
+            }
             entries.push((
                 key,
                 Outcome {
@@ -419,6 +458,7 @@ impl RegionTable {
             table_offset,
             status,
             entries,
+            cursor_bytes,
         })
     }
 
@@ -429,9 +469,10 @@ impl RegionTable {
         self.entries.get(idx).map(|(_, out)| out)
     }
 
-    /// Manifested table size in bytes: `entries * (D + 6)`.
+    /// Manifested table size in bytes: `entries * (D + 6)` for a cursor==position
+    /// machine, or `entries * (D + 14)` for a cursor-divergent one.
     pub fn physical_bytes(&self) -> u64 {
-        region_table_len(self.depth, self.entries.len()).unwrap_or(0)
+        region_table_len(self.depth, self.entries.len(), self.cursor_bytes).unwrap_or(0)
     }
 
     /// A [`RegionDescriptor`] summarizing this parsed table.

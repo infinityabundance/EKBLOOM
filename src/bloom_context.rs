@@ -16,7 +16,7 @@ use crate::bloom::{supported_depth, BloomKind, BloomShell, Certification, Outcom
 use crate::bloom_global::Counterexample;
 use crate::bloom_key::key_from_state;
 use crate::error::{EkbloomError, Result};
-use crate::machine::{state_log_with, OrMachine, NL2};
+use crate::machine::{prepare, state_log_with, OrMachine, Prepared, NL2};
 use crate::state::Snapshot;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
@@ -78,19 +78,20 @@ pub fn certify_context_with(
     let d = u64::from(depth);
     let windows = window_count(logical_len, d)?;
     let width = usize::from(depth);
+    let ctx = prepare(machine, core)?;
 
     let mut map: BTreeMap<(u16, Vec<u8>), KeyState> = BTreeMap::new();
     for (i, &x) in states.iter().enumerate().take(windows) {
         let state = key_from_state(x);
-        let ctx = core
+        let ctx_bytes = core
             .get(i..i + width)
             .ok_or(EkbloomError::Truncated {
                 needed: (i + width) as u64,
                 available: core.len() as u64,
             })?
             .to_vec();
-        let out = outcome_at(machine, core, x, i as u64, depth)?;
-        match map.entry((state, ctx)) {
+        let out = outcome_at(&ctx, core, x, i as u64, depth)?;
+        match map.entry((state, ctx_bytes)) {
             Entry::Vacant(e) => {
                 e.insert(KeyState {
                     pos: i as u64,
@@ -191,19 +192,20 @@ fn build_entries(
     let states = state_log_with(machine, core, logical_len)?;
     let windows = window_count(logical_len, u64::from(depth))?;
     let width = usize::from(depth);
+    let ctx = prepare(machine, core)?;
 
     let mut map: BTreeMap<(u16, Vec<u8>), Outcome> = BTreeMap::new();
     for (i, &x) in states.iter().enumerate().take(windows) {
         let state = key_from_state(x);
-        let ctx = core
+        let ctx_bytes = core
             .get(i..i + width)
             .ok_or(EkbloomError::Truncated {
                 needed: (i + width) as u64,
                 available: core.len() as u64,
             })?
             .to_vec();
-        let out = outcome_at(machine, core, x, i as u64, depth)?;
-        map.entry((state, ctx)).or_insert(out);
+        let out = outcome_at(&ctx, core, x, i as u64, depth)?;
+        map.entry((state, ctx_bytes)).or_insert(out);
     }
     Ok(map
         .into_iter()
@@ -344,7 +346,7 @@ fn window_count(logical_len: u64, depth: u64) -> Result<usize> {
 
 /// Reveal `depth` symbols from `(state, cursor)` and capture the successor state.
 fn outcome_at(
-    machine: &dyn OrMachine,
+    ctx: &Prepared<'_>,
     core: &[u8],
     state: u32,
     cursor: u64,
@@ -353,7 +355,7 @@ fn outcome_at(
     let mut omega = Snapshot::new(state, cursor);
     let mut symbols = Vec::with_capacity(usize::from(depth));
     for _ in 0..depth {
-        symbols.push(machine.reveal(core, &mut omega)?);
+        symbols.push(ctx.reveal(core, &mut omega)?);
     }
     Ok(Outcome {
         symbols,

@@ -10,10 +10,13 @@
 
 use std::path::{Path, PathBuf};
 
+use ekbloom::machine::MACHINE_RANS0;
+use ekbloom::manifest::create_machine;
+use ekbloom::reader::open_bytes;
 use ekbloom::{
-    create, manifest_hot_regions, read, read_region_scoped, verify_deep, AccessTrace, Baseline,
-    BaselineKind, Certification, EkbloomError, ManifestationBudget, ManifestationProfile,
-    ReadRequest, SweepConfig,
+    create, manifest_hot_regions, read, read_region_scoped, verify_deep, write_body, AccessTrace,
+    Baseline, BaselineKind, Certification, EkbloomBody, EkbloomError, ManifestationBudget,
+    ManifestationProfile, ReadRequest, SweepConfig,
 };
 
 /// Deterministic LCG corpus (identical generator to the other harnesses).
@@ -307,4 +310,131 @@ fn certified_verdicts_match_the_deep_verifier() {
         }
     }
     assert!(verify_deep(&body).unwrap().ok);
+}
+
+/// A trace that tiles `[0, n)` into `region_len`-byte regions with decreasing
+/// counts, so many contiguous certified tables exist and there are boundaries
+/// between them.
+fn tiled_trace(n: u64, region_len: u64) -> AccessTrace {
+    let mut regions = Vec::new();
+    let mut counts = Vec::new();
+    let mut start = 0u64;
+    let mut count = 1000u64;
+    while start < n {
+        let len = region_len.min(n - start);
+        regions.push((start, len));
+        counts.push(count.max(1));
+        count = count.saturating_sub(1);
+        start += len;
+    }
+    AccessTrace { regions, counts }
+}
+
+/// Read every traced region whole, and read a span straddling each interior
+/// boundary (so a leap inside one table is followed by a leap inside the next),
+/// comparing **every** returned byte with the source and with the authoritative
+/// reader.
+fn check_region_reads(body: &EkbloomBody, src: &[u8], trace: &AccessTrace) {
+    let n = src.len() as u64;
+    for &(start, len) in &trace.regions {
+        let whole = read_region_scoped(body, start, len).unwrap();
+        assert_eq!(&whole, &src[start as usize..(start + len) as usize]);
+        let end = start + len;
+        // A span covering the last full window of this region and the first of
+        // the next: it exercises a table leap, then a second leap after a boundary.
+        if end + 4 <= n {
+            let off = end - 4;
+            let span = 8u64;
+            let got = read_region_scoped(body, off, span).unwrap();
+            assert_eq!(
+                got,
+                &src[off as usize..(off + span) as usize],
+                "boundary read ({off}, {span})"
+            );
+            assert_eq!(
+                got,
+                read(
+                    body,
+                    ReadRequest {
+                        offset: off,
+                        length: span
+                    }
+                )
+                .unwrap()
+            );
+        }
+    }
+}
+
+/// Machine 2 (`OrANS-RANS0`) is cursor-divergent: its successor state alone does
+/// not resume. Certified region tables therefore carry the complete successor
+/// snapshot, and reads must stay byte-exact across table boundaries — including
+/// after file serialization and reopening.
+#[test]
+fn machine_two_region_tables_are_exact_across_boundaries_and_after_reopen() {
+    let src = lcg(0x0E61_0000_0000_00B2, 4096);
+    let n = src.len() as u64;
+    let mut body = create_machine(&src, ManifestationProfile::Root, MACHINE_RANS0).unwrap();
+    assert_eq!(body.machine_id, MACHINE_RANS0);
+    let trace = tiled_trace(n, 32);
+    let report = manifest_hot_regions(&mut body, &trace, &generous_budget(), &small_cfg()).unwrap();
+    assert!(
+        report.selected_regions > 0,
+        "no certified machine-2 region was materialised: {report:?}"
+    );
+    // The cursor-carrying tables must be accepted for a cursor-divergent body,
+    // i.e. the leap path is actually exercised (not silently rejected).
+    assert!(
+        ekbloom::RegionReader::new(&body).has_regions(),
+        "machine-2 region tables were rejected by the reader"
+    );
+    assert!(
+        verify_deep(&body).unwrap().ok,
+        "machine-2 body must deep-verify"
+    );
+    check_region_reads(&body, &src, &trace);
+
+    // Serialize + reopen: region tables (with cursors) and the cold checkpoint set
+    // round-trip, and reads stay byte-exact.
+    let dir = tmp_dir("machine2-region");
+    let path = dir.join("m2.ekb");
+    write_body(&path, &body).unwrap();
+    let reopened = open_bytes(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(reopened.machine_id, MACHINE_RANS0);
+    assert!(
+        verify_deep(&reopened).unwrap().ok,
+        "reopened body must deep-verify"
+    );
+    check_region_reads(&reopened, &src, &trace);
+}
+
+/// The machine-1 regression: the same boundary/reopen checks must hold where the
+/// cursor equals the position (no per-record cursor bytes are stored).
+#[test]
+fn machine_one_region_tables_are_exact_across_boundaries_and_after_reopen() {
+    let src = lcg(0x0E61_0000_0000_00B1, 4096);
+    let n = src.len() as u64;
+    let mut body = create(&src, ManifestationProfile::Root).unwrap();
+    let trace = tiled_trace(n, 32);
+    let report = manifest_hot_regions(&mut body, &trace, &generous_budget(), &small_cfg()).unwrap();
+    assert!(
+        report.selected_regions > 0,
+        "no certified machine-1 region was materialised: {report:?}"
+    );
+    assert!(ekbloom::RegionReader::new(&body).has_regions());
+    assert!(
+        verify_deep(&body).unwrap().ok,
+        "machine-1 body must deep-verify"
+    );
+    check_region_reads(&body, &src, &trace);
+
+    let dir = tmp_dir("machine1-region");
+    let path = dir.join("m1.ekb");
+    write_body(&path, &body).unwrap();
+    let reopened = open_bytes(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(
+        verify_deep(&reopened).unwrap().ok,
+        "reopened body must deep-verify"
+    );
+    check_region_reads(&reopened, &src, &trace);
 }

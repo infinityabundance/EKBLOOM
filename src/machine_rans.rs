@@ -144,22 +144,6 @@ impl Model {
         Ok(Model { freq, cum })
     }
 
-    /// The symbol owning `slot`. Binary search over the strictly increasing
-    /// `cum`; every partition is non-empty because `freq >= 1`.
-    fn symbol_for_slot(&self, slot: u32) -> u8 {
-        let mut lo = 0usize;
-        let mut hi = SYMBOLS - 1;
-        while lo < hi {
-            let mid = lo + (hi - lo).div_ceil(2);
-            if self.cum[mid] <= slot {
-                lo = mid;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        lo as u8
-    }
-
     /// The initial coder state stored in the header.
     fn initial_state(core: &[u8]) -> u32 {
         u32::from_le_bytes([
@@ -171,28 +155,53 @@ impl Model {
     }
 }
 
-impl Rans0 {
-    /// The genesis snapshot `(initial_state, HEADER_BYTES)`.
-    fn genesis(core: &[u8]) -> Snapshot {
-        Snapshot::new(Model::initial_state(core), HEADER_BYTES as u64)
+/// A validated, reusable order-0 decoder context for one core.
+///
+/// The model header is parsed and validated **once** (frequencies summing to `M`,
+/// every frequency non-zero), the prefix sums are derived, and a direct
+/// `M`-entry `slot -> symbol` table is built so each decoder step is a table
+/// lookup instead of a binary search over `cum`. Sequential decoders, history /
+/// state-log construction, tile certification/reconstruction and the bloom
+/// builders share one context rather than re-parsing the header per symbol.
+///
+/// The context is a pure function of the core header; it holds no cursor and is
+/// immutable, so it may be shared across threads (it is `Send + Sync`).
+pub struct RansContext {
+    freq: [u16; SYMBOLS],
+    cum: [u32; SYMBOLS],
+    /// `table[slot]` is the unique symbol `s` with `cum[s] <= slot < cum[s] + freq[s]`.
+    table: Vec<u8>,
+}
+
+impl RansContext {
+    /// Parse and validate `core`'s model header, then build the direct table.
+    ///
+    /// Errors exactly as [`Model::from_header`]: a truncated header, frequencies
+    /// that do not sum to `M`, or a zero frequency.
+    pub fn from_core(core: &[u8]) -> Result<RansContext> {
+        let model = Model::from_header(core)?;
+        let mut table = vec![0u8; M as usize];
+        for s in 0..SYMBOLS {
+            let start = model.cum[s] as usize;
+            let end = start + usize::from(model.freq[s]);
+            table[start..end].fill(s as u8);
+        }
+        Ok(RansContext {
+            freq: model.freq,
+            cum: model.cum,
+            table,
+        })
     }
 
-    /// The step budget for `core`: `MAX_STEPS_PER_BYTE` per byte plus slack. A
-    /// genuine stream never approaches it; a crafted one is cut off with
-    /// [`EkbloomError::NonTermination`].
-    fn step_cap(core: &[u8]) -> u64 {
-        (core.len() as u64)
-            .saturating_mul(MAX_STEPS_PER_BYTE)
-            .saturating_add(1 << 20)
-    }
-
-    /// One decoder step against a parsed model.
-    fn step(model: &Model, core: &[u8], omega: &mut Snapshot) -> Result<u8> {
+    /// One decoder step: resolve the symbol owning `x & 4095` from the table and
+    /// advance the state, consuming zero or more renormalisation bytes.
+    #[inline]
+    fn step(&self, core: &[u8], omega: &mut Snapshot) -> Result<u8> {
         let x = omega.state;
         let slot = x & (M - 1);
-        let s = model.symbol_for_slot(slot);
-        let f = u64::from(model.freq[s as usize]);
-        let c = u64::from(model.cum[s as usize]);
+        let s = self.table[slot as usize];
+        let f = u64::from(self.freq[s as usize]);
+        let c = u64::from(self.cum[s as usize]);
         let mut nx = f * u64::from(x >> SCALE_BITS) + u64::from(slot) - c;
         let mut p = omega.cursor;
         while nx < u64::from(RANS_L) {
@@ -210,6 +219,35 @@ impl Rans0 {
         omega.cursor = p;
         Ok(s)
     }
+
+    /// Reveal one symbol against this prepared context.
+    #[inline]
+    pub fn reveal(&self, core: &[u8], omega: &mut Snapshot) -> Result<u8> {
+        self.step(core, omega)
+    }
+
+    /// The symbol that would be revealed next, without advancing `omega`.
+    #[inline]
+    pub fn peek(&self, core: &[u8], omega: &Snapshot) -> Result<u8> {
+        let mut probe = *omega;
+        self.step(core, &mut probe)
+    }
+}
+
+impl Rans0 {
+    /// The genesis snapshot `(initial_state, HEADER_BYTES)`.
+    fn genesis(core: &[u8]) -> Snapshot {
+        Snapshot::new(Model::initial_state(core), HEADER_BYTES as u64)
+    }
+
+    /// The step budget for `core`: `MAX_STEPS_PER_BYTE` per byte plus slack. A
+    /// genuine stream never approaches it; a crafted one is cut off with
+    /// [`EkbloomError::NonTermination`].
+    fn step_cap(core: &[u8]) -> u64 {
+        (core.len() as u64)
+            .saturating_mul(MAX_STEPS_PER_BYTE)
+            .saturating_add(1 << 20)
+    }
 }
 
 impl OrMachine for Rans0 {
@@ -224,14 +262,13 @@ impl OrMachine for Rans0 {
     }
 
     fn reveal(&self, core: &[u8], omega: &mut Snapshot) -> Result<u8> {
-        let model = Model::from_header(core)?;
-        Self::step(&model, core, omega)
+        let ctx = RansContext::from_core(core)?;
+        ctx.reveal(core, omega)
     }
 
     fn peek(&self, core: &[u8], omega: &Snapshot) -> Result<u8> {
-        let model = Model::from_header(core)?;
-        let mut probe = *omega;
-        Self::step(&model, core, &mut probe)
+        let ctx = RansContext::from_core(core)?;
+        ctx.peek(core, omega)
     }
 
     fn encode(&self, source: &[u8]) -> Result<Vec<u8>> {
@@ -263,7 +300,7 @@ impl OrMachine for Rans0 {
     }
 
     fn check_core(&self, core: &[u8], logical_len: u64) -> Result<()> {
-        let model = Model::from_header(core)?;
+        let ctx = RansContext::from_core(core)?;
         let mut omega = Self::genesis(core);
         let cap = Self::step_cap(core);
         let mut steps = 0u64;
@@ -271,14 +308,14 @@ impl OrMachine for Rans0 {
             if steps >= cap {
                 return Err(EkbloomError::NonTermination);
             }
-            Self::step(&model, core, &mut omega)?;
+            ctx.reveal(core, &mut omega)?;
             steps += 1;
         }
         Ok(())
     }
 
     fn decode(&self, core: &[u8], logical_len: u64) -> Result<Vec<u8>> {
-        let model = Model::from_header(core)?;
+        let ctx = RansContext::from_core(core)?;
         let mut omega = Self::genesis(core);
         let cap = Self::step_cap(core);
         let mut out: Vec<u8> = Vec::new();
@@ -287,14 +324,14 @@ impl OrMachine for Rans0 {
             if steps >= cap {
                 return Err(EkbloomError::NonTermination);
             }
-            out.push(Self::step(&model, core, &mut omega)?);
+            out.push(ctx.reveal(core, &mut omega)?);
             steps += 1;
         }
         Ok(out)
     }
 
     fn state_log(&self, core: &[u8], logical_len: u64) -> Result<Vec<u32>> {
-        let model = Model::from_header(core)?;
+        let ctx = RansContext::from_core(core)?;
         let mut omega = Self::genesis(core);
         let cap = Self::step_cap(core);
         let mut log: Vec<u32> = Vec::new();
@@ -304,7 +341,7 @@ impl OrMachine for Rans0 {
             if steps >= cap {
                 return Err(EkbloomError::NonTermination);
             }
-            Self::step(&model, core, &mut omega)?;
+            ctx.reveal(core, &mut omega)?;
             log.push(omega.state);
             steps += 1;
         }

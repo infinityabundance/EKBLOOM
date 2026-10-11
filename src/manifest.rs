@@ -151,10 +151,11 @@ impl EkbloomBody {
         }
         let machine = self.machine()?;
         machine.check_core(&self.core, self.logical_len)?;
+        let ctx = crate::machine::prepare(machine, &self.core)?;
         let mut omega = machine.init(&self.core)?;
         let mut pos = 0u64;
         while pos < i {
-            machine.reveal(&self.core, &mut omega)?;
+            ctx.reveal(&self.core, &mut omega)?;
             pos += 1;
         }
         Ok(omega)
@@ -238,12 +239,26 @@ pub fn create_machine(
     let machine =
         machine_by_id(machine_id).ok_or(EkbloomError::UnknownMachine { id: machine_id })?;
     let core = machine.encode(source)?;
+    build_body(core, source.len() as u64, machine_id, profile)
+}
+
+/// Assemble a body from an already-encoded `core` and apply `profile`.
+///
+/// `logical_len` is the number of symbols `core` reveals (the manifesting
+/// structures are sized by the *logical* length, not the visible core length, so
+/// a compressing machine with `V < N` is accounted correctly).
+fn build_body(
+    core: Vec<u8>,
+    logical_len: u64,
+    machine_id: u32,
+    profile: ManifestationProfile,
+) -> Result<EkbloomBody> {
     let core_hash = *blake3::hash(&core).as_bytes();
     let mut body = EkbloomBody {
         object_id: derive_object_id(&core_hash),
         core,
-        logical_len: source.len() as u64,
-        machine_id: machine.machine_id(),
+        logical_len,
+        machine_id,
         core_hash,
         history: None,
         checkpoints: Vec::new(),
@@ -473,16 +488,28 @@ fn regional_bloom_bytes(logical_len: u64, depth: u16, region_bytes: u32) -> u64 
 /// `profile` for a source of `source_len` bytes would occupy, **without building
 /// it**.
 ///
-/// Every term is derived from the exact accounting identities used by
-/// [`EkbloomBody::physical_bytes`]: the `N`-byte core, the `4*(N+1)` history
-/// projection, the `12*(floor(N/K)+1)` checkpoint sets, the exact `Path` and
-/// `Universal` bloom payloads, `MaxSpeed`'s history/checkpoint/path combination,
-/// and the per-kind certificate records. The regional table is the only *bounded*
-/// term (see [`regional_bloom_bytes`]). Arithmetic saturates, so the estimate can
-/// never wrap to a smaller value; it is a hard upper bound and therefore a safe
-/// pre-filter for a physical-byte budget.
+/// This is the machine-1 view: the visible core length equals the logical length
+/// (`V = N`), so it is exactly [`estimate_physical_bytes_for_core`] with
+/// `core_len == source_len`.
 pub fn estimate_physical_bytes(source_len: u64, profile: ManifestationProfile) -> u64 {
-    let core = source_len;
+    estimate_physical_bytes_for_core(source_len, source_len, profile)
+}
+
+/// Static estimate of the physical bytes a fresh body with a visible core of
+/// `core_len` bytes producing `source_len` logical symbols would occupy.
+///
+/// The manifested structures (history, checkpoints, blooms) are sized by the
+/// **logical** length `source_len`; only the core term uses the actual visible
+/// core length `core_len`. For machine 1 `core_len == source_len` and this is
+/// identical to [`estimate_physical_bytes`]; for a compressing machine (machine 2,
+/// `V < N`) it reflects the real, smaller core so a budget is not over-rejected.
+/// Arithmetic saturates, so the result can never wrap to a smaller value.
+pub fn estimate_physical_bytes_for_core(
+    core_len: u64,
+    source_len: u64,
+    profile: ManifestationProfile,
+) -> u64 {
+    let core = core_len;
     match profile {
         ManifestationProfile::Root => core,
         ManifestationProfile::Sparse { interval } => {
@@ -547,10 +574,12 @@ fn faster_profile(a: ManifestationProfile, ea: u64, b: ManifestationProfile, eb:
 /// [`EkbloomError::AllocationTooLarge`]) any profile whose manifested physical
 /// bytes would exceed `budget`.
 ///
-/// The [`estimate_physical_bytes`] pre-filter avoids building an obviously
-/// oversized body; the built body is then re-checked against the *actual*
-/// accounting, so a conservative estimate can never let an over-budget body
-/// escape. Transactional: on rejection no body is returned.
+/// The source is encoded **first** so the estimate uses the *actual* visible core
+/// length: a compressing machine (machine 2) then accepts a configuration whose
+/// real core fits the budget even though its logical length alone would
+/// over-reject. Machine 1 is unaffected (`core_len == source_len`). The built body
+/// is re-checked against the *actual* accounting and the whole call is
+/// transactional: on rejection no body is returned.
 pub fn create_within_budget(
     source: &[u8],
     profile: ManifestationProfile,
@@ -560,21 +589,29 @@ pub fn create_within_budget(
 }
 
 /// Machine-general [`create_within_budget`].
+///
+/// Encodes `source` once, estimates from the actual core length, and only commits
+/// if both the estimate and the real `physical_bytes()` fit the budget.
 pub fn create_machine_within_budget(
     source: &[u8],
     profile: ManifestationProfile,
     machine_id: u32,
     budget: &ManifestationBudget,
 ) -> Result<EkbloomBody> {
+    let machine =
+        machine_by_id(machine_id).ok_or(EkbloomError::UnknownMachine { id: machine_id })?;
     let limit = budget.maximum_physical_bytes;
-    let estimated = estimate_physical_bytes(source.len() as u64, profile);
+    let core = machine.encode(source)?;
+    let core_len = core.len() as u64;
+    let source_len = source.len() as u64;
+    let estimated = estimate_physical_bytes_for_core(core_len, source_len, profile);
     if estimated > limit {
         return Err(EkbloomError::AllocationTooLarge {
             requested: estimated,
             limit,
         });
     }
-    let body = create_machine(source, profile, machine_id)?;
+    let body = build_body(core, source_len, machine_id, profile)?;
     let actual = body.physical_bytes();
     if actual > limit {
         return Err(EkbloomError::AllocationTooLarge {

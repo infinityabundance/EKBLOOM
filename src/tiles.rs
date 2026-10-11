@@ -39,8 +39,9 @@
 
 use std::collections::BTreeSet;
 
+use crate::checkpoint::CheckpointSet;
 use crate::error::{EkbloomError, Result};
-use crate::machine::{machine_by_id, OrMachine};
+use crate::machine::{machine_by_id, prepare, OrMachine};
 use crate::manifest::EkbloomBody;
 use crate::region_adapt::AccessTrace;
 use crate::ManifestationBudget;
@@ -416,7 +417,30 @@ impl TileSet {
     /// `body_core`. Requests that cross tile boundaries are split at each
     /// boundary, so the result is byte-identical to [`crate::read`] for every
     /// input.
+    ///
+    /// With no restart set this reconstructs an absent fragment by replaying the
+    /// machine from `Omega_0`; see [`TileSet::read_bounded`] to bound that replay.
     pub fn read(&self, body_core: &[u8], offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.read_bounded(body_core, &[], offset, len)
+    }
+
+    /// [`TileSet::read`], but reconstructing an absent tile fragment from the
+    /// **nearest** restart in `restarts` rather than from `Omega_0`.
+    ///
+    /// A checkpoint set stores the complete resumable state (for a cursor-divergent
+    /// machine, the true backing cursor) at each interval boundary, so seeding an
+    /// absent fragment costs at most `K - 1` machine steps (`K = cp.interval`)
+    /// instead of up to the fragment's own offset. When no restart covers a
+    /// fragment the authoritative genesis replay is used, so the output is
+    /// byte-for-byte identical for every input. This is the bounded cold path for
+    /// both machines.
+    pub fn read_bounded(
+        &self,
+        body_core: &[u8],
+        restarts: &[CheckpointSet],
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>> {
         let end = offset.checked_add(len).ok_or(EkbloomError::Overflow {
             what: "tile read range",
         })?;
@@ -475,7 +499,15 @@ impl TileSet {
                         next += 1;
                     }
                     let run_len = run_end - pos;
-                    reconstruct_into(machine, body_core, self.logical_len, pos, run_len, &mut out)?;
+                    reconstruct_bounded(
+                        machine,
+                        body_core,
+                        self.logical_len,
+                        restarts,
+                        pos,
+                        run_len,
+                        &mut out,
+                    )?;
                     pos = run_end;
                     continue;
                 }
@@ -597,33 +629,15 @@ impl TileSet {
 
     /// Parse a tile set produced by [`TileSet::to_bytes`], rejecting any
     /// structural inconsistency or content-digest mismatch.
+    ///
+    /// The fixed prefix is validated by the same [`parse_tile_set_prefix`] used by
+    /// the file-backed reader, so `tile_shift` (and magic/version/kind) are checked
+    /// in exactly one place on both the in-memory and file-backed paths.
     pub fn from_bytes(bytes: &[u8]) -> Result<TileSet> {
+        let prefix = parse_tile_set_prefix(bytes)?;
         let mut cur = Cursor::new(bytes);
-        if cur.take(8)? != b"EKBTILES" {
-            return Err(bad("tile set magic mismatch"));
-        }
-        let version = cur.u8()?;
-        if version != 1 {
-            return Err(bad(format!("unsupported tile set version {version}")));
-        }
-        let tile_shift = cur.u8()?;
-        // Mirror `parse_tile_set_prefix`: an untrusted `tile_shift` outside
-        // `1..=MAX_TILE_SHIFT` is rejected here. Without this guard a crafted
-        // section with `tile_shift >= 64` made `1u64 << tile_shift` below panic
-        // (`attempt to shift left with overflow`) in a debug build, i.e. a
-        // reachable abort from `reader::open_bytes` on hostile input.
-        if tile_shift == 0 || tile_shift > MAX_TILE_SHIFT {
-            return Err(bad(format!("tile shift {tile_shift} out of range")));
-        }
-        let kind = DirectoryKind::from_code(cur.u8()?)
-            .ok_or_else(|| bad("unknown tile directory kind"))?;
-        let _reserved = cur.u8()?;
-        let machine_id = cur.u32()?;
-        let logical_len = cur.u64()?;
-        let present_field = cur.u64()?;
-        let core_hash = cur.arr32()?;
-        let digest = cur.arr32()?;
-        let (flat, groups, slots) = match kind {
+        cur.take(TILE_SET_PREFIX_LEN)?;
+        let (flat, groups, slots) = match prefix.kind {
             DirectoryKind::Flat => (read_u32_vec(&mut cur)?, Vec::new(), Vec::new()),
             DirectoryKind::TwoLevelRadix => {
                 let groups = read_u32_vec(&mut cur)?;
@@ -639,10 +653,11 @@ impl TileSet {
         if !cur.is_empty() {
             return Err(bad("tile set has trailing bytes"));
         }
-        let tiles = logical_len.div_ceil(1u64 << tile_shift);
+        let tile_shift = prefix.tile_shift;
+        let tiles = prefix.logical_len.div_ceil(1u64 << tile_shift);
         let directory = TileDirectory {
             tile_shift,
-            kind,
+            kind: prefix.kind,
             tiles,
             flat,
             groups,
@@ -650,13 +665,13 @@ impl TileSet {
         };
         let tile_set = TileSet {
             tile_shift,
-            logical_len,
-            machine_id,
+            logical_len: prefix.logical_len,
+            machine_id: prefix.machine_id,
             directory,
             data,
-            present: present_field,
-            core_hash,
-            digest,
+            present: prefix.present,
+            core_hash: prefix.core_hash,
+            digest: prefix.digest,
         };
         // Structural consistency: the present count and digest must both agree.
         let counted = {
@@ -664,10 +679,10 @@ impl TileSet {
             tile_set.directory.for_each_present(|_, _| n += 1);
             n
         };
-        if counted != present_field {
+        if counted != prefix.present {
             return Err(bad("tile presence count disagrees with the directory"));
         }
-        if tile_set.recompute_digest() != digest {
+        if tile_set.recompute_digest() != prefix.digest {
             return Err(bad("tile content digest mismatch"));
         }
         Ok(tile_set)
@@ -1076,6 +1091,7 @@ fn certify_tiles(
     decoded: &[u8],
 ) -> Result<bool> {
     machine.check_core(core, logical_len)?;
+    let ctx = prepare(machine, core)?;
     let mut omega = machine.init(core)?;
     let mut pos = 0u64;
     for &tile in present {
@@ -1085,51 +1101,83 @@ fn certify_tiles(
             .ok_or(EkbloomError::Overflow {
                 what: "certify tile start",
             })?;
-        while pos < start {
-            machine.reveal(core, &mut omega)?;
-            pos += 1;
+        if start > pos {
+            ctx.skip(core, &mut omega, start - pos)?;
+            pos = start;
         }
-        let mut i = start;
         let end = start.saturating_add(len);
-        while i < end {
-            let symbol = machine.reveal(core, &mut omega)?;
+        while pos < end {
+            let symbol = ctx.reveal(core, &mut omega)?;
             let want = decoded
-                .get(i as usize)
+                .get(pos as usize)
                 .copied()
                 .ok_or_else(|| bad("authoritative decode shorter than the tile range"))?;
             if symbol != want {
                 return Ok(false);
             }
-            i += 1;
             pos += 1;
         }
     }
     Ok(true)
 }
 
+/// The nearest checkpoint covering `pos`, and the position of that checkpoint's
+/// resume point (which is a multiple of its interval). `None` when no restart
+/// covers `pos`, i.e. reconstruction would have to start at `Omega_0`.
+fn nearest_restart(restarts: &[CheckpointSet], pos: u64) -> Option<(&CheckpointSet, u64)> {
+    let mut best: Option<(u64, &CheckpointSet, u64)> = None;
+    for cp in restarts {
+        if cp.interval == 0 || cp.restart_point(pos).is_none() {
+            continue;
+        }
+        let k = u64::from(cp.interval);
+        let restart_pos = (pos / k).saturating_mul(k);
+        let steps = pos - restart_pos;
+        if best.is_none_or(|(b, _, _)| steps < b) {
+            best = Some((steps, cp, restart_pos));
+        }
+    }
+    best.map(|(_, cp, restart_pos)| (cp, restart_pos))
+}
+
+/// The number of machine steps needed to seed logical position `pos` from the
+/// nearest restart in `restarts`: `pos - restart_pos` (bounded by `K - 1` for a
+/// covering checkpoint of interval `K`), or `pos` itself when no restart covers
+/// `pos` (a full genesis replay to `pos`).
+///
+/// This is the *step bound* of [`TileSet::read_bounded`]: a cold fragment at
+/// `offset` seeds in at most this many steps, so the measured bound proves the
+/// cold replay is no longer `O(prefix length)`.
+pub fn bounded_seed_steps(restarts: &[CheckpointSet], pos: u64) -> u64 {
+    match nearest_restart(restarts, pos) {
+        Some((_, restart_pos)) => pos.saturating_sub(restart_pos),
+        None => pos,
+    }
+}
+
 /// Reconstruct `[offset, offset + len)` from the authoritative machine, appending
-/// into `out`.
-fn reconstruct_into(
+/// into `out`, seeded from the nearest restart in `restarts` (bounded replay) or
+/// from `Omega_0` when no restart covers `offset`.
+fn reconstruct_bounded(
     machine: &dyn OrMachine,
     core: &[u8],
     logical_len: u64,
+    restarts: &[CheckpointSet],
     offset: u64,
     len: u64,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     machine.check_core(core, logical_len)?;
-    let mut omega = machine.init(core)?;
-    let mut pos = 0u64;
-    while pos < offset {
-        machine.reveal(core, &mut omega)?;
-        pos += 1;
-    }
-    let mut i = 0u64;
-    while i < len {
-        out.push(machine.reveal(core, &mut omega)?);
-        i += 1;
-    }
-    Ok(())
+    let ctx = prepare(machine, core)?;
+    let mut omega = match nearest_restart(restarts, offset) {
+        Some((cp, _)) => cp.restore_with(machine, core, offset)?,
+        None => {
+            let mut omega = machine.init(core)?;
+            ctx.skip(core, &mut omega, offset)?;
+            omega
+        }
+    };
+    ctx.decode_into(core, &mut omega, len, out)
 }
 
 /// Append `v` as a `u64` length followed by little-endian `u32` entries.
@@ -1187,27 +1235,11 @@ impl<'a> Cursor<'a> {
         Ok(slice)
     }
 
-    fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32> {
-        let b = self.take(4)?;
-        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-    }
-
     fn u64(&mut self) -> Result<u64> {
         let b = self.take(8)?;
         Ok(u64::from_le_bytes([
             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
         ]))
-    }
-
-    fn arr32(&mut self) -> Result<[u8; 32]> {
-        let b = self.take(32)?;
-        let mut out = [0u8; 32];
-        out.copy_from_slice(b);
-        Ok(out)
     }
 }
 
@@ -1252,6 +1284,49 @@ mod tests {
             assert!(dir.offset_of(2).is_none());
             assert!(dir.offset_of(500).is_none());
             assert!(dir.offset_of(tiles_total).is_none());
+        }
+    }
+
+    #[test]
+    fn crafted_tile_shift_is_rejected_without_panicking() {
+        use crate::manifest::create;
+        use crate::region_adapt::AccessTrace;
+        use crate::{ManifestationBudget, ManifestationProfile};
+
+        let src = lcg(0x7111_0000_0000_000D, 16 * 1024);
+        let mut body = create(&src, ManifestationProfile::Root).unwrap();
+        let trace = AccessTrace {
+            regions: vec![(0, 4096)],
+            counts: vec![1],
+        };
+        TileSet::manifest_hot_tiles(
+            &mut body,
+            &trace,
+            10,
+            DirectoryKind::Flat,
+            &ManifestationBudget {
+                maximum_physical_bytes: u64::MAX,
+            },
+        )
+        .unwrap();
+        let valid = body.tiles.last().unwrap().to_bytes();
+        // The shared prefix parser accepts the genuine encoding...
+        assert!(parse_tile_set_prefix(&valid).is_ok());
+        assert!(TileSet::from_bytes(&valid).is_ok());
+
+        // ...and both deserialization paths reject every crafted `tile_shift`
+        // (byte 9) with a clean `Err`, never a shift-overflow panic.
+        for shift in [0u8, 31, 32, 63, 64, 255] {
+            let mut bytes = valid.clone();
+            bytes[9] = shift;
+            assert!(
+                parse_tile_set_prefix(&bytes).is_err(),
+                "file-backed prefix parser accepted tile_shift {shift}"
+            );
+            assert!(
+                TileSet::from_bytes(&bytes).is_err(),
+                "in-memory parser accepted tile_shift {shift}"
+            );
         }
     }
 

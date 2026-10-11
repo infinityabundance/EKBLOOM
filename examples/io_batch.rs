@@ -511,7 +511,7 @@ mod bench {
         let _ = writeln!(s, "  \"ring_available\": {ring_available},");
         let _ = writeln!(
             s,
-            "  \"uncached_via\": \"O_DIRECT (buffer/offset/length aligned to {ALIGN} B); cached_handle and in_memory_tile rows are warm\""
+            "  \"uncached_via\": \"O_DIRECT (buffer/offset/length aligned to {ALIGN} B); cached_handle and in_memory_tile rows are warm\","
         );
         let _ = writeln!(s, "  \"corpus_seed\": {CORPUS_SEED},");
         let _ = writeln!(s, "  \"file_bytes\": {FILE_BYTES},");

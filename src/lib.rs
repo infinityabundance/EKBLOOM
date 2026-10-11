@@ -102,8 +102,9 @@ pub use machine::{machine_by_id, state_log_with, OrMachine, MACHINE_NL2, MACHINE
 pub use machine_rans::{Rans0, RANS0};
 pub use manifest::{
     create, create_machine, create_machine_within_budget, create_within_budget,
-    estimate_physical_bytes, grow, inspect, manifest, manifest_within_budget,
-    select_profile_within_budget, ComponentReport, EkbloomBody, ManifestationReport,
+    estimate_physical_bytes, estimate_physical_bytes_for_core, grow, inspect, manifest,
+    manifest_within_budget, select_profile_within_budget, ComponentReport, EkbloomBody,
+    ManifestationReport,
 };
 pub use mapped::{thp_anonymous_probe, HugePageReport, MapMode, MappedSurface};
 pub use metrics::{now_ns, percentiles, Percentiles};
@@ -143,8 +144,8 @@ pub use sweep::{
     SweepConfig, SweepPoint, SweepReport, TierPoint,
 };
 pub use tiles::{
-    parse_tile_set_prefix, DirectoryKind, TileAdaptReport, TileDirectory, TileSet, TileSetPrefix,
-    TileSummary, RADIX_GROUP_SHIFT, TILE_SET_PREFIX_LEN,
+    bounded_seed_steps, parse_tile_set_prefix, DirectoryKind, TileAdaptReport, TileDirectory,
+    TileSet, TileSetPrefix, TileSummary, RADIX_GROUP_SHIFT, TILE_SET_PREFIX_LEN,
 };
 pub use verify::{verify, verify_deep, CheckOutcome, VerificationReport};
 pub use worker::{available_parallelism, manifest_background, regional_parallel};

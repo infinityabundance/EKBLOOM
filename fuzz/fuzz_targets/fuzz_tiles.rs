@@ -63,6 +63,15 @@ fuzz_target!(|data: &[u8]| {
     let bytes = ts.to_bytes();
     assert!(TileSet::from_bytes(&bytes).is_ok());
 
+    // Crafted `tile_shift` values (byte 9) must be rejected cleanly through both
+    // deserialization paths — never a shift-overflow panic.
+    for shift in [0u8, 31, 32, 63, 64, 255] {
+        let mut crafted = bytes.clone();
+        crafted[9] = shift;
+        assert!(parse_tile_set_prefix(&crafted).is_err());
+        assert!(TileSet::from_bytes(&crafted).is_err());
+    }
+
     // A mutated copy (digest no longer matches) must be a clean `Err`.
     let mut mutated = bytes.clone();
     for (k, &b) in data.iter().enumerate().take(bytes.len()) {

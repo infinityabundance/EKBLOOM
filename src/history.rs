@@ -271,10 +271,11 @@ impl History {
         })?;
         let mut omega = Snapshot::new(last, committed);
         // Build the appended tail first so a failure cannot partially mutate.
+        let ctx = crate::machine::prepare(machine, core)?;
         let mut tail: Vec<u32> = Vec::new();
         let mut i = committed;
         while i < new_logical_len {
-            machine.reveal(core, &mut omega)?;
+            ctx.reveal(core, &mut omega)?;
             tail.push(omega.state);
             i += 1;
         }

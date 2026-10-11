@@ -50,9 +50,13 @@ impl TileSet {
 - **Additive / bounded.** A call appends one `TileSet` as a new generation;
   earlier generations are untouched. The whole change (tile data + directory)
   must fit the `ManifestationBudget` hard cap, or nothing is committed.
-- **Absent tiles reconstruct from the core.** A read fragment whose tile is not
-  materialised is reconstructed by replaying the authoritative machine over
-  `body_core`.
+- **Absent tiles reconstruct from the core, bounded.** A read fragment whose tile
+  is not materialised is reconstructed from the authoritative machine over
+  `body_core`. When the body carries a checkpoint set, `TileSet::read_bounded`
+  seeds that reconstruction from the **nearest restart** (`<= K-1` replay steps)
+  instead of replaying from `Ω₀`; this works for both machines (a cursor-divergent
+  checkpoint stores the true backing cursor). `TileSet::read` (no restarts) remains
+  the exact genesis-replay form.
 
 ### Directory kinds
 
@@ -96,6 +100,7 @@ byte (2,097,152 hot bytes over the pass).
 | tiles 16 KiB two-level-radix | 65,808 | 272 | 100 | 190 | 11,284,486 | 31.9 |
 | tiles 64 KiB flat | 65,792 | 256 | 81 | 110 | 11,572,424 | 31.9 |
 | tiles 64 KiB two-level-radix | 65,796 | 260 | 100 | 361 | 12,201,748 | 31.9 |
+| tiles 4 KiB radix + K=1024 (bounded cold) | 115,020 | 320 | 70 | 81 | **1,223** | 18.2 |
 | ekbloom regional table (prev) | 1,653,834 | 0 | 58,008 | 61,696 | 431 | 1.27 |
 | raw-vec | 0 | 0 | 110 | 751 | 210 | 0.0 |
 | raw-file | 0 | 0 | 261 | 982 | 190 | 0.0 |
@@ -142,12 +147,19 @@ moves across the tile rows. The direction is stable because the byte gap
 
 These are measured limits, stated plainly:
 
-- **Cold / non-materialised access.** A `TileSet` holds no checkpoint set, so a
-  non-materialised read reconstructs by replaying the machine from `Ω₀`: cold
-  1-byte p50 is **10.9–12.4 ms** for tiles, versus **40 ns** for the whole-object
-  `P_32` (whose `hot` array covers the object) and **431 ns** for the regional
-  path (checkpoint restart). Tiles trade cold access for hot: they are a hot-read
-  structure, not a whole-object substitute.
+- **Cold / non-materialised access (bounded).** A `TileSet` holds no checkpoint
+  set itself, so a non-materialised read with no restarts reconstructs by
+  replaying the machine from `Ω₀`: cold 1-byte p50 is **6.3–11.8 ms** for tiles,
+  versus **40 ns** for the whole-object `P_32`. Adding a bounded cold-restart
+  checkpoint set (`Sparse{K=1024}`) and reading through `TileSet::read_bounded`
+  removes the genesis replay: the tile experiment measures cold 1-byte p50
+  **6,402,245 ns (genesis) → 1,223 ns (bounded), a 5,235× improvement** for
+  **49,164 restart bytes** (the seed is bounded by `K-1 = 1023` steps; the observed
+  maximum over the cold sample was **620** steps). The planner's tile dispatch
+  (`CertRef::TileSet`) already passes the body's checkpoints, and a machine-2 body
+  is bounded the same way because its checkpoint carries the true cursor.
+  The bounded contender appears as `tiles 4 KiB radix + K=1024` in
+  `evidence/bench/tiles.json` (`cold_reconstruction`).
 - **Uniformly random access.** With no hot region the trace names *every* tile,
   so tiles must manifest ≈ `N` tile bytes **plus** directory metadata — no better
   than `P_32` and strictly worse than `raw-vec` (which needs no directory). The
@@ -166,7 +178,7 @@ These are measured limits, stated plainly:
 
 ## 4. Tests
 
-`tests/tiles.rs` (9 tests) pins: byte-exact hot reads including boundary
+`tests/tiles.rs` (10 tests) pins: byte-exact hot reads including boundary
 crossings; byte-exact reconstruction of non-materialised ranges; correct
 directory lookup for both kinds including empty top-level groups; radix < flat
 metadata when sparse; tamper detection (a flipped tile byte is rejected);

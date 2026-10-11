@@ -10,8 +10,9 @@
 //! survives a byte roundtrip.
 
 use ekbloom::{
-    create, read, verify_deep, AccessTrace, DirectoryKind, EkbloomError, ManifestationBudget,
-    ManifestationProfile, ReadRequest, TileSet,
+    bounded_seed_steps, create, create_machine, grow, read, verify_deep, AccessTrace,
+    DirectoryKind, EkbloomError, ManifestationBudget, ManifestationProfile, ReadRequest, TileSet,
+    MACHINE_NL2, MACHINE_RANS0,
 };
 
 /// Deterministic LCG corpus (identical generator to the other harnesses).
@@ -23,6 +24,29 @@ fn lcg(seed: u64, len: usize) -> Vec<u8> {
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         out.push((s >> 33) as u8);
+    }
+    out
+}
+
+/// English-like skewed text that machine 2 compresses (`V < N`).
+fn skewed(len: usize) -> Vec<u8> {
+    const ALPHABET: &[u8] = b" etaoinshrdlu,.ET\"'\n";
+    const WEIGHTS: &[u32] = &[40, 25, 18, 15, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 3, 2, 2];
+    let total: u32 = WEIGHTS.iter().sum();
+    let mut s: u64 = 0x5EED_1234_ABCD_0007;
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mut pick = ((s >> 33) as u32) % total;
+        for (i, &w) in WEIGHTS.iter().enumerate() {
+            if pick < w {
+                out.push(ALPHABET[i % ALPHABET.len()]);
+                break;
+            }
+            pick -= w;
+        }
     }
     out
 }
@@ -390,4 +414,68 @@ fn tile_set_byte_roundtrip_roundtrips_geometry_and_data() {
 /// The corpus length used by the roundtrip test.
 fn n() -> u64 {
     256 * 1024
+}
+
+/// FIX 3: an absent (cold) tile fragment is reconstructed from the nearest
+/// checkpoint restart rather than replayed from `Omega_0`, byte-exactly, for both
+/// machines, with a small, measured step bound.
+#[test]
+fn bounded_cold_reconstruction_is_byte_exact_for_both_machines() {
+    let cases: [(u32, Vec<u8>); 2] = [
+        (MACHINE_NL2, lcg(0x7111_0000_0000_000B, 128 * 1024)),
+        (MACHINE_RANS0, skewed(128 * 1024)),
+    ];
+    for (machine, src) in cases {
+        let mut body = create_machine(&src, ManifestationProfile::Root, machine).unwrap();
+        let trace = AccessTrace {
+            regions: vec![(0, 4096)],
+            counts: vec![1000],
+        };
+        TileSet::manifest_hot_tiles(
+            &mut body,
+            &trace,
+            12,
+            DirectoryKind::TwoLevelRadix,
+            &generous(),
+        )
+        .unwrap();
+        // A bounded cold-restart set (K = 64): the seed is at most 63 steps.
+        grow(&mut body, ManifestationProfile::Sparse { interval: 64 }).unwrap();
+        assert!(
+            verify_deep(&body).unwrap().ok,
+            "machine {machine} body verifies"
+        );
+        let tiles = body.tiles.last().unwrap();
+        let n = src.len() as u64;
+
+        for off in [n / 2, n - 1, n / 3, 60_000, n - 5] {
+            let len = (1 + (off % 5)).min(n - off);
+            let bounded = tiles
+                .read_bounded(&body.core, &body.checkpoints, off, len)
+                .unwrap();
+            assert_eq!(
+                bounded,
+                &src[off as usize..(off + len) as usize],
+                "machine {machine} bounded cold ({off},{len})"
+            );
+            // Identical to the authoritative genesis replay.
+            assert_eq!(bounded, tiles.read(&body.core, off, len).unwrap());
+
+            // The measured seed bound is at most K-1, and always below the offset
+            // itself, so cold access is no longer O(prefix length).
+            let steps = bounded_seed_steps(&body.checkpoints, off);
+            assert!(
+                steps <= 63,
+                "machine {machine} seed steps {steps} exceeds K-1"
+            );
+            assert!(steps < off.max(1), "machine {machine} not bounded at {off}");
+        }
+
+        // A multi-byte cold range wholly inside the absent region is exact too.
+        let (off, len) = (n / 2, 100u64);
+        let bounded = tiles
+            .read_bounded(&body.core, &body.checkpoints, off, len)
+            .unwrap();
+        assert_eq!(bounded, &src[off as usize..(off + len) as usize]);
+    }
 }

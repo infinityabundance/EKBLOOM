@@ -116,6 +116,13 @@ fn ratio(a: u64, b: u64) -> f64 {
     }
 }
 
+/// Drop the trailing comma the row writers append so the enclosing array is valid
+/// JSON (a trailing comma is not permitted by the JSON grammar).
+fn json_rows(rows: String) -> String {
+    let trimmed = rows.trim_end();
+    trimmed.strip_suffix(',').unwrap_or(trimmed).to_string()
+}
+
 fn main() -> ekbloom::Result<()> {
     let dir = Path::new("evidence/bench");
     std::fs::create_dir_all(dir)?;
@@ -320,9 +327,9 @@ fn main() -> ekbloom::Result<()> {
         "    \"sparse_k64_1b_p50_ns\": {RECORDED_SPARSE_K64_1B_P50_NS}"
     );
     let _ = writeln!(js, "  }},");
-    let _ = writeln!(js, "  \"space\": [\n{}  ],", space_rows);
-    let _ = writeln!(js, "  \"latency\": [\n{}  ],", latency_rows);
-    let _ = writeln!(js, "  \"locality\": [\n{}  ],", verdicts);
+    let _ = writeln!(js, "  \"space\": [\n{}\n  ],", json_rows(space_rows));
+    let _ = writeln!(js, "  \"latency\": [\n{}\n  ],", json_rows(latency_rows));
+    let _ = writeln!(js, "  \"locality\": [\n{}\n  ],", json_rows(verdicts));
     let _ = writeln!(js, "  \"state_from_hot\": {{");
     let _ = writeln!(js, "    \"corpus\": {hot_corpus},");
     let _ = writeln!(js, "    \"checks\": {hot_checks},");

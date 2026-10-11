@@ -351,3 +351,89 @@ fn already_open_read_takes_no_lock() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// FIX 4: concurrent cache misses are single-flighted, and an open that races a
+/// publication always returns a fully consistent generation — never a torn one.
+#[test]
+fn concurrent_open_under_publication_is_single_flight_and_not_torn() {
+    let dir = temp_dir("race");
+    let src = lcg(0x9006, 128 * 1024);
+    let n = src.len() as u64;
+    let body = tiled_body(&src, 16 * 1024);
+    let path = dir.join("r.ekb");
+    write_body(&path, &body).unwrap();
+
+    let cache = Arc::new(ObjectCache::new());
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_path = path.clone();
+    let writer_src = src.clone();
+    let writer_stop = Arc::clone(&stop);
+    let writer = thread::spawn(move || {
+        let mut bg = tiled_body(&writer_src, 16 * 1024);
+        let core = bg.core.clone();
+        let mut i = 0u64;
+        while !writer_stop.load(Ordering::Relaxed) && i < 24 {
+            bg.generation += 1;
+            let interval = [4096u32, 1024, 256, 64][(i as usize) % 4];
+            bg.checkpoints
+                .push(CheckpointSet::build(&core, writer_src.len() as u64, interval).unwrap());
+            append_generation(&writer_path, &bg).unwrap();
+            i += 1;
+        }
+    });
+
+    let opens_per_thread = 200u64;
+    let threads = 8u64;
+    thread::scope(|scope| {
+        for t in 0..threads {
+            let cache = Arc::clone(&cache);
+            let path = path.clone();
+            let src = src.as_slice();
+            scope.spawn(move || {
+                for k in 0..opens_per_thread {
+                    let obj = cache.open(&path).expect("open under publication");
+                    // Any returned handle is a complete, consistent generation: it
+                    // reads exactly its committed bytes, so it is never torn.
+                    let off = (t * 4096 + k * 131) % (n - 8);
+                    let len = 1 + (k % 8);
+                    let got = obj
+                        .read(ReadRequest {
+                            offset: off,
+                            length: len,
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        got,
+                        &src[off as usize..(off + len) as usize],
+                        "torn read at ({off},{len}) on generation {}",
+                        obj.generation()
+                    );
+                    // The published read directory agrees with the handle.
+                    assert_eq!(obj.directory().generation, obj.generation());
+                    assert_eq!(obj.directory().logical_len, n);
+                }
+            });
+        }
+    });
+
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+
+    // Single-flight: rebuilds are bounded by the number of distinct generations
+    // observed (24 publications plus the odd torn-footer re-probe), not by the
+    // 1,600 concurrent open calls. Without single-flight this would approach the
+    // open count.
+    let opens = opens_per_thread * threads;
+    let rebuilds = cache.misses();
+    assert!(
+        rebuilds <= 128,
+        "expected single-flight rebuilds, got {rebuilds} for {opens} opens"
+    );
+
+    // Once publication stops, repeated opens of the stable generation are hits.
+    let a = cache.open(&path).unwrap();
+    let b = cache.open(&path).unwrap();
+    assert!(Arc::ptr_eq(&a, &b), "stable generation must reuse");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

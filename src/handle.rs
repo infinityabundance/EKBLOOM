@@ -193,8 +193,17 @@ impl OpenObject {
 /// already-open [`OpenObject`] never touches it. Publication of a new generation
 /// inserts a freshly built `Arc` and leaves every previously handed-out handle
 /// untouched.
+///
+/// Construction is **single-flight**: concurrent misses for the same path are
+/// serialised on a per-path builder lock, and each waiter re-checks the cache
+/// before building, so at most one build happens per (path, generation) and two
+/// concurrent misses can never publish conflicting entries. Every published entry
+/// is a fully validated [`OpenObject`] for exactly one committed generation, so a
+/// caller observes either the old or the new consistent generation, never a torn
+/// one.
 pub struct ObjectCache {
     entries: Mutex<BTreeMap<PathBuf, Arc<OpenObject>>>,
+    builders: Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>,
     hits: AtomicU64,
     misses: AtomicU64,
 }
@@ -210,6 +219,7 @@ impl ObjectCache {
     pub fn new() -> ObjectCache {
         ObjectCache {
             entries: Mutex::new(BTreeMap::new()),
+            builders: Mutex::new(BTreeMap::new()),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
@@ -221,22 +231,57 @@ impl ObjectCache {
     /// pure `Arc` clone), and otherwise re-opens and publishes a fresh snapshot.
     /// A new generation — an append, or an atomic file replacement — is detected
     /// by comparing the physical identity *and* the committed generation.
+    ///
+    /// Concurrent misses for the same path are single-flighted: the first builds,
+    /// the rest wait and then reuse the published entry (or rebuild once if a new
+    /// generation appeared while they waited).
     pub fn open(&self, path: &Path) -> Result<Arc<OpenObject>> {
-        let current = FileIdentity::probe(path);
-        {
-            let map = self.lock()?;
-            if let (Some(cached), Some(cur)) = (map.get(path), current) {
-                if cached.identity() == cur {
-                    self.hits.fetch_add(1, Ordering::Relaxed);
-                    return Ok(Arc::clone(cached));
-                }
-            }
+        if let Some(hit) = self.cached_if_current(path)? {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(hit);
         }
+
+        // Single-flight: acquire this path's builder lock; only one thread builds
+        // at a time for a given path.
+        let builder = {
+            let mut builders = self.lock_builders()?;
+            Arc::clone(builders.entry(path.to_path_buf()).or_default())
+        };
+        let _build_guard = builder.lock().map_err(|_| EkbloomError::InvalidArgument {
+            what: "object cache builder lock poisoned".to_string(),
+        })?;
+
+        // Another builder may have published while we waited; re-check.
+        if let Some(hit) = self.cached_if_current(path)? {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(hit);
+        }
+
         self.misses.fetch_add(1, Ordering::Relaxed);
         let obj = Arc::new(OpenObject::open(path)?);
         let mut map = self.lock()?;
+        // Never let an older generation overwrite a newer one that was published
+        // concurrently (a publication that landed during the build).
+        if let Some(existing) = map.get(path) {
+            if existing.generation() > obj.generation() {
+                return Ok(Arc::clone(existing));
+            }
+        }
         map.insert(path.to_path_buf(), Arc::clone(&obj));
         Ok(obj)
+    }
+
+    /// The cached handle for `path` when its identity still matches the file on
+    /// disk, or `None` when the path is absent/stale/unprobeable.
+    fn cached_if_current(&self, path: &Path) -> Result<Option<Arc<OpenObject>>> {
+        let current = FileIdentity::probe(path);
+        let map = self.lock()?;
+        if let (Some(cached), Some(cur)) = (map.get(path), current) {
+            if cached.identity() == cur {
+                return Ok(Some(Arc::clone(cached)));
+            }
+        }
+        Ok(None)
     }
 
     /// Drop any cached handle for `path`; the next [`ObjectCache::open`]
@@ -244,6 +289,9 @@ impl ObjectCache {
     pub fn invalidate(&self, path: &Path) {
         if let Ok(mut map) = self.entries.lock() {
             map.remove(path);
+        }
+        if let Ok(mut builders) = self.builders.lock() {
+            builders.remove(path);
         }
     }
 
@@ -265,6 +313,15 @@ impl ObjectCache {
             .lock()
             .map_err(|_| EkbloomError::InvalidArgument {
                 what: "object cache lock poisoned".to_string(),
+            })
+    }
+
+    /// Acquire the per-path builder lock map.
+    fn lock_builders(&self) -> Result<MutexGuard<'_, BTreeMap<PathBuf, Arc<Mutex<()>>>>> {
+        self.builders
+            .lock()
+            .map_err(|_| EkbloomError::InvalidArgument {
+                what: "object cache builder map lock poisoned".to_string(),
             })
     }
 }

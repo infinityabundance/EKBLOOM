@@ -1,0 +1,35 @@
+{
+  "generated_by": "examples/rans.rs (sh scripts/run-rans.sh)",
+  "machine": "OrANS-RANS0 (machine_id=2)",
+  "corpus_len": 524288,
+  "reps": 3,
+  "note": "prepared = one validated RansContext (freq+cum+4096-entry table) reused for the whole decode; per-symbol = the context rebuilt on every reveal step. The pre-fix code parsed the model header (a strict subset of a RansContext rebuild) per step, so the reported speedup is an upper bound.",
+  "shapes": [
+    {
+      "shape": "skewed",
+      "source_len": 524288,
+      "core_len": 250490,
+      "v_over_n": 0.4778,
+      "prepared_decode_ns": 2379740,
+      "prepared_decode_gb_per_s": 0.220,
+      "prepared_exact": true,
+      "per_symbol_reveal_ns": 392550970,
+      "per_symbol_reveal_gb_per_s": 0.001,
+      "context_build_ns": 611,
+      "speedup": 164.955
+    },
+    {
+      "shape": "uniform",
+      "source_len": 524288,
+      "core_len": 524794,
+      "v_over_n": 1.0010,
+      "prepared_decode_ns": 2010661,
+      "prepared_decode_gb_per_s": 0.261,
+      "prepared_exact": true,
+      "per_symbol_reveal_ns": 230329629,
+      "per_symbol_reveal_gb_per_s": 0.002,
+      "context_build_ns": 441,
+      "speedup": 114.554
+    }
+  ]
+}

@@ -95,6 +95,13 @@ fn p50(mut ns: Vec<u64>) -> u64 {
     ns.get(ns.len() / 2).copied().unwrap_or(0)
 }
 
+/// Drop the trailing comma the row writers append so the enclosing array is valid
+/// JSON (a trailing comma is not permitted by the JSON grammar).
+fn json_rows(rows: String) -> String {
+    let trimmed = rows.trim_end();
+    trimmed.strip_suffix(',').unwrap_or(trimmed).to_string()
+}
+
 fn build_summaries(core: &[u8], bs: usize) -> Vec<Affine> {
     let mut v = Vec::with_capacity(core.len().div_ceil(bs));
     let mut lo = 0usize;
@@ -365,9 +372,13 @@ fn main() -> ekbloom::Result<()> {
     );
     let _ = writeln!(js, "    \"exact\": {scalar_exact}");
     let _ = writeln!(js, "  }},");
-    let _ = writeln!(js, "  \"construction\": [\n{}  ],", construction);
-    let _ = writeln!(js, "  \"strategies\": [\n{}  ],", rows);
-    let _ = writeln!(js, "  \"short_input\": [\n{}  ],", short);
+    let _ = writeln!(
+        js,
+        "  \"construction\": [\n{}\n  ],",
+        json_rows(construction)
+    );
+    let _ = writeln!(js, "  \"strategies\": [\n{}\n  ],", json_rows(rows));
+    let _ = writeln!(js, "  \"short_input\": [\n{}\n  ],", json_rows(short));
     let _ = writeln!(js, "  \"state_at_via_prefix\": {{");
     let _ = writeln!(js, "    \"small_n\": {scn},");
     let _ = writeln!(js, "    \"mismatches\": {sa_mismatches},");

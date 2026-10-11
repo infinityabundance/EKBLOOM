@@ -70,6 +70,16 @@ object holds the `Arc` and reads lock-free; a new generation is published by
 building a **new** `OpenObject` privately and swapping the `Arc` into the map.
 Readers that already hold an older `Arc` keep reading their immutable snapshot.
 
+Construction is **single-flight**: concurrent misses for the same path are
+serialised on a per-path builder lock, and each waiter re-checks the cache before
+building, so at most one build happens per `(path, generation)` and two concurrent
+misses can never publish conflicting entries. Every published entry is a fully
+validated `OpenObject` for exactly one committed generation, and an insert never
+lets an older generation overwrite a newer one, so an open that races a
+publication observes either the old or the new consistent generation — never a
+torn one. `tests/handles.rs::concurrent_open_under_publication_is_single_flight_and_not_torn`
+hammers `open` from eight threads while generations are appended.
+
 Invalidation compares the *committed generation*: `open` probes the file's
 physical identity (device, inode, length) **and** the generation read from the
 trailing `CommitFooter`. An unchanged object is a pure `Arc` clone; an appended
@@ -156,7 +166,7 @@ finding.
 
 ## 4. Tests
 
-`tests/handles.rs` (5 tests) pins: TILES persistence round-trips and verifies;
+`tests/handles.rs` (6 tests) pins: TILES persistence round-trips and verifies;
 `verify`/`verify_deep` reject a tampered persisted tile (a flipped byte in the
 `TILES` payload is rejected at open, and a digest-consistent in-memory tamper is
 rejected by the machine-decode check); `OpenObject`/`ObjectCache` reuse one

@@ -11,8 +11,9 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ekbloom::{
-    create, create_within_budget, estimate_physical_bytes, manifest_within_budget,
-    select_profile_within_budget, EkbloomError, ManifestationBudget, ManifestationProfile,
+    create, create_within_budget, estimate_physical_bytes, estimate_physical_bytes_for_core,
+    manifest_within_budget, select_profile_within_budget, EkbloomError, ManifestationBudget,
+    ManifestationProfile,
 };
 
 /// Deterministic pseudorandom source bytes.
@@ -224,4 +225,85 @@ fn cli_max_physical_bytes_flag_fails_closed_when_too_small() {
     assert!(out.exists());
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// A skewed (low-entropy) source that machine 2 compresses (`V < N`).
+fn skewed(len: usize) -> Vec<u8> {
+    const ALPHABET: &[u8] = b" etaoinshrdlu,.ET\"'\n";
+    const WEIGHTS: &[u32] = &[40, 25, 18, 15, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 3, 2, 2];
+    let total: u32 = WEIGHTS.iter().sum();
+    let mut s: u64 = 0x5EED_1234_ABCD_0001;
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mut pick = ((s >> 33) as u32) % total;
+        for (i, &w) in WEIGHTS.iter().enumerate() {
+            if pick < w {
+                out.push(ALPHABET[i % ALPHABET.len()]);
+                break;
+            }
+            pick -= w;
+        }
+    }
+    out
+}
+
+/// FIX 2: a machine-2 budget must be judged against the **actual compressed
+/// core**, not the source length. A config whose real core fits is accepted even
+/// when the source length alone would over-reject; an over-budget one is rejected
+/// transactionally. Machine 1 is unchanged.
+#[test]
+fn machine2_budget_uses_the_actual_core_length() {
+    use ekbloom::machine::MACHINE_RANS0;
+    use ekbloom::machine_rans::RANS0;
+    use ekbloom::manifest::create_machine_within_budget;
+    use ekbloom::{ManifestationProfile, OrMachine};
+
+    let src = skewed(16 * 1024);
+    let core_len = RANS0.encode(&src).unwrap().len() as u64;
+    let source_len = src.len() as u64;
+    assert!(core_len < source_len, "machine 2 must compress this source");
+
+    // The source-length prefilter would have rejected this budget; the actual
+    // compressed core fits it exactly.
+    let naive = estimate_physical_bytes(source_len, ManifestationProfile::Root);
+    assert!(naive > core_len, "source-length estimate must over-reject");
+
+    let root_budget = budget(core_len);
+    let body = create_machine_within_budget(
+        &src,
+        ManifestationProfile::Root,
+        MACHINE_RANS0,
+        &root_budget,
+    )
+    .expect("machine-2 root fits its real core");
+    assert_eq!(body.machine_id, MACHINE_RANS0);
+    assert_eq!(body.physical_bytes(), core_len);
+    assert!(body.physical_bytes() <= root_budget.maximum_physical_bytes);
+    assert_eq!(
+        estimate_physical_bytes_for_core(core_len, source_len, ManifestationProfile::Root),
+        core_len,
+        "the core-aware estimate is exact for root"
+    );
+
+    // One byte under the real core is rejected, and no body is produced.
+    let tight = budget(core_len - 1);
+    assert!(matches!(
+        create_machine_within_budget(&src, ManifestationProfile::Root, MACHINE_RANS0, &tight),
+        Err(EkbloomError::AllocationTooLarge { requested, limit })
+            if requested > limit && limit == core_len - 1
+    ));
+
+    // A machine-2 configuration with a manifested structure also accounts from
+    // the actual core, and the machine-1 estimate is unchanged.
+    let full_estimate =
+        estimate_physical_bytes_for_core(core_len, source_len, ManifestationProfile::Full);
+    assert!(full_estimate >= core_len);
+    assert_eq!(
+        estimate_physical_bytes(source_len, ManifestationProfile::Root),
+        source_len,
+        "machine 1 root estimate is its own size"
+    );
 }
