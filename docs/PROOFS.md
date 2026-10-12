@@ -805,21 +805,27 @@ fuzzed by `fuzz/fuzz_targets/fuzz_packed.rs`.
 
 ---
 
-## P22. The unified engine bounds positioning with `worst_case_steps` and rejects unbounded bodies — **PROVED** (bound + dispatch), **EMPIRICALLY OBSERVED** (hot index / frontier)
+## P22. The unified engine bounds positioning with `worst_case_steps` (per-region) / `worst_case_steps_for` (request-level) and rejects unbounded bodies — **PROVED** (bound + dispatch), **EMPIRICALLY OBSERVED** (hot index / frontier)
 
 **Claim.** `Engine::plan` admits only certified bounded structures under a strict
 physical budget or **fails** (never an `O(prefix)` genesis replay);
 `Engine::read` performs an O(1), search-free dispatch and is byte-exact to
-`reader::read` on both machines; and `Engine::worst_case_steps()` bounds the
-positioning work of **any** request independently of its length.
+`reader::read` on both machines; `Engine::worst_case_steps()` bounds the
+positioning work of any request **that lies within a single region**; and
+`Engine::worst_case_steps_for(req)` bounds the positioning work of an **arbitrary**
+request, which may be split across regions with different paths.
 
 **Proof.** Every admitted path carries a structure-parameter bound (`K−1` for a
-checkpoint, `B−1` for a block, `0` for a tile / O(1) state load), so a cold read
-at any offset costs at most `worst_case_steps` positioning steps plus its own
-reveals — never `O(prefix)`. Planning is transactional: it returns an in-budget
-plan or an error, so no partial/over-budget plan exists. Each branch re-implements
-the identical primitive `reader::read` would choose, and a request spanning
-regions is split at boundaries and concatenated. ∎
+checkpoint, `B−1` for a block, `0` for a tile / O(1) state load). A request inside
+one region therefore costs at most `worst_case_steps` positioning steps plus its own
+reveals. A request that spans regions is split into the maximal runs of consecutive
+regions served by the same structure and path; each such segment pays at most its
+own structure parameter, and `worst_case_steps_for` is exactly the sum of those
+per-segment bounds — so a multi-path request is bounded by the sum, not the
+per-region maximum, and is never `O(prefix)`. Planning is transactional: it returns
+an in-budget plan or an error, so no partial/over-budget plan exists. Each branch
+re-implements the identical primitive `reader::read` would choose, and a request
+spanning regions is split at boundaries and concatenated. ∎
 
 **Corroboration (hot index).** With the whole output materialised
 (`worst_case_steps = 0`) a fully resident **4 KiB** read is **1.00–1.14×** a raw
@@ -834,8 +840,10 @@ contenders degrade **4.9–6.4×** (non-withdrawal). It honestly **loses** to a 
 LZ4 4 KiB block decompress on cold p99 (`0.99–5.04 µs`). Evidence
 `evidence/bench/frontier.json`; full verdict in `docs/FRONTIER.md` §2/§5.
 
-**Tested:** `tests/engine.rs` (9 tests: byte-exactness on both machines,
-transactional budget, `worst_case_steps` on adversarial offsets, certified-only
+**Tested:** `tests/engine.rs` (16 tests: byte-exactness on both machines,
+transactional budget, per-region `worst_case_steps` on adversarial offsets, the
+request-level `worst_case_steps_for` on a cold → hot → cold read (actual `114,687`
+≤ claimed `131,070`, exceeding the per-region max `65,535`), certified-only
 selection, rejection of an unbounded body, determinism); reviewed in
 `docs/reviews/adversarial.md` (Revision 4).
 

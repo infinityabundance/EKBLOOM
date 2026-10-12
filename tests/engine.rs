@@ -542,6 +542,129 @@ fn worst_case_steps_holds_for_adversarial_offsets() {
     }
 }
 
+/// A 1 MiB machine-1 body with a **large** (`K = 65536`) checkpoint interval over
+/// the whole object plus a materialised tile band over `[256 KiB, 496 KiB)`, so the
+/// plan is cold → hot → cold and a long read crosses all three bands.
+fn mixed_cold_hot_cold_body() -> EkbloomBody {
+    const N: usize = 1 << 20;
+    let source = skewed(0x1CEB_0000_0000_0001, N);
+    let mut body = create_machine(&source, ManifestationProfile::Root, M1).unwrap();
+    let trace = AccessTrace {
+        regions: vec![(256 * 1024, 240 * 1024)], // [256 KiB, 496 KiB)
+        counts: vec![1],
+    };
+    TileSet::manifest_hot_tiles(&mut body, &trace, 12, DirectoryKind::Flat, &generous()).unwrap();
+    add_checkpoint(&mut body, 65536);
+    body
+}
+
+/// The request-level bound covers a request that spans cold → hot → cold regions
+/// and therefore pays **two** restart costs, one more than the per-region maximum.
+#[test]
+fn request_level_bound_covers_a_multi_region_read() {
+    let body = mixed_cold_hot_cold_body();
+    let n = body.logical_len;
+    let engine = Engine::plan(&body, &generous(), &workload4k()).unwrap();
+
+    let dist = engine.plan_ref().distribution();
+    assert!(
+        dist.iter().any(|(p, _)| *p == EnginePath::HotTile)
+            && dist.iter().any(|(p, _)| *p == EnginePath::PackedRestart),
+        "the plan mixes cold and hot paths: {dist:?}"
+    );
+    assert_eq!(
+        engine.worst_case_steps(),
+        65535,
+        "the per-region maximum is K - 1"
+    );
+
+    // Start deep in the cold prefix (offset = K - 1 = 65535, the worst single-region
+    // skip) and run through the hot band into the cold suffix.
+    let req = ReadRequest {
+        offset: 65535,
+        length: 500_000,
+    };
+    let claimed = engine.worst_case_steps_for(req);
+    assert_eq!(claimed, 2 * 65535, "two cold segments, each K - 1");
+
+    let (got, steps) = engine.read_counted_steps(&body, req).unwrap();
+    assert_eq!(got, read(&body, req).unwrap(), "byte-exact vs reader::read");
+    assert_eq!(steps.reveals, req.length);
+    assert_eq!(steps.total(), engine.read_counted(&body, req).unwrap().1);
+    let actual = steps.positioning;
+
+    // The measured positioning exceeds the per-region maximum — precisely the gap
+    // the request-level bound closes.
+    assert!(
+        actual > engine.worst_case_steps(),
+        "actual positioning {actual} should exceed the per-region max {}",
+        engine.worst_case_steps()
+    );
+    assert!(
+        actual <= claimed,
+        "actual positioning {actual} exceeds the claimed bound {claimed}"
+    );
+
+    // Finite and small: at most two structure parameters, far below O(prefix).
+    assert!(claimed <= 2 * engine.worst_case_steps());
+    assert!(
+        claimed < n / 4,
+        "claimed {claimed} is not O(prefix) for n {n}"
+    );
+
+    println!(
+        "request-level bound: actual positioning {actual}, claimed {claimed}, per-region {}",
+        engine.worst_case_steps()
+    );
+}
+
+/// A within-region request is bounded by the per-region maximum and by the
+/// request-level bound, and the two agree for a single segment.
+#[test]
+fn request_level_bound_matches_single_region_reads() {
+    let body = mixed_cold_hot_cold_body();
+    let engine = Engine::plan(&body, &generous(), &workload4k()).unwrap();
+
+    // Cold single region: the bound is exactly the K - 1 skip.
+    let cold = ReadRequest {
+        offset: 65535,
+        length: 1,
+    };
+    assert_eq!(engine.worst_case_steps_for(cold), 65535);
+    let (_, s) = engine.read_counted_steps(&body, cold).unwrap();
+    assert_eq!(s.positioning, 65535);
+    assert_eq!(s.positioning, engine.worst_case_steps_for(cold));
+    assert!(s.positioning <= engine.worst_case_steps());
+
+    // Hot single region: zero positioning.
+    let hot = ReadRequest {
+        offset: 256 * 1024 + 5,
+        length: 16,
+    };
+    assert_eq!(engine.worst_case_steps_for(hot), 0);
+    let (_, s) = engine.read_counted_steps(&body, hot).unwrap();
+    assert_eq!(s.positioning, 0);
+}
+
+/// An all-hot body has a request-level bound of `0` for every request.
+#[test]
+fn request_level_bound_is_zero_for_an_all_hot_body() {
+    let source = skewed(0xA110_0000_0000_0001, 64 * 1024);
+    let mut body = create_machine(&source, ManifestationProfile::Root, M1).unwrap();
+    add_full_tiles(&mut body, 12, &generous());
+    let engine = Engine::plan(&body, &generous(), &workload4k()).unwrap();
+
+    let req = ReadRequest {
+        offset: 100,
+        length: 40_000,
+    };
+    assert_eq!(engine.worst_case_steps_for(req), 0);
+    let (got, s) = engine.read_counted_steps(&body, req).unwrap();
+    assert_eq!(s.positioning, 0);
+    assert_eq!(s.reveals, req.length);
+    assert_eq!(got, read(&body, req).unwrap());
+}
+
 #[test]
 fn hot_surface_is_the_decoded_output_and_read_hot_is_exact() {
     let source = skewed(0x0570_7000_0000_0001, 16 * 1024);

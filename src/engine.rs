@@ -22,13 +22,21 @@
 //!   byte it returns is byte-for-byte identical to [`crate::reader::read`], on
 //!   both machines.
 //!
-//! * [`Engine::worst_case_steps`] is the **explicit guarantee**: the maximum
-//!   number of machine steps needed to *position* at any logical offset (the
-//!   skip/replay), independent of the requested length. Because the engine only
-//!   ever selects paths whose positioning is bounded by a structure parameter
-//!   (`K - 1`, `B - 1`, or `0`), a cold read at any offset is never `O(prefix)`.
-//!   If no certified bounded path can cover some region, [`Engine::plan`] fails
-//!   rather than silently falling back to an unbounded genesis replay.
+//! * [`Engine::worst_case_steps`] is the **per-region** bound: the maximum number
+//!   of machine steps needed to *position* at any logical offset **within a single
+//!   region** (the skip/replay), independent of the requested length.
+//!
+//! * [`Engine::worst_case_steps_for`] is the **request-level** guarantee. A request
+//!   may be split across several regions with **different** paths, so it can pay
+//!   more than one bounded restart; the per-region maximum does not bound it. The
+//!   request-level bound is the sum, over the segments [`Engine::read_counted`]
+//!   actually dispatches for the request, of each segment's per-segment positioning
+//!   bound. [`Engine::read_counted_steps`] exposes the exact positioning steps a
+//!   read takes so the bound is checked mechanically. Because the engine only ever
+//!   selects paths whose positioning is bounded by a structure parameter
+//!   (`K - 1`, `B - 1`, or `0`), a cold read at any offset is never `O(prefix)`. If
+//!   no certified bounded path can cover some region, [`Engine::plan`] fails rather
+//!   than silently falling back to an unbounded genesis replay.
 //!
 //! # Budget
 //!
@@ -156,6 +164,26 @@ pub struct RegionPath {
     pub structure: StructureRef,
 }
 
+/// Exact machine-step accounting for one engine read, as reported by
+/// [`Engine::read_counted_steps`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadSteps {
+    /// Positioning steps: the restart skip taken to reach the request's first byte,
+    /// summed across the segments the request is split into. This is exactly the
+    /// quantity [`Engine::worst_case_steps_for`] bounds.
+    pub positioning: u64,
+    /// Reveal steps: one per requested byte (always exactly `req.length`).
+    pub reveals: u64,
+}
+
+impl ReadSteps {
+    /// Total machine steps performed: `positioning + reveals`.
+    #[inline]
+    pub fn total(self) -> u64 {
+        self.positioning.saturating_add(self.reveals)
+    }
+}
+
 /// The resident structure that serves **every** region when the plan is uniformly
 /// one pure-copy path, so a single byte can be read without a region lookup. This
 /// is the allocation-free fast dispatch for [`Engine::byte_at`].
@@ -199,10 +227,49 @@ impl AccessPlan {
         self.region_at(offset).structure
     }
 
-    /// The worst-case positioning work (machine steps) for any request.
+    /// The worst-case positioning work (machine steps) for a request that lies
+    /// **within a single region**: the maximum, over the plan's regions, of the
+    /// per-region positional bound. For a request that may span regions with
+    /// different paths, use [`AccessPlan::worst_case_steps_for`].
     #[inline]
     pub fn worst_case_steps(&self) -> u64 {
         self.worst_case_steps
+    }
+
+    /// The **request-level** positional bound: the sum, over the segments
+    /// [`Engine::read_counted`] dispatches for `req`, of each segment's per-segment
+    /// positioning bound ([`RegionPath::positional_steps`]).
+    ///
+    /// Unlike [`AccessPlan::worst_case_steps`] — a maximum over *single* regions —
+    /// this bounds an arbitrary request, which may be split across regions with
+    /// different paths and therefore pay one bounded restart per segment. Each
+    /// segment contributes at most its structure parameter (`K - 1`, `B - 1`, or
+    /// `0`), so the bound is `O(segments)`, never `O(prefix)`. The request is
+    /// clamped to the plan's logical length, so an out-of-range request yields a
+    /// finite bound.
+    pub fn worst_case_steps_for(&self, req: ReadRequest) -> u64 {
+        let start = req.offset.min(self.logical_len);
+        let end = req.offset.saturating_add(req.length).min(self.logical_len);
+        if start >= end {
+            return 0;
+        }
+        self.segments(start, end).fold(0u64, |acc, (region, _, _)| {
+            acc.saturating_add(region.positional_steps)
+        })
+    }
+
+    /// The segments [`Engine::read_counted`] dispatches for `[offset, end)`: maximal
+    /// runs of consecutive regions served by the same certified structure and path.
+    /// Shared with [`AccessPlan::worst_case_steps_for`] so the bound is taken over
+    /// exactly the dispatched segments.
+    fn segments(&self, offset: u64, end: u64) -> Segments<'_> {
+        Segments::new(
+            &self.regions,
+            self.region_shift,
+            self.logical_len,
+            offset,
+            end.min(self.logical_len),
+        )
     }
 
     /// The active access-plan bytes: the authoritative core plus the distinct
@@ -303,6 +370,70 @@ impl AccessPlan {
             Path::AffineSummary => matches!(r.structure, StructureRef::History),
             Path::DirectStorage => matches!(r.structure, StructureRef::PathBloom(_)),
         })
+    }
+}
+
+/// The dispatched segments of a request: maximal runs of consecutive planned
+/// regions served by the same certified structure **and** path, clipped to the
+/// requested range. This is exactly the segmentation [`Engine::read_counted`]
+/// dispatches, so summing each segment's per-segment positioning bound gives the
+/// request-level guarantee of [`AccessPlan::worst_case_steps_for`].
+struct Segments<'a> {
+    regions: &'a [RegionPath],
+    region_shift: u8,
+    logical_len: u64,
+    pos: u64,
+    end: u64,
+}
+
+impl<'a> Segments<'a> {
+    fn new(
+        regions: &'a [RegionPath],
+        region_shift: u8,
+        logical_len: u64,
+        offset: u64,
+        end: u64,
+    ) -> Self {
+        Segments {
+            regions,
+            region_shift,
+            logical_len,
+            pos: offset,
+            end,
+        }
+    }
+}
+
+impl<'a> Iterator for Segments<'a> {
+    /// `(region, segment start, segment length)`.
+    type Item = (&'a RegionPath, u64, u64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.end {
+            return None;
+        }
+        let idx = usize::try_from(self.pos >> self.region_shift).ok()?;
+        let region = self.regions.get(idx)?;
+        // Extend across consecutive regions with the same structure and path.
+        // `max(pos + 1)` guarantees progress for a zero-length or mis-sized region.
+        let mut stop = region
+            .end
+            .min(self.logical_len)
+            .max(self.pos.saturating_add(1));
+        while stop < self.end {
+            let nidx = usize::try_from(stop >> self.region_shift).ok()?;
+            let Some(next) = self.regions.get(nidx) else {
+                break;
+            };
+            if next.structure != region.structure || next.path != region.path {
+                break;
+            }
+            stop = next.end.min(self.logical_len).max(stop.saturating_add(1));
+        }
+        let seg_end = stop.min(self.end);
+        let start = self.pos;
+        self.pos = seg_end;
+        Some((region, start, seg_end - start))
     }
 }
 
@@ -550,54 +681,70 @@ impl Engine {
         let shift = self.plan.region_shift;
         let first = (req.offset >> shift) as usize;
         let last = ((end - 1) >> shift) as usize;
-        if first == last {
+        let (bytes, steps) = if first == last {
             let region = self
                 .plan
                 .regions
                 .get(first)
                 .ok_or_else(|| bad("engine plan has no region for the request"))?;
-            return dispatch_owned(body, region, req.offset, req.length);
-        }
-
-        // A request spanning regions is split at each boundary; segments append
-        // into one buffer. Consecutive regions served by the *same* certified
-        // structure are dispatched **once**: every path here is offset-addressable
-        // over the whole object (a hot-tile surface, a checkpoint, a block index,
-        // the history), so grouping by structure is byte-exact and removes the
-        // per-region split cost from an unaligned read.
-        let mut out = Vec::with_capacity(usize::try_from(req.length).map_err(|_| {
-            EkbloomError::Overflow {
-                what: "read length",
-            }
-        })?);
-        let mut steps = 0u64;
-        let mut pos = req.offset;
-        while pos < end {
-            let idx = (pos >> shift) as usize;
-            let region = self
-                .plan
-                .regions
-                .get(idx)
-                .ok_or_else(|| bad("engine plan has no region for the request"))?;
-            let mut stop = region.end.min(body.logical_len).max(pos.saturating_add(1));
-            while stop < end {
-                let nidx = (stop >> shift) as usize;
-                let next = self
-                    .plan
-                    .regions
-                    .get(nidx)
-                    .ok_or_else(|| bad("engine plan has no region for the request"))?;
-                if next.structure != region.structure || next.path != region.path {
-                    break;
+            dispatch_owned(body, region, req.offset, req.length)?
+        } else {
+            // A request spanning regions is split into the segments served by one
+            // certified structure/path each; each segment appends into one buffer.
+            // Every path here is offset-addressable over the whole object (a
+            // hot-tile surface, a checkpoint, a block index, the history), so
+            // grouping consecutive regions by structure is byte-exact and removes
+            // the per-region split cost from an unaligned read.
+            let mut out = Vec::with_capacity(usize::try_from(req.length).map_err(|_| {
+                EkbloomError::Overflow {
+                    what: "read length",
                 }
-                stop = next.end.min(body.logical_len).max(stop.saturating_add(1));
+            })?);
+            let mut steps = 0u64;
+            for (region, seg_start, seg_len) in self.plan.segments(req.offset, end) {
+                steps = steps
+                    .saturating_add(dispatch_into(body, region, seg_start, seg_len, &mut out)?);
             }
-            let seg_end = stop.min(end);
-            let st = dispatch_into(body, region, pos, seg_end - pos, &mut out)?;
-            steps = steps.saturating_add(st);
-            pos = seg_end;
-        }
-        Ok((out, steps))
+            if out.len() as u64 != req.length {
+                return Err(bad("engine plan has no region for the request"));
+            }
+            (out, steps)
+        };
+
+        // Honor the request-level guarantee: the positioning steps a read actually
+        // takes must never exceed the claimed bound. This is a debug-only check (a
+        // free `O(segments)` verification in test builds) so the latency-critical
+        // path pays nothing in release; `Engine::read_counted_steps` exposes the
+        // counter for a mechanical check in release builds.
+        debug_assert!(
+            steps.saturating_sub(req.length) <= self.worst_case_steps_for(req),
+            "engine positioning steps {} exceed worst_case_steps_for {} for {req:?}",
+            steps.saturating_sub(req.length),
+            self.worst_case_steps_for(req)
+        );
+        Ok((bytes, steps))
+    }
+
+    /// [`Engine::read_counted`] decomposed into positioning and reveal steps. The
+    /// `positioning` counter is exactly the quantity [`Engine::worst_case_steps_for`]
+    /// bounds; it is exposed so the request-level guarantee can be checked
+    /// mechanically against the steps a read actually takes.
+    pub fn read_counted_steps(
+        &self,
+        body: &EkbloomBody,
+        req: ReadRequest,
+    ) -> Result<(Vec<u8>, ReadSteps)> {
+        let (bytes, total) = self.read_counted(body, req)?;
+        // Every path performs exactly one reveal per requested byte, so the step
+        // total is `positioning + req.length`.
+        let reveals = req.length;
+        Ok((
+            bytes,
+            ReadSteps {
+                positioning: total.saturating_sub(reveals),
+                reveals,
+            },
+        ))
     }
 
     /// **Allocation-free single-byte read** — the branch-lean fast path.
@@ -732,11 +879,26 @@ impl Engine {
         Ok(())
     }
 
-    /// **The explicit guarantee**: the worst-case positioning work (machine steps)
-    /// for any request, independent of the requested length.
+    /// **The per-region guarantee**: the worst-case positioning work (machine
+    /// steps) for a request that lies within a single region, independent of the
+    /// requested length. A request that spans regions with different paths pays one
+    /// bounded restart per dispatched segment, so use
+    /// [`Engine::worst_case_steps_for`] for an arbitrary request.
     #[inline]
     pub fn worst_case_steps(&self) -> u64 {
         self.plan.worst_case_steps
+    }
+
+    /// **The request-level guarantee**: the sum, over the segments
+    /// [`Engine::read_counted`] dispatches for `req`, of each segment's per-segment
+    /// positioning bound. A request split across regions with different paths pays
+    /// one bounded restart per segment, so this — not the per-region maximum
+    /// [`Engine::worst_case_steps`] — bounds an arbitrary request. It is `O(segments)`
+    /// and never `O(prefix)`, and the request is clamped to the plan's logical
+    /// length so an out-of-range request yields a finite bound.
+    #[inline]
+    pub fn worst_case_steps_for(&self, req: ReadRequest) -> u64 {
+        self.plan.worst_case_steps_for(req)
     }
 
     /// The shared plan.

@@ -33,9 +33,19 @@ impl Engine {
     /// lock, byte-exact vs `reader::read` on BOTH machines.
     pub fn read(&self, body: &EkbloomBody, req: ReadRequest) -> Result<Vec<u8>>;
 
-    /// The explicit guarantee: worst-case reconstruction work (machine steps) for
-    /// any request, independent of the requested length.
+    /// PER-REGION guarantee: the worst-case positioning work (machine steps) for a
+    /// request that lies within a single region, independent of its length.
     pub fn worst_case_steps(&self) -> u64;
+
+    /// REQUEST-LEVEL guarantee: the positioning work for `req`, summed over the
+    /// segments `read` splits it into. Bounds an arbitrary request, including one
+    /// that spans regions with different paths.
+    pub fn worst_case_steps_for(&self, req: ReadRequest) -> u64;
+
+    /// The exact positioning and reveal steps a read takes, so the request-level
+    /// bound is checked mechanically (`positioning <= worst_case_steps_for(req)`).
+    pub fn read_counted_steps(&self, body: &EkbloomBody, req: ReadRequest)
+        -> Result<(Vec<u8>, ReadSteps)>;
 }
 ```
 
@@ -43,9 +53,10 @@ impl Engine {
 `structure_for`, `distribution`, `retained_bytes` (the **active** access-plan
 footprint: the core plus the distinct structures the plan references),
 `committed_bytes` (the **committed** physical bytes of the whole body, whether or
-not the plan references them), `budget_bytes`, `all_certified` and
-`worst_case_steps`. `RegionPath` records, per region, the chosen `Path`, its
-expected cost, its **positional step bound**, and the `StructureRef` backing it.
+not the plan references them), `budget_bytes`, `all_certified`, `worst_case_steps`
+(the per-region maximum) and `worst_case_steps_for` (the request-level bound).
+`RegionPath` records, per region, the chosen `Path`, its expected cost, its
+**positional step bound**, and the `StructureRef` backing it.
 
 ## 2. The five certified bounded paths
 
@@ -95,20 +106,61 @@ shows that a large committed-but-unselected structure still forces the rejection
 and `tests/engine.rs::engine_rejects_an_over_budget_zero_region_body` pins the
 `n == 0` case.
 
-## 4. `worst_case_steps` — the explicit cold bound
+## 4. `worst_case_steps` (per-region) and `worst_case_steps_for` (request-level)
 
-`worst_case_steps()` is the maximum number of machine steps needed to **position**
-at any logical offset, independent of the requested length: the skip/replay (or
-`0` for a direct copy or an O(1) state load). Because every admitted path carries
-a structure-parameter bound (`K − 1`, `B − 1`, or `0`), a cold read at *any*
-offset costs at most `worst_case_steps` positioning steps **plus its own reveals**
-— it is never `O(prefix)`.
+The engine exposes **two** positioning bounds, and the distinction is load-bearing:
 
-`Engine::read_counted` reports the exact steps performed, so the bound is checked
-mechanically: `tests/engine.rs::worst_case_steps_holds_for_adversarial_offsets`
-sweeps offsets at `base + {0, 1, K−2, K−1}` and asserts
-`steps − length ≤ worst_case_steps`, and that the worst offset pays the full
-`K − 1` (checkpoint) or `B − 1` (block) skip.
+- **`worst_case_steps()` — per-region.** The maximum, over the plan's regions, of
+the per-region positional bound: the skip/replay needed to position at any offset
+**within one region** (`K − 1`, `B − 1`, or `0`). It bounds a read that lies in a
+single region, which is the common case.
+- **`worst_case_steps_for(req)` — request-level.** `read` may split a request
+across several regions served by **different** paths, so a long request can pay
+**more than one** bounded restart. The per-region maximum does *not* bound it. The
+request-level bound is
+
+```text
+worst_case_steps_for(req) = Σ over dispatched segments of (segment positioning bound)
+```
+
+where the segments are exactly the maximal runs of consecutive regions served by the
+same certified structure *and* path that `read_counted` dispatches (the plan's
+grouping), clipped to `req`. Each segment contributes at most its structure
+parameter, so the bound is `O(segments)` — never `O(prefix)`. An out-of-range
+request is clamped to the plan's logical length, so the bound is always finite.
+
+`Engine::read_counted_steps` reports the **actual** `positioning` and `reveals`
+counters a read performs (positioning is the restart skip; reveals are exactly
+`req.length`), so the guarantee is checked mechanically:
+`positioning <= worst_case_steps_for(req)`. `read_counted` also carries a
+`debug_assert` of the same inequality, which is free in release builds.
+
+### Measured (multi-region, deterministic)
+
+`tests/engine.rs::request_level_bound_covers_a_multi_region_read` builds a 1 MiB
+machine-1 body with a **large `K = 65536`** checkpoint over the whole object plus a
+materialised tile band over `[256 KiB, 496 KiB)` — a **cold → hot → cold** plan —
+and reads `(offset = 65535, length = 500 000)`, which crosses all three bands:
+
+| quantity | value |
+|---|---:|
+| per-region maximum `worst_case_steps()` (`K − 1`) | `65,535` |
+| **claimed** `worst_case_steps_for(req)` (2 cold segments × `K − 1`) | `131,070` |
+| **actual** positioning steps (`114,687 = 65,535 + 0 + 49,152`) | `114,687` |
+| actual ≤ claimed | ✔ |
+| actual > per-region maximum (the gap closed) | ✔ |
+
+The read spans three dispatched segments (cold, hot, cold): the cold prefix pays
+the full `K − 1 = 65 535` skip, the hot band pays `0`, and the cold suffix pays
+`49 152`. The claimed bound is `2(K − 1)`, i.e. `128 KiB` — finite and independent
+of the prefix length, not `O(prefix)`. A single-region cold read is bounded by
+`K − 1` and matches `worst_case_steps()` exactly; an all-hot body has a request-level
+bound of `0`.
+
+The earlier per-region test still pins the structure-parameter bound on adversarial
+offsets: `tests/engine.rs::worst_case_steps_holds_for_adversarial_offsets` sweeps
+offsets at `base + {0, 1, K−2, K−1}`, asserts `steps − length ≤ worst_case_steps`,
+and that the worst offset pays the full `K − 1` (checkpoint) or `B − 1` (block) skip.
 
 ## 5. O(1), search-free, branch-lean dispatch
 
@@ -142,12 +194,15 @@ whole-object read.
 
 ## 7. Tests
 
-`tests/engine.rs` (9 tests) pins: byte-exactness vs `reader::read` on both
+`tests/engine.rs` (16 tests) pins: byte-exactness vs `reader::read` on both
 machines; `DirectStorage` byte-exactness; rejection of a body with no bounded
 path; cheapest-certified-path selection (`HotTile`/`PackedRestart`/`BlockRestart`/
 `AffineSummary`) with the expected `worst_case_steps` (`0`/`63`/`1023`/`0`);
-transactional budget enforcement; the `worst_case_steps` bound on adversarial
-offsets; the hot surface being the decoded output; plan determinism; and the
+transactional budget enforcement; the per-region `worst_case_steps` bound on
+adversarial offsets; the **request-level** bound — a cold → hot → cold read whose
+actual positioning (`114,687`) exceeds the per-region maximum (`65,535`) yet stays
+within `worst_case_steps_for` (`131,070`), the single-region case, and the all-hot
+case (`0`); the hot surface being the decoded output; plan determinism; and the
 competitor codecs returning byte-exact data.
 
 ## 8. Reproduce

@@ -398,9 +398,10 @@ artifact.
   **197,240 / 49,784 / 12,920 / 3,704 / 1,400 B** (**141×** span). The packed
   `K=64` machine-1 checkpoint drops **196,632 → 32,792 bytes (1/6)**, still
   reading the legacy magic-less layout. (`docs/BLOCKS.md`, `blocks.json`.)
-- **R3b — unified engine + competitive frontier.** The engine's `worst_case_steps`
-  bounds any request's positioning (it rejects a body with no certified bounded
-  path instead of replaying from genesis). A fully resident **4 KiB** read is
+- **R3b — unified engine + competitive frontier.** The engine bounds positioning
+  per region (`worst_case_steps`) and per request (`worst_case_steps_for`, summed
+  over the request's dispatched segments) — it rejects a body with no certified
+  bounded path instead of replaying from genesis. A fully resident **4 KiB** read is
   **1.00–1.14×** a raw `Vec`; a 1-byte read is **~1.5×**. Against block-indexed
   LZ4 and chunked Zstandard (± a hot cache) and raw under one equal budget the
   engine retains **0.27× raw on skewed** (1,142,159 vs 4,194,304 B) and **0.79× on
