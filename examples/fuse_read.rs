@@ -1,7 +1,7 @@
 //! FUSE read-path study: the real end-to-end cost of reading a **fully
 //! materialised** object through the read-only `OrFs` mount.
 //!
-//! Three read paths are compared on the same 2 MiB object:
+//! Five read paths are compared on the same 2 MiB object:
 //!
 //! 1. **backing surface** — the mount serves reads by a direct bounded copy out
 //!    of the object's logically-aligned output surface (its certified
@@ -9,9 +9,16 @@
 //!    no cache probe (`ReadMode::Auto`);
 //! 2. **mapped surface** — the same, but the backing file is a standalone,
 //!    logically-aligned export mapped through the sanctioned safe `MappedSurface`;
-//! 3. **decode** — the mount dispatches to the engine/decoder (`ReadMode::Decode`
-//!    → `OrFs::read`), the pre-existing path;
-//! 4. **direct raw file** — `std::fs::read` of the logically-aligned export.
+//! 3. **materialised dispatch** (`ReadMode::Decode`) — the mount dispatches to
+//!    `OrFs::read`, whose engine path serves this object from the path-bloom `hot`
+//!    array. This is the row the earlier study called "decode": it is **not** a
+//!    decode, it is a materialised-dispatch route, and it is kept here relabelled
+//!    so the two are never conflated;
+//! 4. **genuine machine decode** (`ReadMode::Machine`) — the mount forces
+//!    `OrFs::read_machine`: only the header and the authoritative core are read and
+//!    the machine is replayed from `Omega_0`, bypassing every tile/bloom/block/
+//!    checkpoint/history structure;
+//! 5. **direct raw file** — `std::fs::read` of the logically-aligned export.
 //!
 //! It also probes FUSE **passthrough** support at runtime and records the honest
 //! verdict (unavailable through `fuser` 0.15).
@@ -42,6 +49,10 @@ mod study {
     const WINDOW_SAMPLES: usize = 256;
     /// Samples for the (expensive) full-read rows.
     const FULL_SAMPLES: usize = 15;
+    /// Samples for the (much more expensive) genuine machine-decode full reads.
+    const MACHINE_FULL_SAMPLES: usize = 3;
+    /// Samples for the genuine machine-decode window row.
+    const MACHINE_WINDOW_SAMPLES: usize = 48;
 
     fn lcg_bytes(seed: u64, len: usize) -> Vec<u8> {
         let mut s = seed;
@@ -134,11 +145,13 @@ mod study {
         let mnt_surface = base.join("mnt-surface");
         let mnt_mapped = base.join("mnt-mapped");
         let mnt_decode = base.join("mnt-decode");
+        let mnt_machine = base.join("mnt-machine");
         let _ = std::fs::remove_dir_all(base);
         std::fs::create_dir_all(&root)?;
         std::fs::create_dir_all(&mnt_surface)?;
         std::fs::create_dir_all(&mnt_mapped)?;
         std::fs::create_dir_all(&mnt_decode)?;
+        std::fs::create_dir_all(&mnt_machine)?;
 
         let corpus = lcg_bytes(CORPUS_SEED, OBJ_BYTES as usize);
         {
@@ -181,8 +194,9 @@ mod study {
             std::fs::write(&export, &exported)?;
         }
 
-        // Mount three projections of the same object: backing surface (auto),
-        // standalone mapped surface (explicit), and decode (forced).
+        // Mount four projections of the same object: backing surface (auto),
+        // standalone mapped surface (explicit), materialised dispatch (decode) and
+        // genuine machine decode (machine).
         let fs = OrFs::open(&root)?;
         let h_surface = mount(fs, &mnt_surface, false)?;
         let fs = OrFs::open(&root)?;
@@ -205,16 +219,28 @@ mod study {
                 ..MountOptions::default()
             },
         )?;
+        let fs = OrFs::open(&root)?;
+        let h_machine = mount_with(
+            fs,
+            &mnt_machine,
+            false,
+            &MountOptions {
+                read_mode: ReadMode::Machine,
+                ..MountOptions::default()
+            },
+        )?;
 
         let mounted_surface = mnt_surface.join(logical);
         let mounted_mapped = mnt_mapped.join(logical);
         let mounted_decode = mnt_decode.join(logical);
+        let mounted_machine = mnt_machine.join(logical);
 
         // Byte-exactness through every mount before measuring anything.
         for (label, path) in [
             ("surface", &mounted_surface),
             ("mapped", &mounted_mapped),
             ("decode", &mounted_decode),
+            ("machine", &mounted_machine),
         ] {
             if std::fs::read(path)? != corpus {
                 return Err(bad(&format!("{label} mount did not match the source")));
@@ -260,7 +286,27 @@ mod study {
                 return Err(bad("decode full read returned the wrong length"));
             }
         }
-        full.push(full_row("fuse decode (ReadMode::Decode)", samples));
+        full.push(full_row(
+            "fuse materialised dispatch (ReadMode::Decode)",
+            samples,
+        ));
+
+        // Genuine authoritative machine reconstruction (much more expensive: the
+        // machine is replayed from Omega_0 per request, with no manifested route).
+        let _ = std::fs::read(&mounted_machine)?;
+        let mut samples = Vec::with_capacity(MACHINE_FULL_SAMPLES);
+        for _ in 0..MACHINE_FULL_SAMPLES {
+            let t0 = Instant::now();
+            let got = std::fs::read(&mounted_machine)?;
+            samples.push(t0.elapsed().as_nanos() as u64);
+            if got.len() as u64 != OBJ_BYTES {
+                return Err(bad("machine full read returned the wrong length"));
+            }
+        }
+        full.push(full_row(
+            "fuse genuine machine decode (ReadMode::Machine)",
+            samples,
+        ));
 
         let _ = std::fs::read(&export)?;
         let mut samples = Vec::with_capacity(FULL_SAMPLES);
@@ -316,7 +362,9 @@ mod study {
             });
         }
 
-        // Decode, reopen per read: the pre-existing path's uncached cost.
+        // Materialised dispatch, reopen per read: the route the earlier study
+        // labelled "decode". For this `Path` object it reads the path-bloom hot
+        // array — it does not decode.
         {
             let mut buf = vec![0u8; WINDOW as usize];
             let mut samples = Vec::with_capacity(offsets.len());
@@ -327,7 +375,29 @@ mod study {
                 samples.push(t0.elapsed().as_nanos() as u64);
             }
             window.push(WindowRow {
-                name: "fuse decode (open per read, uncached)",
+                name: "fuse materialised dispatch (ReadMode::Decode)",
+                stats: stats(samples),
+            });
+        }
+
+        // Genuine machine decode, reopen per read: authoritative replay from
+        // Omega_0 over the core (no tile/bloom/block/checkpoint/history route).
+        {
+            let mut buf = vec![0u8; WINDOW as usize];
+            let probes: Vec<u64> = offsets
+                .iter()
+                .copied()
+                .take(MACHINE_WINDOW_SAMPLES)
+                .collect();
+            let mut samples = Vec::with_capacity(probes.len());
+            for &off in &probes {
+                let t0 = Instant::now();
+                let file = File::open(&mounted_machine)?;
+                file.read_exact_at(&mut buf, off)?;
+                samples.push(t0.elapsed().as_nanos() as u64);
+            }
+            window.push(WindowRow {
+                name: "fuse genuine machine decode (ReadMode::Machine)",
                 stats: stats(samples),
             });
         }
@@ -398,28 +468,32 @@ mod study {
              API is exposed, so the mount uses the classic /dev/fuse request loop.";
 
         // ---- verdict ------------------------------------------------------------
-        let f_surface = &full[0].stats;
         let f_decode = &full[2].stats;
-        let f_raw = &full[3].stats;
+        let f_machine = &full[3].stats;
+        let f_raw = &full[4].stats;
         let w_surface = &window[1].stats;
         let w_decode = &window[2].stats;
+        let w_machine = &window[3].stats;
+        let w_mapped = &window[4].stats;
         let verdict = format!(
-            "The backing surface removes the decode and the per-request cache probe: an uncached \
-             4 KiB FUSE read costs {:.1} us on the surface vs {:.1} us through the decoder \
-             ({:.1}x). A full {:.1} MiB read is {:.0} us on the surface vs {:.0} us decoded \
-             (both are dominated by the same kernel copy; the surface skips the identity probe \
-             and path-bloom re-validation). The standalone mapped surface is the floor at {:.2} us \
-             per persistent-fd window. Raw file read: {:.0} us full. FUSE passthrough is NOT \
-             available through fuser (max ABI {}); kernel {} {}. The `.ekb` is not a valid \
-             passthrough backing file (headers/core precede the hot blob), but its path-bloom hot \
-             array is logically aligned and is what the backing surface serves.",
-            w_surface.p50 as f64 / 1000.0,
+            "CORRECTION: for this fully-materialised `Path` object the earlier 'decode' row measured a \
+             MATERIALISED-DISPATCH route (the `.ekb` path-bloom `hot` array served by `OrFs::read`), \
+             not decoding: it costs {:.1} us per uncached 4 KiB read and {:.0} us full. Genuine machine \
+             decode (`ReadMode::Machine`, authoritative replay from Omega_0 per request with no \
+             tile/bloom/block/checkpoint/history route) costs {:.1} us per uncached 4 KiB read \
+             ({:.0}x the dispatch) and {:.0} us full. The backing surface stays {:.1} us per uncached \
+             4 KiB read; the standalone mapped surface is the resident floor at {:.2} us. Raw file \
+             read: {:.0} us full. FUSE passthrough is NOT available through fuser (max ABI {}); \
+             kernel {} {}. The `.ekb` is not a valid passthrough backing file (headers/core precede \
+             the hot blob), but its path-bloom hot array is logically aligned and is what the backing \
+             surface serves.",
             w_decode.p50 as f64 / 1000.0,
-            w_decode.p50 as f64 / w_surface.p50.max(1) as f64,
-            OBJ_BYTES as f64 / (1024.0 * 1024.0),
-            f_surface.p50 as f64 / 1000.0,
             f_decode.p50 as f64 / 1000.0,
-            window[3].stats.p50 as f64 / 1000.0,
+            w_machine.p50 as f64 / 1000.0,
+            w_machine.p50 as f64 / w_decode.p50.max(1) as f64,
+            f_machine.p50 as f64 / 1000.0,
+            w_surface.p50 as f64 / 1000.0,
+            w_mapped.p50 as f64 / 1000.0,
             f_raw.p50 as f64 / 1000.0,
             probe.fuser_max_abi,
             probe.kernel_release,
@@ -463,6 +537,14 @@ mod study {
         let _ = writeln!(s, "  \"object_profile\": \"path(D=4)\",");
         let _ = writeln!(s, "  \"window_bytes\": {WINDOW},");
         let _ = writeln!(s, "  \"window_samples\": {WINDOW_SAMPLES},");
+        let _ = writeln!(s, "  \"machine_window_samples\": {MACHINE_WINDOW_SAMPLES},");
+        let _ = writeln!(
+            s,
+            "  \"read_modes\": {{\"backing\": \"Auto/backing-surface\", \"materialised_dispatch\": \"Decode\", \"genuine_machine_decode\": \"Machine\"}},"
+        );
+        s.push_str(
+            "  \"correction\": \"The previous 'decode' row (ReadMode::Decode) measured a materialised-dispatch route - the .ekb path-bloom hot array served by OrFs::read - not decoding. ReadMode::Machine is the genuine authoritative machine reconstruction baseline.\",\n",
+        );
         let _ = writeln!(
             s,
             "  \"logically_aligned_export\": \"target/fuse-perf-tmp/export.bin\","
@@ -524,6 +606,7 @@ mod study {
         drop(h_surface);
         drop(h_mapped);
         drop(h_decode);
+        drop(h_machine);
         let _ = std::fs::remove_dir_all(base);
         Ok(())
     }

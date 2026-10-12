@@ -5,6 +5,9 @@
   "object_profile": "path(D=4)",
   "window_bytes": 4096,
   "window_samples": 256,
+  "machine_window_samples": 48,
+  "read_modes": {"backing": "Auto/backing-surface", "materialised_dispatch": "Decode", "genuine_machine_decode": "Machine"},
+  "correction": "The previous 'decode' row (ReadMode::Decode) measured a materialised-dispatch route - the .ekb path-bloom hot array served by OrFs::read - not decoding. ReadMode::Machine is the genuine authoritative machine reconstruction baseline.",
   "logically_aligned_export": "target/fuse-perf-tmp/export.bin",
   "aligned_surface": {
     "kind": "ekb path-bloom hot array",
@@ -26,70 +29,83 @@
   "full_read": [
     {
       "name": "fuse backing surface (std::fs::read)",
-      "p50_ns": 233517,
-      "p99_ns": 414616,
-      "min_ns": 197580,
-      "mbps": 8017.6
+      "p50_ns": 205794,
+      "p99_ns": 272690,
+      "min_ns": 196948,
+      "mbps": 9203.5
     },
     {
       "name": "fuse mapped surface (standalone file)",
-      "p50_ns": 194043,
-      "p99_ns": 285545,
-      "min_ns": 189384,
-      "mbps": 9948.0
+      "p50_ns": 288109,
+      "p99_ns": 597416,
+      "min_ns": 207437,
+      "mbps": 6431.8
     },
     {
-      "name": "fuse decode (ReadMode::Decode)",
-      "p50_ns": 198922,
-      "p99_ns": 232315,
-      "min_ns": 195997,
-      "mbps": 9931.0
+      "name": "fuse materialised dispatch (ReadMode::Decode)",
+      "p50_ns": 223538,
+      "p99_ns": 411930,
+      "min_ns": 206406,
+      "mbps": 7810.3
+    },
+    {
+      "name": "fuse genuine machine decode (ReadMode::Machine)",
+      "p50_ns": 30935083,
+      "p99_ns": 39049347,
+      "min_ns": 30212292,
+      "mbps": 59.9
     },
     {
       "name": "raw file (std::fs::read export.bin)",
-      "p50_ns": 30296,
-      "p99_ns": 30827,
-      "min_ns": 29876,
-      "mbps": 65912.2
+      "p50_ns": 48972,
+      "p99_ns": 186288,
+      "min_ns": 41878,
+      "mbps": 26790.5
     }
   ],
   "window_read": [
     {
       "name": "fuse backing surface (persistent fd, warm)",
-      "p50_ns": 180,
-      "p99_ns": 5130,
-      "mean_ns": 1270.4
+      "p50_ns": 250,
+      "p99_ns": 14848,
+      "mean_ns": 3259.8
     },
     {
       "name": "fuse backing surface (open per read, uncached)",
-      "p50_ns": 5941,
-      "p99_ns": 14979,
-      "mean_ns": 6434.6
+      "p50_ns": 8586,
+      "p99_ns": 20128,
+      "mean_ns": 9468.3
     },
     {
-      "name": "fuse decode (open per read, uncached)",
-      "p50_ns": 6913,
-      "p99_ns": 12163,
-      "mean_ns": 7461.1
+      "name": "fuse materialised dispatch (ReadMode::Decode)",
+      "p50_ns": 10961,
+      "p99_ns": 31709,
+      "mean_ns": 12766.4
+    },
+    {
+      "name": "fuse genuine machine decode (ReadMode::Machine)",
+      "p50_ns": 4182036,
+      "p99_ns": 11574671,
+      "mean_ns": 4438295.3
     },
     {
       "name": "fuse mapped surface (persistent fd, warm)",
-      "p50_ns": 161,
-      "p99_ns": 4839,
-      "mean_ns": 1129.4
+      "p50_ns": 200,
+      "p99_ns": 11661,
+      "mean_ns": 2516.3
     },
     {
       "name": "direct OpenObject window (persistent)",
-      "p50_ns": 340,
-      "p99_ns": 460,
-      "mean_ns": 342.3
+      "p50_ns": 441,
+      "p99_ns": 742,
+      "mean_ns": 447.9
     },
     {
       "name": "raw file window (persistent fd)",
-      "p50_ns": 150,
-      "p99_ns": 180,
-      "mean_ns": 149.2
+      "p50_ns": 321,
+      "p99_ns": 871,
+      "mean_ns": 335.4
     }
   ],
-  "verdict": "The backing surface removes the decode and the per-request cache probe: an uncached 4 KiB FUSE read costs 5.9 us on the surface vs 6.9 us through the decoder (1.2x). A full 2.0 MiB read is 234 us on the surface vs 199 us decoded (both are dominated by the same kernel copy; the surface skips the identity probe and path-bloom re-validation). The standalone mapped surface is the floor at 0.16 us per persistent-fd window. Raw file read: 30 us full. FUSE passthrough is NOT available through fuser (max ABI 7.31); kernel 7.2.9-2-cachyos has the passthrough ABI. The `.ekb` is not a valid passthrough backing file (headers/core precede the hot blob), but its path-bloom hot array is logically aligned and is what the backing surface serves."
+  "verdict": "CORRECTION: for this fully-materialised `Path` object the earlier 'decode' row measured a MATERIALISED-DISPATCH route (the `.ekb` path-bloom `hot` array served by `OrFs::read`), not decoding: it costs 11.0 us per uncached 4 KiB read and 224 us full. Genuine machine decode (`ReadMode::Machine`, authoritative replay from Omega_0 per request with no tile/bloom/block/checkpoint/history route) costs 4182.0 us per uncached 4 KiB read (382x the dispatch) and 30935 us full. The backing surface stays 8.6 us per uncached 4 KiB read; the standalone mapped surface is the resident floor at 0.20 us. Raw file read: 49 us full. FUSE passthrough is NOT available through fuser (max ABI 7.31); kernel 7.2.9-2-cachyos has the passthrough ABI. The `.ekb` is not a valid passthrough backing file (headers/core precede the hot blob), but its path-bloom hot array is logically aligned and is what the backing surface serves."
 }

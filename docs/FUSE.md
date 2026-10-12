@@ -14,9 +14,12 @@ normally while keeping the manifested operational store concealed. This is the
 
 ### Mapping to the concealed namespace
 
-`OrFs` stores each object's manifested structures under `<root>/.ekbloom/`
-(core, history, checkpoints, blooms, the committed `.ekb` generation, and the
-concealed index). FUSE never maps that directory into the tree:
+`OrFs` stores each object's manifested structures under `<root>/.ekbloom/`: one
+**authoritative `.ekb` store** (`manifests`) and a set of tiny **pointer views**
+of it (`core`, `history`, `checkpoints`, `bloom4`, `regional`), plus the concealed
+registry. The authoritative payload bytes exist **exactly once**; the views carry
+only section offsets and digests (see `docs/ORFS.md`). FUSE never maps that
+directory into the tree:
 
 - The inode tree is built only from `OrFs::list` and `OrFs::stat`, and `list`
   already filters every name beginning with `.ekbloom`, so `.ekbloom` (and the
@@ -51,7 +54,7 @@ concealed store that produces it. It must never be mistaken for logical content.
 count but reports **zero** free blocks, so physical allocation is never presented
 as free space (matching `OrFs::is_logical_quota`).
 
-## The read path: backing surface vs. decode
+## The read path: backing surface vs. materialised dispatch vs. genuine decode
 
 The reviewer's target was the *spirit* of FUSE passthrough: avoid decoding when
 an object already has a **fully-materialised, logically-aligned output surface**.
@@ -61,8 +64,9 @@ selects how `read` is served:
 
 | Mode | Behaviour |
 |---|---|
-| `ReadMode::Auto` (default) | if the file has a materialised, logically-aligned surface, serve the read by a **direct bounded copy** out of it; otherwise decode |
-| `ReadMode::Decode` | always decode through the engine/decoder (`OrFs::read`) |
+| `ReadMode::Auto` (default) | if the file has a materialised, logically-aligned surface, serve the read by a **direct bounded copy** out of it; otherwise dispatch |
+| `ReadMode::Decode` | dispatch through `OrFs::read` (the engine path). For a fully-materialised object this is served from a manifested structure — tiles, the path-bloom `hot` array, a block index — so it is a **materialised-dispatch** route, **not** a raw decode |
+| `ReadMode::Machine` | **genuine machine reconstruction**: `OrFs::read_machine` reads only the header and the authoritative core and replays the machine from `Omega_0`, bypassing every manifested structure |
 
 Two surface shapes are supported:
 
@@ -97,7 +101,7 @@ The mount is read-only:
 ## API
 
 ```rust
-pub enum ReadMode { Decode, Auto }              // Auto is the default
+pub enum ReadMode { Decode, Machine, Auto }         // Auto is the default
 pub struct MountOptions {
     pub read_mode: ReadMode,
     pub surfaces: HashMap<String, PathBuf>,     // standalone aligned files
@@ -109,8 +113,9 @@ pub fn mount_with(fs, mountpoint, foreground, &MountOptions) -> Result<OrFsMount
 pub fn probe_passthrough() -> PassthroughProbe;   // runtime probe (below)
 ```
 
-`OrFs::aligned_surface(logical_path)` reports the discovered surface, and
-`FileBody::aligned_surface()` reports it for a file opened directly.
+`OrFs::aligned_surface(logical_path)` reports the discovered surface,
+`OrFs::read_machine(logical_path, req)` is the forced authoritative-machine decode,
+and `FileBody::aligned_surface()` reports it for a file opened directly.
 
 ## Running it
 
@@ -129,11 +134,11 @@ plus the runtime `fuse3` / `libfuse3-3` packages) and runs, with:
 ```
 
 1. the `tests/fuse.rs` integration test (real mount/unmount, plus a
-   backing-surface-vs-decode byte-exactness test), and
-2. `examples/fuse_read.rs`, which mounts the projection three ways on one 2 MiB
-   `Path` object (backing surface, standalone mapped surface, forced decode),
-   confirms byte-exactness, measures each path, probes passthrough, and writes
-   `evidence/bench/fuse-perf.json`.
+   backing-surface-vs-dispatch-vs-machine-decode byte-exactness test), and
+2. `examples/fuse_read.rs`, which mounts the projection four ways on one 2 MiB
+   `Path` object (backing surface, standalone mapped surface, materialised
+   dispatch, forced machine decode), confirms byte-exactness, measures each path,
+   probes passthrough, and writes `evidence/bench/fuse-perf.json`.
 
 To mount from your own program:
 
@@ -164,36 +169,41 @@ Full 2 MiB read (open + read, `std::fs::read`):
 
 | path | p50 | throughput |
 |---|---:|---:|
-| FUSE, backing surface (`.ekb` hot array) | 234 µs | 8,018 MB/s |
-| FUSE, standalone mapped surface | 194 µs | 9,948 MB/s |
-| FUSE, decode (`ReadMode::Decode`) | 199 µs | 9,931 MB/s |
-| raw file (`std::fs::read` of the aligned export) | 30.3 µs | 65,912 MB/s |
+| FUSE, backing surface (`.ekb` hot array) | 206 µs | 9,204 MB/s |
+| FUSE, standalone mapped surface | 288 µs | 6,432 MB/s |
+| FUSE, materialised dispatch (`ReadMode::Decode`) | 224 µs | 7,810 MB/s |
+| FUSE, **genuine machine decode** (`ReadMode::Machine`) | 30,935 µs | 59.9 MB/s |
+| raw file (`std::fs::read` of the aligned export) | 49.0 µs | 26,791 MB/s |
 
 4 KiB window:
 
 | path | p50 | p99 |
 |---|---:|---:|
-| FUSE, backing surface (persistent fd, warm) | 180 ns | 5.1 µs |
-| FUSE, mapped surface (persistent fd, warm) | 161 ns | 4.8 µs |
-| FUSE, backing surface (open per read, uncached) | 5.9 µs | 15.0 µs |
-| FUSE, decode (open per read, uncached) | 6.9 µs | 12.2 µs |
-| direct `OpenObject` (persistent) | 340 ns | 0.46 µs |
-| raw file (persistent fd) | 150 ns | 0.18 µs |
+| FUSE, backing surface (persistent fd, warm) | 250 ns | 14.8 µs |
+| FUSE, mapped surface (persistent fd, warm) | 200 ns | 11.7 µs |
+| FUSE, backing surface (open per read, uncached) | 8.6 µs | 20.1 µs |
+| FUSE, materialised dispatch (`ReadMode::Decode`) | 11.0 µs | 31.7 µs |
+| FUSE, **genuine machine decode** (`ReadMode::Machine`) | 4,182 µs | 11,575 µs |
+| direct `OpenObject` (persistent) | 441 ns | 0.74 µs |
+| raw file (persistent fd) | 321 ns | 0.87 µs |
 
-**Verdict (honest).** The backing surface removes the work the decoder path does
-*per request* that the surface does not: the `ObjectCache` identity probe (one
-`metadata` plus a 64-byte footer `pread`) and the path-bloom structural
-re-validation. On **uncached** 4 KiB FUSE requests that is a real **~1.2×**
-(5.9 µs vs 6.9 µs, p50). On a **warm** persistent fd both are page-cache reads
-(180 ns vs a cached floor), and the standalone **mapped** surface is the floor at
-161 ns because a resident mapping needs no syscall at all. The **full 2 MiB** row
-is *not* where the surface helps: 234 µs surface vs 199 µs decode, a difference
-within run-to-run noise (min 198 µs vs 196 µs) — a full read is dominated by the
-kernel copy and the many `/dev/fuse` round trips, not by userspace decoding. The
-raw file is ~7× faster (30 µs) because it is a single contiguous file with no
-FUSE in the path. So the win is a smaller, honest one: fewer per-request
-userspace operations and a zero-syscall floor with a mapped surface — not a
-passthrough-class speedup.
+**Correction (honest).** The earlier revision reported `ReadMode::Decode` as the
+"decode" row. On a fully-materialised `Path` object that mode routes through
+`OrFs::read`, whose engine path serves the range from the **path-bloom `hot`
+array** — a **materialised-dispatch** route, *not* a decode (11.0 µs per uncached
+4 KiB read, 224 µs full). The genuine authoritative decode,
+`ReadMode::Machine` / `OrFs::read_machine`, replays the machine from `Omega_0`
+with **no** manifested route: **4.18 ms** per uncached 4 KiB read (**382×** the
+dispatch) and **30.9 ms** full. That is the real cost of decoding this object
+from scratch; the previous number was not.
+
+Against the backing surface, the win is unchanged and smaller than a
+passthrough-class speedup: the surface removes the `ObjectCache` identity probe
+(one `metadata` plus a 64-byte footer `pread`) and the path-bloom structural
+re-validation. On **uncached** 4 KiB requests that is **~1.3×** (8.6 µs vs
+11.0 µs, p50); on a **warm** persistent fd both are page-cache reads (250 ns vs a
+cached floor), and the standalone **mapped** surface is the resident floor at
+200 ns because a resident mapping needs no syscall at all.
 
 ## FUSE passthrough and FUSE-over-io_uring
 

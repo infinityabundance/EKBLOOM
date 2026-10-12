@@ -69,15 +69,34 @@ const O_RDONLY: i32 = 0o0;
 /// [`probe_passthrough`]), so this module reduces the FUSE read cost in userspace
 /// instead: when an object carries a fully-materialised, logically-aligned output
 /// surface, a read can be a direct bounded copy out of that surface rather than a
-/// decode. [`ReadMode::Decode`] forces the decoder path so the two can be
-/// compared honestly (see `examples/fuse_read.rs`).
+/// decode.
+///
+/// [`ReadMode::Decode`] and [`ReadMode::Machine`] both force the engine path so
+/// the two can be compared honestly, but they are **not** the same thing:
+///
+/// * [`ReadMode::Decode`] routes through [`OrFs::read`], whose dispatch may still
+///   serve the range from persisted tiles, a certified path-bloom `hot` array, a
+///   block index, a checkpoint set or the history. For a `Path` object it serves
+///   the logically-aligned `hot` array — a *materialised-dispatch* route, not a
+///   decode.
+/// * [`ReadMode::Machine`] routes through [`OrFs::read_machine`], which reads only
+///   the header and the authoritative core and replays the machine from `Omega_0`,
+///   bypassing every manifested structure. This is the **genuine machine decode**
+///   baseline.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReadMode {
-    /// Always decode through [`OrFs::read`] (the engine/decoder path).
+    /// Always dispatch through [`OrFs::read`] (the engine/decoder path). For a
+    /// fully-materialised object this may be served from a manifested structure
+    /// (tiles / a path-bloom `hot` array / a block index), so it is not
+    /// necessarily a raw decode.
     Decode,
+    /// Force **genuine machine reconstruction** through [`OrFs::read_machine`]:
+    /// only the authoritative core is read, then the machine is replayed from
+    /// `Omega_0`. No tile, bloom, block, checkpoint or history byte is consulted.
+    Machine,
     /// Serve from a materialised, logically-aligned backing surface when one is
     /// available for the file (a `.ekb` path-bloom `hot` array, or a registered
-    /// standalone aligned file), else decode. This is the default.
+    /// standalone aligned file), else dispatch. This is the default.
     #[default]
     Auto,
 }
@@ -336,9 +355,12 @@ impl OrFsView {
     ///
     /// An explicitly registered standalone file takes precedence; otherwise the
     /// object's certified whole-object path bloom (`hot` array) is used. Returns
-    /// `None` in [`ReadMode::Decode`] or when the object has no aligned surface.
+    /// `None` unless the mode is [`ReadMode::Auto`], or when the object has no
+    /// aligned surface.
     fn resolve_surface(&self, logical_path: &str) -> Option<BackingSurface> {
-        if self.read_mode == ReadMode::Decode {
+        // Only `Auto` attaches a surface; `Decode` and `Machine` never do, so each
+        // mode measures exactly one route.
+        if self.read_mode != ReadMode::Auto {
             return None;
         }
         if let Some(path) = self.explicit_surfaces.get(logical_path) {
@@ -527,16 +549,32 @@ impl OrFsView {
     /// Read a logical file range, clamping to the file length. Returns an errno
     /// on failure so it can be handed straight to a FUSE reply.
     ///
-    /// When the object is fully materialised as a logically-aligned surface and
-    /// the mount is in [`ReadMode::Auto`], the read is a direct bounded copy out
-    /// of that surface — no decode, no re-parse, no cache probe. Otherwise it
-    /// goes through the engine/decoder ([`OrFs::read`]). Both are byte-exact.
+    /// * [`ReadMode::Machine`] forces genuine machine reconstruction
+    ///   ([`OrFs::read_machine`]) — no materialised structure is consulted.
+    /// * Otherwise, when the object is fully materialised as a logically-aligned
+    ///   surface (only in [`ReadMode::Auto`]), the read is a direct bounded copy
+    ///   out of that surface — no decode, no re-parse, no cache probe.
+    /// * Otherwise it goes through the engine/decoder ([`OrFs::read`]).
+    ///
+    /// Every route is byte-exact.
     fn read_logical(&self, ino: u64, offset: u64, size: u32) -> std::result::Result<Vec<u8>, i32> {
         let file = self.files.get(&ino).ok_or(ENOENT)?;
         if offset >= file.len {
             return Ok(Vec::new());
         }
         let want = u64::from(size).min(file.len - offset);
+        if self.read_mode == ReadMode::Machine {
+            return self
+                .fs
+                .read_machine(
+                    &file.path,
+                    ReadRequest {
+                        offset,
+                        length: want,
+                    },
+                )
+                .map_err(|_| EIO);
+        }
         if let Some(surface) = &file.surface {
             return surface.read(offset, want);
         }
@@ -921,6 +959,63 @@ mod tests {
 
         std::fs::remove_dir_all(&auto_root).unwrap();
         std::fs::remove_dir_all(&decode_root).unwrap();
+    }
+
+    /// [`ReadMode::Machine`] attaches no surface (no hot-array/bloom shortcut) and
+    /// its reads are byte-exact: they are produced by genuine authoritative machine
+    /// replay ([`OrFs::read_machine`]), not by the materialised dispatch
+    /// [`ReadMode::Decode`] would take on the same `Path` object.
+    #[test]
+    fn machine_mode_forces_reconstruction_and_attaches_no_surface() {
+        let src: Vec<u8> = (0..8192u32)
+            .map(|i| (i.wrapping_mul(2246822519) >> 23) as u8)
+            .collect();
+
+        let root = temp_root("machine");
+        let fs = OrFs::open(&root).unwrap();
+        fs.create(
+            "data/hot.bin",
+            &src,
+            ManifestationProfile::Path { depth: 4 },
+        )
+        .unwrap();
+
+        // `Decode` (materialised dispatch) and `Machine` (forced replay) agree, so
+        // the forced route is not merely a different-but-wrong code path.
+        let decode_view = OrFsView::new(
+            OrFs::open(&root).unwrap(),
+            &MountOptions {
+                read_mode: ReadMode::Decode,
+                ..MountOptions::default()
+            },
+        )
+        .unwrap();
+        let decode_ino = *decode_view.files.keys().next().unwrap();
+
+        let opts = MountOptions {
+            read_mode: ReadMode::Machine,
+            ..MountOptions::default()
+        };
+        let view = OrFsView::new(OrFs::open(&root).unwrap(), &opts).unwrap();
+        let ino = *view.files.keys().next().unwrap();
+        assert!(
+            view.files[&ino].surface.is_none(),
+            "ReadMode::Machine must not attach a backing surface"
+        );
+        assert_eq!(view.read_logical(ino, 0, src.len() as u32).unwrap(), src);
+        for &(off, len) in &[(1u64, 4095u32), (4096, 4096), (7000, 1192)] {
+            assert_eq!(
+                view.read_logical(ino, off, len).unwrap(),
+                src[off as usize..(off + len as u64) as usize].to_vec()
+            );
+            assert_eq!(
+                view.read_logical(ino, off, len).unwrap(),
+                decode_view.read_logical(decode_ino, off, len).unwrap(),
+                "machine replay and materialised dispatch must agree"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

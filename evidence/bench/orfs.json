@@ -1,0 +1,67 @@
+{
+  "producer": "examples/orfs_disk.rs",
+  "note": "Real on-disk bytes of the OrFS concealed namespace vs a single .ekb, a raw file, and pinned-hot LZ4/Zstandard stores, against the in-memory engine number.",
+  "hot_bytes": 262144,
+  "lz4_block_bytes": 4096,
+  "zstd_chunk_bytes": 16384,
+  "corpora": [
+    {
+      "name": "skewed",
+      "source_len": 4194304,
+      "machine": 2,
+      "core_len": 829911,
+      "budget_bytes": 4718592,
+      "physical_in_memory_bytes": 1141643,
+      "orfs": {
+        "object_bytes": 1163264,
+        "inspect_physical_total_bytes": 1163264,
+        "note": "all files under .ekbloom/ plus the logical pointer artifact"
+      },
+      "single_ekb": {
+        "apparent_bytes": 1142264,
+        "allocated_bytes": 1142784
+      },
+      "raw_file_bytes": 4194304,
+      "pinned_hot_lz4": {
+        "allocated_bytes": 2940928,
+        "within_budget": true
+      },
+      "pinned_hot_zstd": {
+        "allocated_bytes": 1388544,
+        "within_budget": true
+      },
+      "excess_over_in_memory_bytes": 21621,
+      "excess_over_in_memory_ratio": 0.018938,
+      "note": "OrFS disk exceeds the in-memory engine number by 21621 B (1.89%): the `.ekb` container (header, alignment padding, section headers, manifest, footer) plus the pointer views, registry and directory metadata. The authoritative payload itself is stored exactly once, so the excess is bounded container framing, not a duplicated payload."
+    },
+    {
+      "name": "mixed",
+      "source_len": 4194304,
+      "machine": 2,
+      "core_len": 2986989,
+      "budget_bytes": 4718592,
+      "physical_in_memory_bytes": 3298721,
+      "orfs": {
+        "object_bytes": 3321856,
+        "inspect_physical_total_bytes": 3321856,
+        "note": "all files under .ekbloom/ plus the logical pointer artifact"
+      },
+      "single_ekb": {
+        "apparent_bytes": 3299344,
+        "allocated_bytes": 3301376
+      },
+      "raw_file_bytes": 4194304,
+      "pinned_hot_lz4": {
+        "allocated_bytes": 3710976,
+        "within_budget": true
+      },
+      "pinned_hot_zstd": {
+        "allocated_bytes": 2928640,
+        "within_budget": true
+      },
+      "excess_over_in_memory_bytes": 23135,
+      "excess_over_in_memory_ratio": 0.007013,
+      "note": "OrFS disk exceeds the in-memory engine number by 23135 B (0.70%): the `.ekb` container (header, alignment padding, section headers, manifest, footer) plus the pointer views, registry and directory metadata. The authoritative payload itself is stored exactly once, so the excess is bounded container framing, not a duplicated payload."
+    }
+  ]
+}

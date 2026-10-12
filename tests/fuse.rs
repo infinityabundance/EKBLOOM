@@ -135,8 +135,10 @@ fn read_only_mount_exposes_logical_files_and_control_file() {
 
 /// A fully-materialised object (a certified whole-object path bloom) is served
 /// from its logically-aligned backing surface in the default [`ReadMode::Auto`],
-/// and from the decoder in [`ReadMode::Decode`]. Both must return byte-exact
-/// bytes — full reads and arbitrary windows — matching the source.
+/// by the materialised dispatch in [`ReadMode::Decode`], and by genuine
+/// authoritative machine reconstruction in [`ReadMode::Machine`]. All three must
+/// return byte-exact bytes — full reads and arbitrary windows — matching the
+/// source.
 #[test]
 fn backing_surface_and_decode_paths_are_byte_exact() {
     if !fuse_available() {
@@ -149,6 +151,7 @@ fn backing_surface_and_decode_paths_are_byte_exact() {
     let root = temp_dir("readmode-root");
     let auto_mnt = temp_dir("readmode-auto");
     let decode_mnt = temp_dir("readmode-decode");
+    let machine_mnt = temp_dir("readmode-machine");
     let src = lcg(0xEB10_F05E, 64 * 1024);
     {
         let fs = OrFs::open(&root).unwrap();
@@ -164,7 +167,8 @@ fn backing_surface_and_decode_paths_are_byte_exact() {
     // The default mode attaches the `.ekb` path-bloom hot array as a surface.
     let fs = OrFs::open(&root).unwrap();
     let auto = mount_with(fs, &auto_mnt, false, &MountOptions::default()).unwrap();
-    // The decode mode forces the engine/decoder path.
+    // The decode mode dispatches through `OrFs::read` (materialised dispatch: the
+    // path-bloom hot array).
     let fs = OrFs::open(&root).unwrap();
     let decode = mount_with(
         fs,
@@ -176,19 +180,38 @@ fn backing_surface_and_decode_paths_are_byte_exact() {
         },
     )
     .unwrap();
+    // The machine mode forces genuine authoritative machine reconstruction.
+    let fs = OrFs::open(&root).unwrap();
+    let machine = mount_with(
+        fs,
+        &machine_mnt,
+        false,
+        &MountOptions {
+            read_mode: ReadMode::Machine,
+            ..MountOptions::default()
+        },
+    )
+    .unwrap();
 
     let via_auto = auto_mnt.join(logical);
     let via_decode = decode_mnt.join(logical);
+    let via_machine = machine_mnt.join(logical);
 
-    // Full reads through both mounts equal the source exactly.
+    // Full reads through every mount equal the source exactly.
     assert_eq!(std::fs::read(&via_auto).unwrap(), src, "auto full read");
     assert_eq!(std::fs::read(&via_decode).unwrap(), src, "decode full read");
+    assert_eq!(
+        std::fs::read(&via_machine).unwrap(),
+        src,
+        "machine full read"
+    );
 
     // Arbitrary windows, including misaligned and tail-crossing ones, agree with
-    // the source through both mounts.
+    // the source through every mount.
     use std::os::unix::fs::FileExt;
     let f_auto = std::fs::File::open(&via_auto).unwrap();
     let f_decode = std::fs::File::open(&via_decode).unwrap();
+    let f_machine = std::fs::File::open(&via_machine).unwrap();
     for &(off, len) in &[
         (0u64, 1u64),
         (1, 4095),
@@ -203,21 +226,27 @@ fn backing_surface_and_decode_paths_are_byte_exact() {
         let want = &src[off as usize..(off + read_len) as usize];
         let mut a = vec![0u8; read_len as usize];
         let mut d = vec![0u8; read_len as usize];
+        let mut m = vec![0u8; read_len as usize];
         f_auto.read_exact_at(&mut a, off).unwrap();
         f_decode.read_exact_at(&mut d, off).unwrap();
+        f_machine.read_exact_at(&mut m, off).unwrap();
         assert_eq!(a, want, "auto window ({off},{len})");
         assert_eq!(d, want, "decode window ({off},{len})");
+        assert_eq!(m, want, "machine window ({off},{len})");
     }
 
     // Close the FUSE file descriptors before unmounting; an open fd on the mount
     // would make the unmount busy.
     drop(f_auto);
     drop(f_decode);
+    drop(f_machine);
     drop(auto);
     drop(decode);
+    drop(machine);
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&auto_mnt).ok();
     std::fs::remove_dir_all(&decode_mnt).ok();
+    std::fs::remove_dir_all(&machine_mnt).ok();
 }
 
 /// `ReadMode::Auto` attaches a monolithic backing surface only for a fully

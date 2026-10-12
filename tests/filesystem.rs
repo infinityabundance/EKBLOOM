@@ -73,6 +73,20 @@ fn object_dirs(root: &Path) -> Vec<String> {
     dirs
 }
 
+/// The real `du`-style on-disk bytes of `path`: `st_blocks * 512` per inode
+/// (allocated units), each inode counted once, directories included.
+fn du_bytes(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path).unwrap();
+    let mut total = metadata.blocks().saturating_mul(512).max(metadata.len());
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(path).unwrap() {
+            total = total.saturating_add(du_bytes(&entry.unwrap().path()));
+        }
+    }
+    total
+}
+
 #[test]
 fn create_read_and_stat_across_profiles() {
     let root = temp_root("rt");
@@ -412,6 +426,99 @@ fn same_source_many_profiles_stay_isolated() {
         cases.len(),
         "identically-valued objects shared physical directories"
     );
+
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// The authoritative payload is stored **exactly once**: the visible core of each
+/// object lives only in the single authoritative `.ekb` store, and every other
+/// concealed name is a tiny pointer view (not a duplicated payload).
+#[test]
+fn authoritative_payload_is_stored_exactly_once() {
+    let root = temp_root("dedup");
+    let fs = OrFs::open(&root).unwrap();
+    let src = lcg(0x0BAD_F00D_1234_5678, 4096);
+    fs.create("data/obj.bin", &src, ManifestationProfile::MaxSpeed)
+        .unwrap();
+
+    let dirs = object_dirs(&root);
+    assert_eq!(dirs.len(), 1);
+    let obj = root.join(".ekbloom").join(&dirs[0]);
+    let authoritative = obj.join("manifests");
+    assert!(
+        authoritative.is_file(),
+        "one authoritative `.ekb` per object"
+    );
+
+    // The core bytes occur only in the authoritative file, never in a sidecar.
+    let bytes = std::fs::read(&authoritative).unwrap();
+    let header = ekbloom::format::GenesisHeader::decode(&bytes).unwrap();
+    let start = ekbloom::format::CORE_OFFSET as usize;
+    let core = &bytes[start..start + header.core_len as usize];
+    assert!(core.len() > 256);
+
+    let mut holders = 0usize;
+    for entry in std::fs::read_dir(&obj).unwrap() {
+        let path = entry.unwrap().path();
+        let contents = std::fs::read(&path).unwrap();
+        if contents.len() >= core.len() && contents.windows(core.len()).any(|w| w == core) {
+            holders += 1;
+            assert_eq!(path.file_name().unwrap(), "manifests");
+        }
+    }
+    assert_eq!(holders, 1, "the core payload must be stored exactly once");
+
+    // Every sidecar is a tiny pointer view, so the object directory is only
+    // slightly larger than the single authoritative store.
+    let sidecars: u64 = std::fs::read_dir(&obj)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            if e.file_name() == "manifests" {
+                0
+            } else {
+                e.metadata().unwrap().len()
+            }
+        })
+        .sum();
+    assert!(sidecars < 1024, "sidecars carry no payload: {sidecars} B");
+
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// `inspect_physical` reports the real on-disk allocation of the concealed
+/// namespace: an independent `du`-style walk (allocated blocks per inode,
+/// directories counted once) of `.ekbloom/` plus the logical pointer artifacts
+/// agrees exactly, and each object's `stat().physical_bytes` matches a walk of
+/// its own concealed directory.
+#[test]
+fn inspect_physical_matches_du_style_bytes() {
+    let root = temp_root("du");
+    let fs = OrFs::open(&root).unwrap();
+    fs.create(
+        "data/root.bin",
+        &lcg(0x1111_2222, 1024),
+        ManifestationProfile::Root,
+    )
+    .unwrap();
+    fs.create(
+        "data/path.bin",
+        &lcg(0x3333_4444, 2500),
+        ManifestationProfile::Path { depth: 4 },
+    )
+    .unwrap();
+
+    let report = fs.inspect_physical().unwrap();
+    let mut expected = du_bytes(&root.join(".ekbloom"));
+    for name in ["data/root.bin", "data/path.bin"] {
+        expected = expected.saturating_add(du_bytes(&root.join(name)));
+    }
+    assert_eq!(
+        report.total_bytes, expected,
+        "inspect_physical total must equal the real du-style byte count"
+    );
+    assert!(report.concealed_bytes > 0);
+    assert_eq!(report.logical_bytes, 1024 + 2500);
 
     std::fs::remove_dir_all(&root).unwrap();
 }

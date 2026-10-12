@@ -11,10 +11,13 @@
 #   --security-opt apparmor=unconfined   in case an AppArmor profile blocks FUSE
 #
 # With no arguments it runs, in order:
-#   1. the `tests/fuse.rs` smoke test (real mount + unmount);
+#   1. the `tests/fuse.rs` smoke test (real mount + unmount, and the
+#      backing-surface vs materialised-dispatch vs genuine-machine-decode
+#      byte-exactness test);
 #   2. `examples/fuse_read.rs`, which performs a real mount as the invoking user
-#      and writes evidence/bench/fuse-perf.json (backing-surface vs decode vs
-#      direct read, plus the passthrough probe).
+#      and writes evidence/bench/fuse-perf.json (backing surface vs materialised
+#      dispatch vs genuine machine decode vs direct read, plus the passthrough
+#      probe).
 #
 # Any arguments replace the default command and are run verbatim in the image.
 # Nothing here runs project tooling on the host.
