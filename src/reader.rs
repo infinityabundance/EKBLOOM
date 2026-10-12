@@ -22,7 +22,11 @@ use crate::checkpoint::{parse_checkpoint_layout, CheckpointSet, CKPT_HEADER_MAX}
 use crate::error::{EkbloomError, Result};
 use crate::format::{self, SectionKind};
 use crate::history::History;
-use crate::machine::{machine_by_id, prepare, MACHINE_NL2, MACHINE_RANS0I, MACHINE_STORE};
+use crate::machine::{
+    machine_by_id, prepare, OrMachine, Prepared, MACHINE_NL2, MACHINE_RANS0, MACHINE_RANS0I,
+    MACHINE_STORE,
+};
+use crate::machine_rans::encoded_window_bound;
 use crate::manifest::{ComponentReport, EkbloomBody, ManifestationReport};
 use crate::state::Snapshot;
 use crate::tiles::{
@@ -32,6 +36,7 @@ use crate::ReadRequest;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Read the logical bytes `req.offset .. req.offset + req.length`.
 ///
@@ -589,6 +594,31 @@ fn read_vec_at(file: &File, off: u64, len: u64, total: u64) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Build and validate the retained decoder context for a cursor-divergent
+/// machine (`machine_id` 2 or 4) once, at `open`, from its model header.
+///
+/// Only the header window is fetched (the machine-2 model header, or the
+/// machine-4 `freq` ++ `K` ++ lane-states header, bounded by
+/// [`crate::blocks::RANS_I_MODEL_HEADER_BYTES`]); the rest of the core is never
+/// touched here. A truncated or invalid header is a typed error, so a forged
+/// model is rejected before any read. Returns `None` for machines 1 and 3.
+fn build_prepared(
+    machine: &'static dyn OrMachine,
+    file: &File,
+    core_offset: u64,
+    core_len: u64,
+    total: u64,
+) -> Result<Option<Prepared<'static>>> {
+    let header_bound = match machine.machine_id() {
+        MACHINE_RANS0 => crate::machine_rans::HEADER_BYTES as u64,
+        MACHINE_RANS0I => crate::blocks::RANS_I_MODEL_HEADER_BYTES,
+        _ => return Ok(None),
+    };
+    let n = core_len.min(header_bound);
+    let header = read_vec_at(file, core_offset, n, total)?;
+    Ok(Some(prepare(machine, &header)?))
+}
+
 /// Marker for "this tile is not materialised" in a serialized tile directory.
 const TILE_ABSENT: u32 = u32::MAX;
 /// Tiles per top-level radix group (`1 << RADIX_GROUP_SHIFT`).
@@ -982,15 +1012,16 @@ impl FileBlocks {
     }
 
     /// Read `[offset, offset+length)` from the covering block restart plus a
-    /// bounded machine replay. Only one restart record and the needed core window
-    /// are read.
-    #[allow(clippy::too_many_arguments)]
+    /// bounded machine replay.
+    ///
+    /// Machine 1 (`cursor == position`) reads only the rebased core window
+    /// `[block_start, end)`. A cursor-divergent machine with a retained prepared
+    /// model (2 or 4) fetches only a bounded encoded window after the certified
+    /// restart cursor. Otherwise (machine 3) the non-windowed whole-core path is
+    /// kept, unchanged.
     fn read_range(
         &self,
-        file: &File,
-        core_offset: u64,
-        core_len: u64,
-        total: u64,
+        body: &FileBody,
         offset: u64,
         length: u64,
         end: u64,
@@ -1016,7 +1047,7 @@ impl FileBlocks {
             })?;
         let (state, cursor, wide_omega) = if self.packed {
             let mut e = [0u8; 2];
-            read_exact_at_len(file, &mut e, rel, total)?;
+            body.counted_pread(&mut e, rel)?;
             (
                 u32::from(u16::from_le_bytes(e)),
                 u64::try_from(idx)
@@ -1031,51 +1062,55 @@ impl FileBlocks {
             )
         } else if self.wide {
             let mut e = [0u8; Snapshot::WIDE_LEN];
-            read_exact_at_len(file, &mut e, rel, total)?;
+            body.counted_pread(&mut e, rel)?;
             let s = Snapshot::unpack_wide(&e)?;
-            if s.cursor > core_len {
+            if s.cursor > body.core_len {
                 return Err(bad("block restart cursor exceeds the core length"));
             }
             (s.state, s.cursor, Some(s))
         } else {
             let mut e = [0u8; Snapshot::PACKED_LEN];
-            read_exact_at_len(file, &mut e, rel, total)?;
+            body.counted_pread(&mut e, rel)?;
             let s = Snapshot::unpack(&e)?;
-            if s.cursor > core_len {
+            if s.cursor > body.core_len {
                 return Err(bad("block restart cursor exceeds the core length"));
             }
             (s.state, s.cursor, None)
         };
+        let steps = offset.saturating_sub(start);
+
+        if self.machine_id == MACHINE_NL2 {
+            // `cursor == position`: the rebased window `[start, end)` suffices.
+            let win_to = end.min(body.core_len);
+            let core = body.counted_core_window(
+                body.core_offset
+                    .checked_add(start)
+                    .ok_or(EkbloomError::Overflow {
+                        what: "block core window",
+                    })?,
+                win_to.saturating_sub(start),
+            )?;
+            let machine = machine_by_id(self.machine_id).ok_or(EkbloomError::UnknownMachine {
+                id: self.machine_id,
+            })?;
+            let ctx = prepare(machine, &core)?;
+            let mut omega = Snapshot::new(state, 0);
+            ctx.skip(&core, &mut omega, steps)?;
+            ctx.decode_into(&core, &mut omega, length, out)?;
+            return Ok(());
+        }
+
+        let omega = wide_omega.unwrap_or_else(|| Snapshot::new(state, cursor));
+        if let Some(ctx) = body.prepared.as_ref() {
+            return body.decode_windowed(ctx, omega, steps, length, out);
+        }
+        // Machine 3 (`cursor == position`, no retained model): whole-core path.
+        let core = body.counted_core_window(body.core_offset, body.core_len)?;
         let machine = machine_by_id(self.machine_id).ok_or(EkbloomError::UnknownMachine {
             id: self.machine_id,
         })?;
-
-        // For machine 1 the cursor equals the logical boundary, so the core window
-        // `[start, end)` suffices (rebased to 0); a cursor-divergent machine needs
-        // the full core from byte 0 so its prepared model header is available, with
-        // the stored cursor indexing it directly — the same bounded-by-file tradeoff
-        // as the machine-2 checkpoint path.
-        let (win_from, win_to, mut omega) = if self.machine_id == MACHINE_NL2 {
-            (start, end.min(core_len), Snapshot::new(state, 0))
-        } else {
-            (
-                0,
-                core_len,
-                wide_omega.unwrap_or_else(|| Snapshot::new(state, cursor)),
-            )
-        };
-        let core = read_vec_at(
-            file,
-            core_offset
-                .checked_add(win_from)
-                .ok_or(EkbloomError::Overflow {
-                    what: "block core window",
-                })?,
-            win_to.saturating_sub(win_from),
-            total,
-        )?;
         let ctx = prepare(machine, &core)?;
-        let steps = offset.saturating_sub(start);
+        let mut omega = omega;
         ctx.skip(&core, &mut omega, steps)?;
         ctx.decode_into(&core, &mut omega, length, out)?;
         Ok(())
@@ -1488,6 +1523,17 @@ pub struct FileBody {
     blocks: Vec<FileBlocks>,
     segmented: Option<FileSegmentedHistory>,
     profiles: Vec<String>,
+    /// Retained, validated decoder context for a cursor-divergent machine
+    /// (`machine_id` 2 or 4), built once at `open` from the model header so a
+    /// bounded encoded-window read never re-parses it nor loads the whole core.
+    /// `None` for the delegated machines 1 and 3.
+    prepared: Option<Prepared<'static>>,
+    /// Whether bounded encoded-window reads are enabled (default `true`).
+    windowed: bool,
+    /// Encoded (renormalisation) core bytes fetched on the read path so far.
+    fetched_bytes: AtomicU64,
+    /// Read-path `pread` count so far.
+    fetched_reads: AtomicU64,
 }
 
 impl FileBody {
@@ -1859,6 +1905,8 @@ impl FileBody {
             ));
         }
 
+        let prepared = build_prepared(machine, &file, core_offset, core_len, physical_len)?;
+
         Ok(FileBody {
             file,
             logical_len: manifest.logical_len,
@@ -1875,6 +1923,10 @@ impl FileBody {
             blocks,
             segmented,
             profiles: manifest.profiles,
+            prepared,
+            windowed: true,
+            fetched_bytes: AtomicU64::new(0),
+            fetched_reads: AtomicU64::new(0),
         })
     }
 
@@ -1946,16 +1998,7 @@ impl FileBody {
     ) -> Result<bool> {
         for blocks in &self.blocks {
             if blocks.covers(offset, end) {
-                blocks.read_range(
-                    &self.file,
-                    self.core_offset,
-                    self.core_len,
-                    self.physical_len,
-                    offset,
-                    length,
-                    end,
-                    out,
-                )?;
+                blocks.read_range(self, offset, length, end, out)?;
                 return Ok(true);
             }
         }
@@ -1980,6 +2023,125 @@ impl FileBody {
                 what: "core window offset",
             })?;
         read_vec_at(&self.file, off, to - from, self.physical_len)
+    }
+
+    /// Encoded (renormalisation) core bytes fetched by reads on this body so far.
+    ///
+    /// This is the counter the bounded-window contract is stated over: a read
+    /// needing `s` positioning steps and `n` output symbols fetches at most
+    /// `2 * (s + n) + margin` encoded bytes (see [`encoded_window_bound`]) and
+    /// never the whole core. Open-time hashing is not counted.
+    #[inline]
+    pub fn fetched_bytes(&self) -> u64 {
+        self.fetched_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The number of read-path `pread` calls performed so far.
+    #[inline]
+    pub fn fetched_reads(&self) -> u64 {
+        self.fetched_reads.load(Ordering::Relaxed)
+    }
+
+    /// Enable or disable bounded encoded-window reads (default enabled).
+    ///
+    /// Correctness is identical either way; only the number of encoded bytes
+    /// fetched differs. Provided so a benchmark can measure the pre-change
+    /// whole-core fetch in the same binary.
+    #[inline]
+    pub fn set_bounded_windows(&mut self, enabled: bool) {
+        self.windowed = enabled;
+    }
+
+    /// A bounds-checked `pread` that also accounts a read-path syscall.
+    fn counted_pread(&self, buf: &mut [u8], off: u64) -> Result<()> {
+        read_exact_at_len(&self.file, buf, off, self.physical_len)?;
+        self.fetched_reads.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Fetch a core byte window and account it as both a syscall and encoded
+    /// bytes fetched.
+    fn counted_core_window(&self, off: u64, len: u64) -> Result<Vec<u8>> {
+        let buf = read_vec_at(&self.file, off, len, self.physical_len)?;
+        self.fetched_reads.fetch_add(1, Ordering::Relaxed);
+        self.fetched_bytes.fetch_add(len, Ordering::Relaxed);
+        Ok(buf)
+    }
+
+    /// Decode `length` output symbols after `steps` positioning steps from the
+    /// certified restart `omega` (its `cursor` is an absolute core offset).
+    ///
+    /// For a cursor-divergent machine this fetches **only** a bounded encoded
+    /// window after that cursor — `min(2 * (steps + length) + margin, remaining)`
+    /// bytes — and decodes from a cursor rebased onto the window using the
+    /// retained prepared model. No whole-core buffer is built and the model header
+    /// is never re-parsed. If the proven bound is ever insufficient (a crafted or
+    /// edge state), the bounded remainder of the core is fetched and retried once,
+    /// and only then is a typed error returned.
+    fn decode_windowed(
+        &self,
+        ctx: &Prepared<'_>,
+        omega: Snapshot,
+        steps: u64,
+        length: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        ctx.validate_restart(&omega)?;
+        if !self.windowed {
+            // Pre-change behaviour, kept for measurement: fetch the whole core and
+            // decode with the absolute cursor indexing it directly.
+            let core = self.counted_core_window(self.core_offset, self.core_len)?;
+            let mut local = omega;
+            return self.window_decode(ctx, &core, &mut local, steps, length, out);
+        }
+        let c = omega.cursor;
+        if c > self.core_len {
+            return Err(bad("restart cursor exceeds the core length"));
+        }
+        if c < ctx.min_cursor() {
+            return Err(bad("restart cursor precedes the model header"));
+        }
+        let avail = self.core_len - c;
+        let want = encoded_window_bound(steps, length).min(avail);
+        let base = self
+            .core_offset
+            .checked_add(c)
+            .ok_or(EkbloomError::Overflow {
+                what: "core window offset",
+            })?;
+        let mark = out.len();
+        let window = self.counted_core_window(base, want)?;
+        let mut local = omega;
+        local.cursor = 0;
+        match self.window_decode(ctx, &window, &mut local, steps, length, out) {
+            Ok(()) => Ok(()),
+            Err(EkbloomError::CoreTooShort { .. }) if want < avail => {
+                out.truncate(mark);
+                let mut local = omega;
+                local.cursor = 0;
+                let full = self.counted_core_window(base, avail)?;
+                self.window_decode(ctx, &full, &mut local, steps, length, out)
+            }
+            Err(e) => {
+                out.truncate(mark);
+                Err(e)
+            }
+        }
+    }
+
+    /// Skip `steps` then reveal `length` symbols from `local` against `window`
+    /// (whose byte 0 is `local.cursor` 0).
+    fn window_decode(
+        &self,
+        ctx: &Prepared<'_>,
+        window: &[u8],
+        local: &mut Snapshot,
+        steps: u64,
+        length: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        ctx.skip(window, local, steps)?;
+        ctx.decode_into(window, local, length, out)
     }
 
     /// Path 1: read the certified path-bloom `hot` slice directly. Returns `true`
@@ -2124,15 +2286,15 @@ impl FileBody {
             })?;
         let omega = if cp.packed {
             let mut e = [0u8; 2];
-            read_exact_at_len(&self.file, &mut e, entry_off, self.physical_len)?;
+            self.counted_pread(&mut e, entry_off)?;
             Snapshot::new(u32::from(u16::from_le_bytes(e)), expected_cursor)
         } else if cp.wide {
             let mut entry = [0u8; Snapshot::WIDE_LEN];
-            read_exact_at_len(&self.file, &mut entry, entry_off, self.physical_len)?;
+            self.counted_pread(&mut entry, entry_off)?;
             Snapshot::unpack_wide(&entry)?
         } else {
             let mut entry = [0u8; Snapshot::PACKED_LEN];
-            read_exact_at_len(&self.file, &mut entry, entry_off, self.physical_len)?;
+            self.counted_pread(&mut entry, entry_off)?;
             Snapshot::unpack(&entry)?
         };
         let machine = machine_by_id(self.machine_id).ok_or(EkbloomError::UnknownMachine {
@@ -2140,14 +2302,17 @@ impl FileBody {
         })?;
 
         if self.machine_id != MACHINE_NL2 {
-            // Cursor-divergent machine (e.g. machine 2): the checkpoint carries
-            // the true backing cursor, and reconstruction is bounded by the
-            // interval (`<= K - 1` replay steps) but needs the whole core because
-            // the cursor does not match the logical position. This is still a
-            // bounded-step, byte-exact reconstruction.
+            // Cursor-divergent machine: the checkpoint carries the true backing
+            // cursor. With a retained prepared model (machine 2 or 4) the read is
+            // served from a bounded encoded window after that cursor and a rebased
+            // cursor; machine 3 (no retained model) keeps the whole-core path.
+            let steps = offset.saturating_sub(expected_cursor);
+            if let Some(ctx) = self.prepared.as_ref() {
+                self.decode_windowed(ctx, omega, steps, length, out)?;
+                return Ok(true);
+            }
             let core = self.read_core(0, self.core_len)?;
             let ctx = prepare(machine, &core)?;
-            let steps = offset.saturating_sub(expected_cursor);
             let mut local = omega;
             ctx.skip(&core, &mut local, steps)?;
             ctx.decode_into(&core, &mut local, length, out)?;
@@ -2868,5 +3033,225 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounded encoded-window reads.
+    // -----------------------------------------------------------------------
+
+    /// A skewed byte source that machine 2/4 compress (`V < N`).
+    fn skewed(seed: u64, len: usize) -> Vec<u8> {
+        let mut s = seed;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let r = (s >> 33) % 100;
+            out.push(if r < 70 {
+                b'a'
+            } else if r < 92 {
+                b'b'
+            } else {
+                b'c'
+            });
+        }
+        out
+    }
+
+    /// Build, write, and reopen a block-indexed `.ekb` for `src`/`machine_id`.
+    fn window_body(tag: &str, src: &[u8], machine_id: u32) -> (std::path::PathBuf, FileBody) {
+        use crate::blocks::BlockIndex;
+        let machine = machine_by_id(machine_id).unwrap();
+        let core = machine.encode(src).unwrap();
+        let index = BlockIndex::build_machine(&core, src.len() as u64, 256, machine_id).unwrap();
+        let mut body =
+            crate::manifest::create_machine(src, ManifestationProfile::Root, machine_id).unwrap();
+        body.blocks.push(index);
+        let dir = std::env::temp_dir().join(format!("ekbloom-window-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("w.ekb");
+        crate::writer::write_body(&path, &body).unwrap();
+        let opened = FileBody::open(&path).unwrap();
+        (path, opened)
+    }
+
+    #[test]
+    fn windowed_reads_are_exact_and_bounded_for_machine2_and_machine4() {
+        use crate::machine::{MACHINE_RANS0, MACHINE_RANS0I};
+        for &(tag, machine_id) in &[("m2", MACHINE_RANS0), ("m4", MACHINE_RANS0I)] {
+            let src = skewed(0xA11C_E000 + u64::from(machine_id), 65536);
+            let n = src.len() as u64;
+            let (path, body) = window_body(tag, &src, machine_id);
+            let reference = open(&path).unwrap();
+            assert_eq!(body.logical_len(), n);
+
+            let mut probes = vec![
+                (0u64, 0u64),
+                (0, 1),
+                (1, 1),
+                (255, 1),
+                (256, 2),
+                (300, 4096),
+            ];
+            for k in 1..4u64 {
+                let boundary = 256 * k;
+                probes.push((boundary - 1, 2));
+                probes.push((boundary, 4096));
+            }
+            probes.push((n - 5, 5));
+            probes.push((n, 0));
+
+            for &(off, len) in &probes {
+                let before = body.fetched_bytes();
+                let got = body
+                    .read(ReadRequest {
+                        offset: off,
+                        length: len,
+                    })
+                    .unwrap();
+                let fetched = body.fetched_bytes() - before;
+                assert_eq!(
+                    got,
+                    &src[off as usize..(off + len) as usize],
+                    "{tag} window read ({off},{len})"
+                );
+                // Agreement with the authoritative reader as well.
+                assert_eq!(
+                    got,
+                    read(
+                        &reference,
+                        ReadRequest {
+                            offset: off,
+                            length: len
+                        }
+                    )
+                    .unwrap()
+                );
+                if len > 0 {
+                    let steps = (off % 256) + len;
+                    assert!(
+                        fetched <= 2 * steps + crate::machine_rans::WINDOW_MARGIN,
+                        "{tag} ({off},{len}) fetched {fetched} > bound"
+                    );
+                    // A 4 KiB read in a 64 KiB object never reads the whole core.
+                    if len == 4096 && off < n / 2 {
+                        assert!(
+                            fetched < body.core_len,
+                            "{tag} read the whole core: {fetched}"
+                        );
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn window_matches_the_non_windowed_path_byte_for_byte() {
+        use crate::machine::{MACHINE_RANS0, MACHINE_RANS0I};
+        for &(tag, machine_id) in &[("m2", MACHINE_RANS0), ("m4", MACHINE_RANS0I)] {
+            let src = skewed(0xC0FF_EE00 + u64::from(machine_id), 16384);
+            let n = src.len() as u64;
+            let (path, mut body) = window_body(tag, &src, machine_id);
+            for &(off, len) in &[(0u64, n), (1, 63), (300, 4096), (n - 7, 7)] {
+                let windowed = body
+                    .read(ReadRequest {
+                        offset: off,
+                        length: len,
+                    })
+                    .unwrap();
+                body.set_bounded_windows(false);
+                let whole = body
+                    .read(ReadRequest {
+                        offset: off,
+                        length: len,
+                    })
+                    .unwrap();
+                body.set_bounded_windows(true);
+                assert_eq!(windowed, whole, "{tag} window/non-window ({off},{len})");
+                assert_eq!(windowed, &src[off as usize..(off + len) as usize]);
+            }
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn forged_and_out_of_range_restart_states_are_rejected() {
+        use crate::machine::MACHINE_RANS0;
+        let src = skewed(0xDEAD_BEEF, 4096);
+        let (path, body) = window_body("forge", &src, MACHINE_RANS0);
+        let ctx = body.prepared.as_ref().unwrap();
+        // Below `RANS_L`: a forged/under-range state.
+        let low = Snapshot::new(0, crate::machine_rans::HEADER_BYTES as u64);
+        assert!(matches!(
+            ctx.validate_restart(&low),
+            Err(EkbloomError::BadSection { .. })
+        ));
+        // At/above `RANS_L << 8`: would overflow the step arithmetic.
+        let high = Snapshot::new(u32::MAX, crate::machine_rans::HEADER_BYTES as u64);
+        assert!(ctx.validate_restart(&high).is_err());
+        // A legal state is accepted.
+        let good = Snapshot::new(crate::machine_rans::RANS_L, 600);
+        assert!(ctx.validate_restart(&good).is_ok());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn machine4_inconsistent_lane_restart_is_rejected() {
+        use crate::machine::MACHINE_RANS0I;
+        let src = skewed(0xF00D_1234, 4096);
+        let (path, body) = window_body("lane", &src, MACHINE_RANS0I);
+        let ctx = body.prepared.as_ref().unwrap();
+        let header = crate::blocks::RANS_I_MODEL_HEADER_BYTES;
+        let mut s = Snapshot::with_lanes(
+            header,
+            [crate::machine_rans::RANS_L; crate::state::MAX_LANES],
+            0,
+        );
+        // `state` disagrees with `lanes[lane]` after mutation.
+        s.state = crate::machine_rans::RANS_L + 1;
+        assert!(ctx.validate_restart(&s).is_err());
+        // A lane count beyond the core's `K` is rejected too.
+        let mut bad = s;
+        bad.state = bad.lanes[0];
+        bad.lane = crate::state::MAX_LANES as u8;
+        assert!(ctx.validate_restart(&bad).is_err());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn too_short_window_cursor_exhausts_cleanly() {
+        use crate::machine::MACHINE_RANS0;
+        let src = skewed(0x5A5A_0000, 2048);
+        let (path, body) = window_body("short", &src, MACHINE_RANS0);
+        let ctx = body.prepared.as_ref().unwrap();
+        // A restart cursor at the very end of the core cannot supply any bytes.
+        let omega = Snapshot::new(crate::machine_rans::RANS_L, body.core_len);
+        let mut out = Vec::new();
+        assert!(matches!(
+            body.decode_windowed(ctx, omega, 0, 4, &mut out),
+            Err(EkbloomError::CoreTooShort { .. })
+        ));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn truncated_file_read_is_a_clean_error() {
+        use crate::machine::MACHINE_RANS0;
+        let src = skewed(0x7777_8888, 4096);
+        let (path, body) = window_body("trunc", &src, MACHINE_RANS0);
+        // Truncate the backing file after opening; the read path must fail with a
+        // typed error (never a panic or wrong bytes).
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len(crate::format::CORE_OFFSET + 64).unwrap();
+        drop(f);
+        let res = body.read(ReadRequest {
+            offset: 3000,
+            length: 64,
+        });
+        assert!(res.is_err());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

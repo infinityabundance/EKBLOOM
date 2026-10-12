@@ -126,7 +126,7 @@ pub use machine::{
     machine_by_id, prepare, state_log_with, OrMachine, Prepared, MACHINE_NL2, MACHINE_RANS0,
     MACHINE_RANS0I, MACHINE_STORE, NL2,
 };
-pub use machine_rans::{Rans0, RANS0};
+pub use machine_rans::{encoded_window_bound, Rans0, RANS0, RENORM_MAX_PER_STEP, WINDOW_MARGIN};
 pub use machine_rans_i::{
     encode_with_k, Rans0I, RansIContext, DEFAULT_K as RANS_I_DEFAULT_K, RANS0I,
 };

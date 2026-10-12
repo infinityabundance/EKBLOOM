@@ -31,6 +31,7 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`KERNELS.md`](KERNELS.md) | **SIMD reconstruction kernels** (directive §6): Kernel A/B, each kept or rejected with measured ratios. |
 | [`MMAP.md`](MMAP.md) | **Read-only mapped surface + huge pages** (`src/mapped.rs`): mmap KEEP, huge pages rejected. |
 | [`BLOCKS.md`](BLOCKS.md) | **Machine-2 independently restartable blocks** (+ compact packed checkpoints): bounded positional reconstruction, 38–330× vs genesis. |
+| [`WINDOW.md`](WINDOW.md) | **Bounded encoded-window reads** for cursor-divergent machines 2/4: the proven `2·(steps+symbols)`-byte bound and the before/after whole-core-fetch demonstration. |
 | [`ENGINE.md`](ENGINE.md) | The **unified bounded-access engine** (`src/engine.rs`): per-region `worst_case_steps` + request-level `worst_case_steps_for`, five certified bounded paths, committed-vs-active budget, machine-4 cold engine, rejects unbounded bodies. |
 | [`FRONTIER.md`](FRONTIER.md) | **The engine vs indexed codecs** (LZ4/Zstd no-cache / LRU / **pinned-hot**) and raw under one equal budget, with the corrected **footprint-not-latency** milestone verdict. |
 | [`GPU.md`](GPU.md) | **Batched independent reconstruction** (`src/batch.rs`, 8.57× at 16 threads) and the honest accelerator/GPU boundary (`available() == false`). |
@@ -75,6 +76,7 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`bench/mmap.json`](../evidence/bench/mmap.json) | `pread`/resident/`mmap`/`mmap_huge`: latency, faults, and the huge-page non-result. |
 | [`bench/rans.json`](../evidence/bench/rans.json) | Machine-2 ready decode context: prepared vs per-symbol rebuild (**165×** on skewed), byte-exact. |
 | [`bench/blocks.json`](../evidence/bench/blocks.json) | Machine-2 restartable blocks (256 B–64 KiB) vs genesis and the packed checkpoint container (**1/6**). |
+| [`bench/window.json`](../evidence/bench/window.json) | Bounded encoded-window reads for machines 2/4: 4 KiB on a 64 MiB object fetches 10,270,243 B → **16,440 B** (**625×**), same syscalls. |
 | [`bench/frontier.json`](../evidence/bench/frontier.json) | The engine vs indexed LZ4/Zstd (no cache / LRU / **pinned-hot**) and raw: hot index ratio, footprint at non-evicting hot access (**not** latency — the corrected headline). |
 | [`bench/fuse-perf.json`](../evidence/bench/fuse-perf.json) | Measured FUSE read-path cost vs a direct read and the `FUSE` passthrough / `FUSE`-over-`io_uring` non-result. |
 | [`bench/batch.json`](../evidence/bench/batch.json) | Batched independent reconstruction: CPU-thread scaling (8.57× at 16 threads, every row byte-exact) and the GPU-unavailable verdict. |
@@ -103,10 +105,11 @@ sh scripts/run-planner-bg.sh        # planner-bg.json
 sh scripts/run-mmap.sh              # mmap.json
 sh scripts/run-rans.sh              # rans.json (machine-2 prepared decode context)
 sh scripts/run-blocks.sh            # blocks.json (machine-2 blocks + packed checkpoints)
+sh scripts/run-window.sh            # window.json (bounded encoded-window reads, machines 2/4)
 sh scripts/run-frontier.sh          # frontier.json (engine vs indexed codecs)
 sh scripts/run-fuse-perf.sh         # fuse-perf.json (requires /dev/fuse)
 sh scripts/run-batch.sh             # batch.json (batched reconstruction + GPU verdict)
-sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (28 files)
+sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (29 files)
 sh scripts/container-fuzz.sh        # all libFuzzer targets (fuzz_machine/open/bloom/history_store/packed/tiles/blocks/batch/rans_i)
 sh scripts/container-loom.sh        # Loom model checking
 sh scripts/capture-environment.sh   # environment.txt

@@ -244,6 +244,7 @@ impl Prepared<'_> {
     /// Advance `omega` by exactly `n` reveal steps, discarding the symbols.
     pub fn skip(&self, core: &[u8], omega: &mut Snapshot, n: u64) -> Result<()> {
         match self {
+            Prepared::Rans(ctx) => ctx.skip(core, omega, n),
             Prepared::RansI(ctx) => ctx.skip(core, omega, n),
             _ => {
                 for _ in 0..n {
@@ -265,6 +266,9 @@ impl Prepared<'_> {
         if let Prepared::RansI(ctx) = self {
             return ctx.decode_into(core, omega, n, out);
         }
+        if let Prepared::Rans(ctx) = self {
+            return ctx.decode_into(core, omega, n, out);
+        }
         if let Ok(cap) = usize::try_from(n) {
             out.reserve(cap);
         }
@@ -272,6 +276,49 @@ impl Prepared<'_> {
             out.push(self.reveal(core, omega)?);
         }
         Ok(())
+    }
+
+    /// Whether this prepared context is a **cursor-divergent** rANS machine
+    /// (`machine_id` 2 or 4) whose backing cursor is independent of the logical
+    /// position, so a read can be served from a bounded encoded window and a
+    /// rebased cursor. The delegated machines (1, 3) return `false`.
+    #[inline]
+    pub fn is_windowed(&self) -> bool {
+        matches!(self, Prepared::Rans(_) | Prepared::RansI(_))
+    }
+
+    /// The minimal legal encoded cursor: the model-header length for a
+    /// cursor-divergent machine, `0` for the delegated machines.
+    #[inline]
+    pub fn min_cursor(&self) -> u64 {
+        match self {
+            Prepared::Rans(ctx) => ctx.header_bytes(),
+            Prepared::RansI(ctx) => ctx.header_bytes(),
+            Prepared::Delegated(_) => 0,
+        }
+    }
+
+    /// Validate a restart snapshot so the `RENORM_MAX_PER_STEP * (steps + symbols)`
+    /// encoded-window bound holds and the step arithmetic cannot overflow.
+    ///
+    /// Machines 2 and 4 require every active state in `[RANS_L, RANS_L << 8)`
+    /// (and, for machine 4, a consistent lane array); a forged or out-of-range
+    /// restart is a typed error, never a silent wrong decode. The delegated
+    /// machines (1, 3) have no state constraint (their cursor *is* the position).
+    pub fn validate_restart(&self, omega: &Snapshot) -> Result<()> {
+        match self {
+            Prepared::Rans(_) => {
+                if crate::machine_rans::valid_state(omega.state) {
+                    Ok(())
+                } else {
+                    Err(EkbloomError::BadSection {
+                        reason: format!("rans restart state {} out of range", omega.state),
+                    })
+                }
+            }
+            Prepared::RansI(ctx) => ctx.validate_snapshot(omega),
+            Prepared::Delegated(_) => Ok(()),
+        }
     }
 }
 

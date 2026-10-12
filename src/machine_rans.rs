@@ -50,6 +50,47 @@ pub(crate) const HEADER_BYTES: usize = MODEL_BYTES + 4;
 /// rarely and would otherwise spin.
 pub(crate) const MAX_STEPS_PER_BYTE: u64 = 4096;
 
+/// Exclusive upper bound of a legal coder state: a genuine encoder keeps every
+/// state in `[RANS_L, RANS_L << 8)`, which is also the range machine 4 validates
+/// its lane states against at parse time.
+pub(crate) const RANS_X_MAX: u32 = RANS_L << 8;
+
+/// Whether `x` is a legal single-lane coder state (`[RANS_L, RANS_L << 8)`).
+///
+/// The windowed reader requires this so the step arithmetic cannot overflow and
+/// the two-bytes-per-step renormalisation bound holds; a forged state outside
+/// the range is rejected rather than decoded.
+#[inline]
+pub(crate) fn valid_state(x: u32) -> bool {
+    (RANS_L..RANS_X_MAX).contains(&x)
+}
+
+/// Maximum number of renormalisation bytes a single decoder step may consume.
+///
+/// For a valid state `x >= RANS_L` the pre-renorm successor is
+/// `x' = floor(x / 2^SCALE_BITS) * f + r` with `f >= 1` and `r = slot - cum >= 0`,
+/// so `x' >= RANS_L >> SCALE_BITS = 2^11`; two 8-bit renormalisation reads then
+/// give `x' * 2^16 >= 2^27 > RANS_L = 2^23`, so the renorm loop stops after at
+/// most two reads. See `docs/WINDOW.md`.
+pub const RENORM_MAX_PER_STEP: u64 = 2;
+
+/// Safety margin added to the proven `RENORM_MAX_PER_STEP * (steps + symbols)`
+/// encoded-byte bound for a bounded window.
+pub const WINDOW_MARGIN: u64 = 64;
+
+/// Upper bound on the encoded (renormalisation) bytes a bounded window must hold
+/// to run `steps` positioning steps followed by `symbols` output symbols from a
+/// valid restart state: `RENORM_MAX_PER_STEP * (steps + symbols) + margin`, with
+/// saturating arithmetic. It excludes the validated model header, which the
+/// decoder parses and retains separately (never as part of the window).
+#[inline]
+pub fn encoded_window_bound(steps: u64, symbols: u64) -> u64 {
+    steps
+        .saturating_add(symbols)
+        .saturating_mul(RENORM_MAX_PER_STEP)
+        .saturating_add(WINDOW_MARGIN)
+}
+
 /// The `OrANS-RANS0` machine.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Rans0;
@@ -204,6 +245,14 @@ impl RansContext {
     #[inline]
     pub(crate) fn table(&self) -> &[u32] {
         &self.entries
+    }
+
+    /// The model-header length in bytes: the minimal legal encoded cursor, past
+    /// which renormalisation bytes begin. A bounded-window read starts its window
+    /// here (never inside the header).
+    #[inline]
+    pub fn header_bytes(&self) -> u64 {
+        HEADER_BYTES as u64
     }
 
     /// One decoder step: resolve the symbol owning `x & 4095` from the fused table

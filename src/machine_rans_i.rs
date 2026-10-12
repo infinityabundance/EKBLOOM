@@ -36,7 +36,7 @@
 use crate::error::{EkbloomError, Result};
 use crate::machine::{OrMachine, MACHINE_RANS0I};
 use crate::machine_rans::{
-    Model, RansContext, M, MAX_STEPS_PER_BYTE, MODEL_BYTES, RANS_L, SCALE_BITS,
+    valid_state, Model, RansContext, M, MAX_STEPS_PER_BYTE, MODEL_BYTES, RANS_L, SCALE_BITS,
 };
 use crate::state::{Snapshot, MAX_LANES};
 
@@ -121,7 +121,7 @@ impl RansIContext {
         let table = RansContext::from_core(core)?;
         let initial = read_states(core, k);
         for &x in initial[..k].iter() {
-            if !(RANS_L..RANS_L << 8).contains(&x) {
+            if !valid_state(x) {
                 return Err(EkbloomError::BadSection {
                     reason: format!("interleaved rANS lane state {x} out of range"),
                 });
@@ -138,6 +138,43 @@ impl RansIContext {
     #[inline]
     pub fn lanes(&self) -> usize {
         self.k
+    }
+
+    /// The model-header length in bytes (`freq` ++ `K` ++ `K` lane states): the
+    /// minimal legal encoded cursor for this core.
+    #[inline]
+    pub fn header_bytes(&self) -> u64 {
+        self.header_bytes as u64
+    }
+
+    /// Validate a complete restart snapshot for this prepared context: the active
+    /// lane index must be in range, every active lane state must be a legal coder
+    /// state (`[RANS_L, RANS_L << 8)`), and `state` must agree with `lanes[lane]`.
+    /// A forged or internally inconsistent restart is rejected rather than
+    /// decoded, so a windowed read can never return bytes from a bad state.
+    pub fn validate_snapshot(&self, s: &Snapshot) -> Result<()> {
+        let lane = usize::from(s.lane);
+        if lane >= self.k {
+            return Err(EkbloomError::BadSection {
+                reason: format!(
+                    "interleaved rANS restart lane {lane} out of range [0, {})",
+                    self.k
+                ),
+            });
+        }
+        for (i, &x) in s.lanes[..self.k].iter().enumerate() {
+            if !valid_state(x) {
+                return Err(EkbloomError::BadSection {
+                    reason: format!("interleaved rANS restart lane {i} state {x} out of range"),
+                });
+            }
+        }
+        if s.state != s.lanes[lane] {
+            return Err(EkbloomError::BadSection {
+                reason: "interleaved rANS restart state disagrees with its lane array".to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// The genesis snapshot `(initial_states, header_len, lane 0)`.
