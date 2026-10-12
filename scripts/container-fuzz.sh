@@ -78,7 +78,7 @@ docker run --rm \
         failed=0
         # Every target declared in fuzz/Cargo.toml. Keep this list in sync with
         # that manifest so the campaign covers the whole fuzz surface.
-        for TARGET in fuzz_machine fuzz_open fuzz_bloom fuzz_history_store fuzz_packed fuzz_tiles fuzz_blocks; do
+        for TARGET in fuzz_machine fuzz_open fuzz_bloom fuzz_history_store fuzz_packed fuzz_tiles fuzz_blocks fuzz_batch fuzz_rans_i; do
             start=$(date +%s)
             echo "ekbloom-fuzz: running $TARGET"
             if cargo fuzz run "$TARGET" -- -runs="$EKB_FUZZ_RUNS" -max_total_time="$EKB_FUZZ_SECS"; then

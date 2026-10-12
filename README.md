@@ -96,6 +96,19 @@ original specification lives in `research/`.
    `worst_case_steps`, retaining **0.27×–0.79× raw** on skewed/mixed data with a
    non-eviction advantage over indexed codecs, while honestly failing on uniform
    data (1.07×) and cold-vs-bare-LZ4 ([`docs/FRONTIER.md`](docs/FRONTIER.md)).
+16. **Limitations closure (rounds L1–L4) — four gaps folded in honestly.** The
+   verbatim-identity machine 3 (`OrANS-Store`) plus the `auto` policy make the
+   **base representation never expand past raw** (**1.0000×** on uniform); the
+   allocation-free borrowed `ResidentView` reaches raw-`Vec` **parity** on a
+   resident 1-byte lookup (0.95–1.03×; the per-call `byte_at` dispatch residual
+   stays 4.2–5.7×); interleaved machine 4 **narrows but does not close** the cold
+   gap to block-indexed LZ4 (**1.46–1.59×** faster than machine 2); the keyed-MAC
+   `AUTH` covers **every** section with fail-closed `--require-auth`; and batched
+   independent reconstruction scales to **8.57× at 16 threads** while the GPU
+   backend is honestly **unavailable** (`available() == false`). Details and the
+   remaining honest losses are below and in [`docs/FRONTIER.md`](docs/FRONTIER.md),
+   [`docs/CODEC.md`](docs/CODEC.md), [`docs/SECURITY.md`](docs/SECURITY.md),
+   [`docs/FUSE.md`](docs/FUSE.md) and [`docs/GPU.md`](docs/GPU.md).
 
 ---
 
@@ -593,7 +606,7 @@ affix parser (`tiles::parse_tile_set_prefix`, including the `tile_shift` guard)
 is shared by the in-memory and file-backed readers, so parsing happens in exactly
 one place. `sh scripts/validate-evidence.sh`
 (`examples/validate_evidence.rs`, dependency-free) validates every
-`evidence/**/*.json`: **27** files `OK` (up from 24).
+`evidence/**/*.json`: **28** files `OK` (up from 24; `batch.json` added in L4).
 - **R2 — machine-2 prepared decode context, encode-first budgets, bounded cold
 reconstruction, cache single-flight.** A validated `RansContext` (frequencies,
 prefix sums, 4096-entry slot table) is built **once** per bulk decode instead of
@@ -627,9 +640,72 @@ It honestly loses to bare LZ4 on cold 4 KiB decompress
 ([`docs/ENGINE.md`](docs/ENGINE.md), [`docs/FRONTIER.md`](docs/FRONTIER.md),
 `evidence/bench/frontier.json`).
 - **R4 — verifier completeness.** `verify`/`verify_deep` now **re-derive the
-regional successor cursor** from the authoritative machine pass and compare it
-to the stored records (a forged cursor is now `Rejected`, closing the earlier
-verifier gap), and the region-bounds computation uses a checked `start + len` add.
+  regional successor cursor** from the authoritative machine pass and compare it
+  to the stored records (a forged cursor is now `Rejected`, closing the earlier
+  verifier gap), and the region-bounds computation uses a checked `start + len` add.
+
+### Limitations closure (rounds L1–L4)
+
+The final rounds fold four long-standing limitations into the certified body, each
+with an honest keep/narrow/reject verdict. The reviewed surface is L1–L4
+(`docs/reviews/adversarial.md`, `docs/reviews/security.md` Revision 5); the new
+properties are P24–P28 in [`docs/PROOFS.md`](docs/PROOFS.md).
+
+- **L1 — allocation-free reads, verbatim identity, and a base that never expands.**
+  The per-call read API is now allocation-free (`Engine::byte_at`,
+  `Engine::read_into`, `fastpath::byte_at`), and the fully resident
+  allocation-parity index measures **1.00–1.05×** a raw `Vec` for a 1-byte read
+  (`evidence/bench/frontier.json` `hot_index`; [`docs/FRONTIER.md`](docs/FRONTIER.md)
+  §2.1). A new machine 3 (`OrANS-Store`, `machine_id = 3`) is the **verbatim
+  identity** codec (`encode(source) == source`, `V = N` exactly, no model header,
+  `cursor == position`), and the `auto` policy uses it whenever machine 2 does not
+  shrink the source, so the **base representation never exceeds raw**: measured
+  **1.0000×** on uniform random data (machine 3) and **0.198×** on skewed (machine
+  2) ([`docs/CODEC.md`](docs/CODEC.md)). *Honest residual: the per-call
+  `Engine::byte_at` still pays a ~4.2–5.7× dispatch/bounds cost over a bare
+  `raw[i]`; only the borrowed resident view removes it.*
+- **L1b — the borrowed resident view meets the <15% target.** `fastpath::ResidentView`
+  resolves the plan **once** and hands back a borrowed `(&[u8], base)`; the hot loop
+  is then `view.get(i)` — one bounds check and a bare load. Measured **0.95×** at
+  1 MiB and **1.03×** at 256 MiB (committed `byte_at_residency`; the doc's run
+  0.94–1.05×), both **inside 15%**, so the resident 1-byte target is **MET** for the
+  tight hot path. The per-call `Engine::byte_at` dispatch residual stays explicit
+  ([`docs/FRONTIER.md`](docs/FRONTIER.md) §2.2–§2.3).
+- **L2/L2b — cold decode narrows, but does not close, the gap to LZ4.** The new
+  interleaved order-0 machine 4 (`OrANS-RANS0I`, `K` independent rANS lanes, default
+  `K = 4`) decodes at **2.17–2.36 ns/byte** vs machine 2's **3.45** — **1.46×** at
+  `K = 4`, **1.59×** at `K = 8`, byte-exact (`evidence/bench/frontier.json`
+  `decode_rate`). At a comparable footprint its best *compressing* cold read is
+  **10.0 µs (4 KiB)** / **151 µs (64 KiB)** while storing **3.1× less** than
+  block-indexed LZ4 (876,155 B vs 2,675,864 B), yet LZ4 decompresses the same block
+  in **2.8 µs** / **33 µs** — so EKBLOOM stays **≈3.5× (4 KiB) to ≈4.6× (64 KiB)**
+  behind, down from ≈5–7×. Cold decode-rate is a genuine space/speed frontier
+  position, **not closed** ([`docs/FRONTIER.md`](docs/FRONTIER.md) §4,
+  [`docs/CODEC.md`](docs/CODEC.md)).
+- **L3 — FUSE direct backing surfaces, and authenticity when required.**
+  `ReadMode::Auto` serves a read from a fully materialised, logically-aligned
+  surface by a **direct bounded copy** (a *marginal* ~1.2× win on **uncached** 4 KiB
+  FUSE requests; the full 2 MiB read is dominated by `/dev/fuse` round-trips, and
+  the standalone mapped surface gives the zero-syscall floor). True
+  `FUSE_PASSTHROUGH` remains **unsupported** by `fuser` 0.15.1 (reported
+  `fuser_supports: false`) and is probed honestly
+  ([`docs/FUSE.md`](docs/FUSE.md), `evidence/bench/fuse-perf.json`). The opt-in
+  keyed MAC now covers **every** section — history/segmented, packed checkpoints,
+  all four bloom kinds, certificates, tiles, blocks and the manifest — and strict
+  mode (`--require-auth` / `open_require_auth` / `verify_file_require_auth`)
+  **requires** a valid tag (an unkeyed or stripped-`AUTH` file is rejected):
+  **integrity *and* authenticity** when a key is used
+  ([`docs/SECURITY.md`](docs/SECURITY.md)). *Honest residual: the commit footer and
+  the `AUTH` tag itself lie outside the literal MAC range and are cross-checked
+  (footer ↔ covered manifest), not MAC-covered; there is no anti-rollback.*
+- **L4 — batched independent reconstruction; the accelerator boundary is honest.**
+  `src/batch.rs` reconstructs independent restart windows byte-exactly and scales
+  with cores — **4.01× at 4 threads, 6.92× at 8, 8.57× at 16** (`evidence/bench/batch.json`,
+  every row `exact: true`; the 16-thread gain is SMT under an 8-CPU quota). A GPU
+  backend is **not implemented**: `GpuBackend::available()` returns `false`
+  unconditionally, `accelerator_device_present()` is `false`, and no accelerator
+  path is ever taken — the batch API is documented as the boundary such a backend
+  would plug into ([`docs/GPU.md`](docs/GPU.md)).
 
 ---
 
@@ -666,7 +742,11 @@ The `fuse` cargo feature (off by default) adds a **read-only** FUSE filesystem
 presenting the logical `OrFs` namespace while keeping the manifested store
 concealed; `.ekbloom-physical.json` at the mount root reports administrative
 physical accounting and is never logical content. Mounting needs `/dev/fuse` and
-`CAP_SYS_ADMIN` and only ever happens when `mount` is called explicitly. See
+`CAP_SYS_ADMIN` and only ever happens when `mount` is called explicitly.
+`ReadMode::Auto` (the default) serves a fully materialised, logically-aligned
+object from a **direct backing surface** by a bounded copy (a marginal win on
+**uncached** 4 KiB FUSE requests); true kernel `FUSE_PASSTHROUGH` is unsupported
+by this `fuser` version and is probed honestly (round L3). See
 [`docs/FUSE.md`](docs/FUSE.md); run with `sh scripts/container-fuse.sh`.
 
 ---
@@ -702,6 +782,7 @@ sh scripts/run-rans.sh              # evidence/bench/rans.json (machine-2 prepar
 sh scripts/run-blocks.sh            # evidence/bench/blocks.json (machine-2 blocks + packed checkpoints)
 sh scripts/run-frontier.sh          # evidence/bench/frontier.json (engine vs indexed codecs)
 sh scripts/run-fuse-perf.sh         # evidence/bench/fuse-perf.json (requires /dev/fuse)
+sh scripts/run-batch.sh             # evidence/bench/batch.json (batched reconstruction + GPU verdict)
 sh scripts/validate-evidence.sh     # validate every evidence/**/*.json
 sh scripts/container-loom.sh        # Loom model checking (tests/loom.rs)
 sh scripts/container-reproduce.sh   # clean build + tests from scratch
@@ -711,7 +792,7 @@ sh scripts/capture-environment.sh   # write evidence/environment.txt
 Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 (libFuzzer — runs **every** target declared in `fuzz/Cargo.toml`:
 `fuzz_machine`, `fuzz_open`, `fuzz_bloom`, `fuzz_history_store`, `fuzz_packed`,
-`fuzz_tiles`, `fuzz_blocks`), `scripts/container-miri.sh` (UB),
+`fuzz_tiles`, `fuzz_blocks`, `fuzz_batch`, `fuzz_rans_i`), `scripts/container-miri.sh` (UB),
 `scripts/container-sanitize.sh` (AddressSanitizer), and `scripts/container-fuse.sh`
 (read-only FUSE mount).
 
@@ -731,7 +812,32 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 
 ---
 
-## Unresolved limitations
+## Limitations — resolved (L1–L4) and remaining
+
+### Resolved in rounds L1–L4
+
+- **The base representation never expands past raw** (L1). Machine 3
+  (`OrANS-Store`) is the verbatim identity (`encode = source`, `V = N`), and the
+  `auto` policy selects it whenever compression does not help: uniform base
+  footprint **1.0000×** raw, skewed `0.198×`
+  ([`docs/CODEC.md`](docs/CODEC.md)). *(The *manifested hot body* on uniform data
+  is still larger than raw — 1.07×, below.)*
+- **The 1-byte resident-read target is met** (L1b). The borrowed
+  `fastpath::ResidentView` reaches raw-`Vec` parity (0.95–1.03×, inside 15%) for a
+  fully resident lookup; the allocation-free per-call `byte_at`/`read_into`
+  removes the per-call `Vec` (its dispatch residual remains, below).
+- **The cold decode gap to block-indexed LZ4 narrowed** (L2/L2b), from ≈5–7× to
+  **≈3.5–4.6×**, via the interleaved machine 4 — but is **not closed** (below).
+- **FUSE read cost was reduced in userspace** (L3). `ReadMode::Auto` serves a fully
+  materialised, logically-aligned surface by a direct bounded copy; true kernel
+  `FUSE_PASSTHROUGH` remains unsupported (below).
+- **Authenticity when required** (L3). The opt-in keyed MAC covers **every**
+  section of the commit, and strict mode (`--require-auth`) fails closed when no
+  valid tag is present: integrity **and** authenticity.
+- **Batched reconstruction scales with cores** (L4) — **8.57× at 16 threads**,
+  every row byte-exact (the GPU backend remains unimplemented, below).
+
+### Remaining (honest)
 
 - **No certified universal 65,536-entry `T_4[x]`.** For a byte-decoding machine
   the 16-bit state alone cannot determine the next symbol — the next core byte
@@ -745,9 +851,27 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 - **Regional blooms certify only where the per-region state→context map is
   unambiguous**; on pseudorandom data they are rejected and give no speedup, and
   the region-scoped competition loses to an LRU cache on hot reads.
-- **Machine 2 compresses only skewed data and zeroes the win at O(1) reads.** Its
-  cursor diverges from the logical position, so only checkpoint sets restart and
-  the file reader replays for machine 2. Uniform data is `V/N ≈ 1.015×`.
+- **1-byte *per-call* `byte_at` still pays a dispatch residual.** The
+  allocation-free `Engine::byte_at` is **4.2–5.7×** a bare `raw[i]` (bounds/`Result`
+  plus a per-call `Arc<AccessPlan>` deref, `HotIndex` match, tile/bloom index and
+  `hot_surface()` re-validation); only the borrowed `ResidentView` hoists that out
+  of the loop (`docs/FRONTIER.md` §2).
+- **Machine 2/4 have decode-read semantics and a divergent cursor.** Their cores
+  compress skewed sources (`V < N`), but the cursor is a byte offset that diverges
+  from the logical position, so the state-only projection is not resumable: only
+  the complete resumable states restart, and the file reader replays for them.
+  Uniform data is `V/N ≈ 1.015×` for machine 2 (machine 3 gives exactly `1.0000×`).
+- **Cold decode-rate still loses to bare LZ4** — narrowed (**≈3.5–4.6×**) by the
+  interleaved machine 4 but not closed: rANS keeps an ordered renormalising cursor
+  and a per-symbol table gather that LZ4's copy-based block decode avoids
+  ([`docs/CODEC.md`](docs/CODEC.md), `docs/FRONTIER.md` §4).
+- **Uniform data has no space win in the manifested body.** The *base* is exactly
+  `N` (machine 3, never larger than raw), but the manifested hot body + block
+  index retains **1.07× raw** on incompressible data; the unified engine's one
+  reproducible win there is non-eviction ([`docs/FRONTIER.md`](docs/FRONTIER.md) §5).
+- **GPU is not implemented.** `GpuBackend::available()` is `false` and no
+  accelerator path is taken; the batch API is only the *boundary* a device backend
+  would plug into ([`docs/GPU.md`](docs/GPU.md)).
 - **SIMD/CPU tuning did not win.** Alignment, software prefetch, AVX-512 gather
   and AVX2 gather all measured neutral or slower; the hot path stays scalar
   (`docs/LAYOUT.md`).
@@ -763,19 +887,25 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
   `cursor == position`; cursor-divergent machine 2 is rejected/N/A (`docs/PACKED.md`).
 - **FUSE passthrough and FUSE-over-`io_uring` are infeasible here.** The target of
   serving a fully materialised, logically aligned file via kernel passthrough is a
-  recorded non-result (`docs/FUSE.md`, `evidence/bench/fuse-perf.json`).
+  recorded non-result (`fuser` 0.15.1 exposes no passthrough ABI); the userspace
+  direct-backing-surface mode is the honest substitute (`docs/FUSE.md`,
+  `evidence/bench/fuse-perf.json`).
 - **io_uring is slower here for small single-file writes** (~2.2×, median
   416,158 vs 189,884 ns over 15 publications for a ~1 MiB body); its value is a
   genuine completion-driven API and transparent fallback, not throughput. It is
   runtime-verified only under `seccomp=unconfined` (`docs/ASYNC.md`).
+- **The commit footer and the `AUTH` tag are cross-checked, not MAC-covered.** The
+  keyed MAC covers `file[0, auth_header_offset)`; the trailing footer (and the
+  `AUTH` section's own bytes) are outside that range and are validated only
+  structurally and by the footer↔manifest cross-check; there is **no
+  anti-rollback** and key management is the caller's (`docs/SECURITY.md`,
+  `docs/reviews/adversarial.md` Revision 5).
 - **Segmented history states are unauthenticated by default.** `open`/`verify`
   check the `core_hash`/`logical_len` linkage but never authenticate the stored
   segments; only the opt-in `AUTH` mode covers them.
 - **Benchmarks are single-host, single-run, memory/CPU-capped.** Not a
   multi-platform study; percentiles come from 256 samples. Path-family ordering
   within ~3% is run-to-run noise (`docs/reviews/reproducibility.md`).
-- **Budgets have no anti-rollback and no key management.** `AUTH` is opt-in; a
-  leaked key defeats it ([`docs/SECURITY.md`](docs/SECURITY.md)).
 - OrFS is in-process; the FUSE projection is opt-in and read-only.
 
 ---
@@ -807,6 +937,7 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 - `evidence/bench/blocks.json` — machine-2 restartable blocks (**38–330×** vs genesis) + packed checkpoint format (**1/6**).
 - `evidence/bench/frontier.json` — the unified engine vs indexed codecs (LZ4/Zstd ± cache) and raw.
 - `evidence/bench/fuse-perf.json` — measured FUSE read-path cost and the passthrough non-result.
+- `evidence/bench/batch.json` — batched independent reconstruction (8.57× at 16 threads) and the honest GPU-unavailable verdict.
 - `evidence/counterexamples/` — rejected state-keyed blooms.
 - `evidence/model-search/` — finite-model sufficiency sweep.
 
@@ -817,9 +948,9 @@ Documentation map:
 | [`docs/INDEX.md`](docs/INDEX.md) | One-page index of all docs and evidence. |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Frozen internal engineering contract. |
 | [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | The 10 hard gates mapped to tests and commands. |
-| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties P1–P23 (machine 1 + machine 2 + the round-3/round-4 modules) and honest limitations. |
+| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties P1–P28 (machine 1 + machine 2 + the round-3/round-4 modules + the L1–L4 closure) and honest limitations. |
 | [`docs/RESULTS.md`](docs/RESULTS.md) | Measured results and the 65,536 research outcome. |
-| [`docs/CODEC.md`](docs/CODEC.md) | Machine 2 (`OrANS-RANS0`) compressing codec contract. |
+| [`docs/CODEC.md`](docs/CODEC.md) | Machine 2 (`OrANS-RANS0`), machine 3 (`OrANS-Store`, identity) and machine 4 (`OrANS-RANS0I`, interleaved) codecs + the `auto` policy. |
 | [`docs/BASELINES.md`](docs/BASELINES.md) | Conventional baseline comparison (`RawVec`/`RawFile`/…). |
 | [`docs/COMPETITIVE.md`](docs/COMPETITIVE.md) | Region-scoped manifestation vs an ordinary LRU cache and raw. |
 | [`docs/ASYNC.md`](docs/ASYNC.md) | The `io_uring` asynchronous publication backend. |
@@ -839,6 +970,7 @@ Documentation map:
 | [`docs/BLOCKS.md`](docs/BLOCKS.md) | Machine-2 independently restartable blocks + compact (packed) checkpoints. |
 | [`docs/ENGINE.md`](docs/ENGINE.md) | The unified bounded-access engine (`worst_case_steps`, certified dispatch). |
 | [`docs/FRONTIER.md`](docs/FRONTIER.md) | The engine vs indexed codecs (LZ4/Zstd ± cache) and raw, under one budget. |
+| [`docs/GPU.md`](docs/GPU.md) | Batched independent reconstruction (`src/batch.rs`) and the honest accelerator/GPU boundary. |
 | [`docs/reviews/adversarial.md`](docs/reviews/adversarial.md) | Adversarial correctness review. |
 | [`docs/reviews/concurrency.md`](docs/reviews/concurrency.md) | Concurrency audit + Loom model checking. |
 | [`docs/reviews/mathematics.md`](docs/reviews/mathematics.md) | Independent re-derivation of the proofs. |

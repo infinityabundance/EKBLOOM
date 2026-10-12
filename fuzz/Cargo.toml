@@ -63,3 +63,17 @@ path = "fuzz_targets/fuzz_blocks.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_batch"
+path = "fuzz_targets/fuzz_batch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_rans_i"
+path = "fuzz_targets/fuzz_rans_i.rs"
+test = false
+doc = false
+bench = false

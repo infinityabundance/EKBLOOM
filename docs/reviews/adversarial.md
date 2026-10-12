@@ -387,3 +387,115 @@ reachable through the honest writer.
 it returns `false` (the position is never covered), so the read path cleanly falls
 back to bounded restart. Regression test:
 `region_adapt::tests::covers_rejects_overflowing_forged_region`.
+
+## Revision 5 — machines 3/4, `batch`, `ResidentView`, AUTH byte-coverage, FUSE (verdict **NO DEFECT FOUND**)
+
+Round 5 attacks the newest L1–L4 surface. All attacks are executable and live in
+`tests/adversarial_r5.rs` (13 tests, all green) plus a non-mount fallback case in
+`tests/fuse.rs`. No library defect was found, so there is no new finding to FIX or
+REPORT; the one non-test change was a chore (below).
+
+### Attack 8 — machine 3 (identity) and machine 4 (interleaved rANS)
+
+* **Roundtrip.** Machine 3: `encode == source` for every category, `decode` exact, and
+  a mid-stream `(0, p)` restart reveals `src[p..]` for `p ∈ [0,8]`. Machine 4: for
+  every category and `K ∈ {1,2,4,8}`, `skip(p)` + bulk decode equals `src[p..]`,
+  stepwise `reveal` equals the bulk decode, and the symbols equal machine 2's oracle
+  for **all** `K ∈ [1,8]` — lanes never poison each other.
+* **Cross-oracle.** `reader::read` equals the source for machines 3 and 4 over
+  `Root`/`Sparse`/`Path`/`MaxSpeed` at every boundary range (`(0,1)`, `(1,4095)`,
+  `(4095,2)`, `(2048,300)`, `(n-5,5)`, `(n,0)`).
+* **Hostile headers.** `[]` / 100 / 515 zero bytes; `K ∈ {0,9,u32::MAX}`; a lane table
+  that does not fit; zero frequency; frequency sum `≠ M`; a lane state below
+  `RANS_L`; a short renormalisation stream; 64 random 600-byte images — every entry
+  point (`from_core`, `decode`, `check_core`, `state_log`, `reveal`, `peek`, `skip`)
+  is a clean `Err`, never a panic and never an attacker-sized allocation.
+* **Arithmetic safety (why no finding).** The fused-table invariant `slot >= cum`
+  makes `(x>>12)*f + slot - c` non-narrowing for *any* lane state (even one the
+  header did not range-check), and `f ≤ 3841`, `x>>12 ≤ 2^20−1`, so the product stays
+  `< 2^32`: no debug-build overflow even on a forged state — the same reasoning that
+  clears machine 2 in Revision 4.
+
+### Attack 9 — `ResidentView`
+
+Byte-exact against `reader::read` for **all four machines** over both a whole-object
+`HotTile` plan and a `Path`/`DirectStorage` plan, at start/end/boundary offsets
+(`{0,1,4095,4096,4097,8191,n/2,n-2,n-1}`) and a 300-byte cross-tile window.
+`get_checked(n)`, `get_checked(u64::MAX)`, `copy_range(n,..)`, `copy_range(u64::MAX,..)`
+are `None`/`false`; `get` past the end panics exactly as slice indexing does. The
+engine refuses a mixed-path plan (no single resident slice).
+
+### Attack 10 — AUTH byte-coverage (hunting for an uncovered section)
+
+The committed `tests/auth_coverage.rs` already tampers every non-AUTH section of a
+rich body — history/**segmented**, packed checkpoints, **all** bloom kinds incl.
+regional, tiles, blocks, and a self-consistent core+manifest forge — with the
+section CRC recomputed, and every case is rejected by `open_bytes_require_auth` /
+`verify_file_require_auth`; unkeyed and wrong-key files are rejected in strict mode;
+honest files pass. R5 pushed on the region **outside** the literal MAC range
+`[0, auth.header_offset)` and found only fail-closed behaviour:
+
+1. **Footer** (not MAC-covered): flipping its generation and re-sealing its CRC is
+   rejected, because the footer is cross-checked against the covered manifest.
+2. **Trailing bytes** after the last footer: dropped as a torn tail; the reopened
+   object and every read are unchanged.
+3. **The AUTH tag itself** (also outside its own range): flipping a payload byte and
+   re-sealing the section CRC is rejected by the keyed MAC.
+4. **Appended generation** (the sharpest probe): appending a structurally valid but
+   **unkeyed** generation (`writer::append_generation`), or one authenticated under
+   the **wrong key** (`append_generation_authenticated` with a different key), does
+   not inject content — `open_bytes_require_auth` skips it and returns the honest
+   authenticated generation, byte-exact. The unkeyed reader does see the append,
+   which is precisely the trust boundary opt-in AUTH draws.
+
+**Verdict:** no uncovered section can change a read; the only uncovered bytes (the
+footer, the AUTH tag, and post-footer tail) fail closed.
+
+### Attack 11 — `select_machine`/`auto` and `batch::BatchReconstructor`
+
+`auto` selects machine 3 for incompressible data (`V == N <= raw`) and machine 2 for
+compressible data (`V < N`); explicit machine ids are honoured exactly. The batched
+reconstructor is byte-exact vs the authoritative machine for machines 1/3/4 at
+thread counts `{0,1,2,3,5,7,8,16,64}`, for empty/single/large and boundary-sized
+batches, preserves output order, and never silently takes an accelerator path
+(`accelerator_available() == false`).
+
+### Attack 12 — FUSE `ReadMode::Auto`
+
+A surface is attached only when it is a fully materialised, logically-aligned object
+(`OrFs::aligned_surface` is `None` for a `Root` object), so reads fall back to
+`OrFs::read`; both the surface and decode paths are byte-exact across
+region-crossing windows. Exercised by the surface-vs-decode unit test and by the new
+non-mount `tests/fuse.rs::auto_uses_a_surface_only_when_present_and_the_decoder_is_byte_exact`,
+which runs in the ordinary gate; the real-mount tests also pass in this environment.
+
+### Fuzz campaign (Revision 5)
+
+`sh scripts/container-fuzz.sh` runs **all nine** targets clean: `fuzz_batch` (34,466
+runs, 61 s) and `fuzz_rans_i` (100,000 runs, 48 s) are joined by the seven existing
+targets; no crash, no leak, and the build is warning-free.
+
+### Evidence (Revision 5)
+
+`sh scripts/container-reproduce.sh` completed: clean `--locked --release` build, full
+`--release` suite **523 passed / 0 failed / 0 ignored**, then
+`sh scripts/validate-evidence.sh` → **28** evidence JSON files `OK`. The verify gate
+(`cargo fmt --check`, `clippy -D warnings`, `cargo test --all-features`) is green at
+**535 passed** (13 R5 + 3 FUSE).
+
+### Chore (non-library)
+
+`fuzz/fuzz_targets/fuzz_batch.rs` imported `OrMachine` unused (trait methods resolve
+through the `dyn OrMachine` receiver); removed so the fuzz build is warning-free. No
+library behaviour changed.
+
+### Residual risk (Revision 5)
+
+* **No defect found**; no open finding from this pass.
+* The commit `footer` and the `AUTH` tag lie outside the MAC's literal range; their
+  rejection rests on the footer↔manifest cross-checks (and, for the tag, the keyed
+  hash). A future footer field that is neither cross-checked nor MAC-covered would
+  reopen a window — the parser currently rejects any disagreement.
+* Strict authenticated open prefers the newest authenticating generation: an appended
+  unauthenticated generation is a rollback/DoS, not an integrity break.
+* Integrity is not authenticity; only opt-in `AUTH` is the authenticity boundary.

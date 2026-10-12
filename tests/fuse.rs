@@ -8,7 +8,7 @@
 
 #![cfg(all(feature = "fuse", target_os = "linux"))]
 
-use ekbloom::{mount, mount_with, ManifestationProfile, MountOptions, OrFs, ReadMode};
+use ekbloom::{mount, mount_with, ManifestationProfile, MountOptions, OrFs, ReadMode, ReadRequest};
 use std::path::PathBuf;
 
 /// A unique temporary directory, removed by the caller.
@@ -218,4 +218,80 @@ fn backing_surface_and_decode_paths_are_byte_exact() {
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&auto_mnt).ok();
     std::fs::remove_dir_all(&decode_mnt).ok();
+}
+
+/// `ReadMode::Auto` attaches a monolithic backing surface only for a fully
+/// materialised, logically-aligned object. An object without one exposes **no**
+/// surface (`aligned_surface` is `None`), so the read must fall back to the
+/// decoder. Both the present- and absent-surface cases must decode byte-exactly,
+/// including windows that cross a 4096-byte region boundary.
+///
+/// Unlike the mount tests above, this needs no `/dev/fuse`: it drives the public
+/// `OrFs` discovery/read API directly, so it runs in the ordinary gate.
+#[test]
+fn auto_uses_a_surface_only_when_present_and_the_decoder_is_byte_exact() {
+    let root = temp_dir("surface-fallback");
+    let src = lcg(0x5A1F_ACE0, 8 * 1024 + 5);
+    {
+        let fs = OrFs::open(&root).unwrap();
+        // `Root` manifests no whole-object output surface: reads must decode.
+        fs.create("data/plain.bin", &src, ManifestationProfile::Root)
+            .unwrap();
+        // `Path` materialises the whole output as one aligned surface.
+        fs.create(
+            "data/hot.bin",
+            &src,
+            ManifestationProfile::Path { depth: 4 },
+        )
+        .unwrap();
+    }
+    let fs = OrFs::open(&root).unwrap();
+
+    assert!(
+        fs.aligned_surface("data/plain.bin").unwrap().is_none(),
+        "an un-materialised object must expose no backing surface (decode fallback)"
+    );
+    let surface = fs
+        .aligned_surface("data/hot.bin")
+        .unwrap()
+        .expect("a path-bloom object exposes an aligned surface");
+    assert_eq!(surface.logical_len, src.len() as u64);
+
+    // Decoder path over both objects, byte-exact including boundary-crossing reads.
+    for &(off, len) in &[
+        (0u64, 1u64),
+        (1, 4095),
+        (4095, 2),
+        (4096, 4096),
+        (src.len() as u64 - 3, 3),
+        (0, src.len() as u64),
+    ] {
+        let want = &src[off as usize..(off + len) as usize];
+        assert_eq!(
+            fs.read(
+                "data/plain.bin",
+                ReadRequest {
+                    offset: off,
+                    length: len
+                }
+            )
+            .unwrap(),
+            want,
+            "plain decode ({off},{len})"
+        );
+        assert_eq!(
+            fs.read(
+                "data/hot.bin",
+                ReadRequest {
+                    offset: off,
+                    length: len
+                }
+            )
+            .unwrap(),
+            want,
+            "hot decode ({off},{len})"
+        );
+    }
+
+    std::fs::remove_dir_all(&root).ok();
 }

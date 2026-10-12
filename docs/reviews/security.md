@@ -636,4 +636,105 @@ files `OK`.
 * Integrity is not authenticity, as throughout: a forger who recomputes the
   section CRC and the core linkage authors a different valid object; only opt-in
   `AUTH` is an authenticity boundary.
+
+## Revision 5 — `machine_store`, `machine_rans_i`, `batch`, `ResidentView`, AUTH coverage (verdict **NO DEFECT FOUND**)
+
+Independent, executable attacks over the newest L1–L4 surface: machines 3 and 4,
+`batch::BatchReconstructor`, the borrowed `ResidentView`, the `auto` policy, and the
+byte coverage of the opt-in `AUTH` MAC. Pinned by `tests/adversarial_r5.rs` (13
+tests) and an extended non-mount case in `tests/fuse.rs`; every assertion is against
+the authoritative machine, `reader::read`, or the keyed MAC — never against another
+manifested structure.
+
+### Machines 3 and 4 — **held**
+
+* **Machine 3 (identity).** `encode == source` for every category (empty, one,
+  all-256, repeating, skewed, random); `check_core`/`decode` exact; a mid-stream
+  restart `(0, p)` reveals `src[p..]` for every `p ∈ [0, 8]`.
+* **Machine 4 (interleaved rANS).** For every category and `K ∈ {1,2,4,8}`: a
+  prepared `skip(p)` followed by a bulk decode equals `src[p..]` (skipping corrupts
+  no lane), stepwise `reveal` equals the bulk decode, `lanes() == K`, and the decoded
+  symbols equal machine 2's oracle for **all** `K ∈ [1,8]` (lanes are isolated).
+  `reader::read` is byte-exact for machines 3 and 4 on
+  `Root`/`Sparse`/`Path`/`MaxSpeed` at every boundary range.
+* **Crafted/truncated headers.** `[]`, `[0u8;100]`, `[0u8;515]`; `K ∈ {0,9,u32::MAX}`;
+  a lane table that does not fit; a zero frequency; a frequency sum `≠ M`; a lane
+  state below `RANS_L`; a short renormalisation stream; 64 random 600-byte images →
+  all clean `Err`, never a panic. The fused table's `slot >= cum` invariant keeps
+  `(x>>12)*f + slot - c` inside `u32` even for an unvalidated state, so the step
+  cannot overflow in a debug build either — the same argument that clears machine 2.
+* **Structures.** Both machines drive `CheckpointSet::restore_with` (exact at every
+  position), `BlockIndex` (exact/certified for `B ∈ {1,7,256,4096}`) and the
+  `n+1`-entry state log.
+
+### `ResidentView` — **held**
+
+Byte-exact vs `reader::read` for **all four machines** over two surfaces (a
+whole-object `HotTile` plan and a certified `Path`/`DirectStorage` plan) at
+`{0, 1, 4095, 4096, 4097, 8191, n/2, n-2, n-1}` plus a 300-byte tile-crossing
+window; `get_checked`/`copy_range` past the end are `None`/`false`; `get` panics only
+as slice indexing does (documented). A mixed-path plan is rejected.
+
+### AUTH coverage — **held; no uncovered section changes a read**
+
+`AUTH` is the final section and its MAC covers `[0, auth.header_offset)` — verified
+by the committed `tests/auth_coverage.rs` to contain the header, core, alignment
+padding and every other section of a rich body (history/segmented, packed
+checkpoints, every bloom kind incl. regional, tiles, blocks, manifest). Tampering
+any (with its CRC recomputed) is rejected; unkeyed and wrong-key files are rejected
+in strict mode; honest files pass.
+
+**Outside the literal MAC range**, the R5 attacks found only fail-closed regions:
+
+* A re-sealed **footer** tamper (generation) breaks the manifest cross-check, so the
+  commit does not parse and strict open rejects it.
+* Arbitrary **trailing** bytes after the last footer are dropped as a torn tail and
+  cannot change a read.
+* A **tampered AUTH tag** (its own payload), even with the section CRC re-sealed, is
+  rejected by the keyed MAC.
+* A whole **appended generation** — unkeyed, or `AUTH`-carrying under the wrong key,
+  both structurally valid so `scan` accepts them — is *skipped* by
+  `open_bytes_authenticated`, which selects the honest authenticated generation; the
+  returned bytes are the honest bytes. (The unkeyed view does see the append — the
+  exact boundary opt-in AUTH closes.)
+
+### `select_machine`/`auto` and `batch` — **held**
+
+`auto` picks machine 3 for incompressible data (`V == N <= raw`) and machine 2 for
+compressible data (`V < N`); explicit machine ids are exact. `batch` is byte-exact
+vs the authoritative machine for machines 1/3/4 at thread counts
+`{0,1,2,3,5,7,8,16,64}`, for empty/single/large/boundary batches, preserves order,
+and `accelerator_available() == false` (no GPU path is selected).
+
+### FUSE `ReadMode::Auto` — **held**
+
+`OrFs::aligned_surface` exposes a surface only for a fully materialised object; a
+`Root` object has none, so reads fall back to `OrFs::read`. Both the decode path and
+the surface path are byte-exact across region-boundary-crossing windows. The
+surface-vs-decode unit test and the new non-mount `tests/fuse.rs` case run in the
+ordinary gate; the mount tests also pass here.
+
+### Fuzz + evidence (Revision 5)
+
+`sh scripts/container-fuzz.sh` now runs **all nine** targets clean — the seven
+existing plus `fuzz_batch` (34,466 runs / 61 s, no crash) and `fuzz_rans_i`
+(100,000 runs / 48 s, no crash); the fuzz build is warning-free.
+`sh scripts/container-reproduce.sh` completed: clean `--locked --release` build,
+**523 passed / 0 failed / 0 ignored**, then `sh scripts/validate-evidence.sh` →
+**28** evidence JSON files `OK`. The formatting gate is green (`cargo fmt --check`,
+`clippy -D warnings`, `cargo test --all-features`: **535 passed**, incl. 13 R5 tests
+and 3 FUSE tests).
+
+### Residual risk (Revision 5)
+
+* **No defect found this pass**; no regression test was needed beyond the attacks.
+* The commit **footer** is bound to the MAC-covered manifest by cross-checks rather
+  than by direct MAC coverage; that reasoning depends on `parse_commit`'s checks
+  remaining complete (they reject any disagreement).
+* Strict authenticated open **prefers the newest authenticating generation**, so an
+  appended unauthenticated generation is a rollback/DoS, never an integrity break.
+* `ReadMode::Auto` serves the `.ekb` path-bloom region by `pread`; a caller who
+  mutates that file after mount steps outside the mount's snapshot assumption.
+* Integrity is still not authenticity: only opt-in `AUTH` is the authenticity
+  boundary.
  

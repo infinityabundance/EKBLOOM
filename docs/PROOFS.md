@@ -869,7 +869,165 @@ interfere).
 
 ---
 
-## Unresolved limitations (honest)
+## P24. Machine 3 (`OrANS-Store`) is the verbatim-identity codec and the `auto` policy never expands the base representation — **PROVED** (identity + policy), **EMPIRICALLY OBSERVED** (footprint)
+
+**Claim.** Machine 3 (`machine_id = 3`, `src/machine_store.rs`): `encode(source) =
+source` verbatim; one step `reveal` returns `core[cursor]`, sets
+`state = u32::from(symbol)` and advances `cursor` by one, so `p_i = i`
+(`cursor == position`, exactly as machine 1); genesis is `(0, 0)`; `check_core`
+requires `logical_len <= core.len()`. Hence `V = N` exactly — no model header, no
+expansion, no rounding — decode is exact, and every position-rebasing structure
+(checkpoints, packed restarts, tiles, blocks, regions, the bounded engine) applies
+through the machine-general paths. The `auto` policy (`manifest::create_auto`)
+selects machine 3 whenever machine 2 does not shrink the source
+(`core_len >= source_len`), so the base representation satisfies `V <= N` for
+every source.
+
+**Proof.** `encode` is the identity function, so `decode(core) = core[0..N] =
+source`; one step advances both the cursor and the logical position by one, so
+`cursor == position` matches machine 1's rebasing invariant. The policy compares
+`core_len` with `source_len` and keeps the smaller (ties to machine 3), so
+`base_bytes <= N`. ∎
+
+**Corroboration.** Uniform random 4 MiB: machine 3 base `4,194,304 B` = raw
+(**1.0000×**); skewed: machine 2 base `830,013 B` (**0.198×**)
+(`evidence/bench/frontier.json` `representation`/`hot_index`). *Honest residual:
+the **manifested hot body** on uniform data is larger than raw (1.07×).*
+
+**Tested:** `tests/machine_store.rs`; `tests/adversarial_r5.rs` (Attack 11);
+independently attacked in `docs/reviews/adversarial.md` and
+`docs/reviews/security.md` (Revision 5).
+
+---
+
+## P25. Machine 4 (`OrANS-RANS0I`) interleaved order-0 rANS is exactly invertible and its `K` lanes are isolated — **PROVED** (lane isolation + invertibility), **EMPIRICALLY OBSERVED** (narrowed cold rate)
+
+**Claim.** Machine 4 (`machine_id = 4`, `src/machine_rans_i.rs`) keeps `K`
+independent 32-bit rANS states and codes symbol `i` in lane `i % K`. Decode is the
+exact inverse of encode for every source and every `K ∈ [1, 8]`, the decoded
+symbols equal machine 2's oracle for all `K` (lanes never poison one another), and
+the decode rate escapes machine 2's irreducible serial state chain.
+
+**Proof (lane isolation).** Each lane is an independent rANS coder over the
+subsequence of symbols congruent to that lane modulo `K`; the model is
+byte-for-byte machine 2's (`M = 1 << 12`, `RANS_L = 1 << 23`). A step on lane `l`
+reads and writes only lane `l`'s state and the shared renormalising cursor, and
+each group of `K` consecutive symbols visits every lane exactly once, so the `K`
+per-group table loads and updates are `K` independent scalar chains. The `K`
+initial states are stored, and the renorm bytes are the encoder's emission
+sequence reversed, so a forward read is exactly the per-lane order the decoder
+needs; by induction each lane inverts its own subcoder, hence
+`decode ∘ encode = id`. The fused-table invariant `slot >= cum` makes
+`(x>>12)*f + slot - c` non-narrowing and bounded (`f ≤ 3841`, `x>>12 ≤ 2^20−1`), so
+the step cannot overflow even on an unvalidated state. ∎
+
+**Corroboration.** On the 4 MiB skewed corpus machine 4 decodes at **2.364 ns/byte**
+(`K = 4`, **1.46×**) and **2.167 ns/byte** (`K = 8`, **1.59×**) versus machine 2's
+**3.447**, all byte-exact; its best *compressing* cold 4 KiB read is **10.0 µs** at
+`876,155 B` (**3.1×** less than block-indexed LZ4's `2,675,864 B`) yet still
+**≈3.5×** behind LZ4's **2.8 µs** (narrowed from ≈5–7×, **not closed**).
+`evidence/bench/frontier.json` (`decode_rate`, `cold_reads`).
+
+**Tested:** `tests/machine_rans_i.rs`; `tests/adversarial_r5.rs` (Attack 8); fuzzed
+by `fuzz/fuzz_targets/fuzz_rans_i.rs`.
+
+---
+
+## P26. `fastpath::ResidentView` is byte-exact and reaches raw-index parity — **PROVED** (byte-exactness), **EMPIRICALLY OBSERVED** (ratio)
+
+**Claim.** `ResidentView::new(&engine, &body)` resolves the certified hot plan
+**once** (the `Arc<AccessPlan>` deref, the resident-index `match`, the tile/bloom
+index and the `hot_surface()` re-validation) and borrows a `(&[u8], base)`;
+`get(i)` is byte-identical to `reader::read` for **all four machines** over both a
+whole-object `HotTile` plan and a certified `Path`/`DirectStorage` plan, and
+out-of-range `get_checked`/`copy_range` are `None`/`false` (`get` past the end
+panics exactly as slice indexing does).
+
+**Proof.** The view borrows the same certified surface the engine's hot index
+points at and applies `base + i`; because the plan is resolved once, every
+subsequent access is a bare bounds-checked slice index, so the dispatch residual
+attributed to `Engine::byte_at` (P22) is paid **once per object/generation** rather
+than once per byte. Byte-exactness follows because the borrowed slice is exactly
+the authoritative output for the covered range; the engine refuses a mixed-path
+plan (no single resident slice). ∎
+
+**Corroboration.** `view.get(i)` measures **0.95×** (1 MiB) and **1.03×**
+(256 MiB) a raw index, both **inside 15%**; the borrowed slice alone is
+0.96×/0.94×. `evidence/bench/frontier.json` (`byte_at_residency`). *Honest
+residual: the per-call `Engine::byte_at` remains 4.2–5.7× (§P22, limitation 12).*
+
+**Tested:** `tests/adversarial_r5.rs` (Attack 9), `tests/fastpath.rs`;
+`docs/reviews/adversarial.md`/`security.md` (Revision 5).
+
+---
+
+## P27. The opt-in `AUTH` keyed MAC covers every section, and strict mode is fail-closed — **PROVED** (coverage by construction), **EMPIRICALLY OBSERVED** (tamper/strict tests)
+
+**Claim.** On an authenticated write the writer emits one `AUTH` section as the
+**final** section before the `CommitFooter`, carrying
+`MAC = blake3::keyed_hash(K, BLAKE3(file[0, auth_header_offset)))`, whose covered
+range includes the genesis header, the core plus alignment padding, and **every**
+section (history/segmented, packed checkpoints, all bloom kinds,
+certificates, tiles, blocks and the manifest). `open_authenticated` rejects a
+missing or mismatching tag, and **strict mode** (`open_require_auth`,
+`verify_file_require_auth`, CLI `--require-auth`) *requires* a valid tag: an
+unkeyed or stripped-`AUTH` file is rejected with no fallback.
+
+**Proof (coverage).** Sections are emitted in a fixed order with `AUTH` last
+(immediately before the footer); no section kind is written after `AUTH`, so the
+range `file[0, auth_header_offset)` contains the header, core, padding and every
+section (`SectionKind::ALL`). Keyed BLAKE3 is a pseudorandom function, so a forger
+without `K` cannot produce an accepted tag; strict mode has no unauthenticated
+fallback path. ∎
+
+**Corroboration.** `tests/auth_coverage.rs` tampers every non-`AUTH` section of a
+rich body (CRC recomputed) and every case is rejected by
+`open_bytes_require_auth`/`verify_file_require_auth`; unkeyed and wrong-key files
+are rejected in strict mode; honest files pass. Outside the literal MAC range the
+footer↔manifest cross-check and the keyed tag itself fail closed
+(`docs/reviews/adversarial.md` Revision 5, Attacks 10 and AUTH coverage).
+
+**Tested:** `tests/authenticated.rs`, `tests/auth_coverage.rs`,
+`tests/adversarial_r5.rs`; `docs/reviews/security.md` (Revision 5).
+
+---
+
+## P28. Batched independent reconstruction is byte-exact and order-preserving — **PROVED** (per-job independence + order), **EMPIRICALLY OBSERVED** (scaling)
+
+**Claim.** `batch::BatchReconstructor::run(jobs, out)` decodes a slice of
+**independent** `BatchJob`s — each a self-contained resumable `Snapshot` plus its
+own encoded window — to the authoritative machine, byte-exact, writing each result
+to its own `out` slot; the result is independent of the worker count and preserves
+input order.
+
+**Proof.** A job observes no other job (its `start` state and `encoded` bytes are
+private), so the batch is embarrassingly parallel; each worker runs the machine's
+own `Prepared`/`nl2_step` decode over its window, and outputs are indexed by job
+position rather than completion order, so the mapping is order-preserving and equal
+for any thread count. ∎
+
+**Corroboration.** 100,000 independent 256-byte machine-1 windows: scaling versus
+one thread is **4.01×** (4 threads), **6.92×** (8) and **8.57×** (16), every row
+`exact: true` (the 16-thread gain is SMT under an 8-CPU quota).
+`GpuBackend::available()` is `false` and no accelerator path is selected.
+`evidence/bench/batch.json`.
+
+**Tested:** `tests/batch.rs`; `tests/adversarial_r5.rs` (Attack 11); fuzzed by
+`fuzz/fuzz_targets/fuzz_batch.rs`.
+
+---
+
+## Limitations — resolved (L1–L4) and remaining (honest)
+
+**Resolved in rounds L1–L4** (P24–P28): the base representation never expands past
+raw (machine 3 + the `auto` policy, P24); the 1-byte fully-resident read is within
+15% of a raw `Vec` via the borrowed `ResidentView` (P26) — the per-call `byte_at`
+dispatch residual remains (limitation 12); `AUTH` covers every section and strict
+mode fails closed (P27); and batched independent reconstruction scales with cores
+(P28). The cold decode-rate gap to LZ4 is **narrowed but not closed** (P25), and
+the GPU backend is **not implemented** (P28).
+
+**Remaining (honest):**
 
 1. **No certified universal 65,536-entry `T_4[x]` for the byte machine.** By P6
    it does not exist over arbitrary cores. The object-wise verdict is
@@ -891,13 +1049,15 @@ interfere).
    CPU-capped container, with 256 samples per point; it is evidence, not a
    multi-platform study. CPU features are detected at runtime
    (`evidence/bench/cpu.json`).
-6. **Machine 2 has decode-read semantics and a divergent cursor.** Its core
-   compresses skewed sources (`V < N`) but the cursor is a byte offset that
+6. **Machines 2 and 4 have decode-read semantics and a divergent cursor.** Their
+   cores compress skewed sources (`V < N`) but the cursor is a byte offset that
    diverges from the logical position, so the state-only projection is not
    resumable: only the complete resumable states (checkpoint sets) restart, and
-   the file reader falls back to authoritative replay for machine 2. Compressed
+   the file reader falls back to authoritative replay for them. Compressed
    storage therefore costs O(offset) machine work per read unless a path bloom
-   (the raw output array) is also manifested.
+   (the raw output array) is also manifested. Machine 3 (the identity codec) has
+   `cursor == position` and does **not** share this; the cold decode-rate of
+   machines 2/4 remains behind LZ4 (P25, limitation 14).
 7. **Backends.** `io-uring` is an optional, *genuine* completion-driven backend
    (not a probe). It is runtime-verified here under `--security-opt
    seccomp=unconfined` and is byte-identical and durability-ordered, but it is
@@ -913,8 +1073,10 @@ interfere).
    `core_hash`/`logical_len` linkage but do not represent the segment in
    `EkbloomBody`, so `segmented_state_at` returns bounds-checked,
    forger-chosen states. Only the opt-in keyed-MAC `AUTH` mode covers the whole
-   file prefix (see `docs/SECURITY.md`); it has no anti-rollback and key
-   management is the caller's. This is the same *integrity-not-authenticity*
+   commit (P27); the trailing footer and the `AUTH` section's own bytes lie
+   **outside** that literal range and are cross-checked, not MAC-covered
+   (limitation 16). It has no anti-rollback and key management is the caller's.
+   This is the same *integrity-not-authenticity*
    model recorded in `docs/reviews/security.md` (Findings C / rev 2), and it also
    bounds P13/P14: a forged `TileSet` or `Certified` path-bloom label is trusted by
    `read`/`planner`, and the planner is a certified-*dispatch* layer, not an
@@ -949,10 +1111,26 @@ interfere).
     long (`1.00–1.14×`); a **1-byte** read is **~1.5×** because a fixed ~10 ns
     dispatch dominates a ~20 ns allocation-bound copy. No further safe branch can
     be removed without weakening the certified-bound guarantee
-    (`docs/FRONTIER.md` §2/§5, P22).
+    (`docs/FRONTIER.md` §2/§5, P22). The borrowed `ResidentView` removes this for
+    a fully resident lookup, meeting the 15% target at 0.95–1.03× (P26); only the
+    per-call `byte_at` residual remains.
 13. **The regional successor-cursor check is a verifier-completeness property,
     not an authenticity boundary.** `verify`/`verify_deep` now re-derive the
     machine-2 regional cursor (P19), but as everywhere a forger who recomputes
     the section CRC and re-seals the linked certificate and `core_hash` authors a
     different valid object; only the opt-in keyed-MAC `AUTH` mode is an
     authenticity boundary (limitation 8).
+14. **Cold decode-rate still loses to block-indexed LZ4.** The interleaved machine
+    4 narrows the gap to **≈3.5–4.6×** (from ≈5–7×) but does **not** close it:
+    rANS keeps an ordered renormalising cursor and a data-dependent gather that
+    LZ4's copy-based block decode avoids (P25; `docs/CODEC.md`,
+    `docs/FRONTIER.md` §4).
+15. **The GPU / accelerator boundary is unimplemented.** `GpuBackend::available()`
+    is `false` unconditionally and no device backend exists in the pinned
+    capability-dropped container; the batch API is only the plug-in boundary and
+    no performance claim is made for it (P28; `docs/GPU.md`).
+16. **The commit footer and the `AUTH` tag are cross-checked, not MAC-covered.**
+    The keyed MAC covers `file[0, auth_header_offset)`; the trailing footer and
+    the `AUTH` section's own bytes are validated structurally and by the
+    footer↔manifest cross-check only (P27; `docs/reviews/adversarial.md`
+    Revision 5). There is no anti-rollback.

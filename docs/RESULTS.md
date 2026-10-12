@@ -356,6 +356,7 @@ rounds-R1–R4 artifacts (machine-2 context, blocks, unified engine).
 | Machine-2 prepared decode context | one validated `RansContext` reused for a bulk decode **165×** the per-symbol rebuild (skewed; byte-exact) | [`CODEC.md`](CODEC.md) | `rans.json` |
 | Machine-2 restartable blocks | 4 KiB read **18.3 µs (256 B) … 158.3 µs (64 KiB)** vs **6,095,739 ns** from genesis (**38–330×**) at a **141×** footprint span; packed checkpoint (**1/6**, backward-compatible) | [`BLOCKS.md`](BLOCKS.md) | `blocks.json` |
 | Unified bounded-access engine + frontier | hot 4 KiB **1.00–1.14×** raw; footprint **0.27×/0.79×** raw on skewed/mixed (uniform 1.07×); non-eviction thrash p99 **542–591 ns** vs caches degrading **4.9–6.4×**; cold p99 loses to bare LZ4 | [`ENGINE.md`](ENGINE.md), [`FRONTIER.md`](FRONTIER.md) | `frontier.json` |
+| Batched reconstruction + GPU boundary (L4) | 100,000 independent windows scale **4.01× / 6.92× / 8.57×** at 4 / 8 / 16 threads (every row byte-exact); GPU **not implemented** (`available() == false`) | [`GPU.md`](GPU.md) | `batch.json` |
 
 **Honest reading.** These phases add *capabilities* and one exact space win
 (packing), not a new hot-read speed ceiling: the court restates that `raw-vec` wins
@@ -365,8 +366,8 @@ prefix decode win is genuine but construction-bound (P11); tiles trade cold acce
 for hot (P13); the io_uring win is batched-cold-only ([`IOURING.md`](IOURING.md)).
 The kernels win only across windows/blocks (P15), the background planner is a
 is a certified-dispatch adapter (P16), and mmap is a `pread` replacement, not a heap
-replacement (P17). Their proved/observed properties are P11–P23 in
-[`PROOFS.md`](PROOFS.md).
+replacement (P17). Their proved/observed properties are P11–P28 in
+[`PROOFS.md`](PROOFS.md); the L1–L4 closure is the last block of that set (P24–P28).
 
 ### Rounds R1–R4 (`evidence/bench/rans.json`, `blocks.json`, `frontier.json`)
 
@@ -378,7 +379,8 @@ artifact.
   machine adapter and stores the **complete successor cursor** for a
   cursor-divergent machine; `tiles::parse_tile_set_prefix` is the single guard
   shared by the in-memory and file-backed readers. `sh scripts/validate-evidence.sh`
-  validates every `evidence/**/*.json` and reports **27** files `OK` (up from 24).
+  validates every `evidence/**/*.json` and reports **28** files `OK` (up from 24;
+  `batch.json` added in L4).
 - **R2 — machine-2 prepared context, encode-first budgets, bounded cold
   reconstruction, cache single-flight.** A validated `RansContext` reused for the
   whole decode is **165×** the per-symbol rebuild on skewed data
@@ -412,6 +414,58 @@ artifact.
   regional successor cursor** from the authoritative machine pass and reject a
   forged cursor (`src/verify.rs::forged_regional_cursor_is_detected`), and the
   region bounds use a checked `start + len` (`tests/adversarial_r4.rs`).
+
+### Rounds L1–L4 — limits closure (`frontier.json`, `fuse-perf.json`, `batch.json`)
+
+The final rounds close four long-standing limitations. Every number below is read
+from the named artifact; the full verdicts are in the per-phase docs and
+[`docs/PROOFS.md`](PROOFS.md) P24–P28.
+
+- **L1 — allocation-free reads, verbatim identity, and a base that never expands.**
+  The per-call read API is allocation-free (`Engine::byte_at`, `Engine::read_into`,
+  `fastpath::byte_at`); the fully resident allocation-parity index is
+  **1.00–1.05×** a raw `Vec` for a 1-byte read (`frontier.json` `hot_index`). A new
+  machine 3 (`OrANS-Store`, **verbatim identity**, `encode = source`, `V = N`, no
+  model header) plus the `auto` policy make the **base representation never exceed
+  raw**: uniform `1.0000×`, skewed `0.198×` (`frontier.json` `representation`;
+  [`docs/CODEC.md`](CODEC.md)).
+- **L1b — the borrowed resident view meets the <15% target.** `fastpath::ResidentView`
+  resolves the plan once; `ResidentView::get` is at raw-index parity — **0.95×**
+  (1 MiB) / **1.03×** (256 MiB), both inside 15% (`frontier.json`
+  `byte_at_residency`) — removing the **1.7–17.1 ns** per-call dispatch residual.
+  The per-call `byte_at` remains **4.2–5.7×** ([`docs/FRONTIER.md`](FRONTIER.md) §2.2).
+- **L2/L2b — cold decode narrows but does not close the gap to LZ4.** Machine 4
+  (`OrANS-RANS0I`, interleaved rANS) decodes at **2.17–2.36 ns/byte** vs machine
+  2's **3.45** — **1.46×** (`K=4`), **1.59×** (`K=8`), byte-exact
+  (`frontier.json` `decode_rate`). The best *compressing* cold read falls to
+  **10.0 µs (4 KiB)** / **151 µs (64 KiB)** from **14.4 µs** / **223 µs**, at
+  **876,155 B** — **3.1×** less than block-indexed LZ4 (`2,675,864 B`) — yet LZ4
+  still decompresses the same block in **2.8 µs** / **33 µs**, so EKBLOOM stays
+  **≈3.5–4.6×** behind cold (from ≈5–7×): a genuine space/speed frontier position,
+  **not closed** (`frontier.json` `cold_reads`; [`docs/FRONTIER.md`](FRONTIER.md) §4).
+- **L3 — FUSE direct backing surfaces and authenticity when required.**
+  `ReadMode::Auto` serves a fully materialised, logically-aligned surface by a
+  direct bounded copy — a **marginal ~1.2×** on **uncached** 4 KiB FUSE requests
+  (5.9 µs vs 6.9 µs), with the standalone mapped surface the zero-syscall floor
+  (161 ns warm); the full 2 MiB read is dominated by `/dev/fuse` round-trips and
+  true `FUSE_PASSTHROUGH` remains **unsupported** by `fuser` 0.15.1
+  (`fuse-perf.json`; [`docs/FUSE.md`](FUSE.md)). The keyed-MAC `AUTH` now covers
+  **every** section and strict mode (`--require-auth`) fails closed when no valid
+  tag is present — integrity **and** authenticity ([`docs/SECURITY.md`](SECURITY.md)).
+- **L4 — batched independent reconstruction; the GPU boundary is honest.** A large
+  batch of independent machine-1 windows scales **4.01× (4 threads), 6.92× (8),
+  8.57× (16)**, every row byte-exact (`batch.json`). A GPU backend is **not
+  implemented**: `GpuBackend::available() == false` and
+  `accelerator_device_present() == false`, so no accelerator path is ever taken
+  ([`docs/GPU.md`](GPU.md)).
+
+**Honest reading.** L1/L1b/L4 *resolve* their limitations (the base never expands,
+the resident 1-byte target is met, and batch scales with cores); L3 resolves the
+userspace FUSE read cost and the authenticity requirement while true passthrough
+stays unsupported; L2/L2b *narrow* the one genuine remaining frontier loss (cold
+decode-rate vs bare LZ4) without closing it. Four residuals stay in view: the
+per-call `byte_at` dispatch, the uniform-data manifested footprint, cold-vs-LZ4,
+and the footer/`AUTH`-tag cross-check (not MAC-covered).
 
 ---
 
@@ -609,7 +663,8 @@ sh scripts/container-async-io.sh     # io-uring.json (seccomp=unconfined)
 sh scripts/run-rans.sh               # rans.json (machine-2 prepared decode context)
 sh scripts/run-blocks.sh             # blocks.json (machine-2 blocks + packed checkpoints)
 sh scripts/run-frontier.sh           # frontier.json (engine vs indexed codecs)
-sh scripts/validate-evidence.sh      # validate every evidence/**/*.json (27 files)
+sh scripts/run-batch.sh              # batch.json (batched reconstruction + GPU verdict)
+sh scripts/validate-evidence.sh      # validate every evidence/**/*.json (28 files)
 sh scripts/container-loom.sh         # Loom model checking
 sh scripts/container-bench.sh        # Divan microbenchmarks (benches/ekbloom.rs)
 sh scripts/capture-environment.sh    # refresh evidence/environment.txt
