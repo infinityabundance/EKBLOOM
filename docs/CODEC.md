@@ -243,12 +243,13 @@ asserted before timing):
 at a comparable stored footprint (machine 4 `b4096` 876,155 B vs machine 2 `b1024`
 879,179 B) the 4 KiB cold read falls `14,057 -> 9,929 ns` and the 64 KiB read
 `216,445 -> 149,860 ns` (≈1.4× faster), yet LZ4's block decompress is still
-`2,044 ns` / `32,230 ns`, so EKBLOOM stays ≈**4.9× (4 KiB) to ≈4.6× (64 KiB)**
-slower cold (machine 2 was ≈6.9–6.7×). The residual is the serial renormalising
-cursor plus the per-symbol table gather that LZ4 avoids entirely. The `auto` policy
-does **not** select machine 4 (its core is machine 2's plus `4 + 4K` header bytes),
-so existing representation numbers are unchanged; machine 4 is an explicit,
-measured option.
+`2,044 ns` / `32,230 ns`, so EKBLOOM stays ≈**4.7–4.9×** slower cold
+(**≈4.9× at 4 KiB**, **≈4.7× at 64 KiB**; config `ekbloom-m4-k4-b4096` in
+`evidence/bench/frontier.json`; machine 2 was ≈6.9–6.7×). The residual is the
+serial renormalising cursor plus the per-symbol table gather that LZ4 avoids
+entirely. The `auto` policy does **not** select machine 4 (its core is machine 2's
+plus `4 + 4K` header bytes), so existing representation numbers are unchanged;
+machine 4 is an explicit, measured option.
 
 ### Machine 4 as a first-class cold engine
 

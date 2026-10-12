@@ -355,7 +355,7 @@ rounds-R1–R4 artifacts (machine-2 context, blocks, unified engine).
 | FUSE read path | measured FUSE overhead vs a direct read, and the passthrough / FUSE-over-io_uring **non-result** | [`FUSE.md`](FUSE.md) | `fuse-perf.json` |
 | Machine-2 prepared decode context | one validated `RansContext` reused for a bulk decode **165×** the per-symbol rebuild (skewed; byte-exact) | [`CODEC.md`](CODEC.md) | `rans.json` |
 | Machine-2 restartable blocks | 4 KiB read **18.3 µs (256 B) … 158.3 µs (64 KiB)** vs **6,095,739 ns** from genesis (**38–330×**) at a **141×** footprint span; packed checkpoint (**1/6**, backward-compatible) | [`BLOCKS.md`](BLOCKS.md) | `blocks.json` |
-| Unified bounded-access engine + frontier | hot 4 KiB **1.00–1.14×** raw; footprint **0.27×/0.79×** raw on skewed/mixed (uniform 1.07×); non-eviction thrash p99 **542–591 ns** vs caches degrading **4.9–6.4×**; cold p99 loses to bare LZ4 | [`ENGINE.md`](ENGINE.md), [`FRONTIER.md`](FRONTIER.md) | `frontier.json` |
+| Unified bounded-access engine + frontier | hot 4 KiB **1.00–1.14×** raw; footprint **0.27×/0.79×** raw on skewed/mixed (uniform 1.07×); **wins footprint at non-evicting hot access — not latency** (skewed 1.14 MB < pinned Zstd 1.38 MB / LZ4 2.94 MB; raw/pinned-hot Zstd are faster hot, cold p99 loses to bare LZ4) | [`ENGINE.md`](ENGINE.md), [`FRONTIER.md`](FRONTIER.md) | `frontier.json` |
 | Batched reconstruction + GPU boundary (L4) | 100,000 independent windows scale **4.01× / 6.92× / 8.57×** at 4 / 8 / 16 threads (every row byte-exact); GPU **not implemented** (`available() == false`) | [`GPU.md`](GPU.md) | `batch.json` |
 
 **Honest reading.** These phases add *capabilities* and one exact space win
@@ -366,8 +366,9 @@ prefix decode win is genuine but construction-bound (P11); tiles trade cold acce
 for hot (P13); the io_uring win is batched-cold-only ([`IOURING.md`](IOURING.md)).
 The kernels win only across windows/blocks (P15), the background planner is a
 is a certified-dispatch adapter (P16), and mmap is a `pread` replacement, not a heap
-replacement (P17). Their proved/observed properties are P11–P28 in
-[`PROOFS.md`](PROOFS.md); the L1–L4 closure is the last block of that set (P24–P28).
+replacement (P17). Their proved/observed properties are P11–P33 in
+[`PROOFS.md`](PROOFS.md); the L1–L4 and M1–M5 closures are the last blocks of that
+set (P24–P33).
 
 ### Rounds R1–R4 (`evidence/bench/rans.json`, `blocks.json`, `frontier.json`)
 
@@ -399,18 +400,21 @@ artifact.
   `K=64` machine-1 checkpoint drops **196,632 → 32,792 bytes (1/6)**, still
   reading the legacy magic-less layout. (`docs/BLOCKS.md`, `blocks.json`.)
 - **R3b — unified engine + competitive frontier.** The engine bounds positioning
-  per region (`worst_case_steps`) and per request (`worst_case_steps_for`, summed
-  over the request's dispatched segments) — it rejects a body with no certified
-  bounded path instead of replaying from genesis. A fully resident **4 KiB** read is
-  **1.00–1.14×** a raw `Vec`; a 1-byte read is **~1.5×**. Against block-indexed
-  LZ4 and chunked Zstandard (± a hot cache) and raw under one equal budget the
-  engine retains **0.27× raw on skewed** (1,142,159 vs 4,194,304 B) and **0.79× on
-  mixed** (3,299,237 vs 4,194,304 B), and its post-scan hot p99 is essentially
-  unchanged (**591→542→541 ns**) while the cache contenders degrade
-  (**lz4-block+cache** 200→4,929 ns, **zstd-chunk+cache** 13,044 ns) —
-  non-withdrawal. It **fails** honestly where it should: on `uniform` it retains
-  **1.07× raw** (no space win without skew) and its cold p99 loses to a bare LZ4
-  4 KiB decompress. (`docs/ENGINE.md`, `docs/FRONTIER.md`, `frontier.json`.)
+  per region (`worst_case_steps`, P22) and per request (`worst_case_steps_for`,
+  P32) — it rejects a body with no certified bounded path instead of replaying from
+  genesis. A fully resident **4 KiB** read is **1.00–1.14×** a raw `Vec`; a 1-byte
+  read is **~1.5×**. Against block-indexed LZ4 and chunked Zstandard (**no cache**,
+  an **LRU** cache, and a **pinned-hot** set decompressed once and retained
+  permanently with its bytes counted) and raw, under one equal budget, the engine
+  retains **0.27× raw on skewed** (1,141,643 vs 4,194,304 B) and **0.79× on mixed**
+  (3,298,721 vs 4,194,304 B). Its win is the **footprint** at non-evicting hot
+  access (skewed **1.14 MB < pinned Zstd 1.38 MB / LZ4 2.94 MB**), **not** latency:
+  raw and pinned-hot Zstd are faster hot, and the pinned-hot codec reproduces
+  non-eviction **conventionally**, so non-eviction alone is not the win. It
+  **fails** honestly where it should: on `uniform` the manifested body is **1.07×
+  raw**, and on `mixed` it is **larger** than pinned Zstd (3.30 vs 2.92 MB); its
+  cold p99 loses to a bare LZ4 4 KiB decompress. (`docs/ENGINE.md`,
+  `docs/FRONTIER.md`, `frontier.json`.)
 - **R4 — verifier completeness.** `verify`/`verify_deep` now **re-derive the
   regional successor cursor** from the authoritative machine pass and reject a
   forged cursor (`src/verify.rs::forged_regional_cursor_is_detected`), and the
@@ -436,14 +440,15 @@ from the named artifact; the full verdicts are in the per-phase docs and
   `byte_at_residency`) — removing the **1.7–17.1 ns** per-call dispatch residual.
   The per-call `byte_at` remains **4.2–5.7×** ([`docs/FRONTIER.md`](FRONTIER.md) §2.2).
 - **L2/L2b — cold decode narrows but does not close the gap to LZ4.** Machine 4
-  (`OrANS-RANS0I`, interleaved rANS) decodes at **2.17–2.36 ns/byte** vs machine
-  2's **3.45** — **1.46×** (`K=4`), **1.59×** (`K=8`), byte-exact
-  (`frontier.json` `decode_rate`). The best *compressing* cold read falls to
-  **10.0 µs (4 KiB)** / **151 µs (64 KiB)** from **14.4 µs** / **223 µs**, at
-  **876,155 B** — **3.1×** less than block-indexed LZ4 (`2,675,864 B`) — yet LZ4
-  still decompresses the same block in **2.8 µs** / **33 µs**, so EKBLOOM stays
-  **≈3.5–4.6×** behind cold (from ≈5–7×): a genuine space/speed frontier position,
-  **not closed** (`frontier.json` `cold_reads`; [`docs/FRONTIER.md`](FRONTIER.md) §4).
+  (`OrANS-RANS0I`, interleaved rANS) decodes at **2.28 ns/byte** (`K=4`) /
+  **2.12 ns/byte** (`K=8`) vs machine 2's **3.41** — **1.49×** (`K=4`), **1.60×**
+  (`K=8`), byte-exact (`frontier.json` `decode_rate`). The best *compressing* cold
+  read falls to **10.0 µs (4 KiB)** / **152 µs (64 KiB)** from **14.4 µs** /
+  **223 µs**, at **876,155 B** — **3.1×** less than block-indexed LZ4
+  (`2,675,864 B`) — yet LZ4 still decompresses the same block in **2.0 µs** /
+  **32 µs**, so EKBLOOM stays **≈4.7–4.9×** behind cold (from ≈5–7×): a genuine
+  space/speed frontier position, **not closed** (`frontier.json` `cold_reads`;
+  [`docs/FRONTIER.md`](FRONTIER.md) §4).
 - **L3 — FUSE direct backing surfaces and authenticity when required.**
   `ReadMode::Auto` serves a fully materialised, logically-aligned surface by a
   direct bounded copy — a **marginal ~1.2×** on **uncached** 4 KiB FUSE requests
@@ -467,6 +472,55 @@ stays unsupported; L2/L2b *narrow* the one genuine remaining frontier loss (cold
 decode-rate vs bare LZ4) without closing it. Four residuals stay in view: the
 per-call `byte_at` dispatch, the uniform-data manifested footprint, cold-vs-LZ4,
 and the footer/`AUTH`-tag cross-check (not MAC-covered).
+
+### Rounds M1–M5 — machine-4 completion, exact accounting, request-level bound, pinned-hot frontier (`frontier.json`, `tests/accounting.rs`, `tests/machine4_*.rs`, `tests/pinned_hot.rs`)
+
+The M-round folds the last gaps into the certified body; every number is read
+from the named artifact and every property is reviewed in Revision 6
+([`docs/reviews/adversarial.md`](reviews/adversarial.md),
+[`docs/reviews/security.md`](reviews/security.md)); the properties are P29–P33 in
+[`docs/PROOFS.md`](PROOFS.md).
+
+- **M1 — machine-4 complete successor state.** A lane-bearing machine's restart is
+  a **wide** snapshot (state + cursor + per-lane states + active-lane index);
+  `region_adapt`/blocks/checkpoints store it and `verify` re-checks the lanes. A
+  `(state,cursor)`-only projection is proven lossy (`Snapshot::new` drops the
+  lanes); machines 1/2/3 keep their compact record forms (`snapshot_needs_lanes`).
+  `tests/machine4_restarts.rs`.
+- **M2 — exact accounting + committed budget.** `physical_bytes()` equals
+  `to_bytes().len()` for a `BlockIndex` (the shared rANS model header lives once in
+  the core, never re-counted) and obeys the documented fixed-header relation for
+  `History`/`CheckpointSet`/`BloomShell`, audited on machines 1–4
+  (`tests/accounting.rs`); `Engine::plan` now admits on the **committed** body
+  (`body.physical_bytes()`), not the active plan, and the `n == 0` case is checked.
+- **M3 — request-level bounded work.** The engine exposes a per-region
+  `worst_case_steps` **and** a request-level `worst_case_steps_for(req)` that sums
+  the per-segment bounds of the dispatch; `read_counted_steps` reports the actual
+  positioning. A multi-region cold → hot → cold read measures actual **114,687** ≤
+  claimed **131,070**, above the per-region maximum **65,535** — the gap is closed.
+- **M4 — pinned-hot indexed LZ4/Zstd competitor; corrected headline.** The
+  frontier measures a **pinned-hot** codec (decompressed hot blocks retained
+  permanently, counted in footprint) as the strongest conventional **non-evicting**
+  competitor, and states the corrected headline: EKBLOOM wins **footprint at
+  non-evicting hot access, not latency** — skewed **1,141,643 B = 0.27× raw** <
+  pinned Zstd **1,384,698 B** / LZ4 **2,938,008 B**; it loses hot latency to raw
+  (~50/90 ns) and pinned Zstd (~80/150 ns), loses cold to LZ4, and loses footprint
+  on `mixed` (3.30 vs 2.92 MB) and `uniform` (manifested body > raw).
+- **M5 — machine 4 as a first-class cold engine; `create_auto` reuse.** The engine
+  plans machine-4 (`OrANS-RANS0I`) bodies with no special case, choosing
+  `BlockRestart` for cold regions with a scaled cost model and a prepared context
+  built once. The machine-4 engine config cuts skewed cold p99 **17.3 → 12.0 µs**
+  (**1.44×**) at **+12%** retained bytes; `create_auto` reuses the core its machine
+  decision already produced, **18.1 vs 36.1 ms** (**1.99×**, byte-identical); machine
+  4's bulk decode rate is best at **K = 8** (**1.60×** vs machine 2).
+
+**Honest reading.** The M-round adds **no new latency win**: M4 restates that the
+claimed advantage is **footprint at non-eviction**, and M4 notes the pinned-hot
+codec reproduces non-eviction conventionally. M1/M2/M3 remove correctness/accounting
+sharp edges (complete machine-4 state, exact `physical_bytes`, committed-based
+budget, request-level bound); M5 narrows the cold gap and makes machine 4 a
+first-class cold engine. The honest residuals remain the cold-vs-LZ4 gap and the
+uniform manifested footprint (§Remaining below).
 
 ---
 

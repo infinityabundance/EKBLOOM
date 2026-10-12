@@ -8,8 +8,9 @@
 //! read byte-exactly against the authoritative machine on both machines.
 
 use ekbloom::blocks::{BlockIndex, BLOCK_INDEX_PREFIX_LEN};
-use ekbloom::machine::{OrMachine, MACHINE_NL2, MACHINE_RANS0, NL2};
-use ekbloom::machine_rans::RANS0;
+use ekbloom::machine::{
+    machine_by_id, OrMachine, MACHINE_NL2, MACHINE_RANS0, MACHINE_RANS0I, MACHINE_STORE,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -36,16 +37,10 @@ fuzz_target!(|data: &[u8]| {
     let src = &data[..m];
     let n = m as u64;
 
-    for machine in [MACHINE_NL2, MACHINE_RANS0] {
-        let core = match machine {
-            MACHINE_NL2 => match NL2.encode(src) {
-                Ok(c) => c,
-                Err(_) => continue,
-            },
-            _ => match RANS0.encode(src) {
-                Ok(c) => c,
-                Err(_) => continue,
-            },
+    for machine in [MACHINE_NL2, MACHINE_RANS0, MACHINE_STORE, MACHINE_RANS0I] {
+        let core = match machine_by_id(machine).unwrap().encode(src) {
+            Ok(c) => c,
+            Err(_) => continue,
         };
         let block_bytes = 1 + (data[0] as u32 % 4096);
         let idx = match BlockIndex::build_machine(&core, n, block_bytes, machine) {

@@ -77,3 +77,10 @@ path = "fuzz_targets/fuzz_rans_i.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_region"
+path = "fuzz_targets/fuzz_region.rs"
+test = false
+doc = false
+bench = false

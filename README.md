@@ -15,11 +15,12 @@ preserves exact correctness, accounts for the bytes it actually manifests, and
 converts manifested space into access speed.
 
 This crate is a single Cargo package (`ekbloom`), shipping one library and one
-binary (`ekbloom`). The frozen internal contract is `docs/DESIGN.md`; the
-original specification lives in `research/`.
+binary (`ekbloom`), and **`ekbloom` v0.3.0 is published on
+[crates.io](https://crates.io/crates/ekbloom)**. The frozen internal contract is
+`docs/DESIGN.md`; the original specification lives in `research/`.
 
 **Honest headline findings** (all measured; see `docs/RESULTS.md`, `docs/BASELINES.md`,
-`docs/COMPETITIVE.md`, and the per-phase docs linked below):
+`docs/COMPETITIVE.md`, `docs/FRONTIER.md`, and the per-phase docs linked below):
 
 1. **Speed vs replay: large.** The exact path bloom turns reads into memory
    movement — ≈123× sequential throughput and ≈57,000× lower single-byte latency
@@ -92,21 +93,32 @@ original specification lives in `research/`.
    **141×** restart-footprint span — and the versioned, compact checkpoint wire
    format cuts machine-1 restart bytes to **1/6** with **backward-compatible**
    reads. The unified bounded-access engine ([`docs/ENGINE.md`](docs/ENGINE.md))
-   serves every read through a certified bounded path under an explicit
-   `worst_case_steps`, retaining **0.27×–0.79× raw** on skewed/mixed data with a
-   non-eviction advantage over indexed codecs, while honestly failing on uniform
-   data (1.07×) and cold-vs-bare-LZ4 ([`docs/FRONTIER.md`](docs/FRONTIER.md)).
-16. **Limitations closure (rounds L1–L4) — four gaps folded in honestly.** The
+   serves every read through a certified bounded path under an explicit per-region
+   `worst_case_steps` and a request-level `worst_case_steps_for`, and it **wins
+   retained footprint at non-evicting hot access — not latency.** On `skewed` it
+   serves hot 4 KiB reads from the smallest footprint of any non-evicting
+   contender — **1,141,643 B = 0.27× raw** — smaller than the strongest
+   conventional competitor, the **pinned-hot** codec (**1,384,698 B** Zstd /
+   **2,938,008 B** LZ4) ([`docs/FRONTIER.md`](docs/FRONTIER.md)). It does **not**
+   win absolute hot latency (raw ~**50/90 ns**, pinned-hot Zstd ~**80/150 ns**,
+   engine **120–130 / 341–441 ns** p50/p99), does **not** win cold against LZ4
+   (machine-4 engine p99 **12.0 µs** vs ~**2.0 µs** for a plain LZ4 4 KiB decode),
+   and loses footprint on `mixed` (**3.30 MB** vs pinned Zstd **2.92 MB**) and on
+   `uniform` (manifested body exceeds raw).
+16. **Limitations closure (rounds L1–L4 and M1–M5).** The
    verbatim-identity machine 3 (`OrANS-Store`) plus the `auto` policy make the
    **base representation never expand past raw** (**1.0000×** on uniform); the
    allocation-free borrowed `ResidentView` reaches raw-`Vec` **parity** on a
    resident 1-byte lookup (0.95–1.03×; the per-call `byte_at` dispatch residual
    stays 4.2–5.7×); interleaved machine 4 **narrows but does not close** the cold
-   gap to block-indexed LZ4 (**1.46–1.59×** faster than machine 2); the keyed-MAC
+   gap to block-indexed LZ4 (**1.49–1.60×** faster than machine 2); the keyed-MAC
    `AUTH` covers **every** section with fail-closed `--require-auth`; and batched
    independent reconstruction scales to **8.57× at 16 threads** while the GPU
-   backend is honestly **unavailable** (`available() == false`). Details and the
-   remaining honest losses are below and in [`docs/FRONTIER.md`](docs/FRONTIER.md),
+   backend is honestly **unavailable** (`available() == false`). The **M-round**
+   (M1–M5) makes machine-4 restarts complete (wide), accounting exact, the engine
+   budget committed-based, adds a **request-level** positioning bound, and
+   re-measures the frontier against a **pinned-hot** codec (headline above). Details
+   and the remaining honest losses are below and in [`docs/FRONTIER.md`](docs/FRONTIER.md),
    [`docs/CODEC.md`](docs/CODEC.md), [`docs/SECURITY.md`](docs/SECURITY.md),
    [`docs/FUSE.md`](docs/FUSE.md) and [`docs/GPU.md`](docs/GPU.md).
 
@@ -629,14 +641,18 @@ bytes (1/6)** while **still reading the legacy magic-less layout**
 ([`docs/BLOCKS.md`](docs/BLOCKS.md), `evidence/bench/blocks.json`).
 - **R3b — unified bounded-access engine and competitive frontier.** `src/engine.rs`
 is the single certified read planner over every manifested structure, with an
-explicit `worst_case_steps` bound; it **rejects** a body with no certified bounded
-path rather than falling back to an O(prefix) genesis replay. A fully resident
+explicit per-region `worst_case_steps` bound and a request-level
+`worst_case_steps_for`; it **rejects** a body with no certified bounded path
+rather than falling back to an O(prefix) genesis replay. A fully resident
 **4 KiB** read is **1.00–1.14×** a raw `Vec`; a 1-byte read is ~1.5× (fixed
-dispatch). Against block-indexed LZ4 and chunked Zstandard (± a hot-block cache)
-and raw under one equal budget, the engine retains **0.27× raw on skewed** and
-**0.79× on mixed** (uniform 1.07×) and its post-scan (*thrash*) hot p99 stays at
-**542–591 ns** while the cache contenders degrade **4.9–6.4×** — non-withdrawal.
-It honestly loses to bare LZ4 on cold 4 KiB decompress
+dispatch). Against block-indexed LZ4 and chunked Zstandard — no cache, an LRU
+cache, and a **pinned-hot** set decompressed once and retained permanently — and
+raw, all under one equal budget, the engine retains **0.27× raw on skewed** and
+**0.79× on mixed** (uniform 1.07×). Its win is the **footprint** at non-evicting
+hot access (skewed 1.14 MB < pinned Zstd 1.38 MB / LZ4 2.94 MB), **not** latency:
+raw and pinned-hot Zstd are faster hot, and it loses cold to LZ4. It **fails**
+honestly where it should: the manifested body exceeds raw on `uniform`, and on
+`mixed` it is larger than pinned-hot Zstd
 ([`docs/ENGINE.md`](docs/ENGINE.md), [`docs/FRONTIER.md`](docs/FRONTIER.md),
 `evidence/bench/frontier.json`).
 - **R4 — verifier completeness.** `verify`/`verify_deep` now **re-derive the
@@ -644,12 +660,60 @@ It honestly loses to bare LZ4 on cold 4 KiB decompress
   to the stored records (a forged cursor is now `Rejected`, closing the earlier
   verifier gap), and the region-bounds computation uses a checked `start + len` add.
 
-### Limitations closure (rounds L1–L4)
+### M-round: machine-4 completion, exact accounting, request-level bound, pinned-hot frontier (M1–M5)
 
-The final rounds fold four long-standing limitations into the certified body, each
-with an honest keep/narrow/reject verdict. The reviewed surface is L1–L4
-(`docs/reviews/adversarial.md`, `docs/reviews/security.md` Revision 5); the new
-properties are P24–P28 in [`docs/PROOFS.md`](docs/PROOFS.md).
+The M-round folds the last correctness, accounting and frontier gaps into the
+certified body. Every item is measured, covered by P29–P33 in
+[`docs/PROOFS.md`](docs/PROOFS.md), and independently reviewed (Revision 6 in
+[`docs/reviews/adversarial.md`](docs/reviews/adversarial.md) and
+[`docs/reviews/security.md`](docs/reviews/security.md), verdict **NO DEFECT
+FOUND**; 13 tests in `tests/adversarial_m.rs`, plus one new `fuzz_region` target).
+
+- **M1 — machine-4 complete successor state.** A lane-bearing machine's restart is
+  a **wide** snapshot; the regional/block/checkpoint stores record the complete
+  successor (state + cursor + per-lane states + active-lane index) and `verify`
+  re-checks the lanes. A `(state,cursor)`-only reconstruction is proven lossy
+  (`Snapshot::new` drops the lanes) and what resumes is the stored wide record;
+  machines 1/2/3 keep their compact forms under `snapshot_needs_lanes`
+  (`tests/machine4_restarts.rs`, 6 tests; machines 1–3 byte-identical).
+- **M2 — exact accounting and a committed budget.** Each structure's
+  `physical_bytes()` now equals its serialized length (the shared rANS model header
+  is counted **once**, in the core) — audited for machines 1–4 in
+  `tests/accounting.rs` — and the engine budget admits on the **committed** body
+  (`EkbloomBody::physical_bytes()`), not the active plan, with the `n == 0` case
+  checked ([`docs/ENGINE.md`](docs/ENGINE.md) §3).
+- **M3 — request-level bounded work.** `Engine::worst_case_steps_for(req)` sums the
+  per-segment bounds a request's dispatch actually splits into (`read` may cross
+  regions served by different paths), and `read_counted_steps` exposes the actual
+  positioning so `positioning <= worst_case_steps_for(req)` is checked
+  mechanically. Measured multi-region (cold → hot → cold): actual **114,687** ≤
+  claimed **131,070**, while the per-region maximum is only **65,535**
+  ([`docs/ENGINE.md`](docs/ENGINE.md) §4).
+- **M4 — pinned-hot indexed LZ4/Zstd competitor; corrected headline.** The
+  frontier now measures a **pinned-hot** codec (the leading decoded blocks
+  decompressed once and retained permanently, with those bytes counted in its
+  footprint) — the strongest conventional **non-evicting** competitor — and states
+  plainly that EKBLOOM's win is **footprint at non-eviction, not latency**
+  (`tests/pinned_hot.rs`; §15 above).
+- **M5 — machine 4 as a first-class cold engine, and `create_auto` reuse.** The
+  engine plans and reads machine-4 (`OrANS-RANS0I`) bodies with no special case:
+  the `BlockRestart` path is chosen for cold regions, the cost model is scaled for
+  the cheaper interleaved step, and the prepared context is built **once** at plan
+  time. The machine-4 engine configuration cuts skewed cold p99 **17.3 → 12.0 µs**
+  (**1.44×**) at **+12%** retained bytes; `create_auto` reuses the core its machine
+  decision already produced (**18.1 ms** vs **36.1 ms**, **1.99×**, byte-identical);
+  machine-4 bulk decode is best at **K = 8** (**1.60×** vs machine 2)
+  ([`docs/CODEC.md`](docs/CODEC.md), [`docs/ENGINE.md`](docs/ENGINE.md) §2,
+  [`docs/FRONTIER.md`](docs/FRONTIER.md) §4).
+
+### Limitations closure (rounds L1–L4 and M1–M5)
+
+The final rounds fold the long-standing limitations into the certified body, each
+with an honest keep/narrow/reject verdict. The L1–L4 surface is reviewed in
+**Revision 5** of [`docs/reviews/adversarial.md`](docs/reviews/adversarial.md) and
+[`docs/reviews/security.md`](docs/reviews/security.md), and its new properties are
+P24–P28 in [`docs/PROOFS.md`](docs/PROOFS.md); the M1–M5 surface is reviewed in
+**Revision 6** and its properties are **P29–P33**.
 
 - **L1 — allocation-free reads, verbatim identity, and a base that never expands.**
   The per-call read API is now allocation-free (`Engine::byte_at`,
@@ -673,15 +737,18 @@ properties are P24–P28 in [`docs/PROOFS.md`](docs/PROOFS.md).
   ([`docs/FRONTIER.md`](docs/FRONTIER.md) §2.2–§2.3).
 - **L2/L2b — cold decode narrows, but does not close, the gap to LZ4.** The new
   interleaved order-0 machine 4 (`OrANS-RANS0I`, `K` independent rANS lanes, default
-  `K = 4`) decodes at **2.17–2.36 ns/byte** vs machine 2's **3.45** — **1.46×** at
-  `K = 4`, **1.59×** at `K = 8`, byte-exact (`evidence/bench/frontier.json`
-  `decode_rate`). At a comparable footprint its best *compressing* cold read is
-  **10.0 µs (4 KiB)** / **151 µs (64 KiB)** while storing **3.1× less** than
-  block-indexed LZ4 (876,155 B vs 2,675,864 B), yet LZ4 decompresses the same block
-  in **2.8 µs** / **33 µs** — so EKBLOOM stays **≈3.5× (4 KiB) to ≈4.6× (64 KiB)**
-  behind, down from ≈5–7×. Cold decode-rate is a genuine space/speed frontier
-  position, **not closed** ([`docs/FRONTIER.md`](docs/FRONTIER.md) §4,
-  [`docs/CODEC.md`](docs/CODEC.md)).
+  `K = 4`) decodes at **2.28 ns/byte** (`K = 4`) / **2.12 ns/byte** (`K = 8`) vs
+  machine 2's **3.41** — **1.49×** at `K = 4`, **1.60×** at `K = 8`, byte-exact
+  (`evidence/bench/frontier.json` `decode_rate`). At a comparable footprint its best
+  *compressing* cold read is **10.0 µs (4 KiB)** / **152 µs (64 KiB)** while storing
+  **3.1× less** than block-indexed LZ4 (876,155 B vs 2,675,864 B), yet LZ4
+  decompresses the same block in **2.0 µs** / **32 µs** — so EKBLOOM stays
+  **≈4.7× (4 KiB) to ≈4.9× (64 KiB)** behind, down from ≈5–7×. Through the unified
+  engine the machine-4 configuration serves the same bounded cold read at p99
+  **12.0 µs** vs **17.3 µs** on the `auto` (machine-2) plan. Cold decode-rate is a
+  genuine space/speed frontier position, **not closed**
+  ([`docs/FRONTIER.md`](docs/FRONTIER.md) §4, [`docs/CODEC.md`](docs/CODEC.md)).
+  ([`docs/FRONTIER.md`](docs/FRONTIER.md) §4, [`docs/CODEC.md`](docs/CODEC.md)).
 - **L3 — FUSE direct backing surfaces, and authenticity when required.**
   `ReadMode::Auto` serves a read from a fully materialised, logically-aligned
   surface by a **direct bounded copy** (a *marginal* ~1.2× win on **uncached** 4 KiB
@@ -706,6 +773,16 @@ properties are P24–P28 in [`docs/PROOFS.md`](docs/PROOFS.md).
   unconditionally, `accelerator_device_present()` is `false`, and no accelerator
   path is ever taken — the batch API is documented as the boundary such a backend
   would plug into ([`docs/GPU.md`](docs/GPU.md)).
+
+**Resolved in the M-round (M1–M5, P29–P33).** Machine-4 restarts are **complete
+wide snapshots** (state + cursor + per-lane states + active-lane index, re-checked
+by `verify`), and a `(state,cursor)` projection is lossy (M1); **physical
+accounting is exact per structure** and the engine budget admits the **committed**
+body, not the active plan, with `n == 0` checked (M2); a **request-level**
+positioning bound `worst_case_steps_for(req)` is defined and mechanically checked
+(M3, actual **114,687** ≤ claimed **131,070**); the frontier was re-measured against
+a **pinned-hot** codec and its headline corrected (M4); and machine 4 is a
+first-class cold engine with `create_auto` core reuse (M5).
 
 ---
 
@@ -812,9 +889,9 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 
 ---
 
-## Limitations — resolved (L1–L4) and remaining
+## Limitations — resolved (L1–L4 and M1–M5) and remaining
 
-### Resolved in rounds L1–L4
+### Resolved in rounds L1–L4 and M1–M5
 
 - **The base representation never expands past raw** (L1). Machine 3
   (`OrANS-Store`) is the verbatim identity (`encode = source`, `V = N`), and the
@@ -827,7 +904,7 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
   fully resident lookup; the allocation-free per-call `byte_at`/`read_into`
   removes the per-call `Vec` (its dispatch residual remains, below).
 - **The cold decode gap to block-indexed LZ4 narrowed** (L2/L2b), from ≈5–7× to
-  **≈3.5–4.6×**, via the interleaved machine 4 — but is **not closed** (below).
+  **≈4.7–4.9×**, via the interleaved machine 4 — but is **not closed** (below).
 - **FUSE read cost was reduced in userspace** (L3). `ReadMode::Auto` serves a fully
   materialised, logically-aligned surface by a direct bounded copy; true kernel
   `FUSE_PASSTHROUGH` remains unsupported (below).
@@ -836,6 +913,16 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
   valid tag is present: integrity **and** authenticity.
 - **Batched reconstruction scales with cores** (L4) — **8.57× at 16 threads**,
   every row byte-exact (the GPU backend remains unimplemented, below).
+- **Physical accounting is exact** (M2). Every manifested structure's
+  `physical_bytes()` equals its serialized length (the shared rANS model header is
+  counted **once**, in the core), so the budget is admitted on the **committed**
+  body (`body.physical_bytes()`), never the active plan; the `n == 0` case is
+  checked.
+- **A request-level positioning bound is defined** (M3). `worst_case_steps_for`
+  bounds an arbitrary request across regions served by different paths
+  (multi-region actual **114,687** ≤ claimed **131,070**).
+- **Lane-bearing restarts are complete** (M1). A machine-4 restart stores the full
+  wide snapshot and `verify` re-checks the lanes; machines 1/2/3 are unchanged.
 
 ### Remaining (honest)
 
@@ -861,14 +948,16 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
   from the logical position, so the state-only projection is not resumable: only
   the complete resumable states restart, and the file reader replays for them.
   Uniform data is `V/N ≈ 1.015×` for machine 2 (machine 3 gives exactly `1.0000×`).
-- **Cold decode-rate still loses to bare LZ4** — narrowed (**≈3.5–4.6×**) by the
+- **Cold decode-rate still loses to bare LZ4** — narrowed (**≈4.7–4.9×**) by the
   interleaved machine 4 but not closed: rANS keeps an ordered renormalising cursor
   and a per-symbol table gather that LZ4's copy-based block decode avoids
   ([`docs/CODEC.md`](docs/CODEC.md), `docs/FRONTIER.md` §4).
-- **Uniform data has no space win in the manifested body.** The *base* is exactly
-  `N` (machine 3, never larger than raw), but the manifested hot body + block
-  index retains **1.07× raw** on incompressible data; the unified engine's one
-  reproducible win there is non-eviction ([`docs/FRONTIER.md`](docs/FRONTIER.md) §5).
+- **Uniform data has no space win in the manifested body, and the engine wins no
+  latency axis there.** The *base* is exactly `N` (machine 3, never larger than
+  raw), but the manifested hot body + block index retains **1.07× raw** on
+  incompressible data; non-eviction alone is **not** an EKBLOOM win — the
+  pinned-hot codec reproduces it at a comparable but larger footprint
+  ([`docs/FRONTIER.md`](docs/FRONTIER.md) §5).
 - **GPU is not implemented.** `GpuBackend::available()` is `false` and no
   accelerator path is taken; the batch API is only the *boundary* a device backend
   would plug into ([`docs/GPU.md`](docs/GPU.md)).
@@ -935,7 +1024,7 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 - `evidence/bench/mmap.json` — mapped read surfaces vs `pread`/resident and the huge-page non-result.
 - `evidence/bench/rans.json` — machine-2 prepared decode context (**165×** on skewed, byte-exact).
 - `evidence/bench/blocks.json` — machine-2 restartable blocks (**38–330×** vs genesis) + packed checkpoint format (**1/6**).
-- `evidence/bench/frontier.json` — the unified engine vs indexed codecs (LZ4/Zstd ± cache) and raw.
+- `evidence/bench/frontier.json` — the unified engine vs indexed LZ4/Zstd (no cache / LRU / **pinned-hot**) and raw, under one budget, with the corrected footprint-not-latency headline.
 - `evidence/bench/fuse-perf.json` — measured FUSE read-path cost and the passthrough non-result.
 - `evidence/bench/batch.json` — batched independent reconstruction (8.57× at 16 threads) and the honest GPU-unavailable verdict.
 - `evidence/counterexamples/` — rejected state-keyed blooms.
@@ -948,7 +1037,7 @@ Documentation map:
 | [`docs/INDEX.md`](docs/INDEX.md) | One-page index of all docs and evidence. |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Frozen internal engineering contract. |
 | [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | The 10 hard gates mapped to tests and commands. |
-| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties P1–P28 (machine 1 + machine 2 + the round-3/round-4 modules + the L1–L4 closure) and honest limitations. |
+| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties P1–P33 (machine 1 + machine 2 + the round-3/round-4 modules + the L1–L4 closure + the M1–M5 closure) and honest limitations. |
 | [`docs/RESULTS.md`](docs/RESULTS.md) | Measured results and the 65,536 research outcome. |
 | [`docs/CODEC.md`](docs/CODEC.md) | Machine 2 (`OrANS-RANS0`), machine 3 (`OrANS-Store`, identity) and machine 4 (`OrANS-RANS0I`, interleaved) codecs + the `auto` policy. |
 | [`docs/BASELINES.md`](docs/BASELINES.md) | Conventional baseline comparison (`RawVec`/`RawFile`/…). |

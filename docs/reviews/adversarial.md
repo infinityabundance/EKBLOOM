@@ -499,3 +499,74 @@ library behaviour changed.
 * Strict authenticated open prefers the newest authenticating generation: an appended
   unauthenticated generation is a rollback/DoS, not an integrity break.
 * Integrity is not authenticity; only opt-in `AUTH` is the authenticity boundary.
+
+## Revision 6 — M1–M5 (verdict **NO DEFECT FOUND**)
+
+The M-round surface: machine-4 complete successor state (M1), exact physical
+accounting (M2), committed-vs-active budget (M2), request-level bounded work (M3),
+the machine-4 engine path and `create_auto` core reuse (M5), and the pinned-hot
+baseline (M4). All attacks are executable and live in `tests/adversarial_m.rs`
+(13 tests, all green). No library defect was found, so there is no new finding to
+FIX or REPORT; the only code changes are the new tests and one **new fuzz target**.
+
+### Attack 1 — machine-4 complete state
+
+Every accelerated path (DirectStorage / HotTile / PackedRestart / BlockRestart) is
+forced on a machine-4 body and read **beyond** the lookup, byte-exact vs
+`reader::read` and the source, before and after serialize + reopen. A
+`(state,cursor)`-only reconstruction is proven lossy (`Snapshot::new` drops the
+lanes) and the stored wide snapshot (cursor/lane/lane-index) is what resumes. A
+forged-but-self-consistent wide record is rejected by `verify`; a cross-machine
+regional read (base/cursor/wide forms for machines 1/2/3/4) is byte-exact across
+and beyond the region; machines 1/2/3 record forms are unchanged.
+
+### Attack 2 — accounting
+
+`physical_bytes()` equals `to_bytes().len()` for a `BlockIndex` (no shared model
+header re-count) and obeys the documented fixed-header relation for
+`History`/`CheckpointSet`/`BloomShell`, on machines 1–4; the machine-4 wide
+regional shell is counted once and `inspect`'s sum equals `physical_bytes()`.
+
+### Attack 3 — budget
+
+A body whose committed bytes exceed the budget is rejected even when the active
+plan fits; an over-budget `n == 0` core is rejected; and the hard-cap build entry
+points reject an over-budget machine-4 wide body even though the static estimate
+under-counts it (the post-build re-check catches it).
+
+### Attack 4 — request-level bound
+
+A machine-4 body whose plan alternates HotTile/PackedRestart over many regions is
+read whole-object: actual positioning ≤ `worst_case_steps_for`, byte-exact.
+
+### Attack 5/6 — machine-4 engine + `create_auto` reuse
+
+The prepared interleaved context and the unprepared per-read path are
+byte-identical; `create_auto`/`create_auto_within_budget` are byte-identical to the
+explicit path across machines/profiles and the body core is the source encode.
+
+### Attack 7 — pinned-hot
+
+The pinned footprint is the actual pinned bytes; the set is permanent, bounded, and
+never displaced by cold lookups.
+
+### Fuzz campaign (Revision 6)
+
+`sh scripts/container-fuzz.sh` runs **all ten** targets clean: the nine existing
+plus the new `fuzz_region` (44 097 runs / 61 s), with `fuzz_blocks` extended to
+machines 3 and 4 (45 930 runs / 61 s); no crash, warning-free build.
+
+### Evidence (Revision 6)
+
+`sh scripts/container-reproduce.sh`: clean `--locked --release` build, **566 passed
+/ 0 failed**, then `sh scripts/validate-evidence.sh` → **28** evidence JSON files
+`OK`. The verify gate is green at **578 passed** (13 R6 tests).
+
+### Residual risk (Revision 6)
+
+* **No defect found.** The static byte estimate is the machine-1 view (under-counts
+  a machine-2/4 wide checkpoint, over-counts some profiles); the hard cap survives
+  via the post-build re-check, but `select_profile_within_budget` is estimate-only.
+* `pinned_block_count` returns `1` for a zero hot budget (documented "at least one").
+* Integrity is still not authenticity; the engine/reader trust only as far as
+  `verify` does.

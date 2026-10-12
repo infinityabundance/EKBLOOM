@@ -833,12 +833,15 @@ spanning regions is split at boundaries and concatenated. ∎
 `tests/engine.rs::worst_case_steps_holds_for_adversarial_offsets` sweeps offsets
 at `base + {0, 1, K−2, K−1}` and asserts `steps − length ≤ worst_case_steps`.
 **Corroboration (frontier).** Against block-indexed LZ4 and chunked Zstandard
-(± a hot-block cache) and raw under one equal budget, the engine retains
-**0.27× raw on skewed** and **0.79× on mixed** (uniform **1.07×**, no space win)
-and its post-scan (*thrash*) hot p99 stays at **542–591 ns** while the cache
-contenders degrade **4.9–6.4×** (non-withdrawal). It honestly **loses** to a bare
-LZ4 4 KiB block decompress on cold p99 (`0.99–5.04 µs`). Evidence
-`evidence/bench/frontier.json`; full verdict in `docs/FRONTIER.md` §2/§5.
+(**no cache**, an **LRU** cache, and a **pinned-hot** set retained permanently with
+its bytes counted) and raw under one equal budget, the engine retains **0.27× raw
+on skewed** and **0.79× on mixed** (uniform **1.07×**, no space win) and serves hot
+4 KiB reads from the **smallest footprint of any non-evicting contender** —
+**1,141,643 B** vs pinned-hot Zstd **1,384,698 B** / LZ4 **2,938,008 B**. It does
+**not** win absolute hot latency (raw ~**50/90 ns**, pinned Zstd ~**80/150 ns**,
+engine **120–130 / 341–441 ns**) and **loses** cold p99 to a bare LZ4 4 KiB
+decompress; non-eviction **alone** is matched by the pinned-hot codec. Evidence
+`evidence/bench/frontier.json`; full verdict in `docs/FRONTIER.md` §2–§6.
 
 **Tested:** `tests/engine.rs` (16 tests: byte-exactness on both machines,
 transactional budget, per-region `worst_case_steps` on adversarial offsets, the
@@ -929,11 +932,11 @@ needs; by induction each lane inverts its own subcoder, hence
 `(x>>12)*f + slot - c` non-narrowing and bounded (`f ≤ 3841`, `x>>12 ≤ 2^20−1`), so
 the step cannot overflow even on an unvalidated state. ∎
 
-**Corroboration.** On the 4 MiB skewed corpus machine 4 decodes at **2.364 ns/byte**
-(`K = 4`, **1.46×**) and **2.167 ns/byte** (`K = 8`, **1.59×**) versus machine 2's
-**3.447**, all byte-exact; its best *compressing* cold 4 KiB read is **10.0 µs** at
+**Corroboration.** On the 4 MiB skewed corpus machine 4 decodes at **2.279 ns/byte**
+(`K = 4`, **1.49×**) and **2.122 ns/byte** (`K = 8`, **1.60×**) versus machine 2's
+**3.406**, all byte-exact; its best *compressing* cold 4 KiB read is **10.0 µs** at
 `876,155 B` (**3.1×** less than block-indexed LZ4's `2,675,864 B`) yet still
-**≈3.5×** behind LZ4's **2.8 µs** (narrowed from ≈5–7×, **not closed**).
+**≈4.7–4.9×** behind LZ4's **2.0 µs** (narrowed from ≈5–7×, **not closed**).
 `evidence/bench/frontier.json` (`decode_rate`, `cold_reads`).
 
 **Tested:** `tests/machine_rans_i.rs`; `tests/adversarial_r5.rs` (Attack 8); fuzzed
@@ -1025,7 +1028,137 @@ one thread is **4.01×** (4 threads), **6.92×** (8) and **8.57×** (16), every 
 
 ---
 
-## Limitations — resolved (L1–L4) and remaining (honest)
+## P29. Machine-4 restarts must store the complete (wide) successor — **PROVED** (necessity + exactness), **EMPIRICALLY OBSERVED** (all accelerated paths)
+
+**Claim.** A machine-4 (`OrANS-RANS0I`) successor is **not** a `(state, cursor)`
+pair: because the machine decodes `K` interleaved lanes, resuming at an arbitrary
+position needs the per-lane states and the active-lane index as well. Every
+accelerated structure that stores a machine-4 restart — the regional successor
+table, the block index and the checkpoint set — therefore stores the **wide**
+snapshot, `verify` re-derives and re-checks it **including the lanes**, and a
+`(state, cursor)`-only projection is **insufficient** (it decodes different bytes).
+
+**Proof (necessity).** Machine 4 codes symbol `i` in lane `i % K`; the decoder's
+next symbol depends on lane `i % K`'s state, so two positions with the same
+`(state, cursor)` projection but different states in the other lanes have different
+continuations. Constructing a `Snapshot` from `(state, cursor)` alone
+(`Snapshot::new`) drops the lane states and the resulting decode is not
+`source[p..]` — a concrete, executable counterexample — so the complete successor is
+necessary. **Proof (sufficiency).** The stored wide record carries exactly the
+decoder's full state (cursor, each lane state, active-lane index),
+`OrMachine::snapshot_needs_lanes` gates the wide form, and machines 1/2/3 keep their
+compact 2-byte/12-byte forms unchanged; replay from the wide record is the
+authoritative decode. ∎
+
+**Corroboration.** `tests/machine4_restarts.rs` (6 tests);
+`tests/adversarial_m.rs::machine4_every_accelerated_path_is_byte_exact_beyond_the_lookup`,
+`machine4_region_wide_successor_is_used_not_a_state_cursor_projection`,
+`forged_machine4_wide_successor_is_rejected_by_verify`,
+`machines_one_two_three_restart_forms_are_unchanged`. Reviewed in
+`docs/reviews/adversarial.md`/`security.md` Revision 6 (M1 — **held**).
+
+**Tested:** `tests/machine4_restarts.rs`, `tests/adversarial_m.rs`.
+
+---
+
+## P30. Physical accounting is exact per structure — **PROVED** (identities), **EMPIRICALLY OBSERVED** (audited across machines 1–4)
+
+**Claim.** Every manifested structure's `physical_bytes()` equals its serialized
+length, or differs from it by exactly **one** documented fixed container header —
+never by a repeated *shared* header. In particular a `BlockIndex`'s rANS model
+header lives once in the encoded `core`, so `BlockIndex::physical_bytes() ==
+BlockIndex::to_bytes().len()` and the model must **not** be re-counted.
+
+**Proof.** Each structure's `physical_bytes` is defined as its payload (directory +
+records / states / entries); the serialized form is exactly that payload plus a
+single fixed container header (`HISTORY_WIRE_HEADER`, `CKPT_FIXED_LEN`,
+`BLOOM_SHELL_WIRE_HEADER`, the tile scaffold) that is not itself part of the
+accounted body, and the shared machine model is stored once, in `core`. ∎
+
+**Corroboration.** `tests/accounting.rs` asserts the relations for
+`BlockIndex`/`History`/`CheckpointSet`/`BloomShell`/`TileSet` on machines 1–4, that
+appending a `BlockIndex` grows `EkbloomBody::physical_bytes()` by **exactly** its
+serialized length, and that `inspect`'s component sum equals `physical_bytes()`
+(`tests/adversarial_m.rs::accounting_relations_exact_across_machines`). Revision 6
+(M2 — **held**).
+
+**Tested:** `tests/accounting.rs`, `tests/adversarial_m.rs`.
+
+---
+
+## P31. The engine budget admits the committed body, transactionally, including `n == 0` — **PROVED** (enforcement), **EMPIRICALLY OBSERVED** (rejections)
+
+**Claim.** `Engine::plan` admits a body against the budget using the **committed**
+physical bytes (`EkbloomBody::physical_bytes()`), **not** the active access-plan
+footprint: a certified structure the plan does not select still occupies its space,
+so it still counts. Planning is transactional and returns an in-budget engine or an
+error; the `n == 0` body is checked, and the hard-cap build entry points reject an
+over-budget machine-4 wide body even when the static estimate under-counts it.
+
+**Proof.** `AccessPlan::committed_bytes` is `body.physical_bytes()`, computed before
+admission; `plan` returns `Err` and **no** partial plan when the committed total
+exceeds the budget, so no over-budget engine exists. A rejected build leaves the
+body byte-for-byte and generation-for-generation unchanged (post-build re-check). ∎
+
+**Corroboration.** `tests/engine.rs::engine_admits_the_committed_body_not_the_active_plan`,
+`engine_rejects_an_over_budget_zero_region_body`,
+`engine_budget_is_enforced_transactionally`;
+`tests/adversarial_m.rs::engine_rejects_committed_over_budget_and_zero_region_machine4`,
+`hard_cap_is_enforced_even_where_the_estimate_undercounts`. Revision 6 (M2 —
+**held**).
+
+**Tested:** `tests/engine.rs`, `tests/adversarial_m.rs`, `tests/budget.rs`.
+
+---
+
+## P32. The engine's request-level positioning bound covers an arbitrary multi-region request — **PROVED** (bound + mechanical check), **EMPIRICALLY OBSERVED** (measured gap)
+
+**Claim.** `worst_case_steps_for(req)` bounds the positioning work of an arbitrary
+request, including one spanning regions served by **different** paths, and
+`read_counted_steps` reports the actual counters so the guarantee is checked
+mechanically: `positioning <= worst_case_steps_for(req)`. The per-region
+`worst_case_steps` does **not** bound a multi-region request.
+
+**Proof (strengthens P22's bound).** `read` splits a request into the maximal runs
+of consecutive regions served by the same certified structure and path; each
+segment contributes at most its structure parameter, and `worst_case_steps_for` is
+the exact sum, so it is `O(segments)` — never `O(prefix)`. `read_counted` carries a
+`debug_assert` of the inequality (free in release builds). ∎
+
+**Corroboration.** A 1 MiB machine-1 body with a `K = 65536` checkpoint plus a
+materialised tile band reads `(offset 65535, length 500000)` across cold → hot →
+cold: per-region max **65,535**, claimed **131,070**, actual **114,687**
+(= 65,535 + 0 + 49,152) — the actual **exceeds** the per-region max yet stays
+within the request-level bound. `tests/engine.rs::request_level_bound_covers_a_multi_region_read`;
+`tests/adversarial_m.rs::request_level_bound_covers_many_segments_on_machine4`.
+Discussion `docs/ENGINE.md` §4.
+
+**Tested:** `tests/engine.rs`, `tests/adversarial_m.rs`.
+
+---
+
+## P33. `create_auto` reuses its machine decision's core and is byte-identical — **PROVED** (identity), **EMPIRICALLY OBSERVED** (construction-time saving)
+
+**Claim.** `manifest::create_auto` selects machine 2 or machine 3 (the `auto`
+policy) and returns a body whose core is the **same** encode the decision already
+produced — it does **not** encode a second time — and it is byte-identical to the
+explicit `create_machine(.., winning_machine)` path across machines and profiles.
+
+**Proof.** `create_auto` computes the machine-2 encode to compare `core_len` with
+`source_len`; when it selects machine 3 it reuses the source verbatim, and when it
+selects machine 2 it returns the core it just produced, so no second encode occurs
+and the result equals the explicit path by construction. ∎
+
+**Corroboration.** On the 4 MiB skewed corpus construction is **18.1 ms** vs
+**36.1 ms** for the pre-reuse `select_machine` + `create_machine` path (**1.99×**),
+**byte-identical** (`frontier.json` `create_auto_reuse`; `tests/auto_reuse.rs`;
+`tests/adversarial_m.rs::create_auto_reuse_is_byte_identical_and_core_bound`).
+
+**Tested:** `tests/auto_reuse.rs`, `tests/adversarial_m.rs`, `src/manifest.rs` unit tests.
+
+---
+
+## Limitations — resolved (L1–L4 and M1–M5) and remaining (honest)
 
 **Resolved in rounds L1–L4** (P24–P28): the base representation never expands past
 raw (machine 3 + the `auto` policy, P24); the 1-byte fully-resident read is within
@@ -1034,6 +1167,14 @@ dispatch residual remains (limitation 12); `AUTH` covers every section and stric
 mode fails closed (P27); and batched independent reconstruction scales with cores
 (P28). The cold decode-rate gap to LZ4 is **narrowed but not closed** (P25), and
 the GPU backend is **not implemented** (P28).
+
+**Resolved in the M-round** (P29–P33): machine-4 restarts store the **complete wide
+successor** and `verify` re-checks the lanes, so a `(state, cursor)` projection is
+impossible (P29); physical **accounting is exact** per structure and the engine
+budget admits the **committed** body, not the active plan, with `n == 0` checked
+(P30, P31); a **request-level** positioning bound `worst_case_steps_for(req)` is
+defined and checked mechanically (P32); and `create_auto` **reuses** its machine
+decision's core, byte-identically (P33).
 
 **Remaining (honest):**
 
@@ -1111,15 +1252,16 @@ the GPU backend is **not implemented** (P28).
     truncation of an unfaulted page is a `SIGBUS`), and it is a *source-from-file*
     mode, not a faster heap (P17).
 12. **The unified engine has no space win on uniform data and a fixed per-read
-    dispatch cost.** On incompressible (`uniform`) data the engine retains
+    dispatch cost.** On incompressible (`uniform`) data the manifested body is
     **1.07× raw** — *larger* than raw — and its cold p99 **loses** to a bare LZ4
-    4 KiB block decompress (0.99–5.04 µs); the non-eviction advantage over a
-    conventional cache is the one reproducible win there. The **4 KiB** hot-read
-    target (within 15% of a raw `Vec`) is met only for reads at least a region
-    long (`1.00–1.14×`); a **1-byte** read is **~1.5×** because a fixed ~10 ns
-    dispatch dominates a ~20 ns allocation-bound copy. No further safe branch can
-    be removed without weakening the certified-bound guarantee
-    (`docs/FRONTIER.md` §2/§5, P22). The borrowed `ResidentView` removes this for
+    4 KiB block decompress; the engine wins **no** latency axis there, and
+    non-eviction is matched by the pinned-hot codec, so non-eviction **alone** is
+    not an EKBLOOM win (the win is footprint at non-eviction, `skewed` only). The
+    **4 KiB** hot-read target (within 15% of a raw `Vec`) is met only for reads at
+    least a region long (`1.00–1.14×`); a **1-byte** read is **~1.5×** because a
+    fixed ~10 ns dispatch dominates a ~20 ns allocation-bound copy. No further safe
+    branch can be removed without weakening the certified-bound guarantee
+    (`docs/FRONTIER.md` §2/§5–§6, P22). The borrowed `ResidentView` removes this for
     a fully resident lookup, meeting the 15% target at 0.95–1.03× (P26); only the
     per-call `byte_at` residual remains.
 13. **The regional successor-cursor check is a verifier-completeness property,
@@ -1129,7 +1271,7 @@ the GPU backend is **not implemented** (P28).
     different valid object; only the opt-in keyed-MAC `AUTH` mode is an
     authenticity boundary (limitation 8).
 14. **Cold decode-rate still loses to block-indexed LZ4.** The interleaved machine
-    4 narrows the gap to **≈3.5–4.6×** (from ≈5–7×) but does **not** close it:
+    4 narrows the gap to **≈4.7–4.9×** (from ≈5–7×) but does **not** close it:
     rANS keeps an ordered renormalising cursor and a data-dependent gather that
     LZ4's copy-based block decode avoids (P25; `docs/CODEC.md`,
     `docs/FRONTIER.md` §4).

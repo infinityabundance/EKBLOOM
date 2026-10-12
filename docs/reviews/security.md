@@ -737,4 +737,87 @@ and 3 FUSE tests).
   mutates that file after mount steps outside the mount's snapshot assumption.
 * Integrity is still not authenticity: only opt-in `AUTH` is the authenticity
   boundary.
+
+## Revision 6 — M1–M5: machine-4 complete state, exact accounting, committed budgets, request-level bound, machine-4 engine + `create_auto` reuse (verdict **NO DEFECT FOUND**)
+
+Independent, executable attacks over the newest surface, pinned by
+`tests/adversarial_m.rs` (13 tests, all green). Every byte assertion is against the
+**authoritative machine**, `reader::read`, or the exact serialized form — never
+against another manifested structure.
+
+### M1 — machine-4 complete successor state — **held**
+
+A machine-4 body with regional/block/checkpoint structures is driven through every
+accelerated path and read **well beyond** the single lookup (so the reconstructed
+successor is consumed): byte-exact vs `reader::read` and vs the source, before and
+after serialize + reopen. The stored wide snapshot is proven **not** a
+`(state,cursor)` projection (`Snapshot::new` drops lanes and decodes different
+bytes), and the region reader uses the stored lanes. `grep Snapshot::new` finds no
+site that reconstructs a machine-4 successor from `(state,cursor)` alone. A
+*self-consistent but forged* wide record (Phi_D projection intact) — tampered
+cursor, lane state, or active-lane index — is rejected by `verify`'s re-derived
+successor comparison. Machines 1/2/3 keep their compact forms (2-byte packed /
+12-byte full / no cursor vs `u64` cursor) under the `snapshot_needs_lanes`
+predicate.
+
+### M2 — exact physical accounting — **held**
+
+For machines 1–4, `BlockIndex::physical_bytes() == to_bytes().len()` (directory +
+restart records, the shared rANS model header live once in `core`, never
+re-counted); `History`/`CheckpointSet`/`BloomShell` obey their documented
+fixed-header relations; the machine-4 wide regional shell obeys the shell-header
+relation and is counted once by `EkbloomBody::physical_bytes()`/`inspect`.
+
+### M2 — committed budget — **held**
+
+`Engine::plan` rejects a body whose **committed** footprint exceeds the budget even
+when the active plan fits, and rejects an over-budget `n == 0` core. The hard-cap
+build entry points (`create_*_within_budget`) never admit an over-budget machine-4
+body: the post-build `physical_bytes()` re-check closes the gap left by the
+machine-1 static estimate, which (documented) under-counts a wide checkpoint.
+
+### M3 — request-level bounded work — **held**
+
+On a machine-4 body with many cold→hot→cold segments, a whole-object read's actual
+positioning never exceeds `worst_case_steps_for(req)` (checked via
+`read_counted_steps`), and is `O(segments)`, never `O(prefix)`.
+
+### M5 — machine-4 engine + `create_auto` reuse — **held**
+
+The engine reads machine-4 bodies byte-exactly for every request shape over all
+four accelerated paths; the prepared interleaved context and the unprepared
+per-read path are byte-identical. `create_auto`/`create_auto_within_budget` are
+byte-identical to the explicit select-then-create path across machines and
+profiles, and the body's core is the encode of the source (no stale core).
+
+### M4 — pinned-hot baseline — **held**
+
+The pinned footprint counts the actual pinned decoded bytes, the pin set is
+permanent and bounded, and cold lookups never displace a pin.
+
+### Fuzz + evidence (Revision 6)
+
+`sh scripts/container-fuzz.sh` runs **all ten** targets clean (added `fuzz_region`,
+44 097 runs / 61 s; extended `fuzz_blocks` to machines 3/4, 45 930 runs / 61 s;
+the eight others unchanged, all PASS, no crash). `sh scripts/container-reproduce.sh`
+completed: clean `--locked --release` build, **566 passed / 0 failed**, then
+`sh scripts/validate-evidence.sh` → **28** evidence JSON files `OK`. The verify gate
+(`cargo fmt --check`, `clippy -D warnings`, `cargo test --all-features`) is green at
+**578 passed** (incl. the 13 R6 tests).
+
+### Residual risk (Revision 6)
+
+* **No defect found this pass.**
+* The static `estimate_physical_bytes`/`estimate_physical_bytes_for_core` is the
+  machine-1 view: it under-counts a machine-2/4 wide checkpoint and over-counts a
+  regionally-packed profile. The **hard cap** is still enforced (post-build
+  re-check), but `select_profile_within_budget` filters on the estimate alone and
+  can therefore reject a body that would have fit (documented trade-off).
+* `pinned_block_count(hot_bytes = 0, block, total)` returns `1`, not `0`
+  (documented "at least one"); a zero hot budget therefore pins one block.
+* `Engine`/`reader` trust a body only as far as `verify` does: a tampered but
+  unverified history/bloom still drives reads. `verify`/`verify_deep` is the gate.
+* A `HistorySegmented` section is validated and accounted by the file reader but is
+  not represented in the in-memory `EkbloomBody`, so `EkbloomBody::physical_bytes()`
+  omits it (out of scope of M1–M5; unchanged by this round).
  
