@@ -1,6 +1,6 @@
 //! The authoritative byte machines.
 //!
-//! EKBLOOM 0.3 ships five concrete machines. `OrANS-NL2` (`machine_id = 1`) is a
+//! EKBLOOM 0.3 ships six concrete machines. `OrANS-NL2` (`machine_id = 1`) is a
 //! deterministic, exactly invertible state-*expansion* machine (`V = N`); see
 //! `docs/DESIGN.md` §1 for the frozen contract. `OrANS-RANS0` (`machine_id = 2`)
 //! additionally *compresses* skewed sources (`V < N`); see `docs/CODEC.md` and
@@ -16,12 +16,18 @@
 //! **directly-addressable** fixed-width packed representation: each symbol is a
 //! `bits`-wide index into the source alphabet, so any position is an O(1)
 //! shift/mask with no replay, at the cost of fixed-width size (`ceil(N*bits/8)`).
-//! See [`crate::machine_pack`].
+//! See [`crate::machine_pack`]. `OrANS-SEG` (`machine_id = 6`) is the **segmented
+//! container**: a versioned, hashed directory binds each logical segment to its
+//! own directly-addressable representation (packed / raw / constant), so a mixed
+//! source gets packed segments where it is skewed and raw segments where it is
+//! uniform while every position stays an `O(1)` exact reveal. See
+//! [`crate::machine_seg`].
 
 use crate::error::{EkbloomError, Result};
 use crate::machine_pack::{PackContext, PACK};
 use crate::machine_rans::{RansContext, RANS0};
 use crate::machine_rans_i::{RansIContext, RANS0I};
+use crate::machine_seg::{SegContext, SEG};
 use crate::machine_store::STORE;
 use crate::state::Snapshot;
 
@@ -39,6 +45,9 @@ pub const MACHINE_RANS0I: u32 = 4;
 
 /// Machine identifier for `OrANS-PACK` (directly-addressable fixed-width packing).
 pub const MACHINE_PACK: u32 = 5;
+
+/// Machine identifier for `OrANS-SEG` (the versioned segmented container).
+pub const MACHINE_SEG: u32 = 6;
 
 const fn build_sbox() -> [u8; 256] {
     let mut s = [0u8; 256];
@@ -228,6 +237,8 @@ pub enum Prepared<'a> {
     RansI(Box<RansIContext>),
     /// A prepared `OrANS-PACK` packed decoder context (machine 5).
     Pack(Box<PackContext>),
+    /// A prepared `OrANS-SEG` segmented-container decoder context (machine 6).
+    Seg(Box<SegContext>),
 }
 
 impl Prepared<'_> {
@@ -239,6 +250,7 @@ impl Prepared<'_> {
             Prepared::Rans(ctx) => ctx.reveal(core, omega),
             Prepared::RansI(ctx) => ctx.reveal(core, omega),
             Prepared::Pack(ctx) => ctx.reveal(core, omega),
+            Prepared::Seg(ctx) => ctx.reveal(core, omega),
         }
     }
 
@@ -250,6 +262,7 @@ impl Prepared<'_> {
             Prepared::Rans(ctx) => ctx.peek(core, omega),
             Prepared::RansI(ctx) => ctx.peek(core, omega),
             Prepared::Pack(ctx) => ctx.peek(core, omega),
+            Prepared::Seg(ctx) => ctx.peek(core, omega),
         }
     }
 
@@ -259,6 +272,7 @@ impl Prepared<'_> {
             Prepared::Rans(ctx) => ctx.skip(core, omega, n),
             Prepared::RansI(ctx) => ctx.skip(core, omega, n),
             Prepared::Pack(ctx) => ctx.skip(core, omega, n),
+            Prepared::Seg(ctx) => ctx.skip(core, omega, n),
             _ => {
                 for _ in 0..n {
                     self.reveal(core, omega)?;
@@ -283,6 +297,9 @@ impl Prepared<'_> {
             return ctx.decode_into(core, omega, n, out);
         }
         if let Prepared::Pack(ctx) = self {
+            return ctx.decode_into(core, omega, n, out);
+        }
+        if let Prepared::Seg(ctx) = self {
             return ctx.decode_into(core, omega, n, out);
         }
         if let Ok(cap) = usize::try_from(n) {
@@ -310,8 +327,10 @@ impl Prepared<'_> {
         match self {
             Prepared::Rans(ctx) => ctx.header_bytes(),
             Prepared::RansI(ctx) => ctx.header_bytes(),
-            // `OrANS-PACK` is cursor==position: the minimal cursor is 0.
+            // `OrANS-PACK` and `OrANS-SEG` are cursor==position: the minimal
+            // cursor is 0.
             Prepared::Pack(_) => 0,
+            Prepared::Seg(_) => 0,
             Prepared::Delegated(_) => 0,
         }
     }
@@ -337,6 +356,7 @@ impl Prepared<'_> {
             Prepared::RansI(ctx) => ctx.validate_snapshot(omega),
             Prepared::Delegated(_) => Ok(()),
             Prepared::Pack(_) => Ok(()),
+            Prepared::Seg(_) => Ok(()),
         }
     }
 }
@@ -351,6 +371,7 @@ pub fn prepare<'a>(machine: &'a dyn OrMachine, core: &[u8]) -> Result<Prepared<'
         MACHINE_RANS0 => Ok(Prepared::Rans(Box::new(RansContext::from_core(core)?))),
         MACHINE_RANS0I => Ok(Prepared::RansI(Box::new(RansIContext::from_core(core)?))),
         MACHINE_PACK => Ok(Prepared::Pack(Box::new(PackContext::from_core(core)?))),
+        MACHINE_SEG => Ok(Prepared::Seg(Box::new(SegContext::from_core(core)?))),
         _ => Ok(Prepared::Delegated(machine)),
     }
 }
@@ -363,6 +384,7 @@ pub fn machine_by_id(id: u32) -> Option<&'static dyn OrMachine> {
         MACHINE_STORE => Some(&STORE),
         MACHINE_RANS0I => Some(&RANS0I),
         MACHINE_PACK => Some(&PACK),
+        MACHINE_SEG => Some(&SEG),
         _ => None,
     }
 }

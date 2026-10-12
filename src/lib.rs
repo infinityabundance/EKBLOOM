@@ -50,6 +50,7 @@ pub mod machine;
 pub mod machine_pack;
 pub mod machine_rans;
 pub mod machine_rans_i;
+pub mod machine_seg;
 pub mod machine_store;
 pub mod manifest;
 pub mod mapped;
@@ -125,20 +126,25 @@ pub use kernels::{
 };
 pub use machine::{
     machine_by_id, prepare, state_log_with, OrMachine, Prepared, MACHINE_NL2, MACHINE_PACK,
-    MACHINE_RANS0, MACHINE_RANS0I, MACHINE_STORE, NL2,
+    MACHINE_RANS0, MACHINE_RANS0I, MACHINE_SEG, MACHINE_STORE, NL2,
 };
 pub use machine_pack::{Pack, PackContext, PACK};
 pub use machine_rans::{encoded_window_bound, Rans0, RANS0, RENORM_MAX_PER_STEP, WINDOW_MARGIN};
 pub use machine_rans_i::{
     encode_with_k, Rans0I, RansIContext, DEFAULT_K as RANS_I_DEFAULT_K, RANS0I,
 };
+pub use machine_seg::{
+    Seg, SegContext, SegEntry, SEG, SEG_DEFAULT_SEGMENT_BYTES, SEG_ENTRY_BYTES, SEG_HEADER_BYTES,
+    SEG_KIND_CONSTANT, SEG_MAGIC, SEG_VERSION,
+};
 pub use machine_store::{Store, STORE};
 pub use manifest::{
-    create, create_auto, create_auto_packed, create_auto_with_policy, create_auto_within_budget,
-    create_machine, create_machine_within_budget, create_within_budget, estimate_physical_bytes,
-    estimate_physical_bytes_for_core, grow, inspect, manifest, manifest_within_budget,
-    select_machine, select_machine_packed, select_machine_policy, select_profile_within_budget,
-    ComponentReport, EkbloomBody, ManifestationReport, RepresentationPolicy,
+    create, create_auto, create_auto_packed, create_auto_segmented, create_auto_with_policy,
+    create_auto_within_budget, create_machine, create_machine_within_budget, create_within_budget,
+    estimate_physical_bytes, estimate_physical_bytes_for_core, grow, inspect, manifest,
+    manifest_within_budget, select_machine, select_machine_packed, select_machine_policy,
+    select_machine_segmented, select_profile_within_budget, ComponentReport, EkbloomBody,
+    ManifestationReport, RepresentationPolicy,
 };
 pub use mapped::{thp_anonymous_probe, HugePageReport, MapMode, MappedSurface};
 pub use metrics::{now_ns, percentiles, Percentiles};

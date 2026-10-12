@@ -36,7 +36,7 @@ use crate::checkpoint::CheckpointSet;
 use crate::error::{EkbloomError, Result};
 use crate::history::History;
 use crate::machine::{
-    machine_by_id, OrMachine, MACHINE_NL2, MACHINE_PACK, MACHINE_RANS0, MACHINE_STORE,
+    machine_by_id, OrMachine, MACHINE_NL2, MACHINE_PACK, MACHINE_RANS0, MACHINE_SEG, MACHINE_STORE,
 };
 use crate::state::Snapshot;
 use crate::tiles::TileSet;
@@ -309,6 +309,10 @@ pub fn create_auto(source: &[u8], profile: ManifestationProfile) -> Result<Ekblo
 /// position) whenever its core is smaller than raw, trading a possibly larger core
 /// than order-0 rANS for constant-time positional access; when packing does not
 /// beat raw it falls back to [`RepresentationPolicy::Auto`].
+/// [`RepresentationPolicy::Segmented`] admits machine 6 (`OrANS-SEG`), the
+/// versioned segmented container that picks the best directly-addressable
+/// representation *per segment*, when that container is smaller than raw, else
+/// falls back to [`RepresentationPolicy::Auto`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum RepresentationPolicy {
     /// Machine 2 when it shrinks the source, else machine 3 (the default).
@@ -316,6 +320,8 @@ pub enum RepresentationPolicy {
     Auto,
     /// Machine 5 (`OrANS-PACK`) when its core is smaller than raw, else `Auto`.
     Packed,
+    /// Machine 6 (`OrANS-SEG`) when its container is smaller than raw, else `Auto`.
+    Segmented,
 }
 
 /// The machine chosen by `policy` for `source` (the policy-aware [`select_machine`]).
@@ -332,6 +338,12 @@ pub fn select_machine_packed(source: &[u8]) -> Result<u32> {
     select_machine_policy(source, RepresentationPolicy::Packed)
 }
 
+/// [`select_machine_policy`] for [`RepresentationPolicy::Segmented`]: machine 6
+/// when its container is smaller than raw, else the `Auto` policy.
+pub fn select_machine_segmented(source: &[u8]) -> Result<u32> {
+    select_machine_policy(source, RepresentationPolicy::Segmented)
+}
+
 /// The policy decision together with the encoded core it was made against, so
 /// [`create_auto_with_policy`] never encodes the winning machine twice.
 fn select_machine_with_core_policy(
@@ -346,6 +358,16 @@ fn select_machine_with_core_policy(
             let core = machine.encode(source)?;
             if core.len() < source.len() {
                 Ok((MACHINE_PACK, core))
+            } else {
+                select_machine_with_core(source)
+            }
+        }
+        RepresentationPolicy::Segmented => {
+            let machine = machine_by_id(MACHINE_SEG)
+                .ok_or(EkbloomError::UnknownMachine { id: MACHINE_SEG })?;
+            let core = machine.encode(source)?;
+            if core.len() < source.len() {
+                Ok((MACHINE_SEG, core))
             } else {
                 select_machine_with_core(source)
             }
@@ -371,6 +393,13 @@ pub fn create_auto_with_policy(
 /// (`OrANS-PACK`) when it is smaller than raw, else the historical `auto` choice.
 pub fn create_auto_packed(source: &[u8], profile: ManifestationProfile) -> Result<EkbloomBody> {
     create_auto_with_policy(source, profile, RepresentationPolicy::Packed)
+}
+
+/// [`create_auto`] for [`RepresentationPolicy::Segmented`]: prefer machine 6
+/// (`OrANS-SEG`) when its container is smaller than raw, else the historical
+/// `auto` choice.
+pub fn create_auto_segmented(source: &[u8], profile: ManifestationProfile) -> Result<EkbloomBody> {
+    create_auto_with_policy(source, profile, RepresentationPolicy::Segmented)
 }
 
 /// Assemble a body from an already-encoded `core` and apply `profile`.

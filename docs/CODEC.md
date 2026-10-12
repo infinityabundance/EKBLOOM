@@ -1,4 +1,4 @@
-# EKBLOOM — `OrANS-RANS0` (machine 2), `OrANS-Store` (machine 3), `OrANS-RANS0I` (machine 4) and `OrANS-PACK` (machine 5)
+# EKBLOOM — `OrANS-RANS0` (machine 2), `OrANS-Store` (machine 3), `OrANS-RANS0I` (machine 4), `OrANS-PACK` (machine 5) and `OrANS-SEG` (machine 6)
 
 The visible-representation machines. Where the authoritative machine `OrANS-NL2`
 (`machine_id = 1`) is expansion-only (`V = N`), machine 2 **compresses** skewed
@@ -7,13 +7,17 @@ header, never larger than raw), machine 4 is the **interleaved** order-0 rANS �
 the same `V < N` compression as machine 2 but with `K` independent lane states, so
 the decode rate escapes machine 2's inherently serial state chain — and machine 5
 (`OrANS-PACK`) is the **directly-addressable** fixed-width packing: a position is an
-`O(1)` shift/mask with no replay, at a fixed `ceil(N*bits/8)` size. Machine 1 is
-unchanged in every respect (its semantics, wire behaviour and tests are
-bit-identical).
+`O(1)` shift/mask with no replay, at a fixed `ceil(N*bits/8)` size. Machine 6
+(`OrANS-SEG`) is the **segmented container**: a versioned, hashed directory binds
+each logical segment to its own directly-addressable representation (packed / raw /
+constant), so a mixed source is packed where it is skewed and raw where it is
+uniform while every position stays an `O(1)` exact reveal; see
+[`docs/SEGMENTS.md`](SEGMENTS.md). Machine 1 is unchanged in every respect (its
+semantics, wire behaviour and tests are bit-identical).
 
 Machine 2's contract is the first half of this document; machine 3, machine 4,
-machine 5 and the `auto` representation policy that chooses between them are the
-rest.
+machine 5, machine 6 and the `auto` representation policy that chooses between
+them are the rest.
 
 This document freezes the machine-2 contract. The implementation lives in
 `src/machine_rans.rs`; the codec is exercised by `tests/machine_rans.rs`.
@@ -368,6 +372,47 @@ core is smaller than raw, else `Auto`), via `select_machine_policy`,
 `select_machine_packed`, `create_auto_with_policy` and `create_auto_packed`. No
 existing machine choice changes under `Auto`.
 
+## Machine 6 — `OrANS-SEG` (`machine_id = 6`): the versioned segmented container
+
+Machine 5 fixes the width for the *whole* object; machines 2 and 4 compress the
+*whole* object as one order-0 stream. Neither adapts the physical representation to
+the *local* statistics of the source, so a **mixed** object (a skewed half then a
+uniform half) is the pathological case: fixed packing commits to one width
+everywhere and order-0 rANS cannot help the uniform half. Machine 6 **segments**
+the logical object and lets each segment choose its own directly-addressable
+representation, keeping every position an exact `O(1)` lookup.
+
+```text
+core = [magic/version header (96 B)][directory][segment payloads]
+```
+
+Each directory entry (56 B) binds a segment to
+`(logical_start, logical_len, machine_id, physical_offset, physical_len,
+content_id, model_ref)`. A segment is encoded by a **position-addressable** machine
+only — machine 5 (`OrANS-PACK`), machine 3 (`OrANS-Store`, raw) or a
+**constant-symbol** segment (`machine_id = 0`, a one-byte payload) — so any position
+inside it is `O(1)` with no replay. The stateful machines 1/2/4 with a segment-start
+restart are a documented **future extension** and are deliberately excluded.
+
+* **Fixed-size segments** (power-of-two span, `seg_shift`): the directory is a flat
+  array and the containing segment is `offset >> seg_shift` — no division, no
+  modulo, no search.
+* **Variable-size segments**: a **two-level directory** — a level-1 window index
+  (`(first_segment, count)` per `1 << window_shift` logical window) then the flat
+  level-2 entry array. The window is a power-of-two shift too.
+
+The directory is **versioned** (`SEG_VERSION`), **immutable** and **hashed**:
+`directory_hash` is BLAKE3 over the directory bytes *and* the payloads, and each
+entry carries a 16-byte `content_id`. [`SegContext::from_core`](../src/machine_seg.rs)
+rejects a bad magic/version, a bad `entry_bytes`, an out-of-range or overlapping
+physical offset, a truncated payload, a content-id mismatch, a non-contiguous or
+over-declared logical layout and a directory-hash mismatch — each as a typed
+`Err`. `encode` chooses fixed 4096-byte segments and the smallest of
+{constant, packed, raw} per segment *by measured size*; `encode_variable` takes
+explicit boundaries. Genesis `Omega_0 = (0, 0)`; the cursor **equals** the logical
+position (`Snapshot::new(state, i)` is exact and resumable), so `skip` is `O(1)`.
+The full write-up is [`docs/SEGMENTS.md`](SEGMENTS.md).
+
 ## The `auto` representation policy
 
 `create --machine auto` (the CLI default) and `manifest::create_auto` try machine 2
@@ -375,11 +420,12 @@ first; if the encoded core is **not** smaller than the source (`core_len >=
 source_len`) they use machine 3, so **EKBLOOM never stores more than raw for the
 base representation** (`V <= N` for every source). The chosen machine is recorded
 in the body (and therefore the `.ekb` header and `MANIFEST`) exactly as an explicit
-id. Explicit `--machine 1|2|3|4|5` overrides the policy. Machine 4 and machine 5 are
+id. Explicit `--machine 1|2|3|4|5|6` overrides the policy. Machine 4 and machine 5 are
 deliberately **not** selected by `Auto` (machine 4's core is machine 2's plus a
-`4 + 4K` header; machine 5 trades size for `O(1)` access). Machine 5 is reachable
-through `RepresentationPolicy::Packed` / `create_auto_packed` (see the machine-5
-section), never by the default `Auto`.
+`4 + 4K` header; machine 5 trades size for `O(1)` access). Machine 5 and machine 6
+are reachable through `RepresentationPolicy::Packed` / `Segmented` and
+`create_auto_packed` / `create_auto_segmented` (see their sections), never by the
+default `Auto`.
 
 `create_auto` reuses the encoded core the decision already produced, so the winning
 encode runs **once** instead of twice; `create_auto_within_budget` does the same.
@@ -407,6 +453,7 @@ for skewed data machine 2 still wins (`V < N`).
 sh scripts/container-verify.sh          # fmt + clippy -D warnings + full suite
 sh scripts/container-test.sh --test machine_rans -- --nocapture
 sh scripts/container-test.sh --test machine_pack -- --nocapture
+sh scripts/container-test.sh --test machine_seg -- --nocapture
 sh scripts/run-rans.sh                  # writes evidence/bench/rans.json
-sh scripts/run-frontier.sh              # writes evidence/bench/frontier.json (incl. `packed`)
+sh scripts/run-frontier.sh              # writes evidence/bench/frontier.json (incl. `packed`, `segmented`)
 ```

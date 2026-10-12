@@ -22,8 +22,9 @@ use ekbloom::{
     create_auto, create_machine, encode_with_k, machine_by_id, now_ns, percentiles,
     pinned_block_count, prepare, select_machine, spread_offsets, AccessTrace, BlockIndex,
     DirectoryKind, EkbloomBody, Engine, HotBlockCache, ManifestationBudget, ManifestationProfile,
-    OrMachine, PackContext, Percentiles, PinnedHotCache, RansIContext, ReadRequest, TileSet,
-    MACHINE_PACK, MACHINE_RANS0, MACHINE_RANS0I, MACHINE_STORE, PACK, RANS0, RANS0I,
+    OrMachine, PackContext, Percentiles, PinnedHotCache, RansIContext, ReadRequest, SegContext,
+    Snapshot, TileSet, MACHINE_PACK, MACHINE_RANS0, MACHINE_RANS0I, MACHINE_SEG, MACHINE_STORE,
+    PACK, RANS0, RANS0I, SEG_HEADER_BYTES, SEG_KIND_CONSTANT,
 };
 use std::path::Path;
 
@@ -1565,6 +1566,117 @@ fn measure_packed(name: &str, source: &[u8]) -> ekbloom::Result<PackedCorpus> {
     })
 }
 
+/// One segmented-container (machine 6) measurement.
+struct SegmentedReport {
+    name: String,
+    source_len: u64,
+    container_bytes: u64,
+    payload_bytes: u64,
+    directory_bytes: u64,
+    segment_count: u64,
+    packed_segments: u64,
+    raw_segments: u64,
+    constant_segments: u64,
+    oracle_bytes: u64,
+    machine2_core_bytes: u64,
+    machine4_core_bytes: u64,
+    packed_core_bytes: u64,
+    raw_bytes: u64,
+    one_b_p50: f64,
+    one_b_p99: f64,
+    r4k_p50: f64,
+    r4k_p99: f64,
+    r64k_p50: f64,
+    r64k_p99: f64,
+    bulk_gb_s: f64,
+    exact: bool,
+}
+
+/// Measure the segmented-container (machine 6) head-to-head for one corpus.
+fn measure_segmented(name: &str, source: &[u8]) -> ekbloom::Result<SegmentedReport> {
+    let n = source.len() as u64;
+    let offs1 = spread_offsets(0x5E61_0001, SAMPLES, n, 1);
+    let slots4 = (n / READ).max(1);
+    let offs4: Vec<u64> = (0..SAMPLES as u64)
+        .map(|i| i.wrapping_mul(7919) % slots4 * READ)
+        .collect();
+    let slots64 = (n / COLD64K).max(1);
+    let offs64: Vec<u64> = (0..SAMPLES as u64)
+        .map(|i| i.wrapping_mul(7919) % slots64 * COLD64K)
+        .collect();
+    let slice = |off: u64, len: u64| source[off as usize..(off + len) as usize].to_vec();
+
+    let m6 = machine_by_id(MACHINE_SEG).expect("machine 6 is registered");
+    let core6 = m6.encode(source)?;
+    let ctx6 = SegContext::from_core(&core6)?;
+    let (mut packed_n, mut raw_n, mut const_n) = (0u64, 0u64, 0u64);
+    for e in ctx6.entries() {
+        match e.machine_id {
+            SEG_KIND_CONSTANT => const_n += 1,
+            MACHINE_STORE => raw_n += 1,
+            MACHINE_PACK => packed_n += 1,
+            _ => {}
+        }
+    }
+    let seg_read = |off: u64, len: u64| -> Vec<u8> {
+        let mut out = Vec::with_capacity(len as usize);
+        let mut omega = Snapshot::new(0, off);
+        ctx6.decode_into(&core6, &mut omega, len, &mut out)
+            .expect("segmented read");
+        out
+    };
+    let mut exact = true;
+    for &off in offs4.iter().take(16) {
+        exact &= seg_read(off, READ) == slice(off, READ);
+    }
+    let one = time_reads(&offs1, |off| seg_read(off, 1));
+    let r4 = time_reads(&offs4, |off| seg_read(off, READ));
+    let r64 = time_reads(&offs64, |off| seg_read(off, COLD64K));
+    let mut exact_bulk = true;
+    let bulk = bulk_ns(source, &mut exact_bulk, |out| {
+        let mut omega = Snapshot::new(0, 0);
+        ctx6.decode_into(&core6, &mut omega, n, out)
+            .expect("segmented bulk");
+    });
+    exact &= exact_bulk;
+
+    let core2 = RANS0.encode(source)?;
+    let core4 = encode_with_k(source, 4)?;
+    let core5 = PACK.encode(source)?;
+    // Reviewer oracle: a 2-bit packed first half plus a raw second half, before
+    // any directory/version metadata.
+    let oracle = n / 2 / 4 + n / 2;
+
+    Ok(SegmentedReport {
+        name: name.to_string(),
+        source_len: n,
+        container_bytes: core6.len() as u64,
+        payload_bytes: ctx6.payload_bytes(),
+        directory_bytes: ctx6.directory_bytes(),
+        segment_count: ctx6.segment_count() as u64,
+        packed_segments: packed_n,
+        raw_segments: raw_n,
+        constant_segments: const_n,
+        oracle_bytes: oracle,
+        machine2_core_bytes: core2.len() as u64,
+        machine4_core_bytes: core4.len() as u64,
+        packed_core_bytes: core5.len() as u64,
+        raw_bytes: n,
+        one_b_p50: one.p50,
+        one_b_p99: one.p99,
+        r4k_p50: r4.p50,
+        r4k_p99: r4.p99,
+        r64k_p50: r64.p50,
+        r64k_p99: r64.p99,
+        bulk_gb_s: if bulk > 0 {
+            n as f64 / bulk as f64
+        } else {
+            0.0
+        },
+        exact,
+    })
+}
+
 /// One measured contender.
 #[derive(Clone)]
 struct Row {
@@ -2159,6 +2271,7 @@ fn render_json(
     cold: &[ColdReport],
     decode: &[DecodeRate],
     packed: &[PackedCorpus],
+    segmented: &[SegmentedReport],
 ) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
@@ -2406,6 +2519,46 @@ fn render_json(
         s.push('\n');
     }
     s.push_str("  ],\n");
+    s.push_str("  \"segmented\": [\n");
+    for (si, g) in segmented.iter().enumerate() {
+        s.push_str("    {\n");
+        let _ = writeln!(s, "      \"name\": \"{}\",", json_escape(&g.name));
+        let _ = writeln!(s, "      \"source_len\": {},", g.source_len);
+        let _ = writeln!(s, "      \"container_bytes\": {},", g.container_bytes);
+        let _ = writeln!(s, "      \"payload_bytes\": {},", g.payload_bytes);
+        let _ = writeln!(s, "      \"directory_bytes\": {},", g.directory_bytes);
+        let _ = writeln!(s, "      \"segment_count\": {},", g.segment_count);
+        let _ = writeln!(s, "      \"packed_segments\": {},", g.packed_segments);
+        let _ = writeln!(s, "      \"raw_segments\": {},", g.raw_segments);
+        let _ = writeln!(s, "      \"constant_segments\": {},", g.constant_segments);
+        let _ = writeln!(s, "      \"oracle_bytes\": {},", g.oracle_bytes);
+        let _ = writeln!(
+            s,
+            "      \"machine2_core_bytes\": {},",
+            g.machine2_core_bytes
+        );
+        let _ = writeln!(
+            s,
+            "      \"machine4_core_bytes\": {},",
+            g.machine4_core_bytes
+        );
+        let _ = writeln!(s, "      \"packed_core_bytes\": {},", g.packed_core_bytes);
+        let _ = writeln!(s, "      \"raw_bytes\": {},", g.raw_bytes);
+        let _ = writeln!(s, "      \"one_b_p50_ns\": {:.1},", finite(g.one_b_p50));
+        let _ = writeln!(s, "      \"one_b_p99_ns\": {:.1},", finite(g.one_b_p99));
+        let _ = writeln!(s, "      \"r4k_p50_ns\": {:.1},", finite(g.r4k_p50));
+        let _ = writeln!(s, "      \"r4k_p99_ns\": {:.1},", finite(g.r4k_p99));
+        let _ = writeln!(s, "      \"r64k_p50_ns\": {:.1},", finite(g.r64k_p50));
+        let _ = writeln!(s, "      \"r64k_p99_ns\": {:.1},", finite(g.r64k_p99));
+        let _ = writeln!(s, "      \"bulk_gb_s\": {:.3},", finite(g.bulk_gb_s));
+        let _ = writeln!(s, "      \"exact\": {}", g.exact);
+        let _ = write!(s, "    }}");
+        if si + 1 < segmented.len() {
+            s.push(',');
+        }
+        s.push('\n');
+    }
+    s.push_str("  ],\n");
     s.push_str("  \"corpora\": [\n");
     for (ci, c) in corpora.iter().enumerate() {
         s.push_str("    {\n");
@@ -2583,6 +2736,29 @@ fn print_decode_table(decode: &[DecodeRate]) {
     }
 }
 
+fn print_segmented_table(segmented: &[SegmentedReport]) {
+    for g in segmented {
+        println!(
+            "\n== SEGMENTED machine 6 vs rANS/packed/raw (corpus {}) ==  source {} B, {} segments ({} packed, {} raw, {} constant), dir {} B",
+            g.name, g.source_len, g.segment_count, g.packed_segments, g.raw_segments, g.constant_segments, g.directory_bytes
+        );
+        println!(
+            "   container {} B vs oracle {} B (delta {} B) vs machine2 {} B vs machine4 {} B vs packed-only {} B vs raw {} B",
+            g.container_bytes,
+            g.oracle_bytes,
+            g.container_bytes as i64 - g.oracle_bytes as i64,
+            g.machine2_core_bytes,
+            g.machine4_core_bytes,
+            g.packed_core_bytes,
+            g.raw_bytes
+        );
+        println!(
+            "   1B p50 {:.0} ns / p99 {:.0} ns;  4KiB p50 {:.0} ns / p99 {:.0} ns;  64KiB p50 {:.0} ns / p99 {:.0} ns;  bulk {:.2} GB/s;  exact {}",
+            g.one_b_p50, g.one_b_p99, g.r4k_p50, g.r4k_p99, g.r64k_p50, g.r64k_p99, g.bulk_gb_s, g.exact
+        );
+    }
+}
+
 fn print_packed_table(packed: &[PackedCorpus]) {
     for p in packed {
         println!(
@@ -2647,11 +2823,16 @@ fn main() -> ekbloom::Result<()> {
         .filter(|(name, _)| *name == "skewed" || *name == "mixed")
         .map(|(name, source)| measure_packed(name, source))
         .collect::<ekbloom::Result<Vec<_>>>()?;
+    let segmented: Vec<SegmentedReport> = corpus_list
+        .iter()
+        .map(|(name, source)| measure_segmented(name, source))
+        .collect::<ekbloom::Result<Vec<_>>>()?;
 
     print_table(&corpora);
     print_cold_table(&cold);
     print_decode_table(&decode);
     print_packed_table(&packed);
+    print_segmented_table(&segmented);
 
     println!("\n== hot index (fully resident, allocation-parity) ==");
     println!(
@@ -2769,6 +2950,26 @@ fn main() -> ekbloom::Result<()> {
         );
     }
 
+    println!("\n== SEGMENTED summary (machine 6) ==");
+    for g in &segmented {
+        println!(
+            "  {:<7}: container {} B (payload {} + dir {} + header {}); oracle {} B; machine2 {} B; segments {} (packed/raw/const = {}/{}/{}); bulk {:.2} GB/s; exact {}",
+            g.name,
+            g.container_bytes,
+            g.payload_bytes,
+            g.directory_bytes,
+            SEG_HEADER_BYTES,
+            g.oracle_bytes,
+            g.machine2_core_bytes,
+            g.segment_count,
+            g.packed_segments,
+            g.raw_segments,
+            g.constant_segments,
+            g.bulk_gb_s,
+            g.exact
+        );
+    }
+
     let json = render_json(
         &corpora,
         &hot_index,
@@ -2778,6 +2979,7 @@ fn main() -> ekbloom::Result<()> {
         &cold,
         &decode,
         &packed,
+        &segmented,
     );
     let out = Path::new("evidence/bench/frontier.json");
     if let Some(parent) = out.parent() {
