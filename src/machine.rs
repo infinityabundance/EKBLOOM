@@ -71,6 +71,20 @@ pub trait OrMachine: Send + Sync {
     /// Validate that `core` can produce `logical_len` symbols.
     fn check_core(&self, core: &[u8], logical_len: u64) -> Result<()>;
 
+    /// Whether a *complete* resumable snapshot of this machine requires its
+    /// per-lane state (`lanes`/`lane`), i.e. `(state, cursor)` alone cannot
+    /// resume.
+    ///
+    /// The single-state machines (`machine_id = 1|2|3`) return `false`; the
+    /// interleaved order-0 rANS machine (`OrANS-RANS0I`, `machine_id = 4`)
+    /// returns `true`. Manifested successor/restart records (regional tables,
+    /// block indexes, checkpoints) consult this predicate to decide whether to
+    /// store the complete wide [`Snapshot`] rather than the compact
+    /// `(state, cursor)` form, so no site needs to hardcode a machine id.
+    fn snapshot_needs_lanes(&self) -> bool {
+        false
+    }
+
     /// Decode `logical_len` symbols from `core` (authoritative reference path).
     fn decode(&self, core: &[u8], logical_len: u64) -> Result<Vec<u8>> {
         self.check_core(core, logical_len)?;

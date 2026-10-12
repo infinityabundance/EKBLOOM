@@ -66,6 +66,14 @@ const fn region_record_len(depth: u16, cursor_bytes: usize) -> usize {
     2 + depth as usize + 4 + cursor_bytes
 }
 
+/// Complete wide record width at depth `D` for a lane-bearing machine:
+/// `key u16` ++ `symbols[D]` ++ [`Snapshot::pack_wide`]. Such a machine
+/// (`OrANS-RANS0I`) is only resumable with its full per-lane state, so the
+/// compact `(state, cursor)` form is not enough.
+const fn region_wide_record_len(depth: u16) -> usize {
+    2 + depth as usize + Snapshot::WIDE_LEN
+}
+
 /// An observed access trace: `regions[k] = (start, len)` with `counts[k]` accesses.
 ///
 /// `regions` and `counts` must have equal length; every region must lie inside
@@ -156,10 +164,19 @@ fn oob(offset: u64, length: u64, logical_len: u64) -> EkbloomError {
 /// Windows are region-local (`i + D <= start + len`), so the table depends on no
 /// bytes outside its own region — exactly `verify::check_regional`'s semantics.
 ///
-/// For a cursor-divergent machine (`store_cursor`), each record also carries the
-/// complete successor cursor `cursors[i + D]`; two windows that agree on
-/// `(symbols, next_state)` but diverge on the cursor are a conflict, so the table
-/// is a total map from the 16-bit state to the complete successor snapshot.
+/// The stored successor is the *complete* resumable state `Omega_{i+D}`:
+///
+/// - a lane-bearing machine (`store_wide`, `OrANS-RANS0I`) stores the whole
+///   [`Snapshot::pack_wide`] form, so the `K` independent lane states and the
+///   active lane are preserved — `(state, cursor)` alone would not resume it;
+/// - a cursor-divergent machine (`store_cursor`) appends the successor cursor
+///   `u64`;
+/// - a cursor==position machine stores only the 16-bit state.
+///
+/// Conflict detection compares exactly the components that are stored: two
+/// windows whose 16-bit key agrees but whose outcome (or, for a cursor/wide
+/// machine, whose complete successor snapshot) differs are a conflict, so the
+/// table is a total map from the 16-bit state to the complete successor.
 #[allow(clippy::too_many_arguments)]
 fn build_region_shell(
     start: u64,
@@ -167,24 +184,32 @@ fn build_region_shell(
     depth: u16,
     generation: u64,
     core_hash: [u8; 32],
-    logs: &[u32],
+    snapshots: &[Snapshot],
     decoded: &[u8],
-    cursors: &[u64],
     store_cursor: bool,
+    store_wide: bool,
 ) -> Result<(BloomShell, Certification, u64)> {
     let d = u64::from(depth);
     let width = usize::from(depth);
     let windows = if len >= d { len - d + 1 } else { 0 };
 
-    // `(symbols, next_state, next_cursor)`; the cursor is compared only for a
-    // cursor-divergent machine, so machine-1 certification is unchanged.
-    let mut map: BTreeMap<u16, (Vec<u8>, u32, u64)> = BTreeMap::new();
+    // `(symbols, complete successor snapshot)`; the cursor/lanes are compared
+    // only for the machines that store them, so machine-1 certification is
+    // unchanged.
+    let mut map: BTreeMap<u16, (Vec<u8>, Snapshot)> = BTreeMap::new();
     let mut conflicting: BTreeSet<u16> = BTreeSet::new();
     for w in 0..windows {
         let i = usize::try_from(start.saturating_add(w)).map_err(|_| EkbloomError::Overflow {
             what: "region window index",
         })?;
-        let key = (logs[i] & 0xFFFF) as u16;
+        let key = (snapshots
+            .get(i)
+            .ok_or(EkbloomError::Truncated {
+                needed: i as u64 + 1,
+                available: snapshots.len() as u64,
+            })?
+            .state
+            & 0xFFFF) as u16;
         let end = i.checked_add(width).ok_or(EkbloomError::Overflow {
             what: "region window end",
         })?;
@@ -195,22 +220,23 @@ fn build_region_shell(
                 available: decoded.len() as u64,
             })?
             .to_vec();
-        let next_state = logs[end];
-        let next_cursor = *cursors.get(end).ok_or(EkbloomError::Truncated {
-            needed: end as u64,
-            available: cursors.len() as u64,
+        let successor = *snapshots.get(end).ok_or(EkbloomError::Truncated {
+            needed: end as u64 + 1,
+            available: snapshots.len() as u64,
         })?;
         match map.get(&key) {
             None => {
-                map.insert(key, (symbols, next_state, next_cursor));
+                map.insert(key, (symbols, successor));
             }
-            Some((prev_symbols, prev_state, prev_cursor)) => {
-                let differs = if store_cursor {
+            Some((prev_symbols, prev)) => {
+                let differs = if store_wide {
+                    *prev_symbols != symbols || *prev != successor
+                } else if store_cursor {
                     *prev_symbols != symbols
-                        || *prev_state != next_state
-                        || *prev_cursor != next_cursor
+                        || prev.state != successor.state
+                        || prev.cursor != successor.cursor
                 } else {
-                    *prev_symbols != symbols || *prev_state != next_state
+                    *prev_symbols != symbols || prev.state != successor.state
                 };
                 if differs {
                     conflicting.insert(key);
@@ -226,8 +252,13 @@ fn build_region_shell(
     };
     let entries = map.len() as u64;
     let cursor_bytes = if store_cursor { REGION_CURSOR_BYTES } else { 0 };
+    let record_len = if store_wide {
+        region_wide_record_len(depth)
+    } else {
+        region_record_len(depth, cursor_bytes)
+    };
     let table_len = entries
-        .checked_mul(region_record_len(depth, cursor_bytes) as u64)
+        .checked_mul(record_len as u64)
         .ok_or(EkbloomError::Overflow {
             what: "region table length",
         })?;
@@ -240,12 +271,16 @@ fn build_region_shell(
     payload.extend_from_slice(&entries.to_le_bytes());
     payload.extend_from_slice(&status.to_u32().to_le_bytes());
     payload.extend_from_slice(&table_len.to_le_bytes());
-    for (key, (symbols, next_state, next_cursor)) in &map {
+    for (key, (symbols, successor)) in &map {
         payload.extend_from_slice(&key.to_le_bytes());
         payload.extend_from_slice(symbols);
-        payload.extend_from_slice(&next_state.to_le_bytes());
-        if store_cursor {
-            payload.extend_from_slice(&next_cursor.to_le_bytes());
+        if store_wide {
+            payload.extend_from_slice(&successor.pack_wide());
+        } else {
+            payload.extend_from_slice(&successor.state.to_le_bytes());
+            if store_cursor {
+                payload.extend_from_slice(&successor.cursor.to_le_bytes());
+            }
         }
     }
 
@@ -342,61 +377,59 @@ where
     Ok((ns_per_read, reads))
 }
 
-/// The authoritative `(decoded symbols, state at every logical position, cursor
-/// at every logical position)` for `machine` over `core`, in a single bounded
-/// pass. `states[i]` is the machine state before revealing symbol `i`; `cursors[i]`
-/// is the matching backing cursor, which equals `i` only for a cursor==position
-/// machine. This replaces the machine-1-only `NL2::decode` / `state_log` pair so
-/// the regional builder is machine-general.
+/// The authoritative `(decoded symbols, complete resumable state at every
+/// logical position)` for `machine` over `core`, in a single bounded pass.
+/// `snapshots[i] = Omega_i` is the machine state *before* revealing symbol `i`,
+/// carrying its full per-lane state for a lane-bearing machine. This replaces the
+/// machine-1-only `NL2::decode` / `state_log` pair so the regional builder is
+/// machine-general.
 fn authoritative_pass(
     machine: &dyn OrMachine,
     core: &[u8],
     logical_len: u64,
-) -> Result<(Vec<u8>, Vec<u32>, Vec<u64>)> {
+) -> Result<(Vec<u8>, Vec<Snapshot>)> {
     machine.check_core(core, logical_len)?;
     let n = usize::try_from(logical_len).map_err(|_| EkbloomError::Overflow {
         what: "logical length",
     })?;
     let mut decoded: Vec<u8> = Vec::with_capacity(n);
-    let mut states: Vec<u32> = Vec::with_capacity(n.saturating_add(1));
-    let mut cursors: Vec<u64> = Vec::with_capacity(n.saturating_add(1));
+    let mut snapshots: Vec<Snapshot> = Vec::with_capacity(n.saturating_add(1));
     let ctx = crate::machine::prepare(machine, core)?;
     let mut omega = machine.init(core)?;
-    states.push(omega.state);
-    cursors.push(omega.cursor);
+    snapshots.push(omega);
     for _ in 0..logical_len {
         decoded.push(ctx.reveal(core, &mut omega)?);
-        states.push(omega.state);
-        cursors.push(omega.cursor);
+        snapshots.push(omega);
     }
-    Ok((decoded, states, cursors))
+    Ok((decoded, snapshots))
 }
 
-/// The authoritative backing cursor before each logical position for `machine`
-/// over `core`: `cursors[i]` is `Omega_i.cursor` (the cursor *before* revealing
-/// symbol `i`), so a region window starting at `i` stores `cursors[i + D]`.
+/// The authoritative complete resumable state before each logical position for
+/// `machine` over `core`: `snapshots[i] = Omega_i`, so a region window starting
+/// at `i` stores `snapshots[i + D]`.
 ///
-/// This is the cursor projection `verify::check_regional` re-derives for a
-/// cursor-divergent regional table, so a forged successor cursor cannot pass.
-/// A cursor==position machine (`MACHINE_NL2`) stores no cursor and needs no pass.
-pub(crate) fn cursor_log_with(
+/// This is the successor projection `verify::check_regional` re-derives for a
+/// cursor-divergent or lane-bearing regional table, so a forged successor cursor
+/// or lane state cannot pass. A cursor==position machine (`MACHINE_NL2`) stores
+/// neither and needs no pass.
+pub(crate) fn successor_log_with(
     machine: &dyn OrMachine,
     core: &[u8],
     logical_len: u64,
-) -> Result<Vec<u64>> {
+) -> Result<Vec<Snapshot>> {
     machine.check_core(core, logical_len)?;
     let n = usize::try_from(logical_len).map_err(|_| EkbloomError::Overflow {
-        what: "cursor log length",
+        what: "successor log length",
     })?;
     let ctx = crate::machine::prepare(machine, core)?;
     let mut omega = machine.init(core)?;
-    let mut cursors: Vec<u64> = Vec::with_capacity(n.saturating_add(1));
-    cursors.push(omega.cursor);
+    let mut snapshots: Vec<Snapshot> = Vec::with_capacity(n.saturating_add(1));
+    snapshots.push(omega);
     for _ in 0..logical_len {
         ctx.reveal(core, &mut omega)?;
-        cursors.push(omega.cursor);
+        snapshots.push(omega);
     }
-    Ok(cursors)
+    Ok(snapshots)
 }
 
 /// The stored `(16-bit key, successor cursor)` records of a regional shell that
@@ -427,6 +460,35 @@ pub(crate) fn region_stored_cursors(
         let key = u16::from_le_bytes(rec.get(0..2)?.try_into().ok()?);
         let cursor = u64::from_le_bytes(rec.get(cursor_off..cursor_off + 8)?.try_into().ok()?);
         out.push((key, cursor));
+        off = end;
+    }
+    Some(out)
+}
+
+/// The stored `(16-bit key, complete successor snapshot)` records of a regional
+/// shell in the wide form (lane-bearing machine), in stored key order. `None`
+/// when the shell is not wide or its payload is structurally short.
+///
+/// `verify::check_regional` uses this to compare the stored successor cursor
+/// *and* lane state against the ones re-derived from the authoritative machine
+/// pass: `RegionTable::from_shell` discards them, so a self-consistent but forged
+/// snapshot would otherwise survive verification while `read_region_scoped`
+/// returned divergent bytes.
+pub(crate) fn region_stored_snapshots(
+    shell: &BloomShell,
+    depth: u16,
+) -> Option<Vec<(u16, Snapshot)>> {
+    let entries = usize::try_from(shell.entries).ok()?;
+    let record = region_wide_record_len(depth);
+    let snap_off = 2 + usize::from(depth);
+    let mut off = REGION_PREFIX_LEN;
+    let mut out = Vec::with_capacity(entries);
+    for _ in 0..entries {
+        let end = off.checked_add(record)?;
+        let rec = shell.payload.get(off..end)?;
+        let key = u16::from_le_bytes(rec.get(0..2)?.try_into().ok()?);
+        let snap = Snapshot::unpack_wide(rec.get(snap_off..)?).ok()?;
+        out.push((key, snap));
         off = end;
     }
     Some(out)
@@ -506,14 +568,18 @@ pub fn manifest_hot_regions(
 
     // Authoritative arrays, computed once for every region. Every step is
     // dispatched through the body's own machine (`machine_by_id`) so a
-    // cursor-divergent machine (e.g. `OrANS-RANS0`) is handled correctly: its
-    // core is shorter than the logical output and its cursor is not the position.
+    // cursor-divergent machine (e.g. `OrANS-RANS0`) and a lane-bearing machine
+    // (e.g. `OrANS-RANS0I`) are handled correctly: the successor snapshot keeps
+    // the full lane state, and the cursor is not the logical position.
     let machine = machine_by_id(body.machine_id).ok_or(EkbloomError::UnknownMachine {
         id: body.machine_id,
     })?;
-    let store_cursor = machine.machine_id() != MACHINE_NL2;
+    // The capability predicate decides the record form; no machine id is
+    // hardcoded here.
+    let store_wide = machine.snapshot_needs_lanes();
+    let store_cursor = !store_wide && machine.machine_id() != MACHINE_NL2;
     let logical_len = body.logical_len;
-    let (decoded, logs, cursors) = authoritative_pass(machine, &body.core, logical_len)?;
+    let (decoded, snapshots) = authoritative_pass(machine, &body.core, logical_len)?;
 
     // Build every candidate table first (fallible, no mutation yet).
     struct Candidate {
@@ -545,10 +611,10 @@ pub fn manifest_hot_regions(
             depth,
             next_generation,
             body.core_hash,
-            &logs,
+            &snapshots,
             &decoded,
-            &cursors,
             store_cursor,
+            store_wide,
         )?;
         let certificate = region_certificate(&shell, body.machine_id, body.core_hash);
         let bytes = shell
@@ -710,15 +776,26 @@ pub fn manifest_hot_regions(
 // Region-scoped read path.
 // ---------------------------------------------------------------------------
 
+/// The stored successor form of a regional record.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegionForm {
+    /// Only the 16-bit state; the cursor is the logical position (`i + D`).
+    Base,
+    /// The 16-bit state plus the successor cursor `u64` (cursor-divergent machine).
+    Cursor,
+    /// The complete wide [`Snapshot`] (lane-bearing interleaved machine).
+    Wide,
+}
+
 /// A zero-copy view over a regional shell payload, for O(log entries) lookups.
 struct RegionView<'a> {
     depth: u64,
     start: u64,
     len: u64,
     entries: usize,
-    /// Whether each record carries a complete successor cursor `u64`.
-    has_cursor: bool,
-    /// Record width in bytes (base, plus cursor bytes when `has_cursor`).
+    /// The stored successor form (base, cursor, or complete wide snapshot).
+    form: RegionForm,
+    /// Record width in bytes for `form`.
     record_len: usize,
     records: &'a [u8],
 }
@@ -727,10 +804,15 @@ impl<'a> RegionView<'a> {
     /// Parse the region-local fields from a `Regional` shell payload. Returns
     /// `None` on any structural inconsistency (the shell is then ignored).
     ///
-    /// `require_cursor` is set for a cursor-divergent body: such a table must carry
-    /// the successor cursor `u64` per record, otherwise it is not leap-safe and is
-    /// rejected so reads fall back to bounded restart.
-    fn parse(shell: &'a BloomShell, require_cursor: bool) -> Option<RegionView<'a>> {
+    /// `require_cursor` is set for a cursor-divergent (non-lane) body, and
+    /// `require_wide` for a lane-bearing body: such a table must carry the
+    /// successor cursor / complete snapshot per record, otherwise it is not
+    /// leap-safe and is rejected so reads fall back to bounded restart.
+    fn parse(
+        shell: &'a BloomShell,
+        require_cursor: bool,
+        require_wide: bool,
+    ) -> Option<RegionView<'a>> {
         if shell.kind != BloomKind::Regional
             || shell.status != Certification::Certified
             || shell.depth == 0
@@ -755,25 +837,37 @@ impl<'a> RegionView<'a> {
         let entries = usize::try_from(entries_u64).ok()?;
         let base = region_record_len(depth, 0);
         let with_cursor = region_record_len(depth, REGION_CURSOR_BYTES);
-        let has_cursor = if entries == 0 {
+        let wide = region_wide_record_len(depth);
+        let form = if entries == 0 {
             if table_len != 0 {
                 return None;
             }
-            false
+            RegionForm::Base
         } else {
             let n = entries as u64;
             if table_len == n.checked_mul(base as u64)? {
-                false
+                RegionForm::Base
             } else if table_len == n.checked_mul(with_cursor as u64)? {
-                true
+                RegionForm::Cursor
+            } else if table_len == n.checked_mul(wide as u64)? {
+                RegionForm::Wide
             } else {
                 return None;
             }
         };
-        if require_cursor && !has_cursor {
+        if require_cursor && form != RegionForm::Cursor {
             return None;
         }
-        let record_len = if has_cursor { with_cursor } else { base };
+        if require_wide && form != RegionForm::Wide {
+            return None;
+        }
+        let record_len = if form == RegionForm::Wide {
+            wide
+        } else if form == RegionForm::Cursor {
+            with_cursor
+        } else {
+            base
+        };
         let need = (record_len as u64)
             .checked_mul(entries_u64)?
             .checked_add(REGION_PREFIX_LEN as u64)?;
@@ -785,7 +879,7 @@ impl<'a> RegionView<'a> {
             start,
             len,
             entries,
-            has_cursor,
+            form,
             record_len,
             records: &shell.payload[REGION_PREFIX_LEN..],
         })
@@ -803,9 +897,14 @@ impl<'a> RegionView<'a> {
         pos >= self.start && pos.saturating_add(self.depth) <= end
     }
 
-    /// The `(D symbols, successor state, successor cursor)` outcome recorded for
-    /// 16-bit key `key`. The cursor is `None` for a cursor==position machine.
-    fn look(&self, key: u16) -> Option<(&'a [u8], u32, Option<u64>)> {
+    /// The `(D symbols, complete successor snapshot)` outcome recorded for 16-bit
+    /// key `key` at logical position `pos`.
+    ///
+    /// The returned snapshot is exactly resumable: for a lane-bearing machine it
+    /// carries the stored `[u32; K]` lane states and active lane; for a
+    /// cursor-divergent one the stored cursor; for a cursor==position machine the
+    /// derived cursor `pos + D`.
+    fn look(&self, key: u16, pos: u64) -> Option<(&'a [u8], Snapshot)> {
         let rec = self.record_len;
         let mut lo: usize = 0;
         let mut hi: usize = self.entries;
@@ -821,16 +920,23 @@ impl<'a> RegionView<'a> {
                 let sym_off = base + 2;
                 let sym_end = sym_off + self.depth as usize;
                 let symbols = self.records.get(sym_off..sym_end)?;
-                let next = u32::from_le_bytes(self.records[sym_end..sym_end + 4].try_into().ok()?);
-                let cursor = if self.has_cursor {
-                    let cur_off = sym_end + 4;
-                    Some(u64::from_le_bytes(
-                        self.records[cur_off..cur_off + 8].try_into().ok()?,
-                    ))
-                } else {
-                    None
+                let successor = match self.form {
+                    RegionForm::Wide => Snapshot::unpack_wide(self.records.get(sym_end..)?).ok()?,
+                    RegionForm::Cursor => {
+                        let next =
+                            u32::from_le_bytes(self.records[sym_end..sym_end + 4].try_into().ok()?);
+                        let cursor = u64::from_le_bytes(
+                            self.records[sym_end + 4..sym_end + 12].try_into().ok()?,
+                        );
+                        Snapshot::new(next, cursor)
+                    }
+                    RegionForm::Base => {
+                        let next =
+                            u32::from_le_bytes(self.records[sym_end..sym_end + 4].try_into().ok()?);
+                        Snapshot::new(next, pos.saturating_add(self.depth))
+                    }
                 };
-                return Some((symbols, next, cursor));
+                return Some((symbols, successor));
             }
         }
         None
@@ -898,14 +1004,18 @@ pub struct RegionReader<'a> {
 impl<'a> RegionReader<'a> {
     /// Parse and order the body's certified region tables.
     pub fn new(body: &'a EkbloomBody) -> RegionReader<'a> {
-        // A cursor-divergent body must only leap on tables that carry the
-        // successor cursor; a cursor==position body stays compact and derives the
-        // cursor from the position.
-        let require_cursor = body.machine_id != MACHINE_NL2;
+        // A lane-bearing body must only leap on tables that carry the complete
+        // wide snapshot; a cursor-divergent (non-lane) body on tables that carry
+        // the successor cursor; a cursor==position body stays compact and derives
+        // the cursor from the position. The capability predicate selects the
+        // required form without hardcoding a machine id.
+        let machine = machine_by_id(body.machine_id);
+        let require_wide = machine.is_some_and(|m| m.snapshot_needs_lanes());
+        let require_cursor = body.machine_id != MACHINE_NL2 && !require_wide;
         let mut views: Vec<RegionView<'a>> = body
             .blooms
             .iter()
-            .filter_map(|shell| RegionView::parse(shell, require_cursor))
+            .filter_map(|shell| RegionView::parse(shell, require_cursor, require_wide))
             .collect();
         // Non-overlapping region tables are searched by start; an overlapping
         // trace still reads correctly (the covering lookup falls back to reveal).
@@ -955,16 +1065,16 @@ impl<'a> RegionReader<'a> {
             };
             if let Some(view) = covering {
                 if view.covers(pos) && pos.saturating_add(view.depth) <= end {
-                    if let Some((symbols, next_state, cursor)) =
-                        view.look((omega.state & 0xFFFF) as u16)
+                    if let Some((symbols, successor)) =
+                        view.look((omega.state & 0xFFFF) as u16, pos)
                     {
                         if symbols.len() as u64 == view.depth {
                             out.extend_from_slice(symbols);
-                            // A cursor-divergent machine stores the complete
-                            // successor cursor; a cursor==position machine derives
-                            // it as `pos + D` and stores no cursor bytes.
-                            let next_cursor = cursor.unwrap_or_else(|| pos + view.depth);
-                            omega = Snapshot::new(next_state, next_cursor);
+                            // Resume with the exact stored successor: a
+                            // lane-bearing machine keeps its `[u32; K]` lane
+                            // states and active lane, a cursor-divergent one its
+                            // cursor, and a cursor==position machine `pos + D`.
+                            omega = successor;
                             pos = pos.saturating_add(view.depth);
                             continue;
                         }
@@ -996,7 +1106,7 @@ pub fn read_region_scoped(body: &EkbloomBody, offset: u64, length: u64) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::machine::{state_log, NL2};
+    use crate::machine::NL2;
     use crate::manifest::create;
     use crate::ManifestationProfile;
 
@@ -1041,32 +1151,33 @@ mod tests {
         let core = NL2.encode(&src).unwrap();
         let n = src.len() as u64;
         let decoded = NL2.decode(&core, n).unwrap();
-        let logs = state_log(&core, n).unwrap();
-        // Machine 1: the cursor is the logical position.
-        let cursors: Vec<u64> = (0..=n).collect();
+        let snapshots: Vec<Snapshot> = (0..=n).map(|i| Snapshot::new(0, i)).collect();
         let (shell, status, entries) = build_region_shell(
             0,
             n,
             4,
             1,
             *blake3::hash(&core).as_bytes(),
-            &logs,
+            &snapshots,
             &decoded,
-            &cursors,
+            false,
             false,
         )
         .unwrap();
         assert_eq!(status, Certification::Certified);
         assert!(entries > 0);
-        let view = RegionView::parse(&shell, false).expect("certified region must parse");
+        let view = RegionView::parse(&shell, false, false).expect("certified region must parse");
         assert_eq!(view.entries as u64, entries);
         // Every window in the region is exact via the region-local table.
         for i in 0..(n as usize - 4) {
-            let key = (logs[i] & 0xFFFF) as u16;
-            let (syms, next, cursor) = view.look(key).expect("entry");
+            let key = (snapshots[i].state & 0xFFFF) as u16;
+            let (syms, successor) = view.look(key, i as u64).expect("entry");
             assert_eq!(syms, &decoded[i..i + 4]);
-            assert_eq!(next, logs[i + 4]);
-            assert!(cursor.is_none(), "machine 1 stores no cursor");
+            assert_eq!(
+                successor,
+                Snapshot::new(snapshots[i + 4].state, i as u64 + 4),
+                "machine 1 derives the successor cursor from the position"
+            );
         }
     }
 
@@ -1101,7 +1212,8 @@ mod tests {
             status: Certification::Certified,
             core_hash: [0u8; 32],
         };
-        let view = RegionView::parse(&shell, false).expect("structurally valid forged shell");
+        let view =
+            RegionView::parse(&shell, false, false).expect("structurally valid forged shell");
         assert!(!view.covers(u64::MAX));
         assert!(!view.covers(start));
         assert!(!view.covers(start - 1));

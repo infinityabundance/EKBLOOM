@@ -413,6 +413,11 @@ impl OrMachine for Rans0I {
         MACHINE_RANS0I
     }
 
+    #[inline]
+    fn snapshot_needs_lanes(&self) -> bool {
+        true
+    }
+
     fn init(&self, core: &[u8]) -> Result<Snapshot> {
         let ctx = RansIContext::from_core(core)?;
         Ok(ctx.genesis(core))

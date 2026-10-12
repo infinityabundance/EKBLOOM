@@ -22,7 +22,7 @@ use crate::checkpoint::CheckpointSet;
 use crate::error::{EkbloomError, Result};
 use crate::machine::{machine_by_id, state_log_with, OrMachine, MACHINE_NL2};
 use crate::manifest::EkbloomBody;
-use crate::region_adapt::{cursor_log_with, region_stored_cursors};
+use crate::region_adapt::{region_stored_cursors, region_stored_snapshots, successor_log_with};
 use crate::state::Snapshot;
 use std::collections::BTreeMap;
 
@@ -129,17 +129,18 @@ fn run(body: &EkbloomBody, deep: bool) -> Result<VerificationReport> {
     // State log, used by checkpoint and bloom checks.
     let logs = state_log_with(machine, &body.core, body.logical_len).ok();
 
-    // A cursor-divergent machine stores a successor cursor in each regional
-    // record, so `check_regional` must re-derive it from the authoritative pass.
-    // A cursor==position machine derives the cursor from the position and stores
-    // none, so no extra pass is needed.
-    let cursors = if body.machine_id != MACHINE_NL2
+    // A cursor-divergent (non-lane) machine stores a successor cursor in each
+    // regional record, and a lane-bearing machine stores the complete wide
+    // snapshot, so `check_regional` must re-derive it from the authoritative
+    // pass. A cursor==position machine derives the cursor from the position and
+    // stores neither, so no extra pass is needed.
+    let needs_successor_log = body.machine_id != MACHINE_NL2
         && body
             .blooms
             .iter()
-            .any(|shell| shell.kind == BloomKind::Regional)
-    {
-        cursor_log_with(machine, &body.core, body.logical_len).ok()
+            .any(|shell| shell.kind == BloomKind::Regional);
+    let successors = if needs_successor_log {
+        successor_log_with(machine, &body.core, body.logical_len).ok()
     } else {
         None
     };
@@ -172,7 +173,7 @@ fn run(body: &EkbloomBody, deep: bool) -> Result<VerificationReport> {
             idx,
             decoded,
             logs.as_deref(),
-            cursors.as_deref(),
+            successors.as_deref(),
         ));
     }
 
@@ -262,7 +263,7 @@ fn check_bloom(
     idx: usize,
     decoded: Option<&Vec<u8>>,
     logs: Option<&[u32]>,
-    cursors: Option<&[u64]>,
+    successors: Option<&[Snapshot]>,
 ) -> CheckOutcome {
     let name = format!("bloom[{idx}]:{}", shell.kind.as_str());
     if shell.core_hash != body.core_hash {
@@ -271,7 +272,7 @@ fn check_bloom(
     match shell.kind {
         BloomKind::Path => check_path(body, shell, name, decoded, logs),
         BloomKind::Universal => check_global(shell, name, decoded, logs),
-        BloomKind::Regional => check_regional(body, shell, name, decoded, logs, cursors),
+        BloomKind::Regional => check_regional(body, shell, name, decoded, logs, successors),
         BloomKind::Contextual => check_contextual(body, shell, name),
     }
 }
@@ -411,7 +412,7 @@ fn check_regional(
     name: String,
     decoded: Option<&Vec<u8>>,
     logs: Option<&[u32]>,
-    cursors: Option<&[u64]>,
+    successors: Option<&[Snapshot]>,
 ) -> CheckOutcome {
     let table = match RegionTable::from_shell(shell) {
         Ok(table) => table,
@@ -461,34 +462,35 @@ fn check_regional(
         return check(name, false, "regional entries do not reproduce Phi_D");
     }
 
-    // A cursor-divergent table also stores the successor cursor per record.
-    // `RegionTable::from_shell` drops it, so re-derive it from the authoritative
-    // machine pass and require the stored cursor to match: a self-consistent but
-    // forged cursor would otherwise pass while `read_region_scoped` returned bytes
-    // disagreeing with `reader::read`. It is a conflict, so it also forces the
-    // recomputed status to `Rejected`.
-    let mut cursor_conflict = false;
-    let mut expected_cursors: BTreeMap<u16, u64> = BTreeMap::new();
-    if table.cursor_bytes != 0 {
-        let Some(cursors) = cursors else {
-            return check(name, false, "authoritative cursor log unavailable");
+    // A cursor-divergent table stores the successor cursor per record, and a
+    // lane-bearing (wide) table the complete successor snapshot.
+    // `RegionTable::from_shell` drops those bytes, so re-derive them from the
+    // authoritative machine pass and require the stored successor to match: a
+    // self-consistent but forged cursor or lane state would otherwise pass while
+    // `read_region_scoped` returned bytes disagreeing with `reader::read`. It is a
+    // conflict, so it also forces the recomputed status to `Rejected`.
+    let mut successor_conflict = false;
+    let mut expected_successors: BTreeMap<u16, Snapshot> = BTreeMap::new();
+    if table.wide || table.cursor_bytes != 0 {
+        let Some(successors) = successors else {
+            return check(name, false, "authoritative successor log unavailable");
         };
         for w in 0..windows {
             let key = (logs[base + w] & 0xFFFF) as u16;
-            let Some(&cursor) = cursors.get(base + w + depth) else {
-                return check(name, false, "authoritative cursor log too short");
+            let Some(&successor) = successors.get(base + w + depth) else {
+                return check(name, false, "authoritative successor log too short");
             };
-            match expected_cursors.get(&key) {
+            match expected_successors.get(&key) {
                 None => {
-                    expected_cursors.insert(key, cursor);
+                    expected_successors.insert(key, successor);
                 }
-                Some(prev) if *prev != cursor => cursor_conflict = true,
+                Some(prev) if *prev != successor => successor_conflict = true,
                 Some(_) => {}
             }
         }
     }
 
-    let expected_status = if conflict || cursor_conflict {
+    let expected_status = if conflict || successor_conflict {
         Certification::Rejected
     } else {
         Certification::Certified
@@ -501,11 +503,26 @@ fn check_regional(
         );
     }
 
-    if table.cursor_bytes != 0 {
+    if table.wide {
+        let Some(stored) = region_stored_snapshots(shell, table.depth) else {
+            return check(name, false, "regional wide records malformed");
+        };
+        let expected_records: Vec<(u16, Snapshot)> = expected_successors.into_iter().collect();
+        if stored != expected_records {
+            return check(
+                name,
+                false,
+                "regional successor snapshots do not reproduce Phi_D",
+            );
+        }
+    } else if table.cursor_bytes != 0 {
         let Some(stored) = region_stored_cursors(shell, table.depth, table.cursor_bytes) else {
             return check(name, false, "regional cursor records malformed");
         };
-        let expected_records: Vec<(u16, u64)> = expected_cursors.into_iter().collect();
+        let expected_records: Vec<(u16, u64)> = expected_successors
+            .into_iter()
+            .map(|(key, snapshot)| (key, snapshot.cursor))
+            .collect();
         if stored != expected_records {
             return check(
                 name,

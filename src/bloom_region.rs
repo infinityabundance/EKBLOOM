@@ -20,6 +20,7 @@ use crate::bloom_global::Counterexample;
 use crate::bloom_key::key_from_state;
 use crate::error::{EkbloomError, Result};
 use crate::machine::{state_log_with, OrMachine, NL2};
+use crate::state::Snapshot;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 
@@ -36,6 +37,15 @@ pub const REGION_CURSOR_BYTES: usize = 8;
 /// ++ `[next_cursor u64]` when `cursor_bytes == REGION_CURSOR_BYTES`.
 const fn region_record_len(depth: u16, cursor_bytes: usize) -> usize {
     2 + depth as usize + 4 + cursor_bytes
+}
+
+/// Per-entry record width for the complete interleaved (wide) form:
+/// `key u16` ++ `symbols[D]` ++ [`Snapshot::pack_wide`]. Used by a lane-bearing
+/// machine (`OrANS-RANS0I`), where `(state, cursor)` alone is not resumable. The
+/// leading `state u32` of `pack_wide` plays the same role as `next_state`, so the
+/// two formats agree on the first `2 + D + 4` bytes.
+const fn region_wide_record_len(depth: u16) -> usize {
+    2 + depth as usize + Snapshot::WIDE_LEN
 }
 
 /// A single region's placement and certification summary.
@@ -339,6 +349,9 @@ pub struct RegionTable {
     /// Trailing cursor bytes per record (`0` for a cursor==position machine,
     /// [`REGION_CURSOR_BYTES`] for a cursor-divergent one).
     pub cursor_bytes: usize,
+    /// Whether each record carries the complete wide [`Snapshot`] (lane-bearing
+    /// interleaved machine), rather than the compact `(state, cursor)` form.
+    pub wide: bool,
 }
 
 impl RegionTable {
@@ -391,12 +404,13 @@ impl RegionTable {
         // payloads are byte-identical to the pre-cursor format.
         let base = region_record_len(depth, 0) as u64;
         let with_cursor = region_record_len(depth, REGION_CURSOR_BYTES) as u64;
+        let wide = region_wide_record_len(depth) as u64;
         let entries_u64 = entries_len;
-        let cursor_bytes = if count == 0 {
+        let (cursor_bytes, is_wide) = if count == 0 {
             if table_len != 0 {
                 return Err(bad("empty regional table has a non-zero length"));
             }
-            0
+            (0, false)
         } else if table_len
             == entries_u64
                 .checked_mul(base)
@@ -404,7 +418,7 @@ impl RegionTable {
                     what: "regional table length",
                 })?
         {
-            0
+            (0, false)
         } else if table_len
             == entries_u64
                 .checked_mul(with_cursor)
@@ -412,13 +426,25 @@ impl RegionTable {
                     what: "regional table length",
                 })?
         {
-            REGION_CURSOR_BYTES
+            (REGION_CURSOR_BYTES, false)
+        } else if table_len
+            == entries_u64
+                .checked_mul(wide)
+                .ok_or(EkbloomError::Overflow {
+                    what: "regional table length",
+                })?
+        {
+            (0, true)
         } else {
             return Err(bad(
                 "regional table length is inconsistent with depth/entries",
             ));
         };
-        let record = region_record_len(depth, cursor_bytes);
+        let record = if is_wide {
+            region_wide_record_len(depth)
+        } else {
+            region_record_len(depth, cursor_bytes)
+        };
         let need = REGION_PREFIX_LEN
             .checked_add(record.checked_mul(count).ok_or(EkbloomError::Overflow {
                 what: "regional payload length",
@@ -436,7 +462,9 @@ impl RegionTable {
             let key = le_u16(take(p, &mut off, 2)?);
             let symbols = take(p, &mut off, width)?.to_vec();
             let next_state = le_u32(take(p, &mut off, 4)?);
-            if cursor_bytes != 0 {
+            if is_wide {
+                let _rest = take(p, &mut off, Snapshot::WIDE_LEN - 4)?;
+            } else if cursor_bytes != 0 {
                 let _next_cursor = take(p, &mut off, cursor_bytes)?;
             }
             entries.push((
@@ -459,6 +487,7 @@ impl RegionTable {
             status,
             entries,
             cursor_bytes,
+            wide: is_wide,
         })
     }
 
@@ -470,9 +499,15 @@ impl RegionTable {
     }
 
     /// Manifested table size in bytes: `entries * (D + 6)` for a cursor==position
-    /// machine, or `entries * (D + 14)` for a cursor-divergent one.
+    /// machine, `entries * (D + 14)` for a cursor-divergent one, or
+    /// `entries * (D + 2 + Snapshot::WIDE_LEN)` for the interleaved wide form.
     pub fn physical_bytes(&self) -> u64 {
-        region_table_len(self.depth, self.entries.len(), self.cursor_bytes).unwrap_or(0)
+        let per = if self.wide {
+            region_wide_record_len(self.depth) as u64
+        } else {
+            region_record_len(self.depth, self.cursor_bytes) as u64
+        };
+        (self.entries.len() as u64).saturating_mul(per)
     }
 
     /// A [`RegionDescriptor`] summarizing this parsed table.

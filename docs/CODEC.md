@@ -214,7 +214,14 @@ array), so `state_log`, checkpoints, blocks, tiles, path blooms and the engine a
 work through the machine-general paths. A cursor-divergent multi-word machine stores
 restarts in a **wide** form (complete `Snapshot`, `45 B`/entry) in the `BlockIndex`
 and in a versioned wide checkpoint container; machines 1/2/3 keep their `2`/`12`-byte
-wire forms bit-identically.
+wire forms bit-identically. Certified **regional** successor records likewise store
+the complete wide `Snapshot` for machine 4 (`D + 2 + 45` bytes/record) so a table
+leap is exactly resumable, while a cursor-divergent machine keeps its `D + 14`-byte
+`(state, cursor)` record and machine 1 its `D + 6`-byte record. Every such site
+selects the form through the `OrMachine::snapshot_needs_lanes` capability predicate
+(machine 4 returns `true`, machines 1/2/3 default to `false`) rather than a hardcoded
+machine id, and the deep verifier compares the full stored successor (lanes and
+cursor included) against a fresh authoritative pass.
 
 **Decoder (prepared bulk path, `Prepared::decode_into`).** A full group of `K`
 consecutive symbols visits every lane once, so the group's `K` table lookups and
