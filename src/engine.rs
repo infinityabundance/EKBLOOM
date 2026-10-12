@@ -52,7 +52,7 @@
 
 use std::sync::Arc;
 
-use crate::adapt::Workload;
+use crate::adapt::{Workload, WorkloadKind};
 use crate::bloom::{BloomKind, Certification};
 use crate::error::{EkbloomError, Result};
 use crate::machine::{machine_by_id, MACHINE_NL2, MACHINE_RANS0, MACHINE_RANS0I};
@@ -210,6 +210,103 @@ enum HotIndex {
     PathBloom(usize),
 }
 
+/// The immutable identity of the core a plan/engine was built against: the object
+/// id, core hash, machine, generation and logical length.
+///
+/// [`Engine::read`] and its siblings verify the [`EkbloomBody`] they are handed
+/// matches this identity **before** decoding anything. An engine holds decoder
+/// contexts prepared from one core (machine 2's fused table, machine 4's lane
+/// states); decoding a *different* body with them would silently return wrong
+/// bytes, so a mismatch is rejected with [`EkbloomError::EngineBodyMismatch`]
+/// instead. A [`ReadyObject`] binds a body to its engine so the mismatch cannot
+/// even be expressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoreIdentity {
+    /// Content-derived object identity (16-byte BLAKE3 digest prefix).
+    pub object_id: [u8; 16],
+    /// BLAKE3 hash of the visible core.
+    pub core_hash: [u8; 32],
+    /// Identifier of the machine that encoded the core.
+    pub machine_id: u32,
+    /// Manifestation generation the plan was built at.
+    pub generation: u64,
+    /// Number of logical symbols the core reveals.
+    pub logical_len: u64,
+}
+
+impl CoreIdentity {
+    /// The identity of `body`.
+    #[inline]
+    pub fn of(body: &EkbloomBody) -> CoreIdentity {
+        CoreIdentity {
+            object_id: body.object_id,
+            core_hash: body.core_hash,
+            machine_id: body.machine_id,
+            generation: body.generation,
+            logical_len: body.logical_len,
+        }
+    }
+
+    /// Verify that `body` is the object this identity describes, returning a typed
+    /// [`EkbloomError::EngineBodyMismatch`] naming the first field that differs.
+    pub fn verify(&self, body: &EkbloomBody) -> Result<()> {
+        if self.machine_id != body.machine_id {
+            return Err(EkbloomError::EngineBodyMismatch {
+                detail: format!(
+                    "planned machine_id {}, got {}",
+                    self.machine_id, body.machine_id
+                ),
+            });
+        }
+        if self.core_hash != body.core_hash {
+            return Err(EkbloomError::EngineBodyMismatch {
+                detail: format!(
+                    "planned core_hash {}, got {}",
+                    hash_hex(&self.core_hash),
+                    hash_hex(&body.core_hash)
+                ),
+            });
+        }
+        if self.object_id != body.object_id {
+            return Err(EkbloomError::EngineBodyMismatch {
+                detail: format!(
+                    "planned object_id {}, got {}",
+                    hash_hex(&self.object_id),
+                    hash_hex(&body.object_id)
+                ),
+            });
+        }
+        if self.generation != body.generation {
+            return Err(EkbloomError::EngineBodyMismatch {
+                detail: format!(
+                    "planned generation {}, got {}",
+                    self.generation, body.generation
+                ),
+            });
+        }
+        if self.logical_len != body.logical_len {
+            return Err(EkbloomError::EngineBodyMismatch {
+                detail: format!(
+                    "planned logical_len {}, got {}",
+                    self.logical_len, body.logical_len
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Lower-hex rendering of a byte string, for identity-mismatch diagnostics.
+fn hash_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
 /// An immutable, pre-certified access plan: one bounded [`Path`] per region,
 /// plus the worst-case positioning guarantee and the retained footprint.
 #[derive(Clone, Debug, PartialEq)]
@@ -217,6 +314,7 @@ pub struct AccessPlan {
     region_bytes: u64,
     region_shift: u8,
     logical_len: u64,
+    identity: CoreIdentity,
     regions: Vec<RegionPath>,
     worst_case_steps: u64,
     retained_bytes: u64,
@@ -227,6 +325,13 @@ pub struct AccessPlan {
 }
 
 impl AccessPlan {
+    /// The core identity this plan was built against. A plan may only decode the
+    /// body it was derived from; see [`CoreIdentity::verify`].
+    #[inline]
+    pub fn identity(&self) -> &CoreIdentity {
+        &self.identity
+    }
+
     /// The chosen path for the region containing `offset` — one shift and a flat
     /// index, i.e. `O(1)` with no search.
     #[inline]
@@ -459,8 +564,14 @@ impl<'a> Iterator for Segments<'a> {
 /// it instead of rebuilding the `4096`-entry fused table on every read — the
 /// persistent-context win measured in `docs/FRONTIER.md` §4. The context is `None`
 /// for machines 1/3 (whose steps are cheap/verbatim), for an invalid core, and for
-/// a plan reconstructed via [`Engine::from_plan`] (which has no core), where the
-/// dispatch falls back to the per-read build.
+/// a plan reconstructed via [`Engine::from_plan`] (which carries the core identity
+/// but no prepared context), where the dispatch falls back to the per-read build.
+///
+/// Every engine is bound to the [`CoreIdentity`] it was planned against; the read
+/// entry points verify the body they are handed matches it (see
+/// [`Engine::verify_body`]) and reject a different object/generation with
+/// [`EkbloomError::EngineBodyMismatch`] rather than decoding with mismatched
+/// prepared contexts. [`ReadyObject`] makes that binding structural.
 #[derive(Clone)]
 pub struct Engine {
     plan: Arc<AccessPlan>,
@@ -514,6 +625,7 @@ impl Engine {
         let n = body.logical_len;
         let core_bytes = body.core.len() as u64;
         let budget_bytes = budget.maximum_physical_bytes;
+        let identity = CoreIdentity::of(body);
 
         // The authoritative physical-budget condition is on the **committed** body:
         // under non-withdrawal every retained structure occupies space, whether or
@@ -535,6 +647,7 @@ impl Engine {
                     region_bytes,
                     region_shift,
                     logical_len: 0,
+                    identity,
                     regions: Vec::new(),
                     worst_case_steps: 0,
                     retained_bytes: core_bytes,
@@ -621,6 +734,7 @@ impl Engine {
                 region_bytes,
                 region_shift,
                 logical_len: n,
+                identity,
                 regions,
                 worst_case_steps: worst,
                 retained_bytes: retained,
@@ -643,11 +757,35 @@ impl Engine {
         }
     }
 
+    /// The core identity this engine was planned against.
+    #[inline]
+    pub fn identity(&self) -> &CoreIdentity {
+        self.plan.identity()
+    }
+
+    /// Verify that `body` is the object this engine was planned against.
+    ///
+    /// Every read entry point (`read`, `read_counted`, `read_counted_steps`,
+    /// `byte_at`, `read_into`) calls this **before** decoding, so an engine planned
+    /// for object A can never silently serve object B: a different object or a
+    /// newer generation of the same object is rejected with
+    /// [`EkbloomError::EngineBodyMismatch`]. Callers that want the binding to be
+    /// structural should use [`ReadyObject`].
+    #[inline]
+    pub fn verify_body(&self, body: &EkbloomBody) -> Result<()> {
+        self.plan.identity.verify(body)
+    }
+
     /// **Latency-critical**: dispatch `req` to the pre-certified path — no search,
     /// no lock. Bounds and overflow semantics match [`crate::reader::read`], and
     /// the bytes are byte-for-byte identical to it on both machines.
+    ///
+    /// The body is verified against the engine's bound identity first; a body that
+    /// is not the planned object/generation yields
+    /// [`EkbloomError::EngineBodyMismatch`] and no bytes are decoded.
     #[inline]
     pub fn read(&self, body: &EkbloomBody, req: ReadRequest) -> Result<Vec<u8>> {
+        self.verify_body(body)?;
         let end = req
             .offset
             .checked_add(req.length)
@@ -701,6 +839,7 @@ impl Engine {
     /// (positioning skip plus reveal). Lets the [`Engine::worst_case_steps`] bound
     /// be checked mechanically.
     pub fn read_counted(&self, body: &EkbloomBody, req: ReadRequest) -> Result<(Vec<u8>, u64)> {
+        self.verify_body(body)?;
         let end = req
             .offset
             .checked_add(req.length)
@@ -808,6 +947,7 @@ impl Engine {
     /// path (byte-exact vs [`crate::reader::read`]).
     #[inline]
     pub fn byte_at(&self, body: &EkbloomBody, offset: u64) -> Result<u8> {
+        self.verify_body(body)?;
         if offset >= body.logical_len {
             return Err(oob(offset, 1, body.logical_len));
         }
@@ -856,6 +996,11 @@ impl Engine {
     /// slice with no per-call `Arc` deref, structure `match` or re-validation.
     #[inline]
     pub fn resident_surface<'a>(&self, body: &'a EkbloomBody) -> Option<(&'a [u8], u64)> {
+        // A mismatched body exposes no surface: never hand out bytes (or a borrow)
+        // derived from the plan's indices applied to a different object.
+        if self.verify_body(body).is_err() {
+            return None;
+        }
         match self.plan.hot {
             HotIndex::TileSet(ti) => Some((body.tiles.get(ti)?.hot_surface()?, 0)),
             HotIndex::PathBloom(pi) => {
@@ -874,6 +1019,7 @@ impl Engine {
     /// [`crate::reader::read`]; the bytes are byte-for-byte identical to it on both
     /// machines.
     pub fn read_into(&self, body: &EkbloomBody, req: ReadRequest, out: &mut [u8]) -> Result<()> {
+        self.verify_body(body)?;
         let end = req
             .offset
             .checked_add(req.length)
@@ -963,6 +1109,136 @@ impl Engine {
     #[inline]
     pub fn plan_arc(&self) -> Arc<AccessPlan> {
         Arc::clone(&self.plan)
+    }
+}
+
+/// An **object-bound** engine: a body and the [`Engine`] planned from *that exact
+/// body*, with no way to pass a different body to a read.
+///
+/// [`Engine::plan`] takes a body by reference, so a caller could in principle keep
+/// the engine and read a *different* body with it; the engine's identity check
+/// rejects that, but `ReadyObject` removes the possibility entirely by owning both
+/// halves. It is the recommended read path when the body is already in memory:
+///
+/// ```ignore
+/// let ready = ReadyObject::prepare(body)?;
+/// let bytes = ready.read(ReadRequest { offset: 0, length: 4096 })?;
+/// ```
+///
+/// Reads are byte-for-byte identical to [`crate::reader::read`], because the bound
+/// engine dispatches to the same certified paths.
+#[derive(Clone)]
+pub struct ReadyObject {
+    body: Arc<EkbloomBody>,
+    engine: Engine,
+}
+
+impl ReadyObject {
+    /// Plan `body` greedily and bind it: a `u64::MAX` budget (admitting any
+    /// committed body) and the default 4 KiB region workload. Fails, like
+    /// [`Engine::plan`], when no certified bounded path covers some region.
+    pub fn prepare(body: EkbloomBody) -> Result<ReadyObject> {
+        let budget = ManifestationBudget {
+            maximum_physical_bytes: u64::MAX,
+        };
+        let workload = Workload {
+            kind: WorkloadKind::RangeMixed,
+            hot_prefix: None,
+            sample: vec![(0, ENGINE_REGION_BYTES)],
+        };
+        Self::prepare_with(body, &budget, &workload)
+    }
+
+    /// Plan `body` under an explicit budget and workload and bind it.
+    pub fn prepare_with(
+        body: EkbloomBody,
+        budget: &ManifestationBudget,
+        workload: &Workload,
+    ) -> Result<ReadyObject> {
+        let engine = Engine::plan(&body, budget, workload)?;
+        Ok(ReadyObject {
+            body: Arc::new(body),
+            engine,
+        })
+    }
+
+    /// The bound body.
+    #[inline]
+    pub fn body(&self) -> &EkbloomBody {
+        &self.body
+    }
+
+    /// The bound engine.
+    #[inline]
+    pub fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
+    /// The engine's immutable plan.
+    #[inline]
+    pub fn plan_ref(&self) -> &AccessPlan {
+        self.engine.plan_ref()
+    }
+
+    /// The core identity this ready object is bound to.
+    #[inline]
+    pub fn identity(&self) -> &CoreIdentity {
+        self.engine.identity()
+    }
+
+    /// The number of logical symbols the bound body reveals.
+    #[inline]
+    pub fn logical_len(&self) -> u64 {
+        self.body.logical_len
+    }
+
+    /// Read a logical range; byte-exact vs [`crate::reader::read`].
+    #[inline]
+    pub fn read(&self, req: ReadRequest) -> Result<Vec<u8>> {
+        self.engine.read(&self.body, req)
+    }
+
+    /// [`ReadyObject::read`], reporting the exact machine steps performed.
+    #[inline]
+    pub fn read_counted(&self, req: ReadRequest) -> Result<(Vec<u8>, u64)> {
+        self.engine.read_counted(&self.body, req)
+    }
+
+    /// [`ReadyObject::read`] decomposed into positioning and reveal steps.
+    #[inline]
+    pub fn read_counted_steps(&self, req: ReadRequest) -> Result<(Vec<u8>, ReadSteps)> {
+        self.engine.read_counted_steps(&self.body, req)
+    }
+
+    /// Allocation-free single-byte read.
+    #[inline]
+    pub fn byte_at(&self, offset: u64) -> Result<u8> {
+        self.engine.byte_at(&self.body, offset)
+    }
+
+    /// Allocation-free range read into `out` (exactly `req.length` bytes).
+    #[inline]
+    pub fn read_into(&self, req: ReadRequest, out: &mut [u8]) -> Result<()> {
+        self.engine.read_into(&self.body, req, out)
+    }
+
+    /// The per-region positioning bound.
+    #[inline]
+    pub fn worst_case_steps(&self) -> u64 {
+        self.engine.worst_case_steps()
+    }
+
+    /// The request-level positioning bound for `req`.
+    #[inline]
+    pub fn worst_case_steps_for(&self, req: ReadRequest) -> u64 {
+        self.engine.worst_case_steps_for(req)
+    }
+
+    /// The single certified resident byte surface, when the plan is uniformly one
+    /// pure-copy path (see [`Engine::resident_surface`]).
+    #[inline]
+    pub fn resident_surface(&self) -> Option<(&[u8], u64)> {
+        self.engine.resident_surface(&self.body)
     }
 }
 

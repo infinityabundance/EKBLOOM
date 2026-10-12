@@ -46,8 +46,48 @@ impl Engine {
     /// bound is checked mechanically (`positioning <= worst_case_steps_for(req)`).
     pub fn read_counted_steps(&self, body: &EkbloomBody, req: ReadRequest)
         -> Result<(Vec<u8>, ReadSteps)>;
+
+    /// The core identity (`object_id`, `core_hash`, `machine_id`, `generation`,
+    /// `logical_len`) this engine was planned against.
+    pub fn identity(&self) -> &CoreIdentity;
+
+    /// Verify `body` is the object this engine was planned against, or fail with
+    /// `EkbloomError::EngineBodyMismatch`.
+    pub fn verify_body(&self, body: &EkbloomBody) -> Result<()>;
 }
 ```
+
+The engine is **bound to the core identity** of the body it was planned against.
+Every read entry point (`read`, `read_counted`, `read_counted_steps`, `byte_at`,
+`read_into`) verifies the body it is handed matches this identity **before**
+decoding; a different object — or a newer generation of the same object — is
+rejected with `EkbloomError::EngineBodyMismatch` rather than decoded with the
+prepared decoder contexts (a mismatch would otherwise silently return wrong bytes).
+`Engine::identity` / `Engine::verify_body` expose the check, `Engine::from_plan`
+carries the identity forward, and `Engine::resident_surface` hands out no surface for
+a foreign body.
+
+For callers who want the binding to be **structural**, `ReadyObject`
+(`ekbloom::engine::ReadyObject`) owns a body and the engine planned from *that exact
+body*, so a mismatched read cannot be expressed:
+
+```rust
+pub struct ReadyObject { /* Arc<EkbloomBody> + Engine, bound */ }
+impl ReadyObject {
+    pub fn prepare(body: EkbloomBody) -> Result<ReadyObject>;
+    pub fn prepare_with(body: EkbloomBody, budget: &ManifestationBudget,
+                        workload: &Workload) -> Result<ReadyObject>;
+    pub fn read(&self, req: ReadRequest) -> Result<Vec<u8>>;
+    pub fn read_into(&self, req: ReadRequest, out: &mut [u8]) -> Result<()>;
+    pub fn byte_at(&self, offset: u64) -> Result<u8>;
+    pub fn read_counted_steps(&self, req: ReadRequest) -> Result<(Vec<u8>, ReadSteps)>;
+    pub fn worst_case_steps_for(&self, req: ReadRequest) -> u64;
+    // body(), engine(), plan_ref(), logical_len(), identity(), resident_surface()
+}
+```
+
+Reads through `ReadyObject` are byte-for-byte identical to `reader::read`, because
+the bound engine dispatches to the same certified paths.
 
 `AccessPlan` exposes `path_for(offset)` (one shift and a flat index),
 `structure_for`, `distribution`, `retained_bytes` (the **active** access-plan
@@ -224,7 +264,12 @@ case (`0`); the hot surface being the decoded output; plan determinism; and the
 competitor codecs returning byte-exact data. `tests/machine4_engine.rs` (6 tests)
 pins the machine-4 engine integration above, plus `tests/auto_reuse.rs` (1 test)
 for the `create_auto` construction-time saving and `src/manifest.rs` unit tests for
-its byte-identity.
+its byte-identity. `tests/engine_identity.rs` (6 tests) pins the core-identity
+binding: a different machine-4 body of identical length and block geometry (the
+reviewer's counterexample), a new generation of the same object, and machines 1/2
+are all rejected with `EkbloomError::EngineBodyMismatch`; `Engine::from_plan` keeps
+the identity; and `ReadyObject` reads are byte-exact vs `reader::read` on all four
+machines.
 
 ## 8. Reproduce
 

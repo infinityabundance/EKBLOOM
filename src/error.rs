@@ -48,6 +48,12 @@ pub enum EkbloomError {
     NonTermination,
     /// A caller argument was invalid.
     InvalidArgument { what: String },
+    /// A prepared engine/plan was asked to read a body that is not the one it was
+    /// planned against (object id, core hash, machine, generation or logical length
+    /// differs). Refusing is the only safe answer: the engine holds decoder contexts
+    /// prepared from the planned core, so decoding a different body with them would
+    /// silently return wrong bytes.
+    EngineBodyMismatch { detail: String },
     /// Recovery could not find any valid committed generation.
     RecoveryFailed { reason: String },
 }
@@ -98,6 +104,9 @@ impl fmt::Display for EkbloomError {
                 write!(f, "aborted: transition data risks nontermination")
             }
             EkbloomError::InvalidArgument { what } => write!(f, "invalid argument: {what}"),
+            EkbloomError::EngineBodyMismatch { detail } => {
+                write!(f, "engine/body identity mismatch: {detail}")
+            }
             EkbloomError::RecoveryFailed { reason } => write!(f, "recovery failed: {reason}"),
         }
     }
