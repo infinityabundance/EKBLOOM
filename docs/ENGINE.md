@@ -40,10 +40,12 @@ impl Engine {
 ```
 
 `AccessPlan` exposes `path_for(offset)` (one shift and a flat index),
-`structure_for`, `distribution`, `retained_bytes`, `budget_bytes`,
-`all_certified` and `worst_case_steps`. `RegionPath` records, per region, the
-chosen `Path`, its expected cost, its **positional step bound**, and the
-`StructureRef` backing it.
+`structure_for`, `distribution`, `retained_bytes` (the **active** access-plan
+footprint: the core plus the distinct structures the plan references),
+`committed_bytes` (the **committed** physical bytes of the whole body, whether or
+not the plan references them), `budget_bytes`, `all_certified` and
+`worst_case_steps`. `RegionPath` records, per region, the chosen `Path`, its
+expected cost, its **positional step bound**, and the `StructureRef` backing it.
 
 ## 2. The five certified bounded paths
 
@@ -69,20 +71,29 @@ exposes the verdict and `tests/engine.rs` pins it.
    largest sampled request length, rounded up to a power of two and clamped to
    `[4 KiB, 1 MiB]`. This makes the common 4 KiB read a *single* region.
 2. **Enumerate** every certified bounded structure the body carries.
-3. **Admission (the strict budget step).** The budget is a cap on the retained
-   bytes the plan relies on — the authoritative core plus the distinct structures
-   it references. Candidate structures are admitted cheapest-by-bytes first while
-   they fit the allowance left after the core.
-4. **Per region**, choose the cheapest admitted structure that *covers* the
+3. **Admission (the strict budget step).** The budget is a cap on the **committed**
+   physical bytes of the body — every non-withdrawal structure it carries,
+   selected by the plan or not. Because a non-withdrawal structure still occupies
+   its space even when the plan does not select it, the committed footprint
+   (`EkbloomBody::physical_bytes()`) is the authoritative quantity admitted against
+   the budget. The **active** access-plan footprint (the core plus the structures
+   the plan actually references) is reported separately and never used for
+   admission. Every certified bounded structure the body carries is then available
+   to cover a region.
+4. **Per region**, choose the cheapest available structure that *covers* the
    region, using the measured [`CostModel`](PLANNER.md).
 
-Planning is **transactional**: it either returns a plan whose retained footprint
-is within budget, or it returns an error and no engine — never a partial or
-over-budget plan. If no certified *bounded* path can cover some region, `plan`
-**fails** rather than silently falling back to an `O(prefix)` genesis replay.
-`tests/engine.rs::engine_budget_is_enforced_transactionally` shows a generous
-budget selecting tiles, a tight budget dropping them for a bounded restart, and a
-core-only budget failing.
+Planning is **transactional**: it either returns a plan for a body whose committed
+footprint is within budget, or it returns an error and no engine — never a partial
+or over-budget plan. This holds for the empty (`n == 0`) body too: a core (or any
+committed structure) over budget is rejected. If no certified *bounded* path can
+cover some region, `plan` **fails** rather than silently falling back to an
+`O(prefix)` genesis replay. `tests/engine.rs::engine_budget_is_enforced_transactionally`
+shows a generous budget selecting tiles and a committed-over-budget body being
+rejected; `tests/engine.rs::engine_admits_the_committed_body_not_the_active_plan`
+shows that a large committed-but-unselected structure still forces the rejection,
+and `tests/engine.rs::engine_rejects_an_over_budget_zero_region_body` pins the
+`n == 0` case.
 
 ## 4. `worst_case_steps` — the explicit cold bound
 

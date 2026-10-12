@@ -32,12 +32,15 @@
 //!
 //! # Budget
 //!
-//! The [`ManifestationBudget`] is a **strict cap on the retained bytes the plan
-//! relies on** (the authoritative core plus the distinct structures it
-//! references). Planning is **transactional**: it either returns a plan whose
-//! retained footprint is within budget, or it returns an error and no engine —
-//! there is no partial or over-budget plan. Under a tight budget the engine
-//! admits cheaper structures first and drops expensive ones it cannot retain.
+//! The [`ManifestationBudget`] is a **strict cap on the committed physical bytes**
+//! of the body — every non-withdrawal structure it carries, whether or not the
+//! plan references it. Planning is **transactional**: it either returns a plan for
+//! a body whose committed footprint is within budget, or it returns an error and
+//! no engine. Because non-withdrawal means an unselected structure still occupies
+//! its space, the committed footprint (not the plan's active footprint) is the
+//! admitted quantity; [`AccessPlan::retained_bytes`] reports the active footprint
+//! separately and [`AccessPlan::committed_bytes`] reports the committed one. This
+//! holds for the empty (`n == 0`) body too: a core over budget is rejected.
 
 use std::sync::Arc;
 
@@ -176,6 +179,7 @@ pub struct AccessPlan {
     regions: Vec<RegionPath>,
     worst_case_steps: u64,
     retained_bytes: u64,
+    committed_bytes: u64,
     budget_bytes: u64,
     structures: Vec<StructureRef>,
     hot: HotIndex,
@@ -201,10 +205,23 @@ impl AccessPlan {
         self.worst_case_steps
     }
 
-    /// The retained bytes the plan relies on (core plus referenced structures).
+    /// The active access-plan bytes: the authoritative core plus the distinct
+    /// structures **this plan references**. This is a report of the plan's active
+    /// footprint; it is *not* the physical-budget quantity (see
+    /// [`AccessPlan::committed_bytes`]).
     #[inline]
     pub fn retained_bytes(&self) -> u64 {
         self.retained_bytes
+    }
+
+    /// The committed physical bytes of the planned body: **every** non-withdrawal
+    /// structure the body carries, selected by this plan or not. This is the
+    /// authoritative physical-budget quantity — a plan is admitted only when the
+    /// committed body fits the budget, because under non-withdrawal an unselected
+    /// structure still occupies its space.
+    #[inline]
+    pub fn committed_bytes(&self) -> u64 {
+        self.committed_bytes
     }
 
     /// The budget ceiling the plan was built under.
@@ -343,6 +360,20 @@ impl Engine {
         let core_bytes = body.core.len() as u64;
         let budget_bytes = budget.maximum_physical_bytes;
 
+        // The authoritative physical-budget condition is on the **committed** body:
+        // under non-withdrawal every retained structure occupies space, whether or
+        // not this plan selects it. Only the committed footprint is admitted against
+        // the budget; the active access-plan footprint (below) is reported, never
+        // used for admission. This also covers `n == 0`, where there are no regions
+        // but the core (and any committed structure) must still fit.
+        let committed_bytes = body.physical_bytes();
+        if committed_bytes > budget_bytes {
+            return Err(EkbloomError::AllocationTooLarge {
+                requested: committed_bytes,
+                limit: budget_bytes,
+            });
+        }
+
         if n == 0 {
             return Ok(Engine {
                 plan: Arc::new(AccessPlan {
@@ -352,6 +383,7 @@ impl Engine {
                     regions: Vec::new(),
                     worst_case_steps: 0,
                     retained_bytes: core_bytes,
+                    committed_bytes,
                     budget_bytes,
                     structures: Vec::new(),
                     hot: HotIndex::None,
@@ -359,25 +391,10 @@ impl Engine {
             });
         }
 
-        // Admission: cheapest-by-bytes first, up to the allowance left after the
-        // always-retained core. This is the strict, transactional budget step.
-        let mut candidates = enumerate(body);
-        candidates.sort_by(|a, b| {
-            a.bytes
-                .cmp(&b.bytes)
-                .then(a.steps.cmp(&b.steps))
-                .then(a.path.rank().cmp(&b.path.rank()))
-                .then(a.structure.rank().cmp(&b.structure.rank()))
-        });
-        let allowance = budget_bytes.saturating_sub(core_bytes);
-        let mut admitted: Vec<Candidate> = Vec::new();
-        let mut admitted_bytes = 0u64;
-        for c in candidates {
-            if admitted_bytes.saturating_add(c.bytes) <= allowance {
-                admitted_bytes = admitted_bytes.saturating_add(c.bytes);
-                admitted.push(c);
-            }
-        }
+        // Every certified bounded structure the body carries is available: the
+        // committed body already fits the budget, and non-withdrawal means an
+        // unselected structure cannot be discarded to make room for another.
+        let candidates = enumerate(body);
 
         let region_count = n.div_ceil(region_bytes);
         let mut regions: Vec<RegionPath> = Vec::new();
@@ -390,7 +407,7 @@ impl Engine {
             let len = end.saturating_sub(start);
 
             let mut best: Option<(Candidate, f64)> = None;
-            for c in &admitted {
+            for c in &candidates {
                 if !covers(body, c.structure, start, end) {
                     continue;
                 }
@@ -442,6 +459,7 @@ impl Engine {
                 regions,
                 worst_case_steps: worst,
                 retained_bytes: retained,
+                committed_bytes,
                 budget_bytes,
                 structures: used,
                 hot,

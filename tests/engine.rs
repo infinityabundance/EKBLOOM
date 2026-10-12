@@ -12,8 +12,8 @@
 use ekbloom::adapt::{Workload, WorkloadKind};
 use ekbloom::{
     create, create_machine, machine_by_id, manifest, read, AccessTrace, BlockIndex, CheckpointSet,
-    DirectoryKind, EkbloomBody, Engine, EnginePath, ManifestationBudget, ManifestationProfile,
-    ReadRequest, StructureRef, TileSet,
+    CostModel, DirectoryKind, EkbloomBody, EkbloomError, Engine, EnginePath, ManifestationBudget,
+    ManifestationProfile, ReadRequest, StructureRef, TileSet,
 };
 
 const M1: u32 = 1;
@@ -355,20 +355,21 @@ fn engine_budget_is_enforced_transactionally() {
     add_checkpoint(&mut body, 64);
     add_blocks(&mut body, 1024);
     let core = body.core.len() as u64;
+    let committed = body.physical_bytes();
+    assert!(committed > core, "the body carries committed structures");
 
-    // Generous: the cheapest bounded path everywhere, retained within budget.
-    let e = Engine::plan(
-        &body,
-        &ManifestationBudget {
-            maximum_physical_bytes: u64::MAX,
-        },
-        &workload4k(),
-    )
-    .unwrap();
+    // Generous: the cheapest bounded path everywhere, on a committed body that fits.
+    let e = Engine::plan(&body, &generous(), &workload4k()).unwrap();
     assert_eq!(e.worst_case_steps(), 0, "tiles win under a generous budget");
     assert_eq!(e.plan_ref().path_for(0), EnginePath::HotTile);
+    assert_eq!(
+        e.plan_ref().committed_bytes(),
+        committed,
+        "the committed footprint is the authoritative budget quantity"
+    );
 
-    // Exactly the core: no bounded structure is admissible → transactional error.
+    // A core-only budget is below the *committed* footprint (which still retains the
+    // unselected-for-some-regions structures) → transactional error.
     let err = Engine::plan(
         &body,
         &ManifestationBudget {
@@ -377,25 +378,108 @@ fn engine_budget_is_enforced_transactionally() {
         &workload4k(),
     );
     assert!(
-        err.is_err(),
-        "a core-only budget cannot carry a bounded path"
+        matches!(err, Err(EkbloomError::AllocationTooLarge { requested, limit })
+            if requested == committed && limit == core),
+        "committed > budget must be rejected"
     );
 
-    // Small headroom: the expensive tiles are dropped, a bounded restart kept,
-    // and the retained footprint stays within the budget.
-    let tight = ManifestationBudget {
-        maximum_physical_bytes: core + 4096,
+    // Exactly the committed footprint is admitted; the active plan is smaller.
+    let exact = ManifestationBudget {
+        maximum_physical_bytes: committed,
     };
-    let e = Engine::plan(&body, &tight, &workload4k()).unwrap();
-    assert!(e.plan_ref().retained_bytes() <= tight.maximum_physical_bytes);
-    assert!(e.worst_case_steps() <= 63);
+    let e = Engine::plan(&body, &exact, &workload4k()).unwrap();
+    assert!(e.plan_ref().committed_bytes() <= exact.maximum_physical_bytes);
+    assert!(e.plan_ref().retained_bytes() <= e.plan_ref().committed_bytes());
+}
+
+#[test]
+fn engine_admits_the_committed_body_not_the_active_plan() {
+    // A large committed structure the plan does **not** select: tiles materialised
+    // for the first 16 KiB only, plus a small checkpoint covering the whole object.
+    let source = lcg(0xC0FF_0000_0000_0001, 64 * 1024);
+    let mut body = create(&source, ManifestationProfile::Root).unwrap();
+    let n = body.logical_len;
+    let trace = AccessTrace {
+        regions: vec![(0, 16 * 1024)],
+        counts: vec![1],
+    };
+    TileSet::manifest_hot_tiles(&mut body, &trace, 12, DirectoryKind::Flat, &generous()).unwrap();
+    add_checkpoint(&mut body, 64);
+
+    let committed = body.physical_bytes();
+
+    // One region spanning the whole object, so the partial tile set covers nothing
+    // and the covering checkpoint is selected instead.
+    let e = Engine::plan_with(&body, &generous(), n, CostModel::measured_default()).unwrap();
+    assert!(e
+        .plan_ref()
+        .regions()
+        .iter()
+        .all(|r| r.path == EnginePath::PackedRestart));
+    let active = e.plan_ref().retained_bytes();
     assert!(
-        e.plan_ref()
-            .regions()
-            .iter()
-            .all(|r| r.path != EnginePath::HotTile),
-        "tiles must be dropped under a tight budget"
+        active < committed,
+        "active {active} should be below committed {committed}"
     );
+    assert_eq!(e.plan_ref().committed_bytes(), committed);
+
+    // A budget above the *active* plan but below the *committed* body is rejected.
+    let between = active + 1;
+    assert!(between < committed);
+    let err = Engine::plan_with(
+        &body,
+        &ManifestationBudget {
+            maximum_physical_bytes: between,
+        },
+        n,
+        CostModel::measured_default(),
+    );
+    assert!(
+        matches!(err, Err(EkbloomError::AllocationTooLarge { requested, limit })
+            if requested == committed && limit == between),
+        "a small active plan must not admit an over-committed body"
+    );
+}
+
+#[test]
+fn engine_rejects_an_over_budget_zero_region_body() {
+    // `n == 0`: no regions, but the committed core plus a manifested zero-length
+    // checkpoint still counts against the budget and must be checked.
+    let mut body = create(&[], ManifestationProfile::Root).unwrap();
+    assert_eq!(body.logical_len, 0);
+    let cp = CheckpointSet::build(&body.core, 0, 64).unwrap();
+    body.checkpoints.push(cp);
+    body.generation += 1;
+    let committed = body.physical_bytes();
+    assert!(committed > 0);
+
+    // A budget one byte below the committed footprint is rejected.
+    let err = Engine::plan_with(
+        &body,
+        &ManifestationBudget {
+            maximum_physical_bytes: committed - 1,
+        },
+        4096,
+        CostModel::measured_default(),
+    );
+    assert!(
+        matches!(err, Err(EkbloomError::AllocationTooLarge { requested, limit })
+            if requested == committed && limit == committed - 1),
+        "an over-budget zero-region core must be rejected"
+    );
+
+    // At exactly the committed footprint the empty plan is admitted.
+    let e = Engine::plan_with(
+        &body,
+        &ManifestationBudget {
+            maximum_physical_bytes: committed,
+        },
+        4096,
+        CostModel::measured_default(),
+    )
+    .unwrap();
+    assert_eq!(e.plan_ref().region_count(), 0);
+    assert_eq!(e.plan_ref().committed_bytes(), committed);
 }
 
 #[test]

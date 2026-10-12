@@ -85,6 +85,11 @@ impl EkbloomBody {
     }
 
     /// Total manifested physical bytes: `core` plus every manifested structure.
+    ///
+    /// Each structure contributes exactly once. The `core` owns any shared machine
+    /// model header (e.g. the 516-byte rANS frequency table for machine 2), so a
+    /// [`crate::blocks::BlockIndex`] contributes only its own directory plus restart
+    /// records and never repeats that model.
     #[inline]
     pub fn physical_bytes(&self) -> u64 {
         let mut total = self.core.len() as u64;

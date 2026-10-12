@@ -265,18 +265,17 @@ impl BlockIndex {
         (self.entries.len() as u64).saturating_mul(self.entry_bytes())
     }
 
-    /// Total manifested footprint: model header (machine 2) `++` directory `++`
-    /// restart records.
+    /// The index's own serialized payload: the fixed directory prefix `++` the
+    /// compact restart records. This is exactly [`BlockIndex::to_bytes`]`.len()`.
+    ///
+    /// The rANS model header (machine 2: [`RANS_MODEL_HEADER_BYTES`]) and the
+    /// interleaved lane header (machine 4: bounded by [`RANS_I_MODEL_HEADER_BYTES`])
+    /// are **not** repeated here: they are embedded in the encoded `core`, which
+    /// [`crate::manifest::EkbloomBody::physical_bytes`] already counts once. Counting
+    /// them again here would double-count the same shared model bytes.
     #[inline]
     pub fn physical_bytes(&self) -> u64 {
-        let model = match self.machine_id {
-            MACHINE_NL2 => 0,
-            MACHINE_RANS0I => RANS_I_MODEL_HEADER_BYTES,
-            _ => RANS_MODEL_HEADER_BYTES,
-        };
-        model
-            .saturating_add(self.directory_bytes())
-            .saturating_add(self.restart_bytes())
+        self.directory_bytes().saturating_add(self.restart_bytes())
     }
 
     /// The covering block for logical position `i`: `(block_start, index)` where

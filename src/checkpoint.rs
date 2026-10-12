@@ -327,6 +327,9 @@ impl CheckpointSet {
     ///
     /// A machine-1 restart set is cursor==position, so it manifests at 2 bytes per
     /// restart instead of 12 (see `docs/BLOCKS.md` §"packed checkpoint format").
+    /// This is the payload contribution only; the fixed container header
+    /// ([`CKPT_FIXED_LEN`], 22 bytes) is excluded, so the exact serialized relation
+    /// is `to_bytes().len() == physical_bytes() + CKPT_FIXED_LEN`.
     #[inline]
     pub fn physical_bytes(&self) -> u64 {
         self.count.saturating_mul(self.entry_bytes())

@@ -46,7 +46,7 @@ impl BlockIndex {
     pub fn read_range(&self, core, offset, len) -> Result<Vec<u8>>;            // byte-exact
     pub fn read_range_counted(&self, core, offset, len) -> Result<(Vec<u8>, u64)>;
     pub fn max_steps(&self, offset, len) -> u64;        // <= (block_bytes - 1) + len
-    pub fn physical_bytes(&self) -> u64;                // model + directory + restarts
+    pub fn physical_bytes(&self) -> u64;                // directory + restarts (== to_bytes().len())
     pub fn to_bytes(&self) / from_bytes(&[u8]) -> Result<BlockIndex>;
     pub fn certify(&self, core) -> Result<bool>;        // independent block-by-block replay
     pub fn verify(&self) -> bool;                       // content digest
@@ -92,8 +92,13 @@ replay-from-genesis for the same 4 KiB reads was **p50 6,095,739 ns**.
 | 16 KiB | 257 | 3,704 B | 53,460 ns | 85,540 ns | 71.4 ms |
 | 64 KiB | 65 | 1,400 B | 158,316 ns | 287,456 ns | 71.2 ms |
 
-Footprint = 516 B model header + 104 B directory + `count × 12` restart bytes
-(machine 2 stores `(u32 state, u64 cursor)` per block).
+Footprint = `104 B` directory + `count × entry_bytes` restart bytes — exactly the
+serialized index (`BlockIndex::to_bytes().len()`). The rANS model header (`516 B`
+for machine 2; bounded by `RANS_I_MODEL_HEADER_BYTES` for machine 4) is **not**
+repeated here: it is embedded in the encoded `core`, which the body's
+`physical_bytes()` already counts once, so counting it again would double-count the
+same shared bytes. The standalone numbers in the table above are the measured
+model + directory + restart footprint of the released evidence.
 
 **Tradeoff.** Smaller blocks tighten the bounded skip (at most `B - 1` machine
 steps) and lower read latency, but the restart directory grows linearly in
@@ -129,7 +134,10 @@ magic "EKBCKPT\0" ++ version(1) ++ format(1) ++ interval(u32) ++ count(u64) ++ r
   resume cursor equals `j*K`, the interval is a power of two and every state fits
   in `u16`) — i.e. a machine-1 checkpoint. Otherwise it emits complete
   `(state, cursor)` restarts. `physical_bytes()`/`entry_bytes()` agree: 2 bytes
-  per restart for machine 1, 12 for machine 2.
+  per restart for machine 1, 12 for machine 2. As with every structure here,
+  `physical_bytes()` is the payload contribution; the 22-byte container header is
+  counted once, giving the exact relation
+  `to_bytes().len() == physical_bytes() + CKPT_FIXED_LEN`.
 - **Backward compatibility / negotiation.** `CheckpointSet::from_bytes_with`
   first tests for the `EKBCKPT\0` magic; if present it parses the versioned
   container, otherwise it parses the **legacy** magic-less layout

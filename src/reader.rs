@@ -967,18 +967,12 @@ impl FileBlocks {
         self.count.saturating_mul(self.entry_bytes())
     }
 
-    /// Total manifested footprint (model header for machine 2, directory, and
-    /// restart records), matching the in-memory `BlockIndex::physical_bytes`.
+    /// Total manifested footprint (directory plus restart records only), matching
+    /// the in-memory `BlockIndex::physical_bytes`. The rANS model header lives once
+    /// in the encoded `core` and is not repeated here.
     #[inline]
     fn physical_bytes(&self) -> u64 {
-        let model = match self.machine_id {
-            MACHINE_NL2 => 0,
-            MACHINE_RANS0I => crate::blocks::RANS_I_MODEL_HEADER_BYTES,
-            _ => crate::blocks::RANS_MODEL_HEADER_BYTES,
-        };
-        model
-            .saturating_add(self.directory_bytes())
-            .saturating_add(self.restart_bytes())
+        self.directory_bytes().saturating_add(self.restart_bytes())
     }
 
     /// Whether the index covers `[offset, end)`.

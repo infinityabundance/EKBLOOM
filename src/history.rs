@@ -130,7 +130,10 @@ impl History {
         Ok(())
     }
 
-    /// Packed physical cost of the `u32` state projection: `4 * states.len()`.
+    /// The structure's own payload contribution: `4 * states.len()`, the packed
+    /// `u32` state projection. The container's fixed wire header ([`HEADER_LEN`],
+    /// 64 bytes) is *not* included, so the exact serialized relation is
+    /// `to_bytes().len() == physical_bytes() + HEADER_LEN`.
     #[inline]
     pub fn physical_bytes(&self) -> u64 {
         (self.states.len() as u64).saturating_mul(4)

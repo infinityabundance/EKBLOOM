@@ -376,7 +376,13 @@ impl TileSet {
         self.directory.directory_bytes()
     }
 
-    /// Total manifested bytes of this tile set: tile data plus directory metadata.
+    /// Total manifested payload of this tile set: the materialised tile data plus
+    /// the directory descriptors. The container scaffolding is excluded, so the
+    /// exact serialized relation is
+    /// `to_bytes().len() == physical_bytes() + TILE_SET_PREFIX_LEN + dir_scaffold + 8`,
+    /// where `dir_scaffold` is `8` for a `Flat` directory (one `u64` length
+    /// prefix) and `16` for `TwoLevelRadix` (two), and the trailing `8` is the tile
+    /// blob's own `u64` length prefix.
     #[inline]
     pub fn physical_bytes(&self) -> u64 {
         self.tile_bytes().saturating_add(self.directory_bytes())
