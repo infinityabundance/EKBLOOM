@@ -68,6 +68,22 @@ pub fn verify_deep(body: &EkbloomBody) -> Result<VerificationReport> {
     run(body, true)
 }
 
+/// Verify a `.ekb` file in **strict authentication mode**.
+///
+/// Opens `path` with [`crate::reader::open_require_auth`], so a missing or
+/// mismatching `AUTH` section is a hard error (there is no unauthenticated
+/// fallback), then runs [`verify`] (or [`verify_deep`] when `deep`). A file that
+/// lacks a valid `AUTH` never reaches verification: it is rejected at open. See
+/// `docs/SECURITY.md`.
+pub fn verify_file_require_auth(
+    path: &std::path::Path,
+    key: &[u8; 32],
+    deep: bool,
+) -> Result<VerificationReport> {
+    let body = crate::reader::open_require_auth(path, key)?;
+    run(&body, deep)
+}
+
 fn run(body: &EkbloomBody, deep: bool) -> Result<VerificationReport> {
     let machine = machine_by_id(body.machine_id).ok_or(EkbloomError::UnknownMachine {
         id: body.machine_id,

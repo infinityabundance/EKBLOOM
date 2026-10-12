@@ -25,6 +25,7 @@ pub mod adapt;
 pub mod async_io;
 pub mod asyncpub;
 pub mod baseline;
+pub mod batch;
 pub mod blocks;
 pub mod bloom;
 pub mod bloom_context;
@@ -76,6 +77,10 @@ pub use baseline::{
     measure_baseline, measure_body, write_baselines_json, Baseline, BaselineKind, BaselinePoint,
     BaselineReport, Capabilities, HotBlockCache, DEFAULT_INDEX_BLOCK, DEFAULT_LRU_BLOCK,
 };
+pub use batch::{
+    accelerator_available, accelerator_device_present, AcceleratorBackend, Backend as BatchBackend,
+    BatchJob, BatchReconstructor, GpuBackend, GPU_BACKEND,
+};
 pub use blocks::{
     parse_block_index_prefix, BlockIndex, BlockIndexPrefix, BLOCK_INDEX_MAGIC,
     BLOCK_INDEX_PREFIX_LEN, BLOCK_INDEX_VERSION,
@@ -103,15 +108,18 @@ pub use fastpath::{
     read_ranges, read_ranges_parallel, read_sequential, AlignedBuffer, CpuFeatures, ResidentView,
     CACHE_LINE,
 };
-pub use filesystem::{FileMeta, ObjectPhysical, OrFs, PhysicalReport};
+pub use filesystem::{AlignedSurface, FileMeta, ObjectPhysical, OrFs, PhysicalReport};
 #[cfg(feature = "fuse")]
-pub use fuse::{mount, OrFsMount};
+pub use fuse::{
+    mount, mount_with, probe_passthrough, MountOptions, OrFsMount, PassthroughProbe, ReadMode,
+};
 pub use handle::{ObjectCache, OpenObject, ReadDirectory};
 pub use history::History;
 pub use history_store::{current_rss_bytes, peak_rss_bytes, HistoryStore, StoreConfig};
 pub use kernels::{
-    block_start_states, kernel_a_scalar, kernel_a_scalar_windows, kernel_a_simd_windows,
-    kernel_a_table, kernel_a_unrolled, kernel_b_simd, kernel_b_threads, window_start_states,
+    block_start_states, independent_window_jobs, kernel_a_scalar, kernel_a_scalar_windows,
+    kernel_a_simd_windows, kernel_a_table, kernel_a_unrolled, kernel_b_simd, kernel_b_threads,
+    window_start_states,
 };
 pub use machine::{
     machine_by_id, prepare, state_log_with, OrMachine, Prepared, MACHINE_NL2, MACHINE_RANS0,
@@ -145,7 +153,8 @@ pub use prefix::{
     Affine, LinMap,
 };
 pub use reader::{
-    inspect_file, open, open_authenticated, open_bytes_authenticated, read, read_file, FileBody,
+    inspect_file, open, open_authenticated, open_bytes_authenticated, open_bytes_require_auth,
+    open_require_auth, read, read_file, FileBody,
 };
 pub use recovery::{
     recover, scan_generations, truncate_to_valid, GenerationRecord, RecoveryReport,
@@ -169,7 +178,7 @@ pub use tiles::{
     bounded_seed_steps, parse_tile_set_prefix, DirectoryKind, TileAdaptReport, TileDirectory,
     TileSet, TileSetPrefix, TileSummary, RADIX_GROUP_SHIFT, TILE_SET_PREFIX_LEN,
 };
-pub use verify::{verify, verify_deep, CheckOutcome, VerificationReport};
+pub use verify::{verify, verify_deep, verify_file_require_auth, CheckOutcome, VerificationReport};
 pub use worker::{available_parallelism, manifest_background, regional_parallel};
 pub use writer::{
     append_generation, append_generation_authenticated, history_segmented_payload, write_body,

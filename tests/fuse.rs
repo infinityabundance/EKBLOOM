@@ -8,7 +8,7 @@
 
 #![cfg(all(feature = "fuse", target_os = "linux"))]
 
-use ekbloom::{mount, ManifestationProfile, OrFs};
+use ekbloom::{mount, mount_with, ManifestationProfile, MountOptions, OrFs, ReadMode};
 use std::path::PathBuf;
 
 /// A unique temporary directory, removed by the caller.
@@ -38,6 +38,19 @@ fn names(dir: &std::path::Path) -> Vec<String> {
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     out.sort();
+    out
+}
+
+/// Deterministic bytes (shared LCG with the other harnesses).
+fn lcg(seed: u64, len: usize) -> Vec<u8> {
+    let mut s = seed;
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        out.push((s >> 33) as u8);
+    }
     out
 }
 
@@ -118,4 +131,91 @@ fn read_only_mount_exposes_logical_files_and_control_file() {
     drop(handle);
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&mountpoint).ok();
+}
+
+/// A fully-materialised object (a certified whole-object path bloom) is served
+/// from its logically-aligned backing surface in the default [`ReadMode::Auto`],
+/// and from the decoder in [`ReadMode::Decode`]. Both must return byte-exact
+/// bytes — full reads and arbitrary windows — matching the source.
+#[test]
+fn backing_surface_and_decode_paths_are_byte_exact() {
+    if !fuse_available() {
+        eprintln!(
+            "SKIP: /dev/fuse is not available; run scripts/container-fuse.sh for a real mount"
+        );
+        return;
+    }
+
+    let root = temp_dir("readmode-root");
+    let auto_mnt = temp_dir("readmode-auto");
+    let decode_mnt = temp_dir("readmode-decode");
+    let src = lcg(0xEB10_F05E, 64 * 1024);
+    {
+        let fs = OrFs::open(&root).unwrap();
+        fs.create(
+            "data/hot.bin",
+            &src,
+            ManifestationProfile::Path { depth: 4 },
+        )
+        .unwrap();
+    }
+    let logical = "data/hot.bin";
+
+    // The default mode attaches the `.ekb` path-bloom hot array as a surface.
+    let fs = OrFs::open(&root).unwrap();
+    let auto = mount_with(fs, &auto_mnt, false, &MountOptions::default()).unwrap();
+    // The decode mode forces the engine/decoder path.
+    let fs = OrFs::open(&root).unwrap();
+    let decode = mount_with(
+        fs,
+        &decode_mnt,
+        false,
+        &MountOptions {
+            read_mode: ReadMode::Decode,
+            ..MountOptions::default()
+        },
+    )
+    .unwrap();
+
+    let via_auto = auto_mnt.join(logical);
+    let via_decode = decode_mnt.join(logical);
+
+    // Full reads through both mounts equal the source exactly.
+    assert_eq!(std::fs::read(&via_auto).unwrap(), src, "auto full read");
+    assert_eq!(std::fs::read(&via_decode).unwrap(), src, "decode full read");
+
+    // Arbitrary windows, including misaligned and tail-crossing ones, agree with
+    // the source through both mounts.
+    use std::os::unix::fs::FileExt;
+    let f_auto = std::fs::File::open(&via_auto).unwrap();
+    let f_decode = std::fs::File::open(&via_decode).unwrap();
+    for &(off, len) in &[
+        (0u64, 1u64),
+        (1, 4095),
+        (4095, 2),
+        (1234, 777),
+        (32 * 1024 - 8, 16),
+        (src.len() as u64 - 3, 8),
+        (0, src.len() as u64),
+    ] {
+        // The kernel clamps a read past EOF to the file length; mirror that.
+        let read_len = ((src.len() as u64) - off).min(len);
+        let want = &src[off as usize..(off + read_len) as usize];
+        let mut a = vec![0u8; read_len as usize];
+        let mut d = vec![0u8; read_len as usize];
+        f_auto.read_exact_at(&mut a, off).unwrap();
+        f_decode.read_exact_at(&mut d, off).unwrap();
+        assert_eq!(a, want, "auto window ({off},{len})");
+        assert_eq!(d, want, "decode window ({off},{len})");
+    }
+
+    // Close the FUSE file descriptors before unmounting; an open fd on the mount
+    // would make the unmount busy.
+    drop(f_auto);
+    drop(f_decode);
+    drop(auto);
+    drop(decode);
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&auto_mnt).ok();
+    std::fs::remove_dir_all(&decode_mnt).ok();
 }

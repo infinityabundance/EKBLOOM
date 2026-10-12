@@ -1,0 +1,93 @@
+{
+  "generated_by": "examples/batch.rs (sh scripts/run-batch.sh)",
+  "harness": "src/court.rs (Dist, bootstrap 95% CI) + src/batch.rs",
+  "machine": "OrANS-NL2 (machine_id=1)",
+  "workload": "independent restart windows",
+  "window_bytes": 256,
+  "windows": 100000,
+  "total_bytes": 25600000,
+  "corpus_seed": "0xEB100000B47C0001",
+  "corpus_blake3": "acc6d383d1888bc2d9a9670dd28e72550b2b15a1eaae7197b2ff25c89f873901",
+  "thread_counts": [1, 2, 4, 8, 16],
+  "reps": 5,
+  "clock_ghz_estimate": 5.233406,
+  "backend": "cpu-threads",
+  "accelerator_backend": "gpu (unimplemented)",
+  "accelerator_available": false,
+  "accelerator_device_present": false,
+  "environment": {
+    "pinning": "0-15",
+    "governor": "performance",
+    "smt": "1",
+    "page_size": "unknown"
+  },
+  "rows": [
+    {
+      "threads": 1,
+      "ns_p50": 35307003.000,
+      "ci95_lo": 35130581.800,
+      "ci95_hi": 35357925.800,
+      "windows_per_s": 2832299.303,
+      "gb_per_s": 0.725069,
+      "cycles_per_byte": 7.217808,
+      "scaling_vs_t1": 1.0000,
+      "reps": 5,
+      "exact": true,
+      "backend": "cpu-threads"
+    },
+    {
+      "threads": 2,
+      "ns_p50": 17596976.000,
+      "ci95_lo": 17574534.400,
+      "ci95_hi": 17659155.800,
+      "windows_per_s": 5682794.589,
+      "gb_per_s": 1.454795,
+      "cycles_per_byte": 3.597348,
+      "scaling_vs_t1": 2.0064,
+      "reps": 5,
+      "exact": true,
+      "backend": "cpu-threads"
+    },
+    {
+      "threads": 4,
+      "ns_p50": 8805391.000,
+      "ci95_lo": 8792084.000,
+      "ci95_hi": 8986047.800,
+      "windows_per_s": 11356679.107,
+      "gb_per_s": 2.907310,
+      "cycles_per_byte": 1.800085,
+      "scaling_vs_t1": 4.0097,
+      "reps": 5,
+      "exact": true,
+      "backend": "cpu-threads"
+    },
+    {
+      "threads": 8,
+      "ns_p50": 5101528.000,
+      "ci95_lo": 5037911.200,
+      "ci95_hi": 5130616.000,
+      "windows_per_s": 19601970.233,
+      "gb_per_s": 5.018104,
+      "cycles_per_byte": 1.042905,
+      "scaling_vs_t1": 6.9209,
+      "reps": 5,
+      "exact": true,
+      "backend": "cpu-threads"
+    },
+    {
+      "threads": 16,
+      "ns_p50": 4119808.000,
+      "ci95_lo": 4078411.200,
+      "ci95_hi": 4237143.200,
+      "windows_per_s": 24272975.828,
+      "gb_per_s": 6.213882,
+      "cycles_per_byte": 0.842212,
+      "scaling_vs_t1": 8.5701,
+      "reps": 5,
+      "exact": true,
+      "backend": "cpu-threads"
+    }
+  ],
+  "gpu_verdict": "not implemented: no accelerator backend exists, GpuBackend::available() is false and no GPU path is taken; the batch API is the boundary such a backend would plug into. A GPU is not the default for single-byte host latency (transfer/scheduling overhead dominates) but is a plausible extension for very large independent batches already resident in device memory.",
+  "note": "jobs are independent (each from a known restart state + its own encoded block), so throughput scales with cores; scaling_vs_t1 is the ratio to the single-thread row. Every row is byte-exact vs NL2::decode."
+}

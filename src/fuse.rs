@@ -24,6 +24,8 @@
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -34,6 +36,7 @@ use fuser::{
 
 use crate::error::{EkbloomError, Result};
 use crate::filesystem::OrFs;
+use crate::mapped::MappedSurface;
 use crate::ReadRequest;
 
 /// FUSE root inode. Matches [`fuser::FUSE_ROOT_ID`].
@@ -60,6 +63,148 @@ const EROFS: i32 = 30;
 const O_ACCMODE: i32 = 0o3;
 const O_RDONLY: i32 = 0o0;
 
+/// How the projection serves `read` for a logical file.
+///
+/// True `FUSE_PASSTHROUGH` is unavailable through `fuser` 0.15 (see
+/// [`probe_passthrough`]), so this module reduces the FUSE read cost in userspace
+/// instead: when an object carries a fully-materialised, logically-aligned output
+/// surface, a read can be a direct bounded copy out of that surface rather than a
+/// decode. [`ReadMode::Decode`] forces the decoder path so the two can be
+/// compared honestly (see `examples/fuse_read.rs`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadMode {
+    /// Always decode through [`OrFs::read`] (the engine/decoder path).
+    Decode,
+    /// Serve from a materialised, logically-aligned backing surface when one is
+    /// available for the file (a `.ekb` path-bloom `hot` array, or a registered
+    /// standalone aligned file), else decode. This is the default.
+    #[default]
+    Auto,
+}
+
+/// Mount configuration for the read-only projection.
+#[derive(Clone, Debug, Default)]
+pub struct MountOptions {
+    /// Read dispatch mode (default [`ReadMode::Auto`]).
+    pub read_mode: ReadMode,
+    /// Optional standalone, logically-aligned backing files keyed by logical path.
+    ///
+    /// A registered file's byte 0 must be logical byte 0 (a standalone export of
+    /// the object). It is mapped read-only through the sanctioned safe
+    /// [`MappedSurface`] and served by direct copy, taking precedence over the
+    /// automatic `.ekb` surface. Only consulted in [`ReadMode::Auto`].
+    pub surfaces: HashMap<String, PathBuf>,
+}
+
+/// Mount `fs` read-only at `mountpoint` with default [`MountOptions`].
+///
+/// When `foreground` is `false` the FUSE session runs on a background thread and
+/// the returned [`OrFsMount`] unmounts on drop. When `foreground` is `true` the
+/// session runs in the calling thread until the filesystem is unmounted (for
+/// example with `fusermount3 -u`); the returned handle is then already unmounted.
+pub fn mount(fs: OrFs, mountpoint: &Path, foreground: bool) -> Result<OrFsMount> {
+    mount_with(fs, mountpoint, foreground, &MountOptions::default())
+}
+
+/// Mount `fs` read-only at `mountpoint` with explicit [`MountOptions`].
+pub fn mount_with(
+    fs: OrFs,
+    mountpoint: &Path,
+    foreground: bool,
+    options: &MountOptions,
+) -> Result<OrFsMount> {
+    let view = OrFsView::new(fs, options)?;
+    let fuse_options = [
+        MountOption::RO,
+        MountOption::FSName("ekbloom-orfs".to_string()),
+        MountOption::NoAtime,
+    ];
+    if foreground {
+        fuser::mount2(view, mountpoint, &fuse_options)?;
+        Ok(OrFsMount {
+            session: None,
+            mountpoint: mountpoint.to_path_buf(),
+        })
+    } else {
+        let session = fuser::spawn_mount2(view, mountpoint, &fuse_options)?;
+        Ok(OrFsMount {
+            session: Some(session),
+            mountpoint: mountpoint.to_path_buf(),
+        })
+    }
+}
+
+/// The outcome of a runtime probe for FUSE **passthrough** support.
+///
+/// Nothing here is assumed: the kernel side is read from the running system and
+/// the binding side reflects what the linked `fuser` actually exposes. With
+/// `fuser` 0.15.x the binding cannot request passthrough at all, so the feature is
+/// unavailable regardless of kernel, and this is reported rather than faked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PassthroughProbe {
+    /// Whether the linked `fuser` binding can request passthrough. Always `false`
+    /// for `fuser` 0.15.x (no init flag, no backing-open ioctl, no per-inode id).
+    pub fuser_supports: bool,
+    /// The running kernel release string (e.g. `7.2.9-2-cachyos`).
+    pub kernel_release: String,
+    /// Whether the running kernel is new enough to carry the passthrough ABI
+    /// (FUSE ABI 7.40 landed in Linux 6.9). Parsed best-effort from the release.
+    pub kernel_supports: bool,
+    /// Whether passthrough can actually be enabled: `fuser_supports &&
+    /// kernel_supports`. Always `false` with `fuser` 0.15.x.
+    pub available: bool,
+    /// The highest FUSE protocol ABI the linked `fuser` negotiates.
+    pub fuser_max_abi: &'static str,
+    /// Human-readable explanation of the verdict.
+    pub reason: String,
+}
+
+/// Probe FUSE passthrough support at runtime (kernel) and in the binding
+/// (compile-time fact) and report the combined verdict honestly.
+pub fn probe_passthrough() -> PassthroughProbe {
+    let kernel_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let kernel_supports = kernel_at_least(&kernel_release, 6, 9);
+    // `fuser` 0.15.x exposes no `FUSE_PASSTHROUGH` init flag, no
+    // `FUSE_DEV_IOC_BACKING_OPEN` ioctl and no per-inode backing-id API, so the
+    // binding cannot request it no matter how new the kernel is.
+    let fuser_supports = false;
+    let fuser_max_abi = "7.31";
+    let available = fuser_supports && kernel_supports;
+    let reason = if available {
+        "passthrough is available".to_string()
+    } else if !fuser_supports {
+        format!(
+            "fuser 0.15.x exposes no FUSE_PASSTHROUGH init flag, no
+             FUSE_DEV_IOC_BACKING_OPEN ioctl and no per-inode backing id, so the
+             bundled binding cannot request passthrough (max ABI {fuser_max_abi})
+             even though the kernel is {kernel_release}; a newer fuser or a raw
+             ioctl FFI outside the sanctioned modules would be required"
+        )
+    } else {
+        format!("the kernel ({kernel_release}) predates the passthrough ABI (FUSE 7.40, Linux 6.9)")
+    };
+    PassthroughProbe {
+        fuser_supports,
+        kernel_release,
+        kernel_supports,
+        available,
+        fuser_max_abi,
+        reason,
+    }
+}
+
+/// Whether a kernel release string is at least `major.minor` (best effort).
+fn kernel_at_least(release: &str, major: u32, minor: u32) -> bool {
+    let mut it = release.split(['.', '-']);
+    let parse = |s: Option<&str>| s.and_then(|v| v.parse::<u32>().ok());
+    match (parse(it.next()), parse(it.next())) {
+        (Some(kmajor), Some(kminor)) => (kmajor, kminor) >= (major, minor),
+        _ => false,
+    }
+}
+
 /// A mounted, read-only OrFS projection.
 ///
 /// Dropping the handle unmounts the filesystem and joins the serving thread.
@@ -84,38 +229,53 @@ impl Drop for OrFsMount {
     }
 }
 
-/// Mount `fs` read-only at `mountpoint`.
-///
-/// When `foreground` is `false` the FUSE session runs on a background thread and
-/// the returned [`OrFsMount`] unmounts on drop. When `foreground` is `true` the
-/// session runs in the calling thread until the filesystem is unmounted (for
-/// example with `fusermount3 -u`); the returned handle is then already unmounted.
-pub fn mount(fs: OrFs, mountpoint: &Path, foreground: bool) -> Result<OrFsMount> {
-    let view = OrFsView::new(fs)?;
-    let options = [
-        MountOption::RO,
-        MountOption::FSName("ekbloom-orfs".to_string()),
-        MountOption::NoAtime,
-    ];
-    if foreground {
-        fuser::mount2(view, mountpoint, &options)?;
-        Ok(OrFsMount {
-            session: None,
-            mountpoint: mountpoint.to_path_buf(),
-        })
-    } else {
-        let session = fuser::spawn_mount2(view, mountpoint, &options)?;
-        Ok(OrFsMount {
-            session: Some(session),
-            mountpoint: mountpoint.to_path_buf(),
-        })
+/// A fully-materialised, logically-aligned output surface served *without*
+/// decoding, plus the absolute offset of logical byte 0 within it.
+struct BackingSurface {
+    source: SurfaceSource,
+    /// Absolute offset of logical byte 0 within the backing file.
+    base: u64,
+    /// Number of logically-aligned bytes available.
+    len: u64,
+}
+
+/// Where a [`BackingSurface`]'s bytes live.
+enum SurfaceSource {
+    /// A region inside a backing file (e.g. a `.ekb` path-bloom `hot` array),
+    /// served by a bounded `pread` from the kernel page cache. A `.ekb` is not
+    /// memory-mapped here: the writer appends to and truncates it, which would
+    /// violate the immutability a mapping requires.
+    Region(File),
+    /// A standalone file mapped read-only through the sanctioned safe
+    /// [`MappedSurface`]. The file must be immutable for the mount's lifetime.
+    Mapped(MappedSurface),
+}
+
+impl BackingSurface {
+    /// Serve `[offset, offset + length)` (already clamped to the object length)
+    /// by a direct copy, byte-for-byte equal to a decode. `length` bytes are
+    /// always returned for an in-bounds request.
+    fn read(&self, offset: u64, length: u64) -> std::result::Result<Vec<u8>, i32> {
+        let start = self.base.checked_add(offset).ok_or(EIO)?;
+        match &self.source {
+            SurfaceSource::Region(file) => {
+                let n = usize::try_from(length).map_err(|_| EIO)?;
+                let mut buf = vec![0u8; n];
+                file.read_exact_at(&mut buf, start).map_err(|_| EIO)?;
+                Ok(buf)
+            }
+            SurfaceSource::Mapped(surface) => surface.read(start, length).map_err(|_| EIO),
+        }
     }
 }
 
-/// One logical file: its logical path and revealed length.
+/// One logical file: its logical path, revealed length, and (when the object is
+/// fully materialised as a logically-aligned surface) the surface to serve reads
+/// from directly.
 struct FileEntry {
     path: String,
     len: u64,
+    surface: Option<BackingSurface>,
 }
 
 /// One directory child: the name it appears under, its inode and its kind.
@@ -141,6 +301,10 @@ struct OrFsView {
     files: HashMap<u64, FileEntry>,
     /// Directory inode -> children (in name order).
     children: HashMap<u64, Vec<ChildEntry>>,
+    /// How reads are dispatched (decode vs. direct backing-surface copy).
+    read_mode: ReadMode,
+    /// Explicit standalone backing files keyed by logical path.
+    explicit_surfaces: HashMap<String, PathBuf>,
     /// Stable attribute timestamps for the lifetime of the mount.
     mount_time: SystemTime,
     /// Next inode to hand out.
@@ -148,14 +312,17 @@ struct OrFsView {
 }
 
 impl OrFsView {
-    /// Resolve the whole logical tree, assigning inodes.
-    fn new(fs: OrFs) -> Result<OrFsView> {
+    /// Resolve the whole logical tree, assigning inodes and discovering any
+    /// logically-aligned read surfaces.
+    fn new(fs: OrFs, options: &MountOptions) -> Result<OrFsView> {
         let mut view = OrFsView {
             fs,
             dirs: HashMap::new(),
             dir_ino: HashMap::new(),
             files: HashMap::new(),
             children: HashMap::new(),
+            read_mode: options.read_mode,
+            explicit_surfaces: options.surfaces.clone(),
             mount_time: SystemTime::now(),
             next_ino: CONTROL_INO + 1,
         };
@@ -163,6 +330,38 @@ impl OrFsView {
         view.dir_ino.insert(String::new(), ROOT_INO);
         view.walk(ROOT_INO, "")?;
         Ok(view)
+    }
+
+    /// Discover the read surface for a logical file, if any.
+    ///
+    /// An explicitly registered standalone file takes precedence; otherwise the
+    /// object's certified whole-object path bloom (`hot` array) is used. Returns
+    /// `None` in [`ReadMode::Decode`] or when the object has no aligned surface.
+    fn resolve_surface(&self, logical_path: &str) -> Option<BackingSurface> {
+        if self.read_mode == ReadMode::Decode {
+            return None;
+        }
+        if let Some(path) = self.explicit_surfaces.get(logical_path) {
+            if let Ok(surface) = MappedSurface::open(path) {
+                let len = surface.len();
+                return Some(BackingSurface {
+                    source: SurfaceSource::Mapped(surface),
+                    base: 0,
+                    len,
+                });
+            }
+        }
+        match self.fs.aligned_surface(logical_path) {
+            Ok(Some(surface)) => {
+                let file = File::open(&surface.backing_path).ok()?;
+                Some(BackingSurface {
+                    source: SurfaceSource::Region(file),
+                    base: surface.base_offset,
+                    len: surface.logical_len,
+                })
+            }
+            _ => None,
+        }
     }
 
     /// Recursively resolve `dir_path`, assigning inodes to its children.
@@ -187,11 +386,18 @@ impl OrFsView {
             })?;
             match self.fs.stat(&child_path) {
                 Ok(meta) => {
+                    // A surface is only used when it exposes exactly the object's
+                    // logical bytes, so a read can never be silently truncated.
+                    let mut surface = self.resolve_surface(&child_path);
+                    if surface.as_ref().is_some_and(|s| s.len != meta.logical_len) {
+                        surface = None;
+                    }
                     self.files.insert(
                         ino,
                         FileEntry {
                             path: child_path,
                             len: meta.logical_len,
+                            surface,
                         },
                     );
                     kids.push(ChildEntry {
@@ -320,12 +526,20 @@ impl OrFsView {
 
     /// Read a logical file range, clamping to the file length. Returns an errno
     /// on failure so it can be handed straight to a FUSE reply.
+    ///
+    /// When the object is fully materialised as a logically-aligned surface and
+    /// the mount is in [`ReadMode::Auto`], the read is a direct bounded copy out
+    /// of that surface — no decode, no re-parse, no cache probe. Otherwise it
+    /// goes through the engine/decoder ([`OrFs::read`]). Both are byte-exact.
     fn read_logical(&self, ino: u64, offset: u64, size: u32) -> std::result::Result<Vec<u8>, i32> {
         let file = self.files.get(&ino).ok_or(ENOENT)?;
         if offset >= file.len {
             return Ok(Vec::new());
         }
         let want = u64::from(size).min(file.len - offset);
+        if let Some(surface) = &file.surface {
+            return surface.read(offset, want);
+        }
         self.fs
             .read(
                 &file.path,
@@ -589,7 +803,7 @@ mod tests {
             .unwrap();
         fs.create("top.bin", b"top", ManifestationProfile::Root)
             .unwrap();
-        let view = OrFsView::new(fs).unwrap();
+        let view = OrFsView::new(fs, &MountOptions::default()).unwrap();
 
         let root_names = names_of(&view, ROOT_INO);
         assert!(root_names.contains(&"data".to_string()));
@@ -619,7 +833,7 @@ mod tests {
             ManifestationProfile::Path { depth: 4 },
         )
         .unwrap();
-        let view = OrFsView::new(fs).unwrap();
+        let view = OrFsView::new(fs, &MountOptions::default()).unwrap();
 
         let ino = view
             .children
@@ -648,13 +862,74 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// The read mode dispatches: a fully-materialised, logically-aligned object
+    /// is served from its backing surface in [`ReadMode::Auto`] and by the decoder
+    /// in [`ReadMode::Decode`]; both are byte-exact, including partial windows.
+    #[test]
+    fn read_mode_dispatches_surface_vs_decode_byte_exact() {
+        let src: Vec<u8> = (0..4096u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
+
+        let auto_root = temp_root("auto");
+        let fs = OrFs::open(&auto_root).unwrap();
+        fs.create(
+            "data/hot.bin",
+            &src,
+            ManifestationProfile::Path { depth: 4 },
+        )
+        .unwrap();
+        let view = OrFsView::new(fs, &MountOptions::default()).unwrap();
+        let ino = *view.files.keys().next().expect("one file inode");
+        assert!(
+            view.files[&ino].surface.is_some(),
+            "a path-bloom object must expose an aligned backing surface"
+        );
+        assert_eq!(view.read_logical(ino, 0, src.len() as u32).unwrap(), src);
+        assert_eq!(
+            view.read_logical(ino, 1234, 777).unwrap(),
+            src[1234..2011].to_vec()
+        );
+        assert_eq!(
+            view.read_logical(ino, src.len() as u64 - 3, 8).unwrap(),
+            src[src.len() - 3..].to_vec()
+        );
+
+        let decode_root = temp_root("decode");
+        let fs = OrFs::open(&decode_root).unwrap();
+        fs.create(
+            "data/hot.bin",
+            &src,
+            ManifestationProfile::Path { depth: 4 },
+        )
+        .unwrap();
+        let opts = MountOptions {
+            read_mode: ReadMode::Decode,
+            ..MountOptions::default()
+        };
+        let view = OrFsView::new(fs, &opts).unwrap();
+        let ino = *view.files.keys().next().unwrap();
+        assert!(
+            view.files[&ino].surface.is_none(),
+            "ReadMode::Decode must not attach a surface"
+        );
+        assert_eq!(view.read_logical(ino, 0, src.len() as u32).unwrap(), src);
+        assert_eq!(
+            view.read_logical(ino, 1234, 777).unwrap(),
+            src[1234..2011].to_vec()
+        );
+
+        std::fs::remove_dir_all(&auto_root).unwrap();
+        std::fs::remove_dir_all(&decode_root).unwrap();
+    }
+
     #[test]
     fn control_file_reports_physical_accounting_not_logical() {
         let root = temp_root("control");
         let fs = OrFs::open(&root).unwrap();
         fs.create("data/full.bin", &[0x5Au8; 1024], ManifestationProfile::Full)
             .unwrap();
-        let view = OrFsView::new(fs).unwrap();
+        let view = OrFsView::new(fs, &MountOptions::default()).unwrap();
 
         let bytes = view.control_bytes().unwrap();
         let text = String::from_utf8(bytes).unwrap();

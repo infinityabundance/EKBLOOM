@@ -308,6 +308,33 @@ pub fn block_start_states(core: &[u8], block: usize) -> Result<Vec<u16>> {
         .collect())
 }
 
+/// The self-contained machine-1 batch jobs of `core`: one [`crate::batch::BatchJob`]
+/// per `block`-sized window, each carrying its exact restart state (from one
+/// associative prefix scan) and its own encoded bytes, with the cursor at `0`.
+///
+/// This is the independent-window shape [`crate::batch::BatchReconstructor`]
+/// parallelises; the jobs borrow `core`, so no data is copied.
+pub fn independent_window_jobs(
+    core: &[u8],
+    block: usize,
+) -> Result<Vec<crate::batch::BatchJob<'_>>> {
+    let starts = block_start_states(core, block)?;
+    let mut jobs: Vec<crate::batch::BatchJob<'_>> = Vec::with_capacity(starts.len());
+    let mut lo = 0usize;
+    let mut k = 0usize;
+    while lo < core.len() {
+        let hi = lo.saturating_add(block).min(core.len());
+        jobs.push(crate::batch::BatchJob {
+            start: crate::state::Snapshot::new(u32::from(starts[k]), 0),
+            encoded: &core[lo..hi],
+            out_len: (hi - lo) as u64,
+        });
+        lo = hi;
+        k += 1;
+    }
+    Ok(jobs)
+}
+
 /// Kernel B, pure-parallel threads: summaries + prefix scan + per-block decode
 /// across `threads` — the [`crate::prefix::reconstruct_blocks`] path.
 pub fn kernel_b_threads(core: &[u8], block: usize, threads: usize) -> Result<Vec<u8>> {

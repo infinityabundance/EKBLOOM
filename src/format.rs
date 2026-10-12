@@ -145,6 +145,25 @@ impl SectionKind {
         })
     }
 
+    /// Every section kind, in wire-code order. Exhaustive by construction, so a
+    /// new variant cannot be added without updating this list; tests (and any
+    /// coverage accounting) can iterate it instead of hard-coding the variants.
+    pub const ALL: [SectionKind; 13] = [
+        SectionKind::CoreMachine,
+        SectionKind::HistoryFull,
+        SectionKind::Checkpoints,
+        SectionKind::BloomGlobal,
+        SectionKind::BloomContext,
+        SectionKind::BloomRegion,
+        SectionKind::BloomPath,
+        SectionKind::Certificate,
+        SectionKind::Manifest,
+        SectionKind::Auth,
+        SectionKind::HistorySegmented,
+        SectionKind::Tiles,
+        SectionKind::Blocks,
+    ];
+
     /// Stable, human-readable label (used in checksum errors and reports).
     pub fn name(self) -> &'static str {
         match self {
@@ -1036,6 +1055,16 @@ mod tests {
         assert!(SectionKind::from_u32(0).is_none());
         assert!(SectionKind::from_u32(14).is_none());
         assert!(SectionKind::from_u32(u32::MAX).is_none());
+
+        // `ALL` is exhaustive and gap-free: its wire codes are exactly 1..=13,
+        // each name is non-empty, and each round-trips.
+        let mut codes: Vec<u32> = SectionKind::ALL.iter().map(|k| k.to_u32()).collect();
+        codes.sort_unstable();
+        assert_eq!(codes, (1..=13).collect::<Vec<u32>>());
+        for kind in SectionKind::ALL {
+            assert!(!kind.name().is_empty());
+            assert_eq!(SectionKind::from_u32(kind.to_u32()), Some(kind));
+        }
     }
 
     #[test]

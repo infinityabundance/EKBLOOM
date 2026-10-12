@@ -1,23 +1,36 @@
-//! FUSE read-path study: the real end-to-end cost of reading a materialised object
-//! through the read-only `OrFs` mount versus a direct in-process read and an
-//! ordinary raw file read of the same bytes.
+//! FUSE read-path study: the real end-to-end cost of reading a **fully
+//! materialised** object through the read-only `OrFs` mount.
 //!
-//! Writes `evidence/bench/fuse-perf.json` (run by `sh scripts/run-fuse-perf.sh`).
+//! Three read paths are compared on the same 2 MiB object:
 //!
-//! It also emits a **standalone, logically-aligned** output file for the object
-//! (logical byte 0 == file offset 0) and reports the FUSE **passthrough** and
-//! FUSE-over-`io_uring` feasibility findings. Passthrough is *not* available
-//! through `fuser` 0.15.1 and the exact blocker is recorded rather than faked.
+//! 1. **backing surface** — the mount serves reads by a direct bounded copy out
+//!    of the object's logically-aligned output surface (its certified
+//!    whole-object path-bloom `hot` array inside the `.ekb`), with no decode and
+//!    no cache probe (`ReadMode::Auto`);
+//! 2. **mapped surface** — the same, but the backing file is a standalone,
+//!    logically-aligned export mapped through the sanctioned safe `MappedSurface`;
+//! 3. **decode** — the mount dispatches to the engine/decoder (`ReadMode::Decode`
+//!    → `OrFs::read`), the pre-existing path;
+//! 4. **direct raw file** — `std::fs::read` of the logically-aligned export.
+//!
+//! It also probes FUSE **passthrough** support at runtime and records the honest
+//! verdict (unavailable through `fuser` 0.15).
+//!
+//! Writes `evidence/bench/fuse-perf.json` (run by `sh scripts/container-fuse.sh`).
 
 #[cfg(all(feature = "fuse", target_os = "linux"))]
 mod study {
+    use std::collections::HashMap;
     use std::fmt::Write as _;
     use std::fs::File;
     use std::os::unix::fs::FileExt;
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
-    use ekbloom::{mount, FileBody, ManifestationProfile, OpenObject, OrFs, ReadRequest};
+    use ekbloom::{
+        mount, mount_with, probe_passthrough, ManifestationProfile, MountOptions, OpenObject, OrFs,
+        ReadMode, ReadRequest,
+    };
 
     /// Deterministic object size (2 MiB).
     const OBJ_BYTES: u64 = 2 * 1024 * 1024;
@@ -112,32 +125,46 @@ mod study {
 
     pub fn run() -> ekbloom::Result<()> {
         if std::fs::metadata("/dev/fuse").is_err() {
-            eprintln!("SKIP: /dev/fuse is not available; run scripts/run-fuse-perf.sh");
+            eprintln!("SKIP: /dev/fuse is not available; run scripts/container-fuse.sh");
             return Ok(());
         }
 
         let base = Path::new("target/fuse-perf-tmp");
         let root = base.join("root");
-        let mountpoint = base.join("mnt");
+        let mnt_surface = base.join("mnt-surface");
+        let mnt_mapped = base.join("mnt-mapped");
+        let mnt_decode = base.join("mnt-decode");
         let _ = std::fs::remove_dir_all(base);
         std::fs::create_dir_all(&root)?;
-        std::fs::create_dir_all(&mountpoint)?;
+        std::fs::create_dir_all(&mnt_surface)?;
+        std::fs::create_dir_all(&mnt_mapped)?;
+        std::fs::create_dir_all(&mnt_decode)?;
 
         let corpus = lcg_bytes(CORPUS_SEED, OBJ_BYTES as usize);
         {
             let fs = OrFs::open(&root)?;
-            // A fully materialised object (`Full`): reads are cheap bound lookups, so
-            // the FUSE comparison isolates the filesystem overhead rather than
-            // per-request machine reconstruction.
-            fs.create("data/obj.bin", &corpus, ManifestationProfile::Full)?;
+            // A fully materialised object: `Path` stores the whole object as a
+            // certified path-bloom `hot` array, so it exposes a logically-aligned
+            // output surface and a decode would be a single bounded copy.
+            fs.create(
+                "data/obj.bin",
+                &corpus,
+                ManifestationProfile::Path { depth: 4 },
+            )?;
         }
         let ekb = concealed_ekb(&root);
         let logical = "data/obj.bin";
 
-        // Emit a standalone, logically-aligned output file for the object: logical
-        // byte 0 is file offset 0, so every offset matches the FUSE file. This is the
-        // kind of file a passthrough backing store would need (but a `.ekb` is not:
-        // its headers/core precede the tile blob).
+        // The discovered aligned surface (absolute offset of logical byte 0).
+        let surface = {
+            let fs = OrFs::open(&root)?;
+            fs.aligned_surface(logical)?
+                .ok_or_else(|| bad("Path object exposed no aligned surface"))?
+        };
+
+        // A standalone, logically-aligned export (logical byte 0 == offset 0): the
+        // kind of file FUSE passthrough would need, and the backing file for the
+        // `MappedSurface` row.
         let export = base.join("export.bin");
         {
             let fs = OrFs::open(&root)?;
@@ -149,68 +176,93 @@ mod study {
                 },
             )?;
             if exported != corpus {
-                return Err(ekbloom::EkbloomError::InvalidArgument {
-                    what: "exported bytes do not match the source corpus".to_string(),
-                });
+                return Err(bad("exported bytes do not match the source corpus"));
             }
             std::fs::write(&export, &exported)?;
         }
 
-        // Mount the read-only projection and confirm byte-exactness through it.
+        // Mount three projections of the same object: backing surface (auto),
+        // standalone mapped surface (explicit), and decode (forced).
         let fs = OrFs::open(&root)?;
-        let handle = mount(fs, &mountpoint, false)?;
-        let mounted = mountpoint.join(logical);
-        let via_mount = std::fs::read(&mounted)?;
-        if via_mount != corpus {
-            return Err(ekbloom::EkbloomError::InvalidArgument {
-                what: "FUSE read did not match the source corpus".to_string(),
-            });
+        let h_surface = mount(fs, &mnt_surface, false)?;
+        let fs = OrFs::open(&root)?;
+        let h_mapped = mount_with(
+            fs,
+            &mnt_mapped,
+            false,
+            &MountOptions {
+                surfaces: HashMap::from([(logical.to_string(), export.clone())]),
+                ..MountOptions::default()
+            },
+        )?;
+        let fs = OrFs::open(&root)?;
+        let h_decode = mount_with(
+            fs,
+            &mnt_decode,
+            false,
+            &MountOptions {
+                read_mode: ReadMode::Decode,
+                ..MountOptions::default()
+            },
+        )?;
+
+        let mounted_surface = mnt_surface.join(logical);
+        let mounted_mapped = mnt_mapped.join(logical);
+        let mounted_decode = mnt_decode.join(logical);
+
+        // Byte-exactness through every mount before measuring anything.
+        for (label, path) in [
+            ("surface", &mounted_surface),
+            ("mapped", &mounted_mapped),
+            ("decode", &mounted_decode),
+        ] {
+            if std::fs::read(path)? != corpus {
+                return Err(bad(&format!("{label} mount did not match the source")));
+            }
         }
 
         // ---- full-object reads (end-to-end, including open) --------------------
+        // Warm the kernel page cache for each target before sampling, so the rows
+        // are compared on a warm cache rather than by loop order.
         let mut full = Vec::new();
 
+        let _ = std::fs::read(&mounted_surface)?;
         let mut samples = Vec::with_capacity(FULL_SAMPLES);
         for _ in 0..FULL_SAMPLES {
             let t0 = Instant::now();
-            let got = std::fs::read(&mounted)?;
+            let got = std::fs::read(&mounted_surface)?;
             samples.push(t0.elapsed().as_nanos() as u64);
             if got.len() as u64 != OBJ_BYTES {
-                return Err(bad("FUSE full read returned the wrong length"));
+                return Err(bad("surface full read returned the wrong length"));
             }
         }
-        full.push(full_row("fuse (std::fs::read via mount)", samples));
+        full.push(full_row("fuse backing surface (std::fs::read)", samples));
 
+        let _ = std::fs::read(&mounted_mapped)?;
         let mut samples = Vec::with_capacity(FULL_SAMPLES);
         for _ in 0..FULL_SAMPLES {
             let t0 = Instant::now();
-            let object = OpenObject::open(&ekb)?;
-            let got = object.read(ReadRequest {
-                offset: 0,
-                length: OBJ_BYTES,
-            })?;
+            let got = std::fs::read(&mounted_mapped)?;
             samples.push(t0.elapsed().as_nanos() as u64);
             if got.len() as u64 != OBJ_BYTES {
-                return Err(bad("OpenObject full read returned the wrong length"));
+                return Err(bad("mapped full read returned the wrong length"));
             }
         }
-        full.push(full_row("direct OpenObject::open + read", samples));
+        full.push(full_row("fuse mapped surface (standalone file)", samples));
 
+        let _ = std::fs::read(&mounted_decode)?;
         let mut samples = Vec::with_capacity(FULL_SAMPLES);
         for _ in 0..FULL_SAMPLES {
             let t0 = Instant::now();
-            let body = FileBody::open(&ekb)?;
-            let got = body.read(ReadRequest {
-                offset: 0,
-                length: OBJ_BYTES,
-            })?;
+            let got = std::fs::read(&mounted_decode)?;
             samples.push(t0.elapsed().as_nanos() as u64);
             if got.len() as u64 != OBJ_BYTES {
-                return Err(bad("FileBody full read returned the wrong length"));
+                return Err(bad("decode full read returned the wrong length"));
             }
         }
-        full.push(full_row("direct FileBody::open + read", samples));
+        full.push(full_row("fuse decode (ReadMode::Decode)", samples));
 
+        let _ = std::fs::read(&export)?;
         let mut samples = Vec::with_capacity(FULL_SAMPLES);
         for _ in 0..FULL_SAMPLES {
             let t0 = Instant::now();
@@ -230,11 +282,12 @@ mod study {
 
         let mut window = Vec::new();
 
-        // FUSE, persistent handle: after the first touch the kernel page cache serves
-        // the data, so this measures the cached floor of the FUSE path.
+        // Backing surface, persistent fd: after the first touch the kernel page
+        // cache serves the data.
         {
-            let file = File::open(&mounted)?;
+            let file = File::open(&mounted_surface)?;
             let mut buf = vec![0u8; WINDOW as usize];
+            file.read_exact_at(&mut buf, offsets[0])?;
             let mut samples = Vec::with_capacity(offsets.len());
             for &off in &offsets {
                 let t0 = Instant::now();
@@ -242,32 +295,67 @@ mod study {
                 samples.push(t0.elapsed().as_nanos() as u64);
             }
             window.push(WindowRow {
-                name: "fuse window (persistent fd, warm page cache)",
+                name: "fuse backing surface (persistent fd, warm)",
                 stats: stats(samples),
             });
         }
 
-        // FUSE, reopen per read: `fuser` does not set `FOPEN_KEEP_CACHE`, so a fresh
-        // open invalidates the inode's page cache and the read is served by the
-        // userspace filesystem — the real FUSE cost.
+        // Backing surface, reopen per read: the real uncached FUSE request cost.
         {
             let mut buf = vec![0u8; WINDOW as usize];
             let mut samples = Vec::with_capacity(offsets.len());
             for &off in &offsets {
                 let t0 = Instant::now();
-                let file = File::open(&mounted)?;
+                let file = File::open(&mounted_surface)?;
                 file.read_exact_at(&mut buf, off)?;
                 samples.push(t0.elapsed().as_nanos() as u64);
             }
             window.push(WindowRow {
-                name: "fuse window (open per read, uncached FUSE request)",
+                name: "fuse backing surface (open per read, uncached)",
                 stats: stats(samples),
             });
         }
 
-        // Direct cached handle, persistent.
+        // Decode, reopen per read: the pre-existing path's uncached cost.
+        {
+            let mut buf = vec![0u8; WINDOW as usize];
+            let mut samples = Vec::with_capacity(offsets.len());
+            for &off in &offsets {
+                let t0 = Instant::now();
+                let file = File::open(&mounted_decode)?;
+                file.read_exact_at(&mut buf, off)?;
+                samples.push(t0.elapsed().as_nanos() as u64);
+            }
+            window.push(WindowRow {
+                name: "fuse decode (open per read, uncached)",
+                stats: stats(samples),
+            });
+        }
+
+        // Mapped standalone surface, persistent fd (no syscall once resident).
+        {
+            let file = File::open(&mounted_mapped)?;
+            let mut buf = vec![0u8; WINDOW as usize];
+            file.read_exact_at(&mut buf, offsets[0])?;
+            let mut samples = Vec::with_capacity(offsets.len());
+            for &off in &offsets {
+                let t0 = Instant::now();
+                file.read_exact_at(&mut buf, off)?;
+                samples.push(t0.elapsed().as_nanos() as u64);
+            }
+            window.push(WindowRow {
+                name: "fuse mapped surface (persistent fd, warm)",
+                stats: stats(samples),
+            });
+        }
+
+        // Direct `OpenObject` handle over the same `.ekb`, for reference.
         {
             let object = OpenObject::open(&ekb)?;
+            let _ = object.read(ReadRequest {
+                offset: offsets[0],
+                length: WINDOW,
+            })?;
             let mut samples = Vec::with_capacity(offsets.len());
             for &off in &offsets {
                 let t0 = Instant::now();
@@ -290,6 +378,7 @@ mod study {
         {
             let file = File::open(&export)?;
             let mut buf = vec![0u8; WINDOW as usize];
+            file.read_exact_at(&mut buf, offsets[0])?;
             let mut samples = Vec::with_capacity(offsets.len());
             for &off in &offsets {
                 let t0 = Instant::now();
@@ -302,50 +391,52 @@ mod study {
             });
         }
 
-        // ---- feasibility findings ----------------------------------------------
-        let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
-        let passthrough_reason = "fuser 0.15.1 exposes no FUSE_PASSTHROUGH init flag, no \
-             FUSE_DEV_IOC_BACKING_OPEN ioctl, and no per-inode backing id. FUSE passthrough \
-             landed in FUSE ABI 7.40 (Linux 6.9+); fuser 0.15.1 tops out at abi-7-31. \
-             Enabling it needs a newer fuser (a new dependency) or unsafe ioctl FFI outside \
-             the sanctioned src/async_io.rs, so it is out of scope here.";
+        // ---- capability probes --------------------------------------------------
+        let probe = probe_passthrough();
         let io_uring_reason = "fuser 0.15.1 does not negotiate FUSE-over-io_uring (the \
              FUSE_HAS_IO_URING init flag and per-queue uring setup added in Linux 6.14+); no \
              API is exposed, so the mount uses the classic /dev/fuse request loop.";
 
-        // ---- verdict -----------------------------------------------------------
-        let fuse_full = &full[0].stats;
-        let direct_open = &full[1].stats;
-        let raw_full = &full[3].stats;
-        let fuse_uncached = &window[1].stats;
-        let direct_win = &window[2].stats;
-        let raw_win = &window[3].stats;
+        // ---- verdict ------------------------------------------------------------
+        let f_surface = &full[0].stats;
+        let f_decode = &full[2].stats;
+        let f_raw = &full[3].stats;
+        let w_surface = &window[1].stats;
+        let w_decode = &window[2].stats;
         let verdict = format!(
-            "FUSE adds no measurable overhead over the direct read of a materialised object: a \
-             full {:.1} MiB read costs {:.0} us through FUSE vs {:.0} us direct (both are the \
-             EKBLOOM decode, ~{:.0}x the {:.1} us raw-file read). Per uncached {:.0} KiB request \
-             FUSE adds {:.1} us over the direct handle ({:.1} us vs {:.1} us; the /dev/fuse round \
-             trip plus open); a persistent handle is served from the kernel page cache at {:.1} us \
-             p50, and the raw file at {:.1} us. Passthrough is NOT available through fuser \
-             0.15.1.",
+            "The backing surface removes the decode and the per-request cache probe: an uncached \
+             4 KiB FUSE read costs {:.1} us on the surface vs {:.1} us through the decoder \
+             ({:.1}x). A full {:.1} MiB read is {:.0} us on the surface vs {:.0} us decoded \
+             (both are dominated by the same kernel copy; the surface skips the identity probe \
+             and path-bloom re-validation). The standalone mapped surface is the floor at {:.2} us \
+             per persistent-fd window. Raw file read: {:.0} us full. FUSE passthrough is NOT \
+             available through fuser (max ABI {}); kernel {} {}. The `.ekb` is not a valid \
+             passthrough backing file (headers/core precede the hot blob), but its path-bloom hot \
+             array is logically aligned and is what the backing surface serves.",
+            w_surface.p50 as f64 / 1000.0,
+            w_decode.p50 as f64 / 1000.0,
+            w_decode.p50 as f64 / w_surface.p50.max(1) as f64,
             OBJ_BYTES as f64 / (1024.0 * 1024.0),
-            fuse_full.p50 as f64 / 1000.0,
-            direct_open.p50 as f64 / 1000.0,
-            direct_open.p50 as f64 / raw_full.p50.max(1) as f64,
-            raw_full.p50 as f64 / 1000.0,
-            WINDOW as f64 / 1024.0,
-            fuse_uncached.p50.saturating_sub(direct_win.p50) as f64 / 1000.0,
-            fuse_uncached.p50 as f64 / 1000.0,
-            direct_win.p50 as f64 / 1000.0,
-            window[0].stats.p50 as f64 / 1000.0,
-            raw_win.p50 as f64 / 1000.0,
+            f_surface.p50 as f64 / 1000.0,
+            f_decode.p50 as f64 / 1000.0,
+            window[3].stats.p50 as f64 / 1000.0,
+            f_raw.p50 as f64 / 1000.0,
+            probe.fuser_max_abi,
+            probe.kernel_release,
+            if probe.kernel_supports {
+                "has the passthrough ABI"
+            } else {
+                "predates the passthrough ABI"
+            },
+        );
+        println!(
+            "aligned surface: base_offset={} logical_len={}",
+            surface.base_offset, surface.logical_len
         );
         println!("full reads:");
         for row in &full {
             println!(
-                "  {:<40} p50 {:>10} ns  min {:>10} ns  {:>8.1} MB/s",
+                "  {:<42} p50 {:>10} ns  min {:>10} ns  {:>8.1} MB/s",
                 row.name, row.stats.p50, row.stats.min, row.mbps
             );
         }
@@ -356,32 +447,40 @@ mod study {
                 row.name, row.stats.p50, row.stats.p99
             );
         }
+        println!("passthrough probe: {probe:?}");
         println!("verdict: {verdict}");
 
         // ---- evidence ----------------------------------------------------------
         let mut s = String::new();
         s.push_str("{\n");
         let _ = writeln!(s, "  \"fuse_available\": true,");
-        let _ = writeln!(s, "  \"kernel\": \"{}\",", json_escape(&kernel));
+        let _ = writeln!(
+            s,
+            "  \"kernel\": \"{}\",",
+            json_escape(&probe.kernel_release)
+        );
         let _ = writeln!(s, "  \"object_bytes\": {OBJ_BYTES},");
+        let _ = writeln!(s, "  \"object_profile\": \"path(D=4)\",");
         let _ = writeln!(s, "  \"window_bytes\": {WINDOW},");
         let _ = writeln!(s, "  \"window_samples\": {WINDOW_SAMPLES},");
         let _ = writeln!(
             s,
             "  \"logically_aligned_export\": \"target/fuse-perf-tmp/export.bin\","
         );
+        let _ = writeln!(s, "  \"aligned_surface\": {{");
+        let _ = writeln!(s, "    \"kind\": \"ekb path-bloom hot array\",");
+        let _ = writeln!(s, "    \"base_offset\": {},", surface.base_offset);
+        let _ = writeln!(s, "    \"logical_len\": {}", surface.logical_len);
+        let _ = writeln!(s, "  }},");
         s.push_str("  \"passthrough\": {\n");
-        let _ = writeln!(s, "    \"supported\": false,");
-        let _ = writeln!(s, "    \"fuser_version\": \"0.15.1\",");
-        let _ = writeln!(s, "    \"fuser_max_abi\": \"7.31\",");
+        let _ = writeln!(s, "    \"supported\": {},", probe.available);
+        let _ = writeln!(s, "    \"fuser_supports\": {},", probe.fuser_supports);
+        let _ = writeln!(s, "    \"fuser_max_abi\": \"{}\",", probe.fuser_max_abi);
+        let _ = writeln!(s, "    \"kernel_supports_abi\": {},", probe.kernel_supports);
+        let _ = writeln!(s, "    \"reason\": \"{}\",", json_escape(&probe.reason));
         let _ = writeln!(
             s,
-            "    \"reason\": \"{}\",",
-            json_escape(passthrough_reason)
-        );
-        let _ = writeln!(
-            s,
-            "    \"ekb_is_not_a_valid_backing_file\": \"a .ekb generation has headers/core before the tile blob, so file offset != logical offset\""
+            "    \"ekb_is_not_a_valid_backing_file\": \"a .ekb generation has headers/core before the bloom hot blob, so file offset != logical offset; only the certified path-bloom hot array inside it (or a standalone export) is logically aligned\""
         );
         s.push_str("  },\n");
         s.push_str("  \"io_uring_fuse\": {\n");
@@ -422,7 +521,9 @@ mod study {
         println!("wrote {}", out.display());
 
         // Unmount (drop) before removing directories.
-        drop(handle);
+        drop(h_surface);
+        drop(h_mapped);
+        drop(h_decode);
         let _ = std::fs::remove_dir_all(base);
         Ok(())
     }

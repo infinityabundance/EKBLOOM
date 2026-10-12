@@ -111,6 +111,25 @@ pub fn open_authenticated(path: &Path, key: &[u8; 32]) -> Result<EkbloomBody> {
     open_bytes_authenticated(&bytes, key)
 }
 
+/// Open a `.ekb` file in **strict authentication mode**: the file must carry an
+/// `AUTH` section whose keyed MAC verifies against `key`.
+///
+/// This is the explicit "require authenticity" entry point. It behaves exactly
+/// like [`open_authenticated`] — a missing or mismatching `AUTH` is a hard error,
+/// with no unauthenticated fallback — but is named for the strict contract so a
+/// caller can state its intent. A wholly unkeyed file (no `AUTH` at all) is
+/// rejected here, as is any file whose selected generation does not
+/// authenticate. See `docs/SECURITY.md`.
+pub fn open_require_auth(path: &Path, key: &[u8; 32]) -> Result<EkbloomBody> {
+    let bytes = std::fs::read(path)?;
+    open_bytes_require_auth(&bytes, key)
+}
+
+/// [`open_require_auth`] over an in-memory `.ekb` image.
+pub fn open_bytes_require_auth(bytes: &[u8], key: &[u8; 32]) -> Result<EkbloomBody> {
+    open_bytes_authenticated(bytes, key)
+}
+
 /// [`open_authenticated`] over an in-memory `.ekb` image.
 pub fn open_bytes_authenticated(bytes: &[u8], key: &[u8; 32]) -> Result<EkbloomBody> {
     let scan = format::scan(bytes)?;
@@ -1876,6 +1895,37 @@ impl FileBody {
             return false;
         }
         self.tiles.iter().any(|t| t.covers(offset, end))
+    }
+
+    /// The absolute file offset of logical byte 0 when the whole object is
+    /// **fully materialised as a logically-aligned output surface** inside this
+    /// file; `None` otherwise.
+    ///
+    /// A certified whole-object path bloom stores its `hot` array as exactly one
+    /// authoritative byte per logical symbol, contiguously, so logical byte `i`
+    /// lives at `base_offset + i`. This is precisely the surface the FUSE
+    /// projection can serve reads from *without decoding* (see `docs/FUSE.md`).
+    /// The offset is computed with the same structural checks as [`Self::read`]'s
+    /// path-bloom branch, so a shell selected here is the one a decode would use.
+    ///
+    /// Returns `(base_offset, logical_len)`. A zero-length object has no
+    /// surface.
+    pub fn aligned_surface(&self) -> Result<Option<(u64, u64)>> {
+        if self.logical_len == 0 {
+            return Ok(None);
+        }
+        for bloom in &self.blooms {
+            if bloom.kind != BloomKind::Path
+                || bloom.status != Certification::Certified
+                || bloom.logical_len != self.logical_len
+            {
+                continue;
+            }
+            if let Some(hot_off) = self.path_hot_offset(bloom)? {
+                return Ok(Some((hot_off, self.logical_len)));
+            }
+        }
+        Ok(None)
     }
 
     /// Path 0: a persisted tile set that fully materialises the request. Tile

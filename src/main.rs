@@ -29,9 +29,9 @@ usage:
   ekbloom create   <input> -o <out.ekb> [--profile <p>] [--machine auto|1|2|3] [--depth D] [--interval K] [--region-bytes R] [--max-physical-bytes B] [--key-hex H | --key-file F]
   ekbloom manifest <file.ekb> --profile <p> [--depth D] [--interval K] [--region-bytes R] [--max-physical-bytes B] [--key-hex H | --key-file F]
   ekbloom grow     <file.ekb> --profile <p> [--depth D] [--interval K] [--region-bytes R] [--max-physical-bytes B] [--key-hex H | --key-file F]
-  ekbloom read     <file.ekb> --offset O --length L [-o <out.bin>] [--key-hex H | --key-file F]
-  ekbloom inspect  <file.ekb> [--json] [--key-hex H | --key-file F]
-  ekbloom verify   <file.ekb> [--deep] [--key-hex H | --key-file F]
+  ekbloom read     <file.ekb> --offset O --length L [-o <out.bin>] [--key-hex H | --key-file F] [--require-auth]
+  ekbloom inspect  <file.ekb> [--json] [--key-hex H | --key-file F] [--require-auth]
+  ekbloom verify   <file.ekb> [--deep] [--key-hex H | --key-file F] [--require-auth]
   ekbloom certify  <file.ekb> [--bloom universal|contextual|regional] [--depth D] [--region-bytes R]
   ekbloom recover  <file.ekb>
   ekbloom bench    <file.ekb> --workload <seq|random-1b|random-4k|range-64k|mixed|hot-set> [--iterations N]
@@ -54,6 +54,8 @@ keys:
   When a key is given, create/manifest/grow write an authenticated object (keyed
   BLAKE3 MAC) and read/inspect/verify require and check it. The key is never
   printed. Without a key the default unkeyed behaviour is unchanged.
+  --require-auth (read/inspect/verify) demands a key and rejects any file that does
+  not carry a valid AUTH section: strict authenticity, never a silent downgrade.
 
 notes:
   --max-physical-bytes B is a hard ceiling on total manifested physical bytes;
@@ -199,6 +201,22 @@ fn resolve_key(parsed: &Parsed) -> Result<Option<[u8; 32]>, CliError> {
     Ok(None)
 }
 
+/// Resolve the key plus whether strict authentication is demanded.
+///
+/// `--require-auth` (read/inspect/verify) requires a key and makes the open
+/// reject any file without a valid `AUTH` section. It is meaningless without a
+/// key, so that combination is a usage error rather than a silent no-op.
+fn resolve_strict_key(parsed: &Parsed) -> Result<(Option<[u8; 32]>, bool), CliError> {
+    let strict = parsed.has_flag("require-auth");
+    let key = resolve_key(parsed)?;
+    if strict && key.is_none() {
+        return Err(CliError::usage(
+            "--require-auth requires --key-hex or --key-file",
+        ));
+    }
+    Ok((key, strict))
+}
+
 /// Parse exactly 64 hex characters (optionally `0x`-prefixed) into a 32-byte key.
 fn parse_key_hex(s: &str) -> Result<[u8; 32], CliError> {
     let s = s
@@ -236,7 +254,7 @@ fn hex_val(c: u8) -> Option<u8> {
 }
 
 /// Options that take no value.
-const SWITCHES: [&str; 2] = ["json", "deep"];
+const SWITCHES: [&str; 3] = ["json", "deep", "require-auth"];
 
 /// Parse `args` (already stripped of the program and command) into [`Parsed`].
 fn parse_args(args: &[String]) -> Result<Parsed, CliError> {
@@ -450,15 +468,19 @@ fn cmd_read(parsed: &Parsed) -> Result<i32, CliError> {
     let path = parsed.positional(0, "file.ekb")?;
     let offset = parsed.require_u64("offset")?;
     let length = parsed.require_u64("length")?;
-    let key = resolve_key(parsed)?;
+    let (key, strict) = resolve_strict_key(parsed)?;
 
     let req = ReadRequest { offset, length };
-    let bytes = match &key {
-        Some(key) => {
+    let bytes = match (&key, strict) {
+        (Some(key), true) => {
+            let body = reader::open_require_auth(Path::new(path), key)?;
+            ekbloom::read(&body, req)?
+        }
+        (Some(key), false) => {
             let body = reader::open_authenticated(Path::new(path), key)?;
             ekbloom::read(&body, req)?
         }
-        None => reader::read_file(Path::new(path), req)?,
+        (None, _) => reader::read_file(Path::new(path), req)?,
     };
     match parsed.option("o") {
         Some(out) => {
@@ -477,10 +499,11 @@ fn cmd_read(parsed: &Parsed) -> Result<i32, CliError> {
 
 fn cmd_inspect(parsed: &Parsed) -> Result<i32, CliError> {
     let path = parsed.positional(0, "file.ekb")?;
-    let key = resolve_key(parsed)?;
-    let report = match &key {
-        Some(key) => manifest::inspect(&reader::open_authenticated(Path::new(path), key)?),
-        None => reader::inspect_file(Path::new(path))?,
+    let (key, strict) = resolve_strict_key(parsed)?;
+    let report = match (&key, strict) {
+        (Some(key), true) => manifest::inspect(&reader::open_require_auth(Path::new(path), key)?),
+        (Some(key), false) => manifest::inspect(&reader::open_authenticated(Path::new(path), key)?),
+        (None, _) => reader::inspect_file(Path::new(path))?,
     };
     if parsed.has_flag("json") {
         print_inspect_json(&report);
@@ -549,15 +572,22 @@ fn print_inspect_json(report: &ManifestationReport) {
 
 fn cmd_verify(parsed: &Parsed) -> Result<i32, CliError> {
     let path = parsed.positional(0, "file.ekb")?;
-    let key = resolve_key(parsed)?;
-    let body = match &key {
-        Some(key) => reader::open_authenticated(Path::new(path), key)?,
-        None => reader::open(Path::new(path))?,
-    };
-    let report = if parsed.has_flag("deep") {
-        verify::verify_deep(&body)?
+    let (key, strict) = resolve_strict_key(parsed)?;
+    let report = if strict {
+        // `strict` implies `key` is `Some` (enforced by `resolve_strict_key`).
+        let key =
+            key.ok_or_else(|| CliError::usage("--require-auth requires --key-hex or --key-file"))?;
+        verify::verify_file_require_auth(Path::new(path), &key, parsed.has_flag("deep"))?
     } else {
-        verify::verify(&body)?
+        let body = match &key {
+            Some(key) => reader::open_authenticated(Path::new(path), key)?,
+            None => reader::open(Path::new(path))?,
+        };
+        if parsed.has_flag("deep") {
+            verify::verify_deep(&body)?
+        } else {
+            verify::verify(&body)?
+        }
     };
 
     for check in &report.checks {

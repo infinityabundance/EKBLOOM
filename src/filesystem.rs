@@ -79,6 +79,24 @@ pub struct FileMeta {
     pub profiles: Vec<String>,
 }
 
+/// A fully-materialised, logically-aligned output surface backing one object.
+///
+/// Logical byte `i` of the object lives at absolute offset `base_offset + i` of
+/// `backing_path` (the concealed `.ekb` generation), byte-for-byte equal to
+/// [`OrFs::read`]. A read can therefore be served by a direct bounded copy out
+/// of that file instead of a decode — the *spirit* of passthrough (see
+/// `docs/FUSE.md`). The surface is never written or mutated; it is discovered
+/// from the object's certified whole-object path bloom.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlignedSurface {
+    /// Absolute path of the backing file.
+    pub backing_path: PathBuf,
+    /// Absolute offset within the backing file of logical byte 0.
+    pub base_offset: u64,
+    /// Number of logically-aligned bytes available.
+    pub logical_len: u64,
+}
+
 /// Per-object physical accounting entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectPhysical {
@@ -238,6 +256,32 @@ impl OrFs {
                 })
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// If the registered object at `logical_path` carries a fully-materialised,
+    /// logically-aligned output surface, return its location.
+    ///
+    /// Returns `Ok(None)` when the object exists but has no such surface (its
+    /// reads must be decoded), and an error when the path is not a registered
+    /// object or its concealed `.ekb` fails validation. Discovery opens the
+    /// object's `.ekb` once, so this is a mount-time step, not a hot-path one.
+    pub fn aligned_surface(&self, logical_path: &str) -> Result<Option<AlignedSurface>> {
+        let rel = normalize_file_path(logical_path)?;
+        let backing_path = self.object_dir(&rel).join("manifests");
+        if !backing_path.exists() {
+            return Err(EkbloomError::InvalidArgument {
+                what: format!("no such logical object: {rel}"),
+            });
+        }
+        let body = reader::FileBody::open(&backing_path)?;
+        match body.aligned_surface()? {
+            Some((base_offset, logical_len)) => Ok(Some(AlignedSurface {
+                backing_path,
+                base_offset,
+                logical_len,
+            })),
+            None => Ok(None),
         }
     }
 
