@@ -1,0 +1,335 @@
+{
+  "producer": "examples/e2e.rs (sh scripts/run-e2e.sh)",
+  "kernel": "7.2.9-2-cachyos",
+  "fuse_feature": true,
+  "fuse_requested": true,
+  "budget_policy": "equal total on-disk budget = the raw file store's real allocated bytes (du)",
+  "read_bytes": 4096,
+  "hot_bytes": 262144,
+  "hot_samples": 96,
+  "random_samples": 96,
+  "seq_chunk_bytes": 65536,
+  "corpora": [
+    {
+      "name": "text",
+      "kind": "text-like",
+      "origin": "288 real file(s); first /usr/share/common-licenses/Apache-2.0",
+      "source_len": 3363507,
+      "source_blake3": "d6b1014ef273099e265c3e64dd49d37955ad5e5c1f877d8bb9f2a71c43557f0c",
+      "hot_bytes": 262144,
+      "plan": {
+        "optimized": true,
+        "machine": 4,
+        "region_bytes": 4096,
+        "restart": "K1024",
+        "tile_shift": 12,
+        "hot_regions": 21,
+        "committed_bytes": 2477552,
+        "expected_p99_ns": 130.9,
+        "worst_case_steps": 1023,
+        "over_budget": false,
+        "summary": "machine 4 / region 4096 B / restart K1024 / tile 2^12 / hot 21 region(s) / 2477552 committed B / p99 130.9 ns"
+      },
+      "creation": {
+        "plan_build_ns": 2943798044,
+        "create_persist_ns": 3965121
+      },
+      "reopen": {
+        "orfs_open_ns": 4138,
+        "persistent_handle_open_ns": 264613,
+        "ready_object_prepare_ns": 347178
+      },
+      "on_disk": {
+        "budget_bytes": 3366912,
+        "orfs_object_bytes": 2506752,
+        "inspect_physical_total_bytes": 2506752,
+        "manifests_allocated_bytes": 2482176,
+        "raw_bytes": 3366912,
+        "pinned_lz4_bytes": 2031616,
+        "pinned_zstd_bytes": 1216512,
+        "lz4_pinned_decoded_bytes": 262144,
+        "zstd_pinned_decoded_bytes": 262144
+      },
+      "within_budget": {
+        "orfs": true,
+        "pinned_lz4": true,
+        "pinned_zstd": true
+      },
+      "sustained": {
+        "orfs": {
+          "seq_mbps": 338.1,
+          "hot4k_p50_ns": 1333,
+          "hot4k_p99_ns": 1463,
+          "random4k_p50_ns": 13735,
+          "random4k_p99_ns": 18645,
+          "scan_then_hot4k_p50_ns": 1352,
+          "scan_then_hot4k_p99_ns": 2184
+        },
+        "ready_object": {
+          "seq_mbps": 347.3,
+          "hot4k_p50_ns": 120,
+          "hot4k_p99_ns": 180,
+          "random4k_p50_ns": 12363,
+          "random4k_p99_ns": 16070,
+          "scan_then_hot4k_p50_ns": 111,
+          "scan_then_hot4k_p99_ns": 390
+        },
+        "raw": {
+          "seq_mbps": 24264.5,
+          "hot4k_p50_ns": 160,
+          "hot4k_p99_ns": 220,
+          "random4k_p50_ns": 381,
+          "random4k_p99_ns": 561,
+          "scan_then_hot4k_p50_ns": 160,
+          "scan_then_hot4k_p99_ns": 240
+        },
+        "pinned_lz4": {
+          "seq_mbps": 3613.5,
+          "hot4k_p50_ns": 70,
+          "hot4k_p99_ns": 100,
+          "random4k_p50_ns": 1443,
+          "random4k_p99_ns": 4949,
+          "scan_then_hot4k_p50_ns": 70,
+          "scan_then_hot4k_p99_ns": 151
+        },
+        "pinned_zstd": {
+          "seq_mbps": 1912.6,
+          "hot4k_p50_ns": 60,
+          "hot4k_p99_ns": 101,
+          "random4k_p50_ns": 8907,
+          "random4k_p99_ns": 28463,
+          "scan_then_hot4k_p50_ns": 60,
+          "scan_then_hot4k_p99_ns": 210
+        }
+      },
+      "fuse": {
+        "available": true,
+        "error": "",
+        "hot4k_p50_ns": 140,
+        "hot4k_p99_ns": 186638,
+        "random4k_p50_ns": 17292,
+        "random4k_p99_ns": 376181,
+        "full_mbps": 319.9,
+        "direct_ready_hot4k_p50_ns": 131,
+        "raw_file_hot4k_p50_ns": 190
+      },
+      "verdict": "within_equal_budget=true; beats_raw_store=true; orfs=2506752 B (0.74x raw, 1.23x pinned-LZ4, 2.06x pinned-Zstd); hot4k_p50: orfs 1333 ns / ready 120 ns vs raw 160 / LZ4 70 / Zstd 60; scan_then_hot4k_p50=1352 ns; non_evicting=true; hot_competitive_vs_pinned=true",
+      "beats_raw_store": true,
+      "holds_vs_pinned": false
+    },
+    {
+      "name": "elf",
+      "kind": "elf-executable",
+      "origin": "target/release/ekbloom",
+      "source_len": 975392,
+      "source_blake3": "d8019c784ad551bee939865922a47c2cda3570ef1a831f1b14418df0b5239f08",
+      "hot_bytes": 262144,
+      "plan": {
+        "optimized": true,
+        "machine": 4,
+        "region_bytes": 4096,
+        "restart": "K1024",
+        "tile_shift": 12,
+        "hot_regions": 21,
+        "committed_bytes": 929464,
+        "expected_p99_ns": 130.9,
+        "worst_case_steps": 1023,
+        "over_budget": false,
+        "summary": "machine 4 / region 4096 B / restart K1024 / tile 2^12 / hot 21 region(s) / 929464 committed B / p99 130.9 ns"
+      },
+      "creation": {
+        "plan_build_ns": 782559797,
+        "create_persist_ns": 3482982
+      },
+      "reopen": {
+        "orfs_open_ns": 4007,
+        "persistent_handle_open_ns": 106478,
+        "ready_object_prepare_ns": 209601
+      },
+      "on_disk": {
+        "budget_bytes": 978944,
+        "orfs_object_bytes": 958464,
+        "inspect_physical_total_bytes": 958464,
+        "manifests_allocated_bytes": 933888,
+        "raw_bytes": 978944,
+        "pinned_lz4_bytes": 897024,
+        "pinned_zstd_bytes": 729088,
+        "lz4_pinned_decoded_bytes": 262144,
+        "zstd_pinned_decoded_bytes": 262144
+      },
+      "within_budget": {
+        "orfs": true,
+        "pinned_lz4": true,
+        "pinned_zstd": true
+      },
+      "sustained": {
+        "orfs": {
+          "seq_mbps": 385.3,
+          "hot4k_p50_ns": 1402,
+          "hot4k_p99_ns": 1473,
+          "random4k_p50_ns": 12924,
+          "random4k_p99_ns": 88124,
+          "scan_then_hot4k_p50_ns": 1422,
+          "scan_then_hot4k_p99_ns": 2234
+        },
+        "ready_object": {
+          "seq_mbps": 376.6,
+          "hot4k_p50_ns": 130,
+          "hot4k_p99_ns": 200,
+          "random4k_p50_ns": 11672,
+          "random4k_p99_ns": 14737,
+          "scan_then_hot4k_p50_ns": 130,
+          "scan_then_hot4k_p99_ns": 331
+        },
+        "raw": {
+          "seq_mbps": 18726.6,
+          "hot4k_p50_ns": 170,
+          "hot4k_p99_ns": 190,
+          "random4k_p50_ns": 471,
+          "random4k_p99_ns": 2855,
+          "scan_then_hot4k_p50_ns": 170,
+          "scan_then_hot4k_p99_ns": 230
+        },
+        "pinned_lz4": {
+          "seq_mbps": 3741.3,
+          "hot4k_p50_ns": 60,
+          "hot4k_p99_ns": 100,
+          "random4k_p50_ns": 1433,
+          "random4k_p99_ns": 6392,
+          "scan_then_hot4k_p50_ns": 60,
+          "scan_then_hot4k_p99_ns": 130
+        },
+        "pinned_zstd": {
+          "seq_mbps": 1755.1,
+          "hot4k_p50_ns": 60,
+          "hot4k_p99_ns": 100,
+          "random4k_p50_ns": 11501,
+          "random4k_p99_ns": 111738,
+          "scan_then_hot4k_p50_ns": 60,
+          "scan_then_hot4k_p99_ns": 160
+        }
+      },
+      "fuse": {
+        "available": true,
+        "error": "",
+        "hot4k_p50_ns": 131,
+        "hot4k_p99_ns": 172702,
+        "random4k_p50_ns": 14347,
+        "random4k_p99_ns": 354060,
+        "full_mbps": 321.6,
+        "direct_ready_hot4k_p50_ns": 130,
+        "raw_file_hot4k_p50_ns": 191
+      },
+      "verdict": "within_equal_budget=true; beats_raw_store=true; orfs=958464 B (0.98x raw, 1.07x pinned-LZ4, 1.31x pinned-Zstd); hot4k_p50: orfs 1402 ns / ready 130 ns vs raw 170 / LZ4 60 / Zstd 60; scan_then_hot4k_p50=1422 ns; non_evicting=true; hot_competitive_vs_pinned=true",
+      "beats_raw_store": true,
+      "holds_vs_pinned": false
+    },
+    {
+      "name": "mixed",
+      "kind": "mixed-binary",
+      "origin": "100 real file(s); first /usr/bin/[",
+      "source_len": 16777216,
+      "source_blake3": "28f4cfd0100c92afc1d717f60458afc66d1aaeef556a3c07ede20441fcdfb7ea",
+      "hot_bytes": 262144,
+      "plan": {
+        "optimized": true,
+        "machine": 4,
+        "region_bytes": 4096,
+        "restart": "K1024",
+        "tile_shift": 12,
+        "hot_regions": 21,
+        "committed_bytes": 12991829,
+        "expected_p99_ns": 130.9,
+        "worst_case_steps": 1023,
+        "over_budget": false,
+        "summary": "machine 4 / region 4096 B / restart K1024 / tile 2^12 / hot 21 region(s) / 12991829 committed B / p99 130.9 ns"
+      },
+      "creation": {
+        "plan_build_ns": 14550409529,
+        "create_persist_ns": 10998913
+      },
+      "reopen": {
+        "orfs_open_ns": 12443,
+        "persistent_handle_open_ns": 1641070,
+        "ready_object_prepare_ns": 1813150
+      },
+      "on_disk": {
+        "budget_bytes": 16777216,
+        "orfs_object_bytes": 13017088,
+        "inspect_physical_total_bytes": 13017088,
+        "manifests_allocated_bytes": 12992512,
+        "raw_bytes": 16777216,
+        "pinned_lz4_bytes": 10641408,
+        "pinned_zstd_bytes": 7634944,
+        "lz4_pinned_decoded_bytes": 262144,
+        "zstd_pinned_decoded_bytes": 262144
+      },
+      "within_budget": {
+        "orfs": true,
+        "pinned_lz4": true,
+        "pinned_zstd": true
+      },
+      "sustained": {
+        "orfs": {
+          "seq_mbps": 341.5,
+          "hot4k_p50_ns": 1373,
+          "hot4k_p99_ns": 1423,
+          "random4k_p50_ns": 13556,
+          "random4k_p99_ns": 29685,
+          "scan_then_hot4k_p50_ns": 1382,
+          "scan_then_hot4k_p99_ns": 3056
+        },
+        "ready_object": {
+          "seq_mbps": 345.6,
+          "hot4k_p50_ns": 120,
+          "hot4k_p99_ns": 160,
+          "random4k_p50_ns": 12954,
+          "random4k_p99_ns": 22953,
+          "scan_then_hot4k_p50_ns": 121,
+          "scan_then_hot4k_p99_ns": 3396
+        },
+        "raw": {
+          "seq_mbps": 25914.7,
+          "hot4k_p50_ns": 160,
+          "hot4k_p99_ns": 190,
+          "random4k_p50_ns": 401,
+          "random4k_p99_ns": 761,
+          "scan_then_hot4k_p50_ns": 161,
+          "scan_then_hot4k_p99_ns": 541
+        },
+        "pinned_lz4": {
+          "seq_mbps": 2805.6,
+          "hot4k_p50_ns": 60,
+          "hot4k_p99_ns": 111,
+          "random4k_p50_ns": 1653,
+          "random4k_p99_ns": 6632,
+          "scan_then_hot4k_p50_ns": 70,
+          "scan_then_hot4k_p99_ns": 450
+        },
+        "pinned_zstd": {
+          "seq_mbps": 1277.7,
+          "hot4k_p50_ns": 60,
+          "hot4k_p99_ns": 101,
+          "random4k_p50_ns": 13194,
+          "random4k_p99_ns": 43852,
+          "scan_then_hot4k_p50_ns": 70,
+          "scan_then_hot4k_p99_ns": 531
+        }
+      },
+      "fuse": {
+        "available": true,
+        "error": "",
+        "hot4k_p50_ns": 140,
+        "hot4k_p99_ns": 176970,
+        "random4k_p50_ns": 17112,
+        "random4k_p99_ns": 371643,
+        "full_mbps": 332.2,
+        "direct_ready_hot4k_p50_ns": 140,
+        "raw_file_hot4k_p50_ns": 181
+      },
+      "verdict": "within_equal_budget=true; beats_raw_store=true; orfs=13017088 B (0.78x raw, 1.22x pinned-LZ4, 1.70x pinned-Zstd); hot4k_p50: orfs 1373 ns / ready 120 ns vs raw 160 / LZ4 60 / Zstd 60; scan_then_hot4k_p50=1382 ns; non_evicting=true; hot_competitive_vs_pinned=true",
+      "beats_raw_store": true,
+      "holds_vs_pinned": false
+    }
+  ]
+}
