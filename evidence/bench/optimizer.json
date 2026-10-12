@@ -1,0 +1,731 @@
+{
+  "generated_by": "examples/optimizer.rs (sh scripts/run-optimizer.sh)",
+  "source_len": 4194304,
+  "source_hash": "2382614b7aba4b4abec4828b8bee55641b95bbb39510158294165b39043a121c",
+  "read_bytes": 4096,
+  "held_out_trace_fingerprint": "463afdc2dc6cd654f0c0b6c94fa8d3a0730f88732385456a87ba1b48c510c85d",
+  "evaluation_trace_fingerprint": "1121501343e2f4b4cc52b56ca242d69ab35ca4f05f1b243e2baf2f6a8fc83557",
+  "max_reads": 3000,
+  "budgets": [
+    {
+      "budget_bytes": 4194304,
+      "joint": {
+        "machine": 4,
+        "region_bytes": 4096,
+        "committed_bytes": 4094795,
+        "p50_ns": 6622.0,
+        "p99_ns": 10069.0,
+        "p999_ns": 14467.0,
+        "certified": true,
+        "note": "machine 4 / region 4096 B / restart K256 / tile none / hot 0 region(s) / 4094795 committed B / p99 6288.8 ns"
+      },
+      "greedy": {
+        "machine": 2,
+        "region_bytes": 4096,
+        "committed_bytes": 4193628,
+        "p50_ns": 10840.0,
+        "p99_ns": 13576.0,
+        "p999_ns": 121667.0,
+        "certified": true,
+        "note": "machine select + greedy hot tiles (K=64, 4 KiB regions)"
+      },
+      "machine_only": {
+        "machine": 2,
+        "region_bytes": 4096,
+        "committed_bytes": 4143900,
+        "p50_ns": 11662.0,
+        "p99_ns": 15549.0,
+        "p999_ns": 233004.0,
+        "certified": true,
+        "note": "machine select only (K=64, no tiles)"
+      },
+      "joint_improves_frontier": true,
+      "joint_receipts": [
+        {
+          "candidate": "machine=1,region=4096,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4227074,
+          "expected_p99_ns": 0.0,
+          "reason": "infeasible: cold committed 4227074 > budget 4194304"
+        },
+        {
+          "candidate": "machine=1,region=4096,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4202498,
+          "expected_p99_ns": 0.0,
+          "reason": "infeasible: cold committed 4202498 > budget 4194304"
+        },
+        {
+          "candidate": "machine=1,region=4096,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4202602,
+          "expected_p99_ns": 0.0,
+          "reason": "infeasible: cold committed 4202602 > budget 4194304"
+        },
+        {
+          "candidate": "machine=1,region=65536,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4227074,
+          "expected_p99_ns": 0.0,
+          "reason": "infeasible: cold committed 4227074 > budget 4194304"
+        },
+        {
+          "candidate": "machine=1,region=65536,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4202498,
+          "expected_p99_ns": 0.0,
+          "reason": "infeasible: cold committed 4202498 > budget 4194304"
+        },
+        {
+          "candidate": "machine=1,region=65536,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4202602,
+          "expected_p99_ns": 0.0,
+          "reason": "infeasible: cold committed 4202602 > budget 4194304"
+        },
+        {
+          "candidate": "machine=3,region=4096,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4227074,
+          "expected_p99_ns": 0.0,
+          "reason": "infeasible: cold committed 4227074 > budget 4194304"
+        },
+        {
+          "candidate": "machine=3,region=4096,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4202498,
+          "expected_p99_ns": 0.0,
+          "reason": "infeasible: cold committed 4202498 > budget 4194304"
+        },
+        {
+          "candidate": "machine=3,region=4096,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4243572,
+          "expected_p99_ns": 0.0,
+          "reason": "infeasible: cold committed 4243572 > budget 4194304"
+        },
+        {
+          "candidate": "machine=3,region=65536,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4227074,
+          "expected_p99_ns": 0.0,
+          "reason": "infeasible: cold committed 4227074 > budget 4194304"
+        },
+        {
+          "candidate": "machine=3,region=65536,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4202498,
+          "expected_p99_ns": 0.0,
+          "reason": "infeasible: cold committed 4202498 > budget 4194304"
+        },
+        {
+          "candidate": "machine=3,region=65536,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4243572,
+          "expected_p99_ns": 0.0,
+          "reason": "infeasible: cold committed 4243572 > budget 4194304"
+        },
+        {
+          "candidate": "machine=5,region=4096,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4227084,
+          "expected_p99_ns": 0.0,
+          "reason": "infeasible: cold committed 4227084 > budget 4194304"
+        },
+        {
+          "candidate": "machine=5,region=4096,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4202508,
+          "expected_p99_ns": 0.0,
+          "reason": "infeasible: cold committed 4202508 > budget 4194304"
+        },
+        {
+          "candidate": "machine=5,region=4096,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4243582,
+          "expected_p99_ns": 0.0,
+          "reason": "infeasible: cold committed 4243582 > budget 4194304"
+        },
+        {
+          "candidate": "machine=5,region=65536,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4227084,
+          "expected_p99_ns": 0.0,
+          "reason": "infeasible: cold committed 4227084 > budget 4194304"
+        },
+        {
+          "candidate": "machine=5,region=65536,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4202508,
+          "expected_p99_ns": 0.0,
+          "reason": "infeasible: cold committed 4202508 > budget 4194304"
+        },
+        {
+          "candidate": "machine=5,region=65536,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4243582,
+          "expected_p99_ns": 0.0,
+          "reason": "infeasible: cold committed 4243582 > budget 4194304"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4094795,
+          "expected_p99_ns": 6288.8,
+          "reason": "cold base kept for the bounded search"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4094795,
+          "expected_p99_ns": 6288.8,
+          "reason": "cold base kept for the bounded search"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3541835,
+          "expected_p99_ns": 6634.4,
+          "reason": "cold base kept for the bounded search"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3541835,
+          "expected_p99_ns": 6634.4,
+          "reason": "cold base kept for the bounded search"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3541939,
+          "expected_p99_ns": 6634.4,
+          "reason": "cold base kept for the bounded search"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3541939,
+          "expected_p99_ns": 6634.4,
+          "reason": "cold base kept for the bounded search"
+        },
+        {
+          "candidate": "machine=6,region=4096,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 3245154,
+          "expected_p99_ns": 10461.2,
+          "reason": "pruned: cold p99 10461.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=6,region=65536,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 3245154,
+          "expected_p99_ns": 10461.2,
+          "reason": "pruned: cold p99 10461.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=2,region=4096,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 3554076,
+          "expected_p99_ns": 10461.2,
+          "reason": "pruned: cold p99 10461.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=2,region=65536,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 3554076,
+          "expected_p99_ns": 10461.2,
+          "reason": "pruned: cold p99 10461.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=6,region=65536,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3220578,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=6,region=4096,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3220578,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=6,region=4096,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3261652,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=6,region=65536,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3261652,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=2,region=65536,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3406620,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=2,region=4096,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3406620,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=2,region=65536,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3406724,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=2,region=4096,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3406724,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4094795,
+          "expected_p99_ns": 6288.8,
+          "reason": "chosen: lowest held-out p99 (6288.8 ns) at 4094795 committed bytes"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4094795,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=K256,tile=2^16,hot=21/4764",
+          "committed_bytes": 4160591,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=K256,tile=2^16,hot=42/6528",
+          "committed_bytes": 4160591,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=K256,tile=2^16,hot=64/8376",
+          "committed_bytes": 4160591,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=K256,tile=2^12,hot=42/6528",
+          "committed_bytes": 4193675,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=K256,tile=2^12,hot=682/26322",
+          "committed_bytes": 4193675,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=K256,tile=2^12,hot=21/4764",
+          "committed_bytes": 4193675,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=K256,tile=2^12,hot=341/19161",
+          "committed_bytes": 4193675,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=K256,tile=2^12,hot=1024/33504",
+          "committed_bytes": 4193675,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=K256,tile=2^12,hot=64/8376",
+          "committed_bytes": 4193675,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3541835,
+          "expected_p99_ns": 6634.4,
+          "reason": "evaluated: held-out p99 6634.4 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3541939,
+          "expected_p99_ns": 6634.4,
+          "reason": "evaluated: held-out p99 6634.4 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=K1024,tile=2^12,hot=1024/33504",
+          "committed_bytes": 4194187,
+          "expected_p99_ns": 6634.4,
+          "reason": "evaluated: held-out p99 6634.4 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=K1024,tile=2^12,hot=341/19161",
+          "committed_bytes": 4194187,
+          "expected_p99_ns": 6634.4,
+          "reason": "evaluated: held-out p99 6634.4 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=B1024,tile=2^12,hot=682/26322",
+          "committed_bytes": 4194291,
+          "expected_p99_ns": 6634.4,
+          "reason": "evaluated: held-out p99 6634.4 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=B1024,tile=2^12,hot=1024/33504",
+          "committed_bytes": 4194291,
+          "expected_p99_ns": 6634.4,
+          "reason": "evaluated: held-out p99 6634.4 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=B1024,tile=2^12,hot=341/19161",
+          "committed_bytes": 4194291,
+          "expected_p99_ns": 6634.4,
+          "reason": "evaluated: held-out p99 6634.4 ns (chosen 6288.8 ns at 4094795 bytes)"
+        }
+      ]
+    },
+    {
+      "budget_bytes": 6291456,
+      "joint": {
+        "machine": 4,
+        "region_bytes": 4096,
+        "committed_bytes": 4094795,
+        "p50_ns": 6653.0,
+        "p99_ns": 9838.0,
+        "p999_ns": 10910.0,
+        "certified": true,
+        "note": "machine 4 / region 4096 B / restart K256 / tile none / hot 0 region(s) / 4094795 committed B / p99 6288.8 ns"
+      },
+      "greedy": {
+        "machine": 2,
+        "region_bytes": 4096,
+        "committed_bytes": 6288732,
+        "p50_ns": 120.0,
+        "p99_ns": 13194.0,
+        "p999_ns": 13385.0,
+        "certified": true,
+        "note": "machine select + greedy hot tiles (K=64, 4 KiB regions)"
+      },
+      "machine_only": {
+        "machine": 2,
+        "region_bytes": 4096,
+        "committed_bytes": 4143900,
+        "p50_ns": 11651.0,
+        "p99_ns": 13265.0,
+        "p999_ns": 21329.0,
+        "certified": true,
+        "note": "machine select only (K=64, no tiles)"
+      },
+      "joint_improves_frontier": true,
+      "joint_receipts": [
+        {
+          "candidate": "machine=4,region=4096,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4094795,
+          "expected_p99_ns": 6288.8,
+          "reason": "cold base kept for the bounded search"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4094795,
+          "expected_p99_ns": 6288.8,
+          "reason": "cold base kept for the bounded search"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3541835,
+          "expected_p99_ns": 6634.4,
+          "reason": "cold base kept for the bounded search"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3541835,
+          "expected_p99_ns": 6634.4,
+          "reason": "cold base kept for the bounded search"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3541939,
+          "expected_p99_ns": 6634.4,
+          "reason": "cold base kept for the bounded search"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3541939,
+          "expected_p99_ns": 6634.4,
+          "reason": "cold base kept for the bounded search"
+        },
+        {
+          "candidate": "machine=6,region=4096,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 3245154,
+          "expected_p99_ns": 10461.2,
+          "reason": "pruned: cold p99 10461.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=6,region=65536,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 3245154,
+          "expected_p99_ns": 10461.2,
+          "reason": "pruned: cold p99 10461.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=2,region=4096,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 3554076,
+          "expected_p99_ns": 10461.2,
+          "reason": "pruned: cold p99 10461.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=2,region=65536,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 3554076,
+          "expected_p99_ns": 10461.2,
+          "reason": "pruned: cold p99 10461.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=1,region=4096,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4227074,
+          "expected_p99_ns": 10461.2,
+          "reason": "pruned: cold p99 10461.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=1,region=65536,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4227074,
+          "expected_p99_ns": 10461.2,
+          "reason": "pruned: cold p99 10461.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=3,region=4096,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4227074,
+          "expected_p99_ns": 10461.2,
+          "reason": "pruned: cold p99 10461.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=3,region=65536,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4227074,
+          "expected_p99_ns": 10461.2,
+          "reason": "pruned: cold p99 10461.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=5,region=65536,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4227084,
+          "expected_p99_ns": 10461.2,
+          "reason": "pruned: cold p99 10461.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=5,region=4096,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4227084,
+          "expected_p99_ns": 10461.2,
+          "reason": "pruned: cold p99 10461.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=6,region=65536,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3220578,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=6,region=4096,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3220578,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=6,region=4096,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3261652,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=6,region=65536,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3261652,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=2,region=65536,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3406620,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=2,region=4096,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3406620,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=2,region=65536,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3406724,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=2,region=4096,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3406724,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=1,region=4096,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4202498,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=3,region=65536,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4202498,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=3,region=4096,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4202498,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=1,region=65536,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4202498,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=5,region=4096,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4202508,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=5,region=65536,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4202508,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=1,region=4096,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4202602,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=1,region=65536,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4202602,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=3,region=4096,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4243572,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=3,region=65536,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4243572,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=5,region=65536,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4243582,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=5,region=4096,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 4243582,
+          "expected_p99_ns": 11037.2,
+          "reason": "pruned: cold p99 11037.2 ns not among the best 6 bases"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4094795,
+          "expected_p99_ns": 6288.8,
+          "reason": "chosen: lowest held-out p99 (6288.8 ns) at 4094795 committed bytes"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=K256,tile=2^12,hot=0/0",
+          "committed_bytes": 4094795,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=K256,tile=2^16,hot=21/4764",
+          "committed_bytes": 5471311,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=K256,tile=2^12,hot=21/4764",
+          "committed_bytes": 5472651,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=K256,tile=2^12,hot=341/19161",
+          "committed_bytes": 5493387,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=K256,tile=2^16,hot=42/6528",
+          "committed_bytes": 6257743,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=K256,tile=2^16,hot=64/8376",
+          "committed_bytes": 6257743,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=K256,tile=2^12,hot=42/6528",
+          "committed_bytes": 6288779,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=K256,tile=2^12,hot=682/26322",
+          "committed_bytes": 6288779,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=K256,tile=2^12,hot=1024/33504",
+          "committed_bytes": 6288779,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=65536,restart=K256,tile=2^12,hot=64/8376",
+          "committed_bytes": 6288779,
+          "expected_p99_ns": 6288.8,
+          "reason": "evaluated: held-out p99 6288.8 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=K1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3541835,
+          "expected_p99_ns": 6634.4,
+          "reason": "evaluated: held-out p99 6634.4 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=B1024,tile=2^12,hot=0/0",
+          "committed_bytes": 3541939,
+          "expected_p99_ns": 6634.4,
+          "reason": "evaluated: held-out p99 6634.4 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=K1024,tile=2^12,hot=341/19161",
+          "committed_bytes": 4940427,
+          "expected_p99_ns": 6634.4,
+          "reason": "evaluated: held-out p99 6634.4 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=B1024,tile=2^12,hot=341/19161",
+          "committed_bytes": 4940531,
+          "expected_p99_ns": 6634.4,
+          "reason": "evaluated: held-out p99 6634.4 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=K1024,tile=2^12,hot=1024/33504",
+          "committed_bytes": 6289291,
+          "expected_p99_ns": 6634.4,
+          "reason": "evaluated: held-out p99 6634.4 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=B1024,tile=2^12,hot=682/26322",
+          "committed_bytes": 6289395,
+          "expected_p99_ns": 6634.4,
+          "reason": "evaluated: held-out p99 6634.4 ns (chosen 6288.8 ns at 4094795 bytes)"
+        },
+        {
+          "candidate": "machine=4,region=4096,restart=B1024,tile=2^12,hot=1024/33504",
+          "committed_bytes": 6289395,
+          "expected_p99_ns": 6634.4,
+          "reason": "evaluated: held-out p99 6634.4 ns (chosen 6288.8 ns at 4094795 bytes)"
+        }
+      ]
+    }
+  ]
+}

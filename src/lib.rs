@@ -56,6 +56,7 @@ pub mod manifest;
 pub mod mapped;
 pub mod metrics;
 pub mod model_search;
+pub mod optimize;
 pub mod packed;
 pub mod planner;
 pub mod prefix;
@@ -150,6 +151,10 @@ pub use mapped::{thp_anonymous_probe, HugePageReport, MapMode, MappedSurface};
 pub use metrics::{now_ns, percentiles, Percentiles};
 pub use model_search::{
     canonical_state_only_counterexample, sufficiency_sweep, AbstractCounterexample, SufficiencyRow,
+};
+pub use optimize::{
+    evaluate, trace_fingerprint, Latency, OptimizedPlan, PlanReceipt, RestartGeometry,
+    OPTIMIZER_READ_BYTES,
 };
 pub use packed::{state_from_hot, PackedHistory, PackedRestarts};
 pub use planner::{
