@@ -1158,7 +1158,208 @@ and the result equals the explicit path by construction. ∎
 
 ---
 
-## Limitations — resolved (L1–L4 and M1–M5) and remaining (honest)
+## P34. A read plan is bound to the planned body's `CoreIdentity` — **PROVED** (binding + rejection), **EMPIRICALLY OBSERVED** (mismatch rejection)
+
+**Claim.** `Engine::plan` records the **`CoreIdentity`** of the body it planned —
+object id, machine id, logical length, `core_hash` and generation — and every read
+(certified dispatch, `byte_at`, `read_into`) re-checks that identity against the
+body it is about to decode, so a plan made on body `A` cannot be applied to a
+different body `B`, nor to a **newer generation** of `A`, and a `ReadyObject` is
+likewise object-bound. A mismatch is a typed `EngineBodyMismatch` returned **before
+any decode**, never a wrong byte.
+
+**Proof.** The identity is captured from the same `EkbloomBody` the plan is built
+from, stored in the plan, and compared field-wise at read entry (a full struct
+equality over id/machine/logical-length/core-hash/generation). Since equal
+identities imply equal `core` bytes, a body that passes the check has the same
+authoritative core the plan was certified against; any differing object or
+generation fails a field and returns `EngineBodyMismatch` before the dispatch is
+entered. ∎
+
+**Corroboration.** `tests/adversarial_r7.rs` plans on `A` and reads `B` (different
+object, different core hash) and a newer generation of `A`, both rejected for
+machines 5 and 6; the same body + generation is byte-exact and equals
+`reader::read`. The same attack held in the independent Revision 7 review
+(`docs/reviews/adversarial.md`, `docs/reviews/security.md`).
+
+**Tested:** `tests/adversarial_r7.rs`, `src/engine.rs` unit tests.
+
+---
+
+## P35. A cursor-divergent read fetches a bounded encoded window (≤ `2·(steps+symbols)+64` bytes) — **PROVED** (byte bound), **EMPIRICALLY OBSERVED** (625× reduction)
+
+**Claim.** For an order-0 rANS machine (2, `OrANS-RANS0`; 4, `OrANS-RANS0I`),
+every decoder step on a **valid** state `x ∈ [RANS_L, RANS_L << 8)` consumes **at
+most two** 8-bit input bytes after renormalisation, so a read that performs `s`
+positioning steps and reveals `n` symbols fetches at most
+`min(2·(s + n) + margin, core_len − cursor)` encoded bytes immediately after the
+certified restart, where `margin = 64`; the model header is validated once and
+never re-joined into a whole-core buffer.
+
+**Proof.** One step forms `x' = floor(x / 2^12)·f + r` with `r ∈ [0, f)`,
+`f ≥ 1`; `x ≥ RANS_L = 2^23` gives `floor(x / 2^12) ≥ 2^11`, so `x' ≥ 2^11`, and
+renormalisation (`x *= 256` while `x < RANS_L`) stops after at most **two** reads
+because `x'·2^16 ≥ 2^27 > RANS_L`. Summing over the `s + n` steps gives the bound.
+Machine 4 keeps `K` independent lanes, each satisfying the same per-step bound, so
+the shared window still sums to `2·(s + n)`. A restart outside
+`[RANS_L, RANS_L << 8)` (or an inconsistent machine-4 lane) is rejected by
+`validate_restart`; if the proven bound is ever insufficient the bounded remainder
+is fetched and retried **once** before a typed `CoreTooShort`. ∎
+
+**Corroboration.** 4 KiB of a 64 MiB machine-2 object fetches **10,270,243 →
+16,440 B** (**625×**, exactly `2·(4096+4096)+64`) at the **same two `pread`
+syscalls**; p99 **972 → 26.4 µs**; a 1-byte read fetches 8,216 B (1,250×)
+(`evidence/bench/window.json`). A frequency-1 model (many minimal-frequency
+boundary states) keeps every per-read fetch `≤ 2·(steps+len)+64` across block
+boundaries via `FileBody::fetched_bytes`.
+
+**Tested:** `tests/window.rs` (5 tests), `src/reader.rs`, `tests/adversarial_r7.rs`.
+
+---
+
+## P36. Machine 5 (`OrANS-PACK`) reveals every position in exact `O(1)`, with a `N/4` 4-symbol core — **PROVED** (extraction), **EMPIRICALLY OBSERVED** (latency / size)
+
+**Claim.** A machine-5 core `[bits][k][alphabet][logical_len][payload]` with
+`payload = ceil(N·bits/8)` maps position `i` to its symbol by a single shift/mask
+table load — no division, modulo, replay or allocation — and the constant
+(`k = 1`, empty payload) and identity (`bits = 8`, `k = 0`, verbatim) renderings are
+exact. A malformed core (`idx ≥ k`, `bits ∉ [1,8]`, truncated/short payload,
+trailing bytes) is a typed error. The smallest fitting width of `{1,2,4,8}` is
+chosen, so a machine-5 core is never larger than raw + its 10-byte header.
+
+**Proof.** With `mask = 2^bits − 1`, `bit = i·bits`, `byte = bit >> 3`,
+`off = bit & 7`, `idx = (payload[byte] >> off) & mask` (a second byte only when
+`off + bits > 8`), and `symbol = alphabet[idx]` iff `k > 0`; each is a constant-time
+bit operation on a bounded byte offset, and `byte_at(core, i)` is undefined only for
+`i ≥ N`, which is a typed `CoreTooShort`. ∎
+
+**Corroboration.** On the 4-symbol `skewed` source (`bits = 2`) the core is
+`ceil(N·2/8) = N/4 = 1,048,590 B` with the 14-byte header; the 1-byte p50 is
+**30 ns** at raw-index parity and 4 KiB is **3.5 µs vs 13.5 µs** for machine 2, but
+it is *larger* than order-0 rANS (829,911 B) and does not beat raw `memcpy`
+(`evidence/bench/frontier.json` `packed`).
+
+**Tested:** `tests/machine_pack.rs` (11 tests), `tests/adversarial_r7.rs`, `src/machine_pack.rs`.
+
+---
+
+## P37. Machine 6 (`OrANS-SEG`) is a byte-exact, hash-bound, exactly-accounted segmented container — **PROVED** (layout + exactness), **EMPIRICALLY OBSERVED** (heterogeneous win)
+
+**Claim.** A machine-6 core `[96 B header][directory][segment payloads]` maps a
+logical range to per-segment **constant**/**raw**/**packed** representations; each
+segment is located by a **shift** (flat fixed-size) or a shift plus a bounded
+window scan (two-level variable-size), and every position is an exact `O(1)`
+dispatch to that segment's representation. The header's `directory_hash` (BLAKE3)
+covers the directory **and** the segment payloads, and each entry's `content_id` is
+the BLAKE3 prefix of its payload, so a forged/aliased/overlapping directory, a wrong
+magic/version, a truncation or a content-id tamper is a clean typed `Err`;
+`physical_bytes()` equals `header + directory + payloads` exactly.
+
+**Proof.** Locating is a shift on a validated directory; the raw half stores exactly
+its bytes (no per-segment header), the constant segment stores one byte and the
+packed segment is a machine-5 core (P36), each with exact `cursor == position`
+semantics and `Snapshot::new(state, i)` resumability. Because every referenced range
+is checked for in-range, non-overlapping, contiguous coverage and every payload is
+hashed into the bound header hash, a self-inconsistent container cannot decode. ∎
+
+**Corroboration.** On a heterogeneous `mixed` object the container is
+**2,686,048 B** — **10.1 % smaller** than machine 2 (**2,986,989 B**) and within
+**2.5 %** of the 2,621,440 B oracle **including all metadata**; the 1-byte read is
+`O(1)` and index-free (**40 ns**). Pure `skewed`/`uniform` pay a per-segment header /
+directory tax and remain order-0 rANS / raw territory
+(`evidence/bench/frontier.json` `segmented`).
+
+**Tested:** `tests/machine_seg.rs` (12 tests), `tests/adversarial_r7.rs`, `src/machine_seg.rs`.
+
+---
+
+## P38. The OrFS namespace stores its authoritative payload exactly once and reports real allocated bytes — **PROVED** (single store + accounting), **EMPIRICALLY OBSERVED** (du-style footprint)
+
+**Claim.** In the concealed OrFS namespace (`<root>/.ekbloom/`) the committed `.ekb`
+generation lives in **one** file (`<logical-id>/manifests`); every other concealed
+name is an `EKBFSVW1` **pointer/metadata view** (magic, kind, count, and per-section
+generation + absolute `payload_offset`/`payload_len` + a 16-byte BLAKE3 prefix —
+56 B per record, **never a payload byte**). `OrFs::inspect_physical` counts each
+inode once as `st_blocks · 512`, so the reported footprint is the true allocated
+footprint, not an inflated or double-counted one. `OrFs::read_machine` reads only the
+80-byte header and the visible core from that one store and replays the machine from
+`Ω₀`, bypassing every manifested structure.
+
+**Proof.** `write_views` derives each view by scanning the just-written store with
+`format::scan`, so the recorded offsets are the writer's true layout; the only file
+carrying payload bytes is the store, and each inode is summed once, so the accounted
+total equals the real allocation by construction. ∎
+
+**Corroboration.** The unit test `authoritative_payload_is_stored_exactly_once`
+shows the core bytes occur in exactly one concealed file with every sidecar
+< 512 B; `physical_accounting_matches_du_style_bytes` shows `inspect_physical`
+equals an independent `du` walk. The real on-disk excess over the in-memory engine is
+**+1.89 % (`skewed`) / +0.70 % (`mixed`)** — bounded framing, not a duplicated
+payload (`evidence/bench/orfs.json`) — and the genuine `ReadMode::Machine` decode is
+**382×** the dispatch (`evidence/bench/fuse-perf.json`).
+
+**Tested:** `src/filesystem.rs`, `tests/filesystem.rs`, `tests/adversarial_r7.rs`.
+
+---
+
+## P39. The joint planner is certified, cap-bounded, held-out and additive — **PROVED** (constraints), **EMPIRICALLY OBSERVED** (held-out p99 win)
+
+**Claim.** `OptimizedPlan::optimize` chooses the **complete plan** (machine 1–6 ×
+region/segment size × restart geometry × tile size × hot-region subset) to minimise
+expected p99 on **one held-out trace** under `CommittedBytes(plan) ≤ B`; it builds and
+re-checks every candidate against the cap, evaluates only `all_certified` plans, and
+`grow_into` applies a recipe **additively** to an existing body of the same machine
+(earlier generations stay byte-identical). The recorded `held_out_fingerprint` is
+`trace_fingerprint` of the one trace passed in, and the result is deterministic for a
+fixed seed.
+
+**Proof.** Selection is a bounded search (`MAX_BASES`, `MAX_EVALUATED`) over built
+bodies whose `physical_bytes()` is re-checked `≤ B` before admission; the cold base
+geometry guarantees every region a certified bounded path (`PackedRestart` /
+`BlockRestart`), so no unbounded plan is admitted; `expected_p99` equals
+`evaluate(engine, held_out)`; and `grow_into` appends only new structures, so the
+non-withdrawal contract holds by construction. ∎
+
+**Corroboration.** On a 4 MiB heterogeneous object (skewed half + uniform half) the
+joint plan cuts held-out p99 **13.58 → 10.07 µs** (budget `N`) and **13.19 →
+9.84 µs** (`1.5·N`) vs greedy hot tiles, with `joint_improves_frontier = true`
+(`evidence/bench/optimizer.json`). Only `all_certified` plans are evaluated; the
+evaluation trace is never passed to the optimiser and its fingerprint differs
+(`held_out ≠ evaluation`).
+
+**Tested:** `tests/optimize.rs`, `tests/adversarial_r7.rs`, `src/optimize.rs`.
+
+---
+
+## P40. Whole-object allocations are bounded by `ResourcePolicy` — **PROVED** (guard placement), **EMPIRICALLY OBSERVED** (typed rejection)
+
+**Claim.** Every whole-object allocation driven by an attacker-authorable,
+**declared** logical length — machines 5/6 read `logical_len` from the core header,
+machines 2/4 take it from the caller, machines 1/3 derive it from the header — is
+guarded by `resource::checked_capacity(requested, policy)` **before** the
+`Vec::with_capacity` / `vec![0; n]` / `reserve` / `resize`, returning
+`EkbloomError::AllocationTooLarge { requested, limit }` when the request exceeds the
+ceiling. The default ceiling is `DEFAULT_MAX_SINGLE_ALLOCATION = 1 GiB`. The bounded
+file-backed paths (`Engine`, `reader`, `BlockIndex`, tiles) decode only the requested
+range and are unaffected.
+
+**Proof.** `checked_capacity` compares `requested > policy.max_single_allocation`
+and returns `Err` before the allocation site is reached, so a tiny forged core
+declaring `u64::MAX` symbols cannot amplify into a huge heap allocation: the call
+fails typed, and the default policy leaves normal operation byte-for-byte unchanged.
+The guarded sites are the machines 1–6 whole-object decoders, the history/checkpoint
+and bloom/tile builders, and `SegContext::from_core` / `PackContext::unpack_into`. ∎
+
+**Corroboration.** `tests/resource.rs` and the `fuzz_resource` target exercise a
+forged huge declared length through the guarded APIs and observe a typed
+`AllocationTooLarge` rather than an allocation; the bounded read paths are asserted
+unaffected (`docs/SECURITY.md`, §Resource policy).
+
+**Tested:** `tests/resource.rs`, `fuzz/fuzz_targets/fuzz_resource.rs`, `src/resource.rs`.
+
+---
+
+## Limitations — resolved (L1–L4, M1–M5 and N1–N8) and remaining (honest)
 
 **Resolved in rounds L1–L4** (P24–P28): the base representation never expands past
 raw (machine 3 + the `auto` policy, P24); the 1-byte fully-resident read is within
@@ -1175,6 +1376,17 @@ budget admits the **committed** body, not the active plan, with `n == 0` checked
 (P30, P31); a **request-level** positioning bound `worst_case_steps_for(req)` is
 defined and checked mechanically (P32); and `create_auto` **reuses** its machine
 decision's core, byte-identically (P33).
+
+**Resolved in the N-round** (P34–P40): reads are **bound to the planned core
+identity** and a mismatched body/generation is rejected before any decode (P34); a
+cursor-divergent read fetches a **bounded encoded window** (`≤ 2·(steps+symbols)+64`
+bytes; a 4 KiB read of a 64 MiB object drops 10,270,243 → 16,440 B, **625×**) (P35);
+machine 5 (`OrANS-PACK`) reveals every position in exact **`O(1)`** (P36) and machine
+6 (`OrANS-SEG`) is a **hash-bound, exactly-accounted segmented container** (P37); the
+OrFS namespace stores its **authoritative payload exactly once** and reports real
+allocated bytes (P38); the **joint planner** is certified, cap-bounded, held-out and
+additive (P39); and every whole-object allocation driven by a declared length is
+bounded by `ResourcePolicy` (**1 GiB** default) (P40).
 
 **Remaining (honest):**
 
@@ -1284,3 +1496,26 @@ decision's core, byte-identically (P33).
     the `AUTH` section's own bytes are validated structurally and by the
     footer↔manifest cross-check only (P27; `docs/reviews/adversarial.md`
     Revision 5). There is no anti-rollback.
+17. **On real data EKBLOOM loses the footprint and hot-latency axes to the
+    pinned-hot codecs, and the cold/sequential axes to raw/LZ4.** The end-to-end
+    verdict is win-vs-raw / lose-vs-pinned: pinned LZ4 (0.60–0.92×) and Zstd
+    (0.36–0.74×) are smaller than EKBLOOM (0.74–0.98×) and ~2× faster hot; EKBLOOM
+    is ~8–9× slower than pinned LZ4 cold (random 4 KiB ~13 µs vs 1.4–1.7 µs) and
+    decode-bound sequentially (338–385 MB/s vs LZ4 2.8–3.7 GB/s). The synthetic
+    order-0 footprint win does **not** generalise to real text/binary data
+    (`docs/E2E.md`).
+18. **Machines 5 and 6 are explicit, non-default options.** `RepresentationPolicy::Packed`
+    trades size for constant-time positioning (larger than order-0 rANS on
+    low-entropy data; does not beat raw `memcpy`), and `Segmented` beats order-0
+    rANS/fixed packing **only** on heterogeneous objects, paying a per-segment
+    header and a fixed directory on homogeneous ones. `Auto` (machines 1–4) is
+    unchanged (`docs/PACKED_MACHINE.md`, `docs/SEGMENTS.md`).
+19. **The bounded window is a byte bound, not an authenticity boundary.** A restart
+    whose `state` is legal but whose `cursor` is inconsistent is bound only by the
+    section CRC + `core_hash` linkage (integrity, not authenticity); `verify`/`certify`
+    is the gate for in-memory bodies (P35; `docs/reviews/security.md` Revision 7).
+20. **Whole-object APIs are bounded by policy, not by the bounded read path.**
+    `ResourcePolicy` (P40) turns a forged declared length into a typed
+    `AllocationTooLarge`, but a caller that feeds an untrusted core to a *whole-object*
+    API still allocates up to the ceiling; the bounded file-backed paths
+    (`Engine`/`reader`/`BlockIndex`/tiles) are the recommended untrusted-input route.

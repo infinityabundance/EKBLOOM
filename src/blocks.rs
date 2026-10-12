@@ -383,6 +383,12 @@ impl BlockIndex {
                 let ctx = prepare(machine, core)?;
                 let mut omega = entry;
                 ctx.skip(core, &mut omega, skip)?;
+                // `Prepared::decode_into` *appends* to `out` (unlike the tight
+                // `decode_into_slice` arms above, which fill the pre-sized buffer),
+                // so drop the zero-filled placeholder first. Without this, a
+                // cursor==position machine without a tight arm (5/6) returns
+                // `2 * len` bytes with `len` leading zeros.
+                out.clear();
                 ctx.decode_into(core, &mut omega, len, &mut out)?;
             }
         }

@@ -375,7 +375,7 @@ impl PackContext {
     pub fn byte_at(&self, core: &[u8], i: u64) -> Result<u8> {
         if i >= self.logical_len {
             return Err(EkbloomError::CoreTooShort {
-                needed: i + 1,
+                needed: i.saturating_add(1),
                 available: self.logical_len,
             });
         }
@@ -478,6 +478,10 @@ impl PackContext {
                 available: self.logical_len,
             });
         }
+        // `n` symbols are appended: bound the allocation before reserving it. For
+        // `bulk_unpack`/`unpack_range` with no explicit length, `n` is the
+        // core-declared length, which is untrusted.
+        crate::resource::checked_default(n)?;
         if let Ok(cap) = usize::try_from(n) {
             out.reserve(cap);
         }

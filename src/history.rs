@@ -202,6 +202,9 @@ impl History {
         let count_usize = usize::try_from(count).map_err(|_| EkbloomError::Overflow {
             what: "history count",
         })?;
+        // The state projection is `count` `u32` entries; bound it before reserving
+        // (the section loader calls this with an untrusted declared count).
+        crate::resource::checked_default(count.saturating_mul(4))?;
         let mut states = Vec::with_capacity(count_usize);
         let mut off = HEADER_LEN;
         for _ in 0..count {
@@ -249,6 +252,13 @@ impl History {
             return Ok(());
         }
         machine.check_core(core, new_logical_len)?;
+        // The appended tail adds `new_logical_len - committed` `u32` states; bound
+        // it before building (a caller-supplied length).
+        crate::resource::checked_default(
+            (new_logical_len - self.logical_len)
+                .saturating_mul(4)
+                .saturating_add(4),
+        )?;
 
         let committed = self.logical_len;
         let committed_len = usize::try_from(committed).map_err(|_| EkbloomError::Overflow {

@@ -387,6 +387,8 @@ impl RansContext {
         let n = usize::try_from(n).map_err(|_| EkbloomError::Overflow {
             what: "rans decode length",
         })?;
+        // The output buffer is `n` symbols; bound it before resizing.
+        crate::resource::checked_default(n as u64)?;
         let start = out.len();
         let end = start.checked_add(n).ok_or(EkbloomError::Overflow {
             what: "rans decode buffer",
@@ -477,6 +479,9 @@ impl OrMachine for Rans0 {
     }
 
     fn decode(&self, core: &[u8], logical_len: u64) -> Result<Vec<u8>> {
+        // Bound the whole-object output before any per-symbol work; `logical_len`
+        // is caller-supplied and untrusted.
+        crate::resource::checked_default(logical_len)?;
         let ctx = RansContext::from_core(core)?;
         let mut omega = Self::genesis(core);
         let cap = Self::step_cap(core);
@@ -493,6 +498,8 @@ impl OrMachine for Rans0 {
     }
 
     fn state_log(&self, core: &[u8], logical_len: u64) -> Result<Vec<u32>> {
+        // `(logical_len + 1)` `u32` states: bound the allocation up front.
+        crate::resource::checked_default(logical_len.saturating_mul(4).saturating_add(4))?;
         let ctx = RansContext::from_core(core)?;
         let mut omega = Self::genesis(core);
         let cap = Self::step_cap(core);

@@ -417,6 +417,13 @@ impl CheckpointSet {
         let count_usize = usize::try_from(layout.count).map_err(|_| EkbloomError::Overflow {
             what: "checkpoint count",
         })?;
+        // The resume vector is `count` snapshots; bound it before reserving (the
+        // section loader calls this with an untrusted declared count).
+        crate::resource::checked_default(
+            layout
+                .count
+                .saturating_mul(core::mem::size_of::<Snapshot>() as u64),
+        )?;
         let mut resume = Vec::with_capacity(count_usize);
         let mut off = layout.header_len;
         for j in 0..layout.count {

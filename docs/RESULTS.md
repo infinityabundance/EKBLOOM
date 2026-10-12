@@ -366,9 +366,9 @@ prefix decode win is genuine but construction-bound (P11); tiles trade cold acce
 for hot (P13); the io_uring win is batched-cold-only ([`IOURING.md`](IOURING.md)).
 The kernels win only across windows/blocks (P15), the background planner is a
 is a certified-dispatch adapter (P16), and mmap is a `pread` replacement, not a heap
-replacement (P17). Their proved/observed properties are P11–P33 in
-[`PROOFS.md`](PROOFS.md); the L1–L4 and M1–M5 closures are the last blocks of that
-set (P24–P33).
+replacement (P17). Their proved/observed properties are P11–P40 in
+[`PROOFS.md`](PROOFS.md); the L1–L4, M1–M5 and N1–N8 closures are the last blocks of
+that set (P24–P40).
 
 ### Rounds R1–R4 (`evidence/bench/rans.json`, `blocks.json`, `frontier.json`)
 
@@ -380,8 +380,8 @@ artifact.
   machine adapter and stores the **complete successor cursor** for a
   cursor-divergent machine; `tiles::parse_tile_set_prefix` is the single guard
   shared by the in-memory and file-backed readers. `sh scripts/validate-evidence.sh`
-  validates every `evidence/**/*.json` and reports **28** files `OK` (up from 24;
-  `batch.json` added in L4).
+  validates every `evidence/**/*.json` and reports **32** files `OK` (up from 24;
+  `batch.json` added in L4, and `window`/`orfs`/`optimizer`/`e2e` added in the N-round).
 - **R2 — machine-2 prepared context, encode-first budgets, bounded cold
   reconstruction, cache single-flight.** A validated `RansContext` reused for the
   whole decode is **165×** the per-symbol rebuild on skewed data
@@ -521,6 +521,31 @@ sharp edges (complete machine-4 state, exact `physical_bytes`, committed-based
 budget, request-level bound); M5 narrows the cold gap and makes machine 4 a
 first-class cold engine. The honest residuals remain the cold-vs-LZ4 gap and the
 uniform manifested footprint (§Remaining below).
+
+### Rounds N1–N8 — core-identity, bounded windows, machines 5/6, OrFS, joint optimiser, E2E, resource policy
+
+The N-round closes the concealed-access surface; every number below is read from
+the named artifact, the properties are P34–P40 in [`docs/PROOFS.md`](PROOFS.md),
+and the surface is reviewed in **Revision 7** (`tests/adversarial_r7.rs`, 11 tests +
+`fuzz_pack`/`fuzz_seg`/`fuzz_resource`; verdict **TWO DEFECTS, BOTH FIXED**).
+
+| Item | Headline measured result | Doc | Evidence |
+|---|---|---|---|
+| N1 plan identity | `Engine::plan` binds `CoreIdentity`; a different body / newer generation is `EngineBodyMismatch` before any decode; `ReadyObject` object-bound | [`ENGINE.md`](ENGINE.md) | `tests/adversarial_r7.rs` |
+| N2 bounded encoded window | 4 KiB of a 64 MiB machine-2 object **10,270,243 → 16,440 B** (**625×**) at the **same 2 `pread`s**; p99 **972 → 26.4 µs**; 1-byte **8,216 B** (1,250×); bound `2·(steps+symbols)+64` | [`WINDOW.md`](WINDOW.md) | `window.json` |
+| N3 machine 5 `OrANS-PACK` | 4-symbol core **`N/4`** (1,048,590 B); 1-byte p50 **30 ns** (raw parity, index-free); 4 KiB **3.5 µs vs 13.5 µs**; constant/identity exact; never > raw + 10 B | [`PACKED_MACHINE.md`](PACKED_MACHINE.md) | `frontier.json` `packed` |
+| N4 machine 6 `OrANS-SEG` | `mixed` **2,686,048 B = −10.1 %** vs machine 2, within **2.5 %** of the **2,621,440 B** oracle incl. metadata; 1-byte **40 ns** `O(1)` | [`SEGMENTS.md`](SEGMENTS.md) | `frontier.json` `segmented` |
+| N5 OrFS single store | payload stored **exactly once**; real on-disk **+1.89 % (`skewed`) / +0.70 % (`mixed`)** over the in-memory engine; genuine `ReadMode::Machine` **382×** the dispatch | [`ORFS.md`](ORFS.md) | `orfs.json`, `fuse-perf.json` |
+| N6 joint optimiser | held-out p99 **10.07 µs vs greedy 13.58 µs** (budget `N`); **9.84 vs 13.19 µs** (`1.5·N`); deterministic; only `all_certified` plans | [`OPTIMIZER.md`](OPTIMIZER.md) | `optimizer.json` |
+| N7 E2E real data | `beats_raw_store = true` on `text`/`elf`/`mixed` (0.74×/0.98×/0.78× raw; hot 4 KiB 120–130 ns vs raw 160–170 ns; non-evicting); `holds_vs_pinned = false` | [`E2E.md`](E2E.md) | `e2e.json` |
+| N8 resource policy | whole-object allocations bounded at **1 GiB** default (`AllocationTooLarge`); **13** fuzz targets; bounded read paths unaffected | [`SECURITY.md`](SECURITY.md) §Resource policy | `src/resource.rs` |
+
+**Honest reading.** The N-round adds bounded resource use and real capabilities
+(identity-bound plans, bounded windows, machines 5/6, a single-store OrFS, a
+certified joint planner), but it **adds no end-to-end win on real data**: N7's verdict
+is win-vs-raw / lose-vs-pinned, because the synthetic order-0 footprint win does
+**not** generalise to real text/binary data, where LZ77/FSE codecs dominate
+(§Remaining below).
 
 ---
 
@@ -717,9 +742,13 @@ sh scripts/container-perf.sh         # perf.json (hardware counters)
 sh scripts/container-async-io.sh     # io-uring.json (seccomp=unconfined)
 sh scripts/run-rans.sh               # rans.json (machine-2 prepared decode context)
 sh scripts/run-blocks.sh             # blocks.json (machine-2 blocks + packed checkpoints)
-sh scripts/run-frontier.sh           # frontier.json (engine vs indexed codecs)
+sh scripts/run-frontier.sh           # frontier.json (engine vs indexed codecs + packed/segmented)
 sh scripts/run-batch.sh              # batch.json (batched reconstruction + GPU verdict)
-sh scripts/validate-evidence.sh      # validate every evidence/**/*.json (28 files)
+sh scripts/run-window.sh             # window.json (bounded encoded-window reads, machines 2/4)
+sh scripts/run-orfs.sh               # orfs.json (OrFS single authoritative store)
+sh scripts/run-optimizer.sh          # optimizer.json (joint budget-aware planner)
+sh scripts/run-e2e.sh                # e2e.json (end-to-end real-data proof)
+sh scripts/validate-evidence.sh      # validate every evidence/**/*.json (32 files)
 sh scripts/container-loom.sh         # Loom model checking
 sh scripts/container-bench.sh        # Divan microbenchmarks (benches/ekbloom.rs)
 sh scripts/capture-environment.sh    # refresh evidence/environment.txt

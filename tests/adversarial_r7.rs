@@ -165,9 +165,13 @@ fn machine5_forged_shapes_are_typed_errors_never_wrong_bytes() {
 
     // Geometry is valid, but the packed payload holds an out-of-alphabet index:
     // the decode must be a typed error, never a wrong symbol or a panic. The
-    // alphabet is {1, 2, 3} (k = 3), so index 3 is illegal.
+    // alphabet is {1, 2, 3} (k = 3, bits = 2), so index 3 is illegal. The first
+    // payload byte follows the 2-byte fixed prefix + `k`-byte alphabet + 8-byte
+    // logical length; forging inside the header (e.g. byte 10) would corrupt the
+    // declared length instead of the payload.
+    let header_len = 2 + 3 + 8;
     let mut forged = good.clone();
-    forged[10] |= 0b11; // first symbol's 2-bit index becomes 3
+    forged[header_len] |= 0b11; // first symbol's 2-bit index becomes 3
     let ctx = PackContext::from_core(&forged).unwrap();
     assert!(
         ctx.byte_at(&forged, 0).is_err(),
@@ -324,7 +328,9 @@ fn window_bound_holds_at_boundaries_with_a_frequency_one_model() {
 
     // A 2-symbol source: 254 model slots have frequency 1, so many decoder steps
     // hit the minimal-frequency boundary states.
-    let src: Vec<u8> = (0..96 * 1024).map(|i| if i % 5 == 0 { b'z' } else { b'a' }).collect();
+    let src: Vec<u8> = (0..96 * 1024)
+        .map(|i| if i % 5 == 0 { b'z' } else { b'a' })
+        .collect();
     let n = src.len() as u64;
 
     for &machine_id in &[ekbloom::MACHINE_RANS0, MACHINE_RANS0I] {
@@ -347,12 +353,28 @@ fn window_bound_holds_at_boundaries_with_a_frequency_one_model() {
             probes.push((n / 2, 7));
             for &(off, len) in &probes {
                 let before = body.fetched_bytes();
-                let got = body.read(ReadRequest { offset: off, length: len }).unwrap();
+                let got = body
+                    .read(ReadRequest {
+                        offset: off,
+                        length: len,
+                    })
+                    .unwrap();
                 let fetched = body.fetched_bytes() - before;
-                assert_eq!(got, &src[off as usize..(off + len) as usize], "m{machine_id} ({off},{len})");
                 assert_eq!(
                     got,
-                    read(&reference, ReadRequest { offset: off, length: len }).unwrap()
+                    &src[off as usize..(off + len) as usize],
+                    "m{machine_id} ({off},{len})"
+                );
+                assert_eq!(
+                    got,
+                    read(
+                        &reference,
+                        ReadRequest {
+                            offset: off,
+                            length: len
+                        }
+                    )
+                    .unwrap()
                 );
                 if len > 0 {
                     let steps = (off % u64::from(b)) + len;
@@ -380,8 +402,14 @@ fn window_truncation_and_forgery_are_typed_errors() {
     let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
     f.set_len(ekbloom::format::CORE_OFFSET + 64).unwrap();
     drop(f);
-    let res = body.read(ReadRequest { offset: 4000, length: 512 });
-    assert!(res.is_err(), "truncated window read must error, got {res:?}");
+    let res = body.read(ReadRequest {
+        offset: 4000,
+        length: 512,
+    });
+    assert!(
+        res.is_err(),
+        "truncated window read must error, got {res:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -419,7 +447,10 @@ fn engine_identity_binding_holds_for_machines_five_and_six() {
         assert_ne!(a.core_hash, b.core_hash, "bodies must differ");
 
         let engine = Engine::plan(&a, &budget, &workload()).unwrap();
-        let req = ReadRequest { offset: 4096, length: 4096 };
+        let req = ReadRequest {
+            offset: 4096,
+            length: 4096,
+        };
         assert_eq!(engine.read(&a, req).unwrap().as_slice(), &src_a[4096..8192]);
 
         // A different object, and a new generation of the same object, are both
@@ -438,4 +469,84 @@ fn engine_identity_binding_holds_for_machines_five_and_six() {
         // Engine and reader agree byte-for-byte on the planned body.
         assert_eq!(engine.read(&a, req).unwrap(), read(&a, req).unwrap());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Regression — a block-index read on machines 5/6 must be length- and
+// byte-exact (the `_` fallback arm of `BlockIndex::read_range_counted` used to
+// pre-fill a zero buffer and then *append*, returning `2*len` bytes with `len`
+// leading zeros).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn block_index_reads_are_length_and_byte_exact_for_machines_five_and_six() {
+    for &machine_id in &[MACHINE_PACK, MACHINE_SEG] {
+        let src = mixed(16 * 1024);
+        let n = src.len() as u64;
+        let machine = machine_by_id(machine_id).unwrap();
+        let core = machine.encode(&src).unwrap();
+        for &b in &[1u32, 7, 1024, 4096] {
+            let idx = BlockIndex::build_machine(&core, n, b, machine_id).unwrap();
+            let mut probes: Vec<(u64, u64)> = vec![(0, 1), (0, n), (n - 1, 1), (12345, 512)];
+            let edge = u64::from(b);
+            if edge > 0 {
+                probes.push((edge - 1, 2.min(n - (edge - 1))));
+                if edge < n {
+                    probes.push((edge, 4));
+                }
+            }
+            for &(off, len) in &probes {
+                if off.checked_add(len).is_none_or(|e| e > n) {
+                    continue;
+                }
+                let got = idx.read_range(&core, off, len).unwrap();
+                assert_eq!(
+                    got.len() as u64,
+                    len,
+                    "m{machine_id} b{b} ({off},{len}) length"
+                );
+                assert_eq!(
+                    got,
+                    &src[off as usize..(off + len) as usize],
+                    "m{machine_id} b{b} ({off},{len})"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Regression — a positional read one past the end (including `u64::MAX`) must
+// be a typed error, never an arithmetic-overflow panic: machines 5 and 6 used
+// `index + 1` (unchecked) when building the `CoreTooShort` diagnostic.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn positional_reads_past_the_end_are_typed_errors_not_overflow_panics() {
+    let src = mixed(4096);
+
+    let core = PACK.encode(&src).unwrap();
+    let ctx = PackContext::from_core(&core).unwrap();
+    assert!(matches!(
+        ctx.byte_at(&core, u64::MAX),
+        Err(EkbloomError::CoreTooShort { .. })
+    ));
+    assert!(matches!(
+        ctx.byte_at(&core, ctx.logical_len()),
+        Err(EkbloomError::CoreTooShort { .. })
+    ));
+    // `unpack_range` already uses checked arithmetic; assert it stays total.
+    let mut out = Vec::new();
+    assert!(ctx.unpack_range(&core, u64::MAX, 1, &mut out).is_err());
+
+    let core = SEG.encode(&src).unwrap();
+    let ctx = SegContext::from_core(&core).unwrap();
+    assert!(matches!(
+        ctx.byte_at(&core, u64::MAX),
+        Err(EkbloomError::CoreTooShort { .. })
+    ));
+    assert!(matches!(
+        ctx.byte_at(&core, ctx.logical_len()),
+        Err(EkbloomError::CoreTooShort { .. })
+    ));
 }

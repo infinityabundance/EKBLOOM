@@ -584,6 +584,12 @@ impl SegContext {
         }
 
         let payload_region_end = payload_offset + payload_bytes;
+        // The whole-object allocations below (the entry vector, the per-segment
+        // packed contexts and the level-1 window index) are sized from the
+        // directory, which has already been proven to fit inside `core`. Bound
+        // the directory before reserving it anyway, so the guard is explicit
+        // rather than incidental.
+        crate::resource::checked_default(directory_bytes)?;
         let mut entries: Vec<SegEntry> = Vec::with_capacity(count);
         let mut packed: Vec<Option<PackContext>> = Vec::with_capacity(count);
         let mut logical_cursor = 0u64;
@@ -825,7 +831,7 @@ impl SegContext {
     fn locate(&self, offset: u64) -> Result<usize> {
         if offset >= self.logical_len {
             return Err(EkbloomError::CoreTooShort {
-                needed: offset + 1,
+                needed: offset.saturating_add(1),
                 available: self.logical_len,
             });
         }
@@ -962,6 +968,9 @@ impl SegContext {
                 available: self.logical_len,
             });
         }
+        // A whole-object decode of `n` symbols uses the core-declared length for
+        // `bulk_unpack`; bound it before reserving.
+        crate::resource::checked_default(n)?;
         if let Ok(cap) = usize::try_from(n) {
             out.reserve(cap);
         }

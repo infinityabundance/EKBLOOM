@@ -63,6 +63,7 @@ pub mod prefix;
 pub mod reader;
 pub mod recovery;
 pub mod region_adapt;
+pub mod resource;
 pub mod simd;
 pub mod state;
 pub mod sweep;
@@ -177,6 +178,10 @@ pub use recovery::{
 pub use region_adapt::{
     manifest_hot_regions, read_region_scoped, AccessTrace, RegionAdaptReport, RegionEntry,
     RegionReader, COLD_CHECKPOINT_INTERVAL, REGION_ADAPT_DEPTH,
+};
+pub use resource::{
+    checked_capacity, default_policy, max_single_allocation, set_max_single_allocation,
+    ResourcePolicy, ResourcePolicyGuard, DEFAULT_MAX_SINGLE_ALLOCATION,
 };
 pub use simd::{
     avx2_available, avx512_available, gather_bytes, gather_bytes_avx512, gather_bytes_prefetch,

@@ -85,6 +85,8 @@ impl PathBloom {
         let nblocks_usize = usize::try_from(nblocks).map_err(|_| EkbloomError::Overflow {
             what: "path bloom block count",
         })?;
+        // One `u32` successor per block; bound the vector before reserving.
+        crate::resource::checked_default(nblocks.saturating_mul(4))?;
         let mut cold: Vec<u32> = Vec::with_capacity(nblocks_usize);
         for j in 0..nblocks {
             let end = d.saturating_mul(j + 1).min(logical_len);

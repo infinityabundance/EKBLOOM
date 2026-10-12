@@ -1031,6 +1031,9 @@ fn assemble(
 ) -> Result<(TileDirectory, Vec<u8>)> {
     let size = 1u64 << tile_shift;
     let tiles = logical_len.div_ceil(size);
+    // The flat/radix directory has one `u32` slot per tile; bound the directory
+    // allocation before building it (a caller- or core-declared logical length).
+    crate::resource::checked_default(tiles.saturating_mul(4))?;
     let mut directory = TileDirectory {
         tile_shift,
         kind,

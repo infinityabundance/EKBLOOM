@@ -84,3 +84,24 @@ path = "fuzz_targets/fuzz_region.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_pack"
+path = "fuzz_targets/fuzz_pack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_seg"
+path = "fuzz_targets/fuzz_seg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_resource"
+path = "fuzz_targets/fuzz_resource.rs"
+test = false
+doc = false
+bench = false

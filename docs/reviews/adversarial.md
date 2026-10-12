@@ -570,3 +570,102 @@ machines 3 and 4 (45 930 runs / 61 s); no crash, warning-free build.
 * `pinned_block_count` returns `1` for a zero hot budget (documented "at least one").
 * Integrity is still not authenticity; the engine/reader trust only as far as
   `verify` does.
+
+## Revision 7 — N1–N7 (verdict **TWO DEFECTS, BOTH FIXED**)
+
+The N-round surface: core-identity binding (N1), the bounded encoded window (N2),
+machines 5/6 (N3/N4), OrFS pointer views (N5), the budget-aware optimiser (N6),
+and the end-to-end OrFS proof (N7). All attacks are executable and live in
+`tests/adversarial_r7.rs` (11 tests, green); the campaign also adds the fuzz
+targets `fuzz_pack`, `fuzz_seg`, and the N8 `fuzz_resource`.
+
+### Finding G (**High**, FIXED) — block-index reads doubled the output for machines 5/6
+
+`BlockIndex::read_range_counted` allocated `out = vec![0u8; len]`, then the `_`
+arm (machines 5/6, which have no tight fill arm) called `Prepared::decode_into`,
+which **appends**. A machine-5/6 block index therefore produced `2 * len` bytes
+with `len` leading zeros, and `Engine::read` returned that buffer verbatim — a
+wrong-length, zero-prefixed read. Repro: `block_index_reads_are_length_and_byte_exact_for_machines_five_and_six`
+and `engine_identity_binding_holds_for_machines_five_and_six` (both failed before
+the fix). **Fix:** `out.clear();` before the `_`-arm decode (`src/blocks.rs`).
+
+### Finding H (**Medium**, FIXED) — `index + 1` overflow panic in machines 5/6
+
+`PackContext::byte_at` and `SegContext::locate` built `CoreTooShort { needed: index + 1 }`
+from an attacker-controlled `u64`; `byte_at(core, u64::MAX)` panicked with
+`attempt to add with overflow` under overflow checks. Found by `fuzz_pack`.
+**Fix:** `saturating_add(1)` at both sites; pinned by
+`positional_reads_past_the_end_are_typed_errors_not_overflow_panics`.
+
+### Attack 1 — plan identity (N1): held
+
+Planning on body `A`, reading a different body `B` (different object, different
+core hash) and a newer generation of `A` are rejected with `EngineBodyMismatch`
+before any decode, for machines 5 and 6; the identity also checks machine, logical
+length and object id. Same body+generation is byte-exact and equals `reader::read`.
+
+### Attack 2 — bounded window (N2): held
+
+With a frequency-1 model that drives many minimal-frequency boundary states, the
+per-read encoded bytes stay `≤ 2·(steps+len)+64` across block boundaries (counted
+through `FileBody::fetched_bytes`), byte-exact vs `reader::read`; truncation and a
+cursor at the core end are typed `Err`; machines 1/3 are unaffected (rebased /
+whole-core paths, `tests/window.rs`). A forged state outside `[RANS_L, RANS_L<<8)`
+and a machine-4 state/lane disagreement are rejected by `validate_restart`.
+
+### Attack 3 — packed machine 5 (N3): held (besides H)
+
+Every position is exact for every width 1–8, including non-power-of-two widths and
+the partial final word; constant (k=1) and raw/identity fallbacks are exact; a
+forged header (`bits∉[1,8]`, `k>2^bits`, identity with `bits≠8`, duplicate
+alphabet, truncation, trailing bytes) and an out-of-alphabet *payload* index are
+clean typed errors.
+
+### Attack 4 — segmented container 6 (N4): held
+
+A forged directory (aliased offset, aliased offset+content-id, an over-spanning
+logical length, wrong version/magic, truncation, directory-hash mismatch, a
+zeroed content id) is a clean `Err`; reads are exact across every segment/window
+boundary; an unknown segment machine id is rejected, so no machine 2/4 core is
+silently reinterpreted.
+
+### Attack 5 — OrFS pointer views (N5): held
+
+`inspect_physical` equals an independent `du`-style walk; the authoritative core
+is stored in exactly one file (sidecars hold no payload); `read_machine` bypasses
+the hot/bloom/tile dispatch and is byte-exact for a `Path` object; FUSE
+`ReadMode::Machine` attaches no surface and agrees with the decode dispatch.
+
+### Attack 6 — optimiser (N6): held
+
+The chosen plan is built and its `physical_bytes()` re-checked against the cap
+before selection; only `all_certified` plans are evaluated; `expected_p99` equals
+`evaluate(engine, held_out)` and the recorded fingerprint is that same trace (the
+evaluation trace is never passed); the result is deterministic for a fixed seed.
+
+### Attack 7 — fuzz + evidence
+
+`sh scripts/container-fuzz.sh`: **thirteen targets PASS** (added `fuzz_pack`,
+`fuzz_seg`, `fuzz_resource`). `sh scripts/container-reproduce.sh`: clean build,
+**649 passed / 0 failed**, `validate-evidence.sh` → **32 OK**. Verify gate green at
+**663 passed**.
+
+### Residual risk (Revision 7)
+
+* Two defects fixed (G, H). No unfixed read-path defect found.
+* Whole-object APIs (`Pack::bulk_unpack`, `machine.decode`, whole `SegContext`
+decode) allocating a core-declared logical length are now **ADDRESSED (N8)** by the
+`ResourcePolicy` (1 GiB default): each site guards with `checked_default` and
+returns `AllocationTooLarge` before reserving — `OrMachine::decode`/`state_log`,
+`Prepared::decode_into`, `block_restarts_with` (`machine.rs`);
+`RansContext`/`RansIContext::decode_into`, `Rans0`/`Rans0I::decode`/`state_log`
+(`machine_rans*.rs`); `PackContext::unpack_into`; `SegContext::from_core`/
+`decode_into`; `History::from_bytes`/`extend_with`; `CheckpointSet::from_bytes_with`;
+the `PathBloom`/region build vectors. The bounded read paths never allocate a
+declared length and are unaffected. Pinned by `tests/resource.rs` + `fuzz_resource`;
+a caller may raise/lower the cap via `set_max_single_allocation`.
+* A restart cursor that is in range but state-inconsistent is not re-derived at
+read time; the file path relies on section CRC + `core_hash` linkage (integrity,
+not authenticity). Unchanged.
+* Pre-existing: a crafted `Snapshot.cursor == u64::MAX` still overflows `p + 1` in
+`NL2`/`STORE` reveal; not reachable from a read path.

@@ -105,6 +105,9 @@ pub trait OrMachine: Send + Sync {
     /// Decode `logical_len` symbols from `core` (authoritative reference path).
     fn decode(&self, core: &[u8], logical_len: u64) -> Result<Vec<u8>> {
         self.check_core(core, logical_len)?;
+        // Bound the whole-object allocation before reserving it: `logical_len` is
+        // untrusted on the read path (machines 5/6 declare it in the core).
+        crate::resource::checked_default(logical_len)?;
         let mut omega = self.init(core)?;
         let mut out = Vec::with_capacity(logical_len as usize);
         for _ in 0..logical_len {
@@ -120,10 +123,12 @@ pub trait OrMachine: Send + Sync {
     /// model once rather than once per revealed symbol.
     fn state_log(&self, core: &[u8], logical_len: u64) -> Result<Vec<u32>> {
         self.check_core(core, logical_len)?;
-        let mut omega = self.init(core)?;
         let n = usize::try_from(logical_len).map_err(|_| EkbloomError::Overflow {
             what: "state log length",
         })?;
+        // `(logical_len + 1)` `u32` states: bound the allocation before reserving.
+        crate::resource::checked_default(logical_len.saturating_mul(4).saturating_add(4))?;
+        let mut omega = self.init(core)?;
         let mut log = Vec::with_capacity(n + 1);
         log.push(omega.state);
         for _ in 0..logical_len {
@@ -302,6 +307,9 @@ impl Prepared<'_> {
         if let Prepared::Seg(ctx) = self {
             return ctx.decode_into(core, omega, n, out);
         }
+        // A whole-object decode of `n` symbols (`n` is the declared length for a
+        // `bulk_unpack`): bound it before reserving.
+        crate::resource::checked_default(n)?;
         if let Ok(cap) = usize::try_from(n) {
             out.reserve(cap);
         }
@@ -425,6 +433,10 @@ pub fn block_restarts_with(
     let capacity = usize::try_from(count).map_err(|_| EkbloomError::Overflow {
         what: "block restart count",
     })?;
+    // The restart vector is `count` complete snapshots; bound it before reserving.
+    crate::resource::checked_default(
+        count.saturating_mul(core::mem::size_of::<Snapshot>() as u64),
+    )?;
     let mut entries: Vec<Snapshot> = Vec::with_capacity(capacity);
     let mut omega = machine.init(core)?;
     entries.push(omega);

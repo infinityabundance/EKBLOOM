@@ -231,6 +231,11 @@ fn build_regions(
     let rb = u64::from(region_bytes);
     let d = u64::from(depth);
     let nregions = logical_len.div_ceil(rb);
+    // One build record per region; bound the vector before reserving. The whole
+    // projection was already bounded by `decode`/`state_log` above.
+    crate::resource::checked_default(
+        nregions.saturating_mul(core::mem::size_of::<RegionBuild>() as u64),
+    )?;
     let mut out = Vec::with_capacity(usize::try_from(nregions).unwrap_or(0));
 
     for region in 0..nregions {

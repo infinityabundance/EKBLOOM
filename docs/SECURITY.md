@@ -173,6 +173,50 @@ chance of producing an accepted tag is negligible.
 4. **Key hygiene is the caller's.** A leaked key defeats the scheme. Key
    generation, storage, rotation and distribution are out of scope.
 
+## Resource policy (whole-object allocation bound)
+
+Several **whole-object** APIs take a *declared* logical length: machines 5
+(`OrANS-PACK`) and 6 (`OrANS-SEG`) carry it inside the (attacker-authorable)
+core header, machine 1/3 derive it from the header, and machines 2/4 receive it
+from the caller. That declaration is untrusted on the read path, and a tiny
+forged core can declare `u64::MAX` symbols — a memory-amplification denial of
+service if the declaration directly sizes a heap allocation.
+
+`src/resource.rs` introduces a single, cheap ceiling:
+
+```rust
+pub struct ResourcePolicy { pub max_single_allocation: u64 }
+```
+
+with
+
+* **default `max_single_allocation = 1 GiB`** (`DEFAULT_MAX_SINGLE_ALLOCATION`),
+* a process-wide default accessor (`max_single_allocation` /
+  `set_max_single_allocation` / `default_policy`), and
+* `checked_capacity(requested, policy) -> Result<()>` (plus `checked_default`)
+  returning `EkbloomError::AllocationTooLarge { requested, limit }`.
+
+Every whole-object allocation driven by a declared/core-derived length calls the
+guard **before** its `Vec::with_capacity` / `vec![0; n]` / `reserve` / `resize`,
+so a forged huge length is a typed error and never an allocation. Guarded sites:
+
+* `OrMachine::decode` / `state_log` (default and the machines 2/4 overrides) and
+  `Prepared::decode_into` / `block_restarts_with` (`src/machine.rs`);
+* `RansContext::decode_into`, `RansIContext::decode_into` (machines 2/4);
+* `PackContext::unpack_into` — `bulk_unpack` and `unpack_range` (machine 5);
+* `SegContext::from_core` (directory) and `decode_into` (machine 6);
+* history/state-log construction (`History::from_bytes`, `History::extend_with`)
+  and checkpoint construction (`CheckpointSet::from_bytes_with`), i.e. the
+  in-memory `.ekb` section loader; and
+* bloom/tile construction (`PathBloom::build_with`, `build_regions`, the tile
+  directory) — the whole-object build paths.
+
+The **bounded, file-backed window path is unaffected**: `Engine`, `reader`,
+`BlockIndex` and tiles decode only the requested range, never the declared
+whole-object length, so a legitimate bounded request stays under the default
+ceiling. The default policy leaves normal operation byte-for-byte unchanged; a
+caller may raise or lower the ceiling explicitly.
+
 ## Tests
 
 `tests/authenticated.rs` (existing) pins round-trips, core/section tamper
