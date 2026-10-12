@@ -26,6 +26,13 @@
 //! These intentionally mirror EKBLOOM's certified path-bloom `hot` array, which
 //! **is** a raw `N`-byte array. The comparison is therefore fair: no read-speed
 //! win over `RawVec` is expected, and EKBLOOM's cost is its extra structures.
+//!
+//! [`HotBlockCache`] (an ordinary byte-budgeted LRU) and [`PinnedHotCache`] (a
+//! **permanent** pin, never evicted) are the two cache policies the frontier
+//! experiment gives the indexed codecs: the LRU for contrast, and the pinned hot
+//! set as the *strongest* conventional competitor, because it reproduces
+//! non-eviction **without** EKBLOOM's architecture. Both count the decoded bytes
+//! they retain in the codec's footprint.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -266,6 +273,147 @@ impl HotBlockCache {
         self.insert(block, data);
         self.resident.get(&block).map(Vec::as_slice)
     }
+}
+
+/// A conventional **pinned-hot block cache** over decoded fixed-size blocks.
+///
+/// An indexed codec that decompresses its hot blocks **once** and retains them
+/// **permanently** — never evicting them — is a materially stronger conventional
+/// competitor to EKBLOOM's non-withdrawal manifested structures than an LRU
+/// cache, because it reproduces the **non-eviction** property *without* EKBLOOM's
+/// architecture. This type models exactly that retention policy and its
+/// footprint:
+///
+/// * the pinned decoded bytes are real retained bytes and must be counted
+///   alongside the codec's stored (compressed) bytes plus its block-index bytes;
+/// * the pinned set is fixed at construction to at most `max_pinned_blocks` and
+///   is **never** evicted;
+/// * a block that is not pinned is decoded **on demand** by the caller and is
+///   *not* retained.
+///
+/// Unlike [`HotBlockCache`] there is no recency order and no eviction: pinning is
+/// permanent and cold blocks never displace pinned ones.
+#[derive(Debug, Default)]
+pub struct PinnedHotCache {
+    /// Size of each decoded block, in bytes.
+    block_bytes: u64,
+    /// Maximum number of blocks that may be pinned.
+    max_pinned_blocks: usize,
+    /// Permanently resident decoded blocks, keyed by block ordinal.
+    pinned: BTreeMap<u64, Vec<u8>>,
+    /// Total pinned decoded bytes (the retention this cache adds to the codec's
+    /// stored footprint).
+    pinned_bytes: u64,
+    /// Pinned-block hits (a pinned block was requested).
+    hits: u64,
+    /// Cold lookups (a block was requested, was not pinned, and was decoded on
+    /// demand by the caller).
+    misses: u64,
+}
+
+impl PinnedHotCache {
+    /// A pinned cache of `block_bytes`-sized decoded blocks retaining at most
+    /// `max_pinned_blocks` of them permanently.
+    pub fn new(block_bytes: u64, max_pinned_blocks: usize) -> PinnedHotCache {
+        PinnedHotCache {
+            block_bytes,
+            max_pinned_blocks,
+            ..PinnedHotCache::default()
+        }
+    }
+
+    /// The decoded block size this cache holds.
+    #[inline]
+    pub fn block_bytes(&self) -> u64 {
+        self.block_bytes
+    }
+
+    /// The maximum number of permanently pinned blocks.
+    #[inline]
+    pub fn max_pinned_blocks(&self) -> usize {
+        self.max_pinned_blocks
+    }
+
+    /// The number of blocks currently pinned.
+    #[inline]
+    pub fn pinned_blocks(&self) -> usize {
+        self.pinned.len()
+    }
+
+    /// The pinned decoded bytes currently retained (part of the codec's retained
+    /// footprint).
+    #[inline]
+    pub fn pinned_bytes(&self) -> u64 {
+        self.pinned_bytes
+    }
+
+    /// Pinned-block hits.
+    #[inline]
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    /// Cold lookups (blocks decoded on demand and not retained).
+    #[inline]
+    pub fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    /// Whether `block` is permanently pinned.
+    #[inline]
+    pub fn is_pinned(&self, block: u64) -> bool {
+        self.pinned.contains_key(&block)
+    }
+
+    /// Permanently retain decoded `data` for `block`.
+    ///
+    /// Returns `true` when the block became resident. Returns `false` (and drops
+    /// `data`) when `block` is already pinned or the pin budget is full, so the
+    /// pinned set never exceeds [`PinnedHotCache::max_pinned_blocks`].
+    pub fn pin(&mut self, block: u64, data: Vec<u8>) -> bool {
+        if self.pinned.contains_key(&block) || self.pinned.len() >= self.max_pinned_blocks {
+            return false;
+        }
+        self.pinned_bytes = self.pinned_bytes.saturating_add(data.len() as u64);
+        self.pinned.insert(block, data);
+        true
+    }
+
+    /// The pinned decoded bytes for `block`, if pinned (recorded as a hit).
+    pub fn get(&mut self, block: u64) -> Option<&[u8]> {
+        if self.pinned.contains_key(&block) {
+            self.hits = self.hits.saturating_add(1);
+            self.pinned.get(&block).map(Vec::as_slice)
+        } else {
+            None
+        }
+    }
+
+    /// Record that `block` was not pinned and was decoded on demand.
+    pub fn note_miss(&mut self) {
+        self.misses = self.misses.saturating_add(1);
+    }
+
+    /// Hit fraction over the lookups seen (`0.0` when none).
+    #[inline]
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits.saturating_add(self.misses);
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
+}
+
+/// The number of leading `block_bytes`-blocks covering a `hot_bytes` prefix — the
+/// natural pinned set for a codec with a hot working set — bounded by
+/// `total_blocks` and at least one (or `0` when either size is `0`).
+pub fn pinned_block_count(hot_bytes: u64, block_bytes: u64, total_blocks: u64) -> u64 {
+    if block_bytes == 0 || total_blocks == 0 {
+        return 0;
+    }
+    hot_bytes.div_ceil(block_bytes).clamp(1, total_blocks)
 }
 
 /// Mutable LRU-cache state (interior mutability so reads keep the `&self` API).
