@@ -55,7 +55,9 @@ use std::sync::Arc;
 use crate::adapt::Workload;
 use crate::bloom::{BloomKind, Certification};
 use crate::error::{EkbloomError, Result};
-use crate::machine::{machine_by_id, MACHINE_NL2};
+use crate::machine::{machine_by_id, MACHINE_NL2, MACHINE_RANS0, MACHINE_RANS0I};
+use crate::machine_rans::RansContext;
+use crate::machine_rans_i::RansIContext;
 use crate::manifest::EkbloomBody;
 use crate::planner::CostModel;
 use crate::tiles::TileSet;
@@ -68,6 +70,17 @@ pub const ENGINE_REGION_BYTES: u64 = 4096;
 pub const MIN_ENGINE_REGION_BYTES: u64 = 4096;
 /// Largest accepted engine region size.
 pub const MAX_ENGINE_REGION_BYTES: u64 = 1 << 20;
+
+/// Per-step and per-reveal cost scale of the interleaved machine 4 relative to
+/// machine 2's serial state chain.
+///
+/// Machine 4 keeps `K` independent lanes, so its per-symbol decode is cheaper than
+/// machine 2's irreducible dependent chain. The factor is the measured bulk
+/// decode-rate ratio (`docs/FRONTIER.md` §4: machine 4 `K = 8` ≈ `2.03 ns/byte` vs
+/// machine 2 ≈ `3.39 ns/byte`, ≈ `0.60×`). The cost model only needs the right
+/// ordering, but making it explicit means a machine-4 block-restart path is chosen
+/// for cold/positional regions where it is genuinely cheapest.
+const INTERLEAVED_COST_SCALE: f64 = 0.60;
 
 /// The classes of certified bounded access path the engine chooses between.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -439,9 +452,20 @@ impl<'a> Iterator for Segments<'a> {
 
 /// The unified bounded-access engine: an immutable [`AccessPlan`] behind an
 /// `Arc`, served with no search and no lock.
+///
+/// It additionally holds the **prepared** decoder context for the planned body's
+/// core (machine 2's fused `RansContext` or machine 4's interleaved
+/// `RansIContext`), built **once** at plan time. Cold block/replay reads then reuse
+/// it instead of rebuilding the `4096`-entry fused table on every read — the
+/// persistent-context win measured in `docs/FRONTIER.md` §4. The context is `None`
+/// for machines 1/3 (whose steps are cheap/verbatim), for an invalid core, and for
+/// a plan reconstructed via [`Engine::from_plan`] (which has no core), where the
+/// dispatch falls back to the per-read build.
 #[derive(Clone)]
 pub struct Engine {
     plan: Arc<AccessPlan>,
+    rans: Option<Arc<RansContext>>,
+    rans_i: Option<Arc<RansIContext>>,
 }
 
 /// The engine is the *bounded* engine; this alias is provided for callers that
@@ -519,6 +543,8 @@ impl Engine {
                     structures: Vec::new(),
                     hot: HotIndex::None,
                 }),
+                rans: None,
+                rans_i: None,
             });
         }
 
@@ -542,7 +568,7 @@ impl Engine {
                 if !covers(body, c.structure, start, end) {
                     continue;
                 }
-                let cost = path_cost(&model, c.path, c.steps, len);
+                let cost = path_cost(&model, body.machine_id, c.path, c.steps, len);
                 let take = match &best {
                     Some((bc, bcost)) => {
                         cost < *bcost
@@ -582,6 +608,14 @@ impl Engine {
         }
 
         let hot = hot_index(&regions);
+        // Build the prepared decoder context once, for the machines whose read
+        // step rebuilds a fused table. An invalid core simply leaves it `None`
+        // (planning itself does not newly fail).
+        let (rans, rans_i) = match body.machine_id {
+            MACHINE_RANS0 => (RansContext::from_core(&body.core).ok().map(Arc::new), None),
+            MACHINE_RANS0I => (None, RansIContext::from_core(&body.core).ok().map(Arc::new)),
+            _ => (None, None),
+        };
         Ok(Engine {
             plan: Arc::new(AccessPlan {
                 region_bytes,
@@ -595,6 +629,8 @@ impl Engine {
                 structures: used,
                 hot,
             }),
+            rans,
+            rans_i,
         })
     }
 
@@ -602,6 +638,8 @@ impl Engine {
     pub fn from_plan(plan: AccessPlan) -> Engine {
         Engine {
             plan: Arc::new(plan),
+            rans: None,
+            rans_i: None,
         }
     }
 
@@ -687,7 +725,14 @@ impl Engine {
                 .regions
                 .get(first)
                 .ok_or_else(|| bad("engine plan has no region for the request"))?;
-            dispatch_owned(body, region, req.offset, req.length)?
+            dispatch_owned(
+                body,
+                region,
+                req.offset,
+                req.length,
+                self.rans.as_deref(),
+                self.rans_i.as_deref(),
+            )?
         } else {
             // A request spanning regions is split into the segments served by one
             // certified structure/path each; each segment appends into one buffer.
@@ -702,8 +747,15 @@ impl Engine {
             })?);
             let mut steps = 0u64;
             for (region, seg_start, seg_len) in self.plan.segments(req.offset, end) {
-                steps = steps
-                    .saturating_add(dispatch_into(body, region, seg_start, seg_len, &mut out)?);
+                steps = steps.saturating_add(dispatch_into(
+                    body,
+                    region,
+                    seg_start,
+                    seg_len,
+                    &mut out,
+                    self.rans.as_deref(),
+                    self.rans_i.as_deref(),
+                )?);
             }
             if out.len() as u64 != req.length {
                 return Err(bad("engine plan has no region for the request"));
@@ -1069,13 +1121,21 @@ fn tile_set_covers(ts: &TileSet, start: u64, end: u64) -> bool {
 }
 
 /// The documented per-path cost model (nanoseconds), using the same constants as
-/// the planner.
-fn path_cost(model: &CostModel, path: Path, steps: u64, len: u64) -> f64 {
+/// the planner. Machine 4's interleaved decode is scaled by
+/// [`INTERLEAVED_COST_SCALE`] so its cheaper restart/reveal steps are reflected.
+fn path_cost(model: &CostModel, machine_id: u32, path: Path, steps: u64, len: u64) -> f64 {
     let l = len as f64;
+    let scale = if machine_id == MACHINE_RANS0I {
+        INTERLEAVED_COST_SCALE
+    } else {
+        1.0
+    };
     match path {
         Path::HotTile | Path::DirectStorage => model.hot_lookup_ns + model.copy_ns_per_byte * l,
         Path::PackedRestart | Path::BlockRestart => {
-            model.restart_ns + (steps as f64 / 2.0) * model.step_ns + model.reveal_ns * l
+            model.restart_ns
+                + (steps as f64 / 2.0) * model.step_ns * scale
+                + model.reveal_ns * scale * l
         }
         Path::AffineSummary => model.state_ns + model.reveal_ns * l,
     }
@@ -1088,9 +1148,11 @@ fn dispatch_owned(
     region: &RegionPath,
     offset: u64,
     length: u64,
+    rans: Option<&RansContext>,
+    rans_i: Option<&RansIContext>,
 ) -> Result<(Vec<u8>, u64)> {
     let mut out = Vec::new();
-    let steps = dispatch_into(body, region, offset, length, &mut out)?;
+    let steps = dispatch_into(body, region, offset, length, &mut out, rans, rans_i)?;
     Ok((out, steps))
 }
 
@@ -1104,6 +1166,8 @@ fn dispatch_into(
     offset: u64,
     length: u64,
     out: &mut Vec<u8>,
+    rans: Option<&RansContext>,
+    rans_i: Option<&RansIContext>,
 ) -> Result<u64> {
     match (region.path, region.structure) {
         (Path::HotTile, StructureRef::TileSet(ti)) => {
@@ -1159,6 +1223,25 @@ fn dispatch_into(
                 .blocks
                 .get(bi)
                 .ok_or_else(|| bad("engine planned block index is out of range"))?;
+            // Prefer the plan's persistent prepared context: it skips the per-read
+            // header parse and 4096-entry fused-table build (machine 2) or the
+            // lane-state validation (machine 4) for a cold block read.
+            if block.machine_id() == MACHINE_RANS0 {
+                if let Some(ctx) = rans {
+                    let (bytes, steps) =
+                        block.read_range_counted_rans(&body.core, ctx, offset, length)?;
+                    out.extend_from_slice(&bytes);
+                    return Ok(steps);
+                }
+            }
+            if block.machine_id() == MACHINE_RANS0I {
+                if let Some(ctx) = rans_i {
+                    let (bytes, steps) =
+                        block.read_range_counted_rans_i(&body.core, ctx, offset, length)?;
+                    out.extend_from_slice(&bytes);
+                    return Ok(steps);
+                }
+            }
             let (bytes, steps) = block.read_range_counted(&body.core, offset, length)?;
             out.extend_from_slice(&bytes);
             Ok(steps)

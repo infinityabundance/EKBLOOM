@@ -74,6 +74,22 @@ covers the object *with the body's machine*, a tile set indexing the object, or
 a complete history on the cursor==position machine. `AccessPlan::all_certified`
 exposes the verdict and `tests/engine.rs` pins it.
 
+### Machine 4 as a first-class cold engine
+
+The block index candidate is admitted **for the body's machine**, so the engine
+plans and reads over **machine-4** (`OrANS-RANS0I`) bodies with no special case: the
+`BlockRestart` path is chosen for cold/positional regions and the same
+certification, byte-exactness and `B − 1` bound hold. The cost model reflects
+machine 4's cheaper interleaved step (`INTERLEAVED_COST_SCALE = 0.60`). Beyond the
+plan, `Engine` also holds the **prepared** decoder context for the planned body's
+core — machine 2's [`RansContext`](../src/machine_rans.rs) or machine 4's
+[`RansIContext`](../src/machine_rans_i.rs) — built **once** at plan time; the
+`BlockRestart` dispatch reuses it (`BlockIndex::read_range_counted_rans_i` /
+`read_range_counted_rans`) so a cold read does not rebuild the `4096`-entry fused
+table. `tests/machine4_engine.rs` pins engine reads over machine-4 bodies against
+`reader::read`, the per-region certification, the planner's `BlockRestart` choice,
+and that machines 1/2/3 are unchanged.
+
 ## 3. Planning
 
 `Engine::plan` is the expensive, offline step:
@@ -188,9 +204,11 @@ Every branch re-implements the identical primitive `reader::read` would choose
 (`TileSet::read_bounded` / `read_hot`, `fastpath`'s hot slice,
 `CheckpointSet::restore_with` + `decode_into`, `BlockIndex::read_range`,
 `History::snapshot_at` + `reveal`). `tests/engine.rs` compares the engine against
-`reader::read` across machine 1 and machine 2, over the four machines' structures,
+`reader::read` across machines 1 and 2, over the four machines' structures,
 for eleven requests including region-boundary crossings, a spanning read and a
-whole-object read.
+whole-object read; `tests/machine4_engine.rs` adds machine-4 bodies (three block
+sizes, every request shape), the planner's machine-4 `BlockRestart` choice, the
+prepared-context exactness and the machine-1/2/3 regression.
 
 ## 7. Tests
 
@@ -203,7 +221,10 @@ adversarial offsets; the **request-level** bound — a cold → hot → cold rea
 actual positioning (`114,687`) exceeds the per-region maximum (`65,535`) yet stays
 within `worst_case_steps_for` (`131,070`), the single-region case, and the all-hot
 case (`0`); the hot surface being the decoded output; plan determinism; and the
-competitor codecs returning byte-exact data.
+competitor codecs returning byte-exact data. `tests/machine4_engine.rs` (6 tests)
+pins the machine-4 engine integration above, plus `tests/auto_reuse.rs` (1 test)
+for the `create_auto` construction-time saving and `src/manifest.rs` unit tests for
+its byte-identity.
 
 ## 8. Reproduce
 

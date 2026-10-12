@@ -265,23 +265,38 @@ pub fn create_machine(
 /// smaller representation. It is available explicitly via [`create_machine`] and
 /// measured in `examples/frontier.rs`.
 pub fn select_machine(source: &[u8]) -> Result<u32> {
+    Ok(select_machine_with_core(source)?.0)
+}
+
+/// The `auto` decision together with the encoded core it was made against.
+///
+/// Machine 2 (`OrANS-RANS0`) is tried first; when its core is **not** smaller than
+/// the source (`core_len >= source_len`) the policy falls back to machine 3
+/// (`OrANS-Store`, verbatim), so the base representation is **never larger than
+/// raw** (`V <= N`). The returned core is exactly what the chosen machine's
+/// `encode` produces — machine 2's compressed core when it wins, otherwise
+/// `source` itself (machine 3's verbatim core) — so [`create_auto`] and
+/// [`create_auto_within_budget`] reuse it instead of encoding a second time.
+fn select_machine_with_core(source: &[u8]) -> Result<(u32, Vec<u8>)> {
     let machine =
         machine_by_id(MACHINE_RANS0).ok_or(EkbloomError::UnknownMachine { id: MACHINE_RANS0 })?;
     let core = machine.encode(source)?;
     if core.len() < source.len() {
-        Ok(MACHINE_RANS0)
+        Ok((MACHINE_RANS0, core))
     } else {
-        Ok(MACHINE_STORE)
+        Ok((MACHINE_STORE, source.to_vec()))
     }
 }
 
 /// Build a fresh body from `source` using the `auto` representation policy.
 ///
 /// The chosen machine is recorded in the body (and therefore the `.ekb` header and
-/// manifest) exactly as [`create_machine`] records an explicit one.
+/// manifest) exactly as [`create_machine`] records an explicit one. The core that
+/// [`select_machine_with_core`] produced for the decision is reused directly, so
+/// the winning encode is performed **once** rather than twice.
 pub fn create_auto(source: &[u8], profile: ManifestationProfile) -> Result<EkbloomBody> {
-    let machine_id = select_machine(source)?;
-    create_machine(source, profile, machine_id)
+    let (machine_id, core) = select_machine_with_core(source)?;
+    build_body(core, source.len() as u64, machine_id, profile)
 }
 
 /// Assemble a body from an already-encoded `core` and apply `profile`.
@@ -645,8 +660,14 @@ pub fn create_auto_within_budget(
     profile: ManifestationProfile,
     budget: &ManifestationBudget,
 ) -> Result<EkbloomBody> {
-    let machine_id = select_machine(source)?;
-    create_machine_within_budget(source, profile, machine_id, budget)
+    let (machine_id, core) = select_machine_with_core(source)?;
+    build_within_budget(
+        core,
+        source.len() as u64,
+        machine_id,
+        profile,
+        budget.maximum_physical_bytes,
+    )
 }
 
 /// Machine-general [`create_within_budget`].
@@ -661,10 +682,28 @@ pub fn create_machine_within_budget(
 ) -> Result<EkbloomBody> {
     let machine =
         machine_by_id(machine_id).ok_or(EkbloomError::UnknownMachine { id: machine_id })?;
-    let limit = budget.maximum_physical_bytes;
     let core = machine.encode(source)?;
+    build_within_budget(
+        core,
+        source.len() as u64,
+        machine_id,
+        profile,
+        budget.maximum_physical_bytes,
+    )
+}
+
+/// Build a body from an already-encoded `core` under a byte `limit`, estimating
+/// from the **actual** core length first and re-checking the real
+/// `physical_bytes()` after the build. Shared by the machine-general and `auto`
+/// budget paths so a selected core is never encoded twice.
+fn build_within_budget(
+    core: Vec<u8>,
+    source_len: u64,
+    machine_id: u32,
+    profile: ManifestationProfile,
+    limit: u64,
+) -> Result<EkbloomBody> {
     let core_len = core.len() as u64;
-    let source_len = source.len() as u64;
     let estimated = estimate_physical_bytes_for_core(core_len, source_len, profile);
     if estimated > limit {
         return Err(EkbloomError::AllocationTooLarge {
@@ -905,6 +944,84 @@ mod tests {
             out.push((s >> 33) as u8);
         }
         out
+    }
+
+    /// A skewed 4-symbol source (machine 2/4 compress it, `V < N`).
+    fn skewed(seed: u64, len: usize) -> Vec<u8> {
+        let mut s = seed;
+        let alpha = *b"abcd";
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let r = (s >> 33) % 100;
+            let idx = if r < 60 {
+                0
+            } else if r < 85 {
+                1
+            } else if r < 95 {
+                2
+            } else {
+                3
+            };
+            out.push(alpha[idx]);
+        }
+        out
+    }
+
+    /// The **pre-reuse** `auto` policy: select (which encodes machine 2 to decide)
+    /// and then encode a second time in `create_machine`. Kept as the byte-identity
+    /// oracle for the core-reuse optimisation.
+    fn create_auto_without_reuse(
+        source: &[u8],
+        profile: ManifestationProfile,
+    ) -> Result<EkbloomBody> {
+        let machine_id = select_machine(source)?;
+        create_machine(source, profile, machine_id)
+    }
+
+    #[test]
+    fn create_auto_reuses_the_core_byte_identically() {
+        let sources = vec![
+            ("empty", Vec::new()),
+            ("one", vec![0x42]),
+            ("skewed", skewed(0x00A0_7001, 8192)),
+            ("uniform", lcg(0x00A0_7002, 8192)),
+        ];
+        let profiles = [
+            ManifestationProfile::Root,
+            ManifestationProfile::Sparse { interval: 64 },
+            ManifestationProfile::Path { depth: 4 },
+            ManifestationProfile::MaxSpeed,
+        ];
+        for (name, src) in &sources {
+            for profile in profiles {
+                let reused = create_auto(src, profile).unwrap();
+                let oracle = create_auto_without_reuse(src, profile).unwrap();
+                assert_eq!(reused, oracle, "{name} {profile:?} body differs");
+                assert_eq!(reused.core, oracle.core, "{name} {profile:?} core differs");
+                assert_eq!(reused.machine_id, oracle.machine_id);
+                assert_eq!(reused.object_id, oracle.object_id);
+            }
+        }
+    }
+
+    #[test]
+    fn create_auto_within_budget_reuses_the_core_byte_identically() {
+        let src = skewed(0x00A0_7003, 4096);
+        let budget = ManifestationBudget {
+            maximum_physical_bytes: u64::MAX,
+        };
+        for profile in [
+            ManifestationProfile::Root,
+            ManifestationProfile::Sparse { interval: 64 },
+        ] {
+            let reused = create_auto_within_budget(&src, profile, &budget).unwrap();
+            let machine_id = select_machine(&src).unwrap();
+            let oracle = create_machine_within_budget(&src, profile, machine_id, &budget).unwrap();
+            assert_eq!(reused, oracle, "{profile:?} budget body differs");
+        }
     }
 
     #[test]

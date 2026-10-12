@@ -16,11 +16,13 @@
 //! sequential scan** — the non-eviction property.
 
 use ekbloom::adapt::{Workload, WorkloadKind};
+use ekbloom::machine_rans_i::{decode_measured, encode_measured};
 use ekbloom::{
-    create_auto, encode_with_k, machine_by_id, now_ns, percentiles, pinned_block_count, prepare,
-    spread_offsets, AccessTrace, BlockIndex, DirectoryKind, Engine, HotBlockCache,
-    ManifestationBudget, ManifestationProfile, OrMachine, Percentiles, PinnedHotCache, ReadRequest,
-    TileSet, MACHINE_STORE, RANS0,
+    create_auto, create_machine, encode_with_k, machine_by_id, now_ns, percentiles,
+    pinned_block_count, prepare, select_machine, spread_offsets, AccessTrace, BlockIndex,
+    DirectoryKind, EkbloomBody, Engine, HotBlockCache, ManifestationBudget, ManifestationProfile,
+    OrMachine, Percentiles, PinnedHotCache, RansIContext, ReadRequest, TileSet, MACHINE_RANS0I,
+    MACHINE_STORE, RANS0,
 };
 use std::path::Path;
 
@@ -367,6 +369,55 @@ fn measure_representation() -> ekbloom::Result<Representation> {
         skewed_base_bytes: sb.physical_bytes(),
         skewed_source_bytes: text.len() as u64,
         skewed_ratio: sb.physical_bytes() as f64 / text.len() as f64,
+    })
+}
+
+/// `create_auto`'s construction-time saving from reusing the encoded core that the
+/// machine decision already produced, rather than encoding the winning machine a
+/// second time.
+struct AutoReuse {
+    source_len: u64,
+    winning_machine: u32,
+    reuse_ns: u64,
+    double_encode_ns: u64,
+    speedup: f64,
+    identical: bool,
+}
+
+/// Measure `create_auto` (reuses the decision core) against the pre-optimisation
+/// path (`select_machine` then `create_machine`, which encodes twice when machine 2
+/// wins). Best of 7; the two bodies must be byte-identical (`identical`).
+fn measure_auto_reuse(source: &[u8]) -> ekbloom::Result<AutoReuse> {
+    let profile = ManifestationProfile::Root;
+    let reps = 7usize;
+    let mut reuse_ns = u64::MAX;
+    let mut double_ns = u64::MAX;
+    let mut reuse_body = None;
+    let mut double_body = None;
+    for _ in 0..reps {
+        let t = now_ns();
+        let body = create_auto(source, profile)?;
+        reuse_ns = reuse_ns.min(now_ns().saturating_sub(t));
+        reuse_body = Some(body);
+
+        let t = now_ns();
+        let machine_id = select_machine(source)?;
+        let body = create_machine(source, profile, machine_id)?;
+        double_ns = double_ns.min(now_ns().saturating_sub(t));
+        double_body = Some(body);
+    }
+    let identical = reuse_body == double_body;
+    Ok(AutoReuse {
+        source_len: source.len() as u64,
+        winning_machine: select_machine(source)?,
+        reuse_ns,
+        double_encode_ns: double_ns,
+        speedup: if reuse_ns > 0 {
+            double_ns as f64 / reuse_ns as f64
+        } else {
+            0.0
+        },
+        identical,
     })
 }
 
@@ -855,6 +906,65 @@ fn measure_cold(name: &str, source: &[u8]) -> ekbloom::Result<ColdReport> {
         }
     }
 
+    // ---- Machine-4 decode-kernel variants at the 4 KiB block size. The main
+    // loop's `ekbloom-m4-b4096` row uses the default `K = 4` and rebuilds the
+    // decoder context per read (`read_range` calls `RansIContext::from_core` each
+    // time). These rows hold the machine and block size fixed and isolate (a) a
+    // context built **once** (`read_range_counted_rans_i`) versus per read, and
+    // (b) the lane count `K`, so the delta is the kernel, not the geometry.
+    for &k in &[4usize, 8] {
+        let core = encode_with_k(source, k)?;
+        let index = BlockIndex::build_machine(&core, n, 4096, MACHINE_RANS0I)?;
+        let ctx = RansIContext::from_core(&core)?;
+        let index_bytes = index
+            .directory_bytes()
+            .saturating_add(index.restart_bytes());
+        let stored = (core.len() as u64).saturating_add(index_bytes);
+        for &off in offs4.iter().take(8) {
+            assert_eq!(
+                index.read_range_counted_rans_i(&core, &ctx, off, COLD4K)?.0,
+                &source[off as usize..(off + COLD4K) as usize],
+                "ekbloom m4 k{k} prepared cold exact"
+            );
+        }
+        let u4k = time_reads(&offs4, |off| index.read_range(&core, off, COLD4K).unwrap());
+        let u64k = time_reads(&offs64, |off| {
+            index.read_range(&core, off, COLD64K).unwrap()
+        });
+        rows.push(ColdRow::new(
+            format!("ekbloom-m4-k{k}-b4096"),
+            "ekbloom",
+            stored,
+            index_bytes,
+            0,
+            &u4k,
+            &u64k,
+            format!("machine 4, K={k}, 4096 B block restart, context rebuilt per read"),
+        ));
+        let p4k = time_reads(&offs4, |off| {
+            index
+                .read_range_counted_rans_i(&core, &ctx, off, COLD4K)
+                .unwrap()
+                .0
+        });
+        let p64k = time_reads(&offs64, |off| {
+            index
+                .read_range_counted_rans_i(&core, &ctx, off, COLD64K)
+                .unwrap()
+                .0
+        });
+        rows.push(ColdRow::new(
+            format!("ekbloom-m4-k{k}-b4096+prep"),
+            "ekbloom",
+            stored,
+            index_bytes,
+            0,
+            &p4k,
+            &p64k,
+            format!("machine 4, K={k}, 4096 B block restart, prepared context built once"),
+        ));
+    }
+
     // ---- Block-indexed LZ4 (explicit u32 offset table) and a cached variant.
     let budget = n + n / 8;
     for &block in &[1024usize, 4096, 16384] {
@@ -1016,35 +1126,49 @@ struct DecodeRate {
 }
 
 /// Measure bulk decode throughput (`ns/byte`, GB/s) of machine 2 versus the
-/// interleaved machine 4 at `K = 4` and `K = 8`, all through the prepared bulk
-/// decoder (`prepare` + `Prepared::decode_into`), best of 3, byte-exact checked.
+/// interleaved machine 4 across lane counts `K ∈ {2,4,8,16}`, best of 3,
+/// byte-exact checked.
+///
+/// `K ∈ {2,4,8}` and machine 2 go through the **prepared stored** decoder
+/// (`prepare` + `Prepared::decode_into`, one context build per rep). `K = 16`
+/// exceeds the stored lane bound (`state::MAX_LANES = 8`, which sizes every
+/// machine-4 restart record), so it is measured through the **measurement kernel**
+/// (`encode_measured` / `decode_measured`) which keeps its lanes in a local array
+/// and widens nothing on the wire.
 fn measure_decode(source: &[u8]) -> ekbloom::Result<Vec<DecodeRate>> {
     let n = source.len() as u64;
     let reps = 3usize;
-    let configs: [(&str, u32, usize, Vec<u8>); 3] = [
-        ("rans0-m2", 2, 1, RANS0.encode(source)?),
-        ("rans0i-k4", 4, 4, encode_with_k(source, 4)?),
-        ("rans0i-k8", 4, 8, encode_with_k(source, 8)?),
-    ];
     let mut rows = Vec::new();
-    for (name, machine_id, k, core) in &configs {
-        let machine = machine_by_id(*machine_id).expect("known machine");
+
+    // Machine 2 and machine 4 K ∈ {2,4,8}: the prepared stored decoder.
+    for (name, machine_id, k) in [
+        ("rans0-m2", 2u32, 1usize),
+        ("rans0i-k2", 4, 2),
+        ("rans0i-k4", 4, 4),
+        ("rans0i-k8", 4, 8),
+    ] {
+        let machine = machine_by_id(machine_id).expect("known machine");
+        let core = if machine_id == 2 {
+            RANS0.encode(source)?
+        } else {
+            encode_with_k(source, k)?
+        };
         let mut best = u64::MAX;
         let mut exact = true;
         for _ in 0..reps {
-            let ctx = prepare(machine, core)?;
-            let mut omega = machine.init(core)?;
+            let ctx = prepare(machine, &core)?;
+            let mut omega = machine.init(&core)?;
             let mut out: Vec<u8> = Vec::with_capacity(source.len());
             let t = now_ns();
-            ctx.decode_into(core, &mut omega, n, &mut out)?;
+            ctx.decode_into(&core, &mut omega, n, &mut out)?;
             best = best.min(now_ns().saturating_sub(t));
             exact &= out == source;
         }
         let ns = best as f64;
         rows.push(DecodeRate {
             name: name.to_string(),
-            machine: *machine_id,
-            k: *k,
+            machine: machine_id,
+            k,
             core_bytes: core.len() as u64,
             source_bytes: n,
             best_ns: ns,
@@ -1053,6 +1177,34 @@ fn measure_decode(source: &[u8]) -> ekbloom::Result<Vec<DecodeRate>> {
             exact,
         });
     }
+
+    // Machine 4 K = 16: the measurement kernel (above the stored lane bound).
+    {
+        let k = 16usize;
+        let core = encode_measured(source, k)?;
+        let mut out = vec![0u8; source.len()];
+        let mut best = u64::MAX;
+        let mut exact = true;
+        for _ in 0..reps {
+            let t = now_ns();
+            decode_measured(&core, k, &mut out)?;
+            best = best.min(now_ns().saturating_sub(t));
+            exact &= out == source;
+        }
+        let ns = best as f64;
+        rows.push(DecodeRate {
+            name: "rans0i-k16".to_string(),
+            machine: 4,
+            k,
+            core_bytes: core.len() as u64,
+            source_bytes: n,
+            best_ns: ns,
+            ns_per_byte: ns / n as f64,
+            gb_per_s: if ns > 0.0 { n as f64 / ns } else { 0.0 },
+            exact,
+        });
+    }
+
     Ok(rows)
 }
 
@@ -1113,18 +1265,12 @@ struct CorpusReport {
     rows: Vec<Row>,
 }
 
-/// Measure one corpus under a single equal budget.
-fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
-    let n = source.len() as u64;
-    let build_start = now_ns();
-
-    // ---- EKBLOOM: `auto` body, hot tiles, a bounded cold block index, engine plan.
-    let mut body = create_auto(source, ManifestationProfile::Root)?;
-    let core_len = body.core.len() as u64;
-    let machine = body.machine_id;
-    // One equal budget per corpus: headroom above raw for the manifested
-    // structures (but *not* enough for a conventional cache of the whole output).
-    let budget = n.max(core_len) + n / 8;
+/// Manifest the engine's structures on `body` — the 256 KiB hot prefix as tiles
+/// plus a 1024-byte cold block index — and plan the engine under `budget`.
+///
+/// Shared by the `auto` engine configuration and the machine-4 engine
+/// configuration so both are built identically and compared at one budget.
+fn manifest_engine_body(body: &mut EkbloomBody, n: u64, budget: u64) -> ekbloom::Result<Engine> {
     let budget_manifest = ManifestationBudget {
         maximum_physical_bytes: budget,
     };
@@ -1133,13 +1279,13 @@ fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
         counts: vec![1],
     };
     TileSet::manifest_hot_tiles(
-        &mut body,
+        body,
         &trace,
         12,
         DirectoryKind::TwoLevelRadix,
         &budget_manifest,
     )?;
-    let block = BlockIndex::build_machine(&body.core, n, 1024, machine)?;
+    let block = BlockIndex::build_machine(&body.core, n, 1024, body.machine_id)?;
     body.blocks.push(block);
     body.generation += 1;
     let workload = Workload {
@@ -1147,13 +1293,112 @@ fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
         hot_prefix: Some(HOT_BYTES),
         sample: vec![(0, READ)],
     };
-    let engine = Engine::plan(&body, &budget_manifest, &workload)?;
-    let ek_build_ns = now_ns().saturating_sub(build_start);
+    Engine::plan(body, &budget_manifest, &workload)
+}
+
+/// Measure one engine configuration (a body and its plan) into a contender row:
+/// byte-exact check, then warm hot, cold and post-scan hot reads. `label` names
+/// the machine/representation in the row note so no two engine configs are
+/// conflated.
+#[allow(clippy::too_many_arguments)]
+fn measure_engine_row(
+    name: &str,
+    label: &str,
+    source: &[u8],
+    body: &EkbloomBody,
+    engine: &Engine,
+    build_ns: u64,
+    core_len: u64,
+    budget: u64,
+    hot_offsets: &[u64],
+    cold_offsets: &[u64],
+    scan_offsets: &[u64],
+) -> ekbloom::Result<Row> {
+    for &off in hot_offsets.iter().chain(cold_offsets.iter()).take(32) {
+        let got = engine.read(
+            body,
+            ReadRequest {
+                offset: off,
+                length: READ,
+            },
+        )?;
+        assert_eq!(
+            got,
+            &source[off as usize..(off + READ) as usize],
+            "engine {name} is not byte-exact"
+        );
+    }
     assert!(
         body.physical_bytes() <= budget,
-        "ekbloom retained {} > budget {budget}",
+        "engine {name} retained {} > budget {budget}",
         body.physical_bytes()
     );
+    let mut row = Row::new(name, "ekbloom", body.physical_bytes(), core_len);
+    row.build_ns = build_ns;
+    let ek_read = |off: u64| -> Vec<u8> {
+        engine
+            .read(
+                body,
+                ReadRequest {
+                    offset: off,
+                    length: READ,
+                },
+            )
+            .unwrap_or_default()
+    };
+    let hot = time_reads(hot_offsets, ek_read);
+    let cold = time_reads(cold_offsets, ek_read);
+    // A full scan never evicts manifested structures.
+    for &off in scan_offsets {
+        let _ = engine.read(
+            body,
+            ReadRequest {
+                offset: off,
+                length: READ,
+            },
+        );
+    }
+    let thrash = time_reads(hot_offsets, ek_read);
+    row.hot_p50 = hot.p50;
+    row.hot_p99 = hot.p99;
+    row.cold_p50 = cold.p50;
+    row.cold_p99 = cold.p99;
+    row.thrash_hot_p50 = thrash.p50;
+    row.thrash_hot_p99 = thrash.p99;
+    row.note = format!(
+        "engine: {label}; worst_case_steps {} over {} regions; core {core_len} B",
+        engine.worst_case_steps(),
+        engine.plan_ref().region_count()
+    );
+    Ok(row)
+}
+
+/// Measure one corpus under a single equal budget.
+fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
+    let n = source.len() as u64;
+    let build_start = now_ns();
+
+    // ---- EKBLOOM: `auto` body (machine 2 or 3), hot tiles, a bounded cold block
+    // index, engine plan.
+    let mut body = create_auto(source, ManifestationProfile::Root)?;
+    let core_len = body.core.len() as u64;
+    let machine = body.machine_id;
+    // One equal budget per corpus: headroom above raw for the manifested
+    // structures (but *not* enough for a conventional cache of the whole output).
+    // The machine-4 engine configuration below is built under this *same* budget.
+    let budget = n.max(core_len) + n / 8;
+    let engine = manifest_engine_body(&mut body, n, budget)?;
+    let ek_build_ns = now_ns().saturating_sub(build_start);
+
+    // ---- EKBLOOM machine-4 engine configuration: the interleaved machine's own
+    // body, the same hot tiles + block index, planned under the *same* budget. It
+    // is a distinct engine row so the machine-2/3 engine row is never conflated
+    // with the separate machine-4 block-index row in the cold head-to-head.
+    let m4_build_start = now_ns();
+    let mut body4 = create_machine(source, ManifestationProfile::Root, MACHINE_RANS0I)?;
+    let core4_len = body4.core.len() as u64;
+    let engine4 = manifest_engine_body(&mut body4, n, budget)?;
+    let ek4_build_ns = now_ns().saturating_sub(m4_build_start);
 
     let hot_offsets = spread_offsets(0x4070_0001, SAMPLES, HOT_BYTES, READ);
     let cold_offsets: Vec<u64> = spread_offsets(0x4070_0002, SAMPLES, n - HOT_BYTES, READ)
@@ -1161,18 +1406,6 @@ fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
         .map(|o| o + HOT_BYTES)
         .collect();
     let scan_offsets: Vec<u64> = (0..n.saturating_sub(READ)).step_by(READ as usize).collect();
-
-    // Byte-exact check for EKBLOOM before timing.
-    for &off in hot_offsets.iter().chain(cold_offsets.iter()).take(32) {
-        let got = engine.read(
-            &body,
-            ReadRequest {
-                offset: off,
-                length: READ,
-            },
-        )?;
-        assert_eq!(got, &source[off as usize..(off + READ) as usize]);
-    }
 
     let mut rows: Vec<Row> = Vec::new();
 
@@ -1461,47 +1694,36 @@ fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
         rows.push(row);
     }
 
-    // ---- EKBLOOM engine row.
-    {
-        let mut row = Row::new("ekbloom-engine", "ekbloom", body.physical_bytes(), core_len);
-        row.build_ns = ek_build_ns;
-        let ek_read = |off: u64| -> Vec<u8> {
-            engine
-                .read(
-                    &body,
-                    ReadRequest {
-                        offset: off,
-                        length: READ,
-                    },
-                )
-                .unwrap_or_default()
-        };
-        let hot = time_reads(&hot_offsets, ek_read);
-        let cold = time_reads(&cold_offsets, ek_read);
-        // A full scan never evicts manifested structures.
-        for &off in &scan_offsets {
-            let _ = engine.read(
-                &body,
-                ReadRequest {
-                    offset: off,
-                    length: READ,
-                },
-            );
-        }
-        let thrash = time_reads(&hot_offsets, ek_read);
-        row.hot_p50 = hot.p50;
-        row.hot_p99 = hot.p99;
-        row.cold_p50 = cold.p50;
-        row.cold_p99 = cold.p99;
-        row.thrash_hot_p50 = thrash.p50;
-        row.thrash_hot_p99 = thrash.p99;
-        row.note = format!(
-            "engine: worst_case_steps {} over {} regions; core {core_len} B",
-            engine.worst_case_steps(),
-            engine.plan_ref().region_count()
-        );
-        rows.push(row);
-    }
+    // ---- EKBLOOM engine rows: the `auto` configuration and the machine-4
+    // configuration, each with the hot tiles + cold block index above, under the
+    // same budget. The row notes name the machine so the two configs are never
+    // conflated.
+    rows.push(measure_engine_row(
+        "ekbloom-engine",
+        &format!("auto representation (machine {machine})"),
+        source,
+        &body,
+        &engine,
+        ek_build_ns,
+        core_len,
+        budget,
+        &hot_offsets,
+        &cold_offsets,
+        &scan_offsets,
+    )?);
+    rows.push(measure_engine_row(
+        "ekbloom-engine-m4",
+        "machine 4 (OrANS-RANS0I, interleaved rANS, K=4)",
+        source,
+        &body4,
+        &engine4,
+        ek4_build_ns,
+        core4_len,
+        budget,
+        &hot_offsets,
+        &cold_offsets,
+        &scan_offsets,
+    )?);
 
     // ---- Verdict flags for this corpus.
     let indexed = |pred: &dyn Fn(&Row) -> f64, class: &str| -> f64 {
@@ -1575,6 +1797,7 @@ fn render_json(
     hot: &HotIndex,
     residency: &[Residency],
     rep: &Representation,
+    auto: &AutoReuse,
     cold: &[ColdReport],
     decode: &[DecodeRate],
 ) -> String {
@@ -1707,6 +1930,14 @@ fn render_json(
         rep.skewed_source_bytes
     );
     let _ = writeln!(s, "    \"skewed_ratio\": {:.4}", finite(rep.skewed_ratio));
+    s.push_str("  },\n");
+    s.push_str("  \"create_auto_reuse\": {\n");
+    let _ = writeln!(s, "    \"source_len\": {},", auto.source_len);
+    let _ = writeln!(s, "    \"winning_machine\": {},", auto.winning_machine);
+    let _ = writeln!(s, "    \"reuse_ns\": {},", auto.reuse_ns);
+    let _ = writeln!(s, "    \"double_encode_ns\": {},", auto.double_encode_ns);
+    let _ = writeln!(s, "    \"speedup\": {:.4},", finite(auto.speedup));
+    let _ = writeln!(s, "    \"identical\": {}", auto.identical);
     s.push_str("  },\n");
     s.push_str("  \"cold_reads\": [\n");
     for (ci, c) in cold.iter().enumerate() {
@@ -1956,6 +2187,7 @@ fn main() -> ekbloom::Result<()> {
         .map(|(name, source)| measure_corpus(name, source))
         .collect::<ekbloom::Result<Vec<_>>>()?;
     let decode = measure_decode(&skew_src)?;
+    let auto_reuse = measure_auto_reuse(&skew_src)?;
 
     print_table(&corpora);
     print_cold_table(&cold);
@@ -2017,6 +2249,15 @@ fn main() -> ekbloom::Result<()> {
         representation.skewed_ratio
     );
 
+    println!(
+        "\n== create_auto core reuse (construction time; skewed winning machine {}) ==",
+        auto_reuse.winning_machine
+    );
+    println!(
+        "  create_auto (reused core): {} ns;  select+create (double encode): {} ns;  speedup {:.3}x;  byte-identical {}",
+        auto_reuse.reuse_ns, auto_reuse.double_encode_ns, auto_reuse.speedup, auto_reuse.identical
+    );
+
     let footprint_win = corpora.iter().any(|c| c.ekbloom_smaller_than_raw);
     let smaller_than_pinned = corpora.iter().any(|c| c.ekbloom_smaller_than_pinned);
     let hot_latency_win = corpora.iter().any(|c| c.ekbloom_hot_p99_best);
@@ -2043,6 +2284,7 @@ fn main() -> ekbloom::Result<()> {
         &hot_index,
         &residency,
         &representation,
+        &auto_reuse,
         &cold,
         &decode,
     );

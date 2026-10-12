@@ -433,6 +433,54 @@ impl BlockIndex {
         Ok((out, skip.saturating_add(len)))
     }
 
+    /// [`BlockIndex::read_range_counted`] for a **machine-4** index that reuses a
+    /// prepared [`RansIContext`] built once by the caller, so the per-read model
+    /// parse, fused-table build and lane-state validation are paid once for many
+    /// cold reads — the interleaved counterpart of
+    /// [`BlockIndex::read_range_counted_rans`].
+    pub fn read_range_counted_rans_i(
+        &self,
+        core: &[u8],
+        ctx: &RansIContext,
+        offset: u64,
+        len: u64,
+    ) -> Result<(Vec<u8>, u64)> {
+        if self.machine_id != MACHINE_RANS0I {
+            return Err(bad(
+                "prepared interleaved rANS read requires a machine-4 block index",
+            ));
+        }
+        let end = offset.checked_add(len).ok_or(EkbloomError::Overflow {
+            what: "block read range",
+        })?;
+        if end > self.logical_len {
+            return Err(EkbloomError::OutOfBounds {
+                offset,
+                length: len,
+                logical_len: self.logical_len,
+            });
+        }
+        if len == 0 {
+            return Ok((Vec::new(), 0));
+        }
+        let (start, idx) = self
+            .block_of(offset)
+            .ok_or_else(|| bad(format!("no block restart covers offset {offset}")))?;
+        let entry = *self
+            .entries
+            .get(idx)
+            .ok_or_else(|| bad("block restart index out of range"))?;
+        let skip = offset - start;
+        let cap = usize::try_from(len).map_err(|_| EkbloomError::Overflow {
+            what: "block read length",
+        })?;
+        let mut out = vec![0u8; cap];
+        let mut omega = entry;
+        ctx.skip(core, &mut omega, skip)?;
+        ctx.decode_into_slice(core, &mut omega, &mut out)?;
+        Ok((out, skip.saturating_add(len)))
+    }
+
     /// Recompute the content digest over the geometry and restart records.
     fn recompute_digest(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();

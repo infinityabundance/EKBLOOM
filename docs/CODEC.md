@@ -235,20 +235,72 @@ asserted before timing):
 
 | config | machine | K | ns/byte | GB/s | vs machine 2 |
 |---|---|---:|---:|---:|---:|
-| `rans0-m2` | 2 | 1 | 3.447 | 0.290 | 1.00× |
-| `rans0i-k4` | 4 | 4 | 2.364 | 0.423 | **1.46×** |
-| `rans0i-k8` | 4 | 8 | 2.167 | 0.461 | **1.59×** |
+| `rans0-m2` | 2 | 1 | 3.406 | 0.294 | 1.00× |
+| `rans0i-k4` | 4 | 4 | 2.279 | 0.439 | **1.49×** |
+| `rans0i-k8` | 4 | 8 | 2.122 | 0.471 | **1.60×** |
 
 **Honest bound.** Interleaving narrows but does **not** close the cold gap vs LZ4:
 at a comparable stored footprint (machine 4 `b4096` 876,155 B vs machine 2 `b1024`
-879,179 B) the 4 KiB cold read falls `14,447 -> 10,019 ns` and the 64 KiB read
-`223,026 -> 151,082 ns` (≈1.44–1.48× faster), yet LZ4's block decompress is still
-`2,825 ns` / `33,002 ns`, so EKBLOOM stays ≈**3.5× (4 KiB) to ≈4.6× (64 KiB)**
-slower cold (machine 2 was ≈5.1–6.8×). The residual is the serial renormalising
+879,179 B) the 4 KiB cold read falls `14,057 -> 9,929 ns` and the 64 KiB read
+`216,445 -> 149,860 ns` (≈1.4× faster), yet LZ4's block decompress is still
+`2,044 ns` / `32,230 ns`, so EKBLOOM stays ≈**4.9× (4 KiB) to ≈4.6× (64 KiB)**
+slower cold (machine 2 was ≈6.9–6.7×). The residual is the serial renormalising
 cursor plus the per-symbol table gather that LZ4 avoids entirely. The `auto` policy
 does **not** select machine 4 (its core is machine 2's plus `4 + 4K` header bytes),
 so existing representation numbers are unchanged; machine 4 is an explicit,
 measured option.
+
+### Machine 4 as a first-class cold engine
+
+The unified [`Engine`](../src/engine.rs) plans and reads over **machine-4** bodies
+exactly as for machines 1/2/3: its region enumeration admits a machine-4
+[`BlockIndex`](../src/blocks.rs), the `BlockRestart` path is chosen for
+cold/positional regions, and the same certification, byte-exactness and
+`worst_case_steps` bound (`B − 1`) hold. The engine's cost model now reflects
+machine 4's cheaper interleaved step, and `Engine::plan` builds the **prepared**
+decoder context **once** (machine 4's `RansIContext`, machine 2's `RansContext`), so
+a cold block read does not rebuild the `4096`-entry fused table per read: the
+engine's `BlockRestart` dispatch prefers `BlockIndex::read_range_counted_rans_i`
+(prepared) over the per-read `read_range_counted`.
+
+Measured on the 4 MiB `skewed` corpus (`examples/frontier.rs`; both engine rows are
+built identically — 256 KiB hot tiles + a 1024-byte block index — under the **same**
+budget; `evidence/bench/frontier.json`):
+
+| engine config | machine | retained B | hot 4 KiB p50 | cold 4 KiB p99 |
+|---|---|---:|---:|---:|
+| `ekbloom-engine` | 2 (`auto`) | 1,141,643 | 130 ns | 17,342 ns |
+| `ekbloom-engine-m4` | 4 | 1,276,859 | 120 ns | **12,023 ns** |
+
+The machine-4 engine configuration is **≈1.44× faster cold** on `skewed`
+(**≈1.37×** on `mixed`) at a **≈12% larger** retained footprint; the delta is
+entirely the wide (`45 B`/entry) machine-4 block-restart records versus machine 2's
+12-byte ones. On `uniform` the `auto` engine is machine 3 (a verbatim index,
+cold p99 752 ns) and wins cold outright, as expected.
+
+### Machine-4 decode-kernel tuning (measured)
+
+`K ∈ {2,4,8,16}` and prepared-vs-per-read context, `skewed`, 4 KiB block size
+(`evidence/bench/frontier.json`, `decode_rate` and `cold_reads`):
+
+| config | K | context | ns/byte | r4k p50 | r64k p50 |
+|---|---:|---|---:|---:|---:|
+| `rans0-m2` | 1 | prepared | 3.406 | — | — |
+| `rans0i-k2` | 2 | prepared | 2.465 | — | — |
+| `rans0i-k4-b4096` | 4 | per read | 2.279 | 9,929 | 149,860 |
+| `rans0i-k4-b4096+prep` | 4 | once | 2.279 | 9,378 | 149,549 |
+| `rans0i-k8-b4096` | 8 | per read | **2.122** | 9,347 | 139,912 |
+| `rans0i-k8-b4096+prep` | 8 | once | **2.122** | **8,736** | **139,130** |
+| `rans0i-k16` | 16 | measured kernel | 3.055 | — | — |
+
+**Verdict.** Lane tuning helps up to **K = 8** (2.122 ns/byte, **1.60×** machine 2)
+and then **regresses**: K = 16 (3.055 ns/byte) is slower than K = 4 and near machine
+2, so it is measured and **rejected** — and retaining it would require
+`state::MAX_LANES > 8`, widening *every* stored machine-4 restart record. The
+persistent prepared context removes the per-read fused-table rebuild for **≈5–6%**
+on a 4 KiB cold read (9,929 → 9,378 at K = 4; 9,347 → 8,736 at K = 8) and ≈0–1% at
+64 KiB. Neither tuning removes the residual — the ordered renormalising cursor and
+the per-symbol gather are inherent to rANS.
 
 ## The `auto` representation policy
 
@@ -258,6 +310,15 @@ source_len`) they use machine 3, so **EKBLOOM never stores more than raw for the
 base representation** (`V <= N` for every source). The chosen machine is recorded
 in the body (and therefore the `.ekb` header and `MANIFEST`) exactly as an explicit
 id. Explicit `--machine 1|2|3` overrides the policy.
+
+`create_auto` reuses the encoded core the decision already produced, so the winning
+encode runs **once** instead of twice; `create_auto_within_budget` does the same.
+Measured on the 4 MiB `skewed` corpus (`evidence/bench/frontier.json`,
+`create_auto_reuse`): **18,138,751 ns** versus **36,144,443 ns** for the pre-reuse
+`select_machine` + `create_machine` path — **1.99×** faster construction, with
+byte-identical bodies. (When machine 2 does not win there is no double encode —
+machine 3's `encode` is a verbatim copy — so the saving applies exactly where the
+policy picks machine 2.)
 
 Measured by `examples/frontier.rs` (`evidence/bench/frontier.json`):
 

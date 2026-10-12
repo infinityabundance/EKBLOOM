@@ -44,6 +44,16 @@ use crate::state::{Snapshot, MAX_LANES};
 pub const DEFAULT_K: usize = 4;
 /// Smallest accepted lane count.
 const MIN_K: usize = 1;
+/// Lane cap of the **measurement** bulk kernel ([`encode_measured`] /
+/// [`decode_measured`]).
+///
+/// The stored resumable forms — [`Snapshot`]'s lane array and every block /
+/// checkpoint / regional restart record — are bounded by [`MAX_LANES`], because
+/// enlarging that array would widen *every* stored machine-4 restart record. This
+/// kernel lets lane counts above that bound be *measured* (the `K ∈ {2,4,8,16}`
+/// decode-rate study) without paying that storage cost, so it is deliberately
+/// separate from the stored path.
+pub const MAX_MEASURE_LANES: usize = 16;
 /// Number of bytes before the `K` field (`256 * u16` frequencies).
 const K_FIELD_OFFSET: usize = MODEL_BYTES;
 /// Number of bytes before the initial lane states (`freq` ++ `K`).
@@ -407,6 +417,136 @@ pub fn encode_with_k(source: &[u8], k: usize) -> Result<Vec<u8>> {
     Ok(core)
 }
 
+/// Encode `source` with `k` interleaved lanes for the **measurement** kernel
+/// (`1 <= k <= `[`MAX_MEASURE_LANES`]).
+///
+/// The core layout and reversed-renormalisation convention are identical to
+/// [`encode_with_k`]; only the accepted lane cap differs. A `k > `[`MAX_LANES`]
+/// core produced here is decodable by [`decode_measured`] but **not** by the stored
+/// [`RansIContext`]/[`Snapshot`] path, which is exactly the point: lane counts above
+/// the stored bound can be measured without widening every stored restart record.
+pub fn encode_measured(source: &[u8], k: usize) -> Result<Vec<u8>> {
+    if !(MIN_K..=MAX_MEASURE_LANES).contains(&k) {
+        return Err(EkbloomError::InvalidArgument {
+            what: format!(
+                "measured interleaved rANS lane count {k} out of range [1, {MAX_MEASURE_LANES}]"
+            ),
+        });
+    }
+    let model = Model::from_source(source);
+    let mut states = [RANS_L; MAX_MEASURE_LANES];
+    let mut emitted: Vec<u8> = Vec::new();
+    for i in (0..source.len()).rev() {
+        let lane = i % k;
+        let f = u64::from(model.freq[source[i] as usize]);
+        let c = u64::from(model.cum[source[i] as usize]);
+        let mut x = u64::from(states[lane]);
+        let x_max = u64::from((RANS_L >> SCALE_BITS) << 8) * f;
+        while x >= x_max {
+            emitted.push((x & 0xFF) as u8);
+            x >>= 8;
+        }
+        states[lane] = (((x / f) << SCALE_BITS) + (x % f) + c) as u32;
+    }
+
+    let header = STATES_OFFSET + 4 * k;
+    let mut core = Vec::with_capacity(header.saturating_add(emitted.len()));
+    for &f in model.freq.iter() {
+        core.extend_from_slice(&f.to_le_bytes());
+    }
+    core.extend_from_slice(&(k as u32).to_le_bytes());
+    for &x in states[..k].iter() {
+        core.extend_from_slice(&x.to_le_bytes());
+    }
+    core.extend(emitted.iter().rev());
+    Ok(core)
+}
+
+/// Decode a core produced by [`encode_measured`] from genesis into `out`, using
+/// the same lane-grouped bulk kernel as [`RansIContext::decode_into_slice`].
+///
+/// This is a measurement helper for lane counts up to [`MAX_MEASURE_LANES`]; it
+/// keeps its lane states in a local array and never constructs a [`Snapshot`], so
+/// it can decode `k > `[`MAX_LANES`]. It is byte-exact against the stored path for
+/// every `k` the stored path supports.
+pub fn decode_measured(core: &[u8], k: usize, out: &mut [u8]) -> Result<()> {
+    if !(MIN_K..=MAX_MEASURE_LANES).contains(&k) {
+        return Err(EkbloomError::InvalidArgument {
+            what: format!(
+                "measured interleaved rANS lane count {k} out of range [1, {MAX_MEASURE_LANES}]"
+            ),
+        });
+    }
+    let header_bytes = STATES_OFFSET + 4 * k;
+    if core.len() < header_bytes {
+        return Err(EkbloomError::Truncated {
+            needed: header_bytes as u64,
+            available: core.len() as u64,
+        });
+    }
+    // Validate/parse the model once through machine 2's fused context.
+    let ctx = RansContext::from_core(core)?;
+    let table = ctx.table();
+    let mut lanes = [0u32; MAX_MEASURE_LANES];
+    for (i, slot) in lanes.iter_mut().enumerate().take(k) {
+        let o = STATES_OFFSET + 4 * i;
+        *slot = u32::from_le_bytes([core[o], core[o + 1], core[o + 2], core[o + 3]]);
+    }
+    let mut p = header_bytes as u64;
+    let n = out.len();
+    let mut i = 0usize;
+
+    // Full groups of `k` independent lanes (the ILP kernel).
+    while i + k <= n {
+        let mut nx = [0u32; MAX_MEASURE_LANES];
+        let mut sym = [0u8; MAX_MEASURE_LANES];
+        for t in 0..k {
+            let x = lanes[t];
+            let slot = x & (M - 1);
+            let e = table[slot as usize];
+            nx[t] = (x >> SCALE_BITS) * (e & 0x0FFF) + slot - ((e >> SCALE_BITS) & 0x0FFF);
+            sym[t] = (e >> 24) as u8;
+        }
+        for v_slot in nx.iter_mut().take(k) {
+            let mut v = *v_slot;
+            while v < RANS_L {
+                let b = *core.get(p as usize).ok_or(EkbloomError::CoreTooShort {
+                    needed: p + 1,
+                    available: core.len() as u64,
+                })?;
+                v = (v << 8) | u32::from(b);
+                p += 1;
+            }
+            *v_slot = v;
+        }
+        out[i..i + k].copy_from_slice(&sym[..k]);
+        lanes[..k].copy_from_slice(&nx[..k]);
+        i += k;
+    }
+
+    // Trailing partial group (from a lane-0 boundary).
+    let mut t = 0usize;
+    while i < n {
+        let x = lanes[t];
+        let slot = x & (M - 1);
+        let e = table[slot as usize];
+        let mut v = (x >> SCALE_BITS) * (e & 0x0FFF) + slot - ((e >> SCALE_BITS) & 0x0FFF);
+        while v < RANS_L {
+            let b = *core.get(p as usize).ok_or(EkbloomError::CoreTooShort {
+                needed: p + 1,
+                available: core.len() as u64,
+            })?;
+            v = (v << 8) | u32::from(b);
+            p += 1;
+        }
+        lanes[t] = v;
+        out[i] = (e >> 24) as u8;
+        i += 1;
+        t += 1;
+    }
+    Ok(())
+}
+
 impl OrMachine for Rans0I {
     #[inline]
     fn machine_id(&self) -> u32 {
@@ -535,6 +675,38 @@ mod tests {
                 Some(r) => assert_eq!(&got, r),
             }
         }
+    }
+
+    #[test]
+    fn measured_kernel_is_exact_for_every_lane_count_up_to_sixteen() {
+        for src in [
+            skewed(0x4EA5_0001, 4096),
+            (0..3000u32).map(|i| (i * 37) as u8).collect::<Vec<u8>>(),
+            Vec::new(),
+        ] {
+            for k in [1usize, 2, 4, 8, 16] {
+                let core = encode_measured(&src, k).unwrap();
+                let mut out = vec![0u8; src.len()];
+                decode_measured(&core, k, &mut out).unwrap();
+                assert_eq!(out, src, "measured kernel k={k} not exact");
+                // For k within the stored bound, the stored path must agree too.
+                if k <= MAX_LANES {
+                    let stored = encode_with_k(&src, k).unwrap();
+                    assert_eq!(core, stored, "measured encode differs from stored k={k}");
+                    assert_eq!(RANS0I.decode(&stored, src.len() as u64).unwrap(), src);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn measured_kernel_rejects_out_of_range_lane_counts() {
+        assert!(encode_measured(b"abc", 0).is_err());
+        assert!(encode_measured(b"abc", MAX_MEASURE_LANES + 1).is_err());
+        let mut out = [0u8; 3];
+        assert!(decode_measured(&[0u8; 600], 0, &mut out).is_err());
+        let core = encode_measured(b"abcabcabc", 16).unwrap();
+        assert!(decode_measured(&core, 17, &mut out).is_err());
     }
 
     #[test]
