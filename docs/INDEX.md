@@ -13,7 +13,8 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`ACCEPTANCE.md`](ACCEPTANCE.md) | The **10 hard acceptance gates**, each mapped to its implementing module, artifact and exact reproduction command, plus additional evidence. |
 | [`PROOFS.md`](PROOFS.md) | **Proved properties P1–P33** (machine 1 + machine 2 + the round-3/round-4 modules + the L1–L4 closure + the M1–M5 closure, tagged PROVED / EMPIRICALLY OBSERVED) and the honest limitations (resolved in L1–L4 and M1–M5, plus the remaining ones). |
 | [`RESULTS.md`](RESULTS.md) | **Measured results** — the speed-vs-space frontier, budget frontier, curves, hardware counters, machine 2, baselines, the cache competition, the 65,536-entry `T_4[x]` research outcome, the L1–L4 limits closures, and the M1–M5 rounds. |
-| [`CODEC.md`](CODEC.md) | **Machine 2** (`OrANS-RANS0`, compressing), **machine 3** (`OrANS-Store`, identity `V = N`) and **machine 4** (`OrANS-RANS0I`, interleaved) plus the `auto` representation policy. |
+| [`CODEC.md`](CODEC.md) | **Machine 2** (`OrANS-RANS0`, compressing), **machine 3** (`OrANS-Store`, identity `V = N`), **machine 4** (`OrANS-RANS0I`, interleaved) and **machine 5** (`OrANS-PACK`, directly-addressable fixed-width packing) plus the `auto` representation policy. |
+| [`PACKED_MACHINE.md`](PACKED_MACHINE.md) | **Machine 5** (`OrANS-PACK`, `machine_id = 5`): the directly-addressable fixed-width packed core (`ceil(N·bits/8)`, `O(1)` per position, constant/identity renderings), its `RepresentationPolicy::Packed` selection, and the packed-vs-rANS/raw/LZ4 frontier. |
 | [`BASELINES.md`](BASELINES.md) | **Conventional baseline comparison** (`RawVec`/`RawFile`/`Predecoded`/`IndexedArray`) plus machine 2 vs `raw`. |
 | [`COMPETITIVE.md`](COMPETITIVE.md) | **Region-scoped manifestation** vs an ordinary byte-budgeted LRU cache and raw/no-cache. |
 | [`ASYNC.md`](ASYNC.md) | The optional **`io_uring` asynchronous publication backend** — contract, durability ordering, and its honest runtime status/speed. |
@@ -77,7 +78,7 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`bench/rans.json`](../evidence/bench/rans.json) | Machine-2 ready decode context: prepared vs per-symbol rebuild (**165×** on skewed), byte-exact. |
 | [`bench/blocks.json`](../evidence/bench/blocks.json) | Machine-2 restartable blocks (256 B–64 KiB) vs genesis and the packed checkpoint container (**1/6**). |
 | [`bench/window.json`](../evidence/bench/window.json) | Bounded encoded-window reads for machines 2/4: 4 KiB on a 64 MiB object fetches 10,270,243 B → **16,440 B** (**625×**), same syscalls. |
-| [`bench/frontier.json`](../evidence/bench/frontier.json) | The engine vs indexed LZ4/Zstd (no cache / LRU / **pinned-hot**) and raw: hot index ratio, footprint at non-evicting hot access (**not** latency — the corrected headline). |
+| [`bench/frontier.json`](../evidence/bench/frontier.json) | The engine vs indexed LZ4/Zstd (no cache / LRU / **pinned-hot**) and raw: hot index ratio, footprint at non-evicting hot access (**not** latency — the corrected headline); plus the **`packed`** section (machine 5 vs rANS/raw/LZ4). |
 | [`bench/fuse-perf.json`](../evidence/bench/fuse-perf.json) | Measured FUSE read-path cost vs a direct read and the `FUSE` passthrough / `FUSE`-over-`io_uring` non-result. |
 | [`bench/batch.json`](../evidence/bench/batch.json) | Batched independent reconstruction: CPU-thread scaling (8.57× at 16 threads, every row byte-exact) and the GPU-unavailable verdict. |
 | [`counterexamples/bloom-key-0001.json`](../evidence/counterexamples/bloom-key-0001.json) | The rejected universal `T_4[x]` witness (key `175`, two equal-state/different-outcome positions). |

@@ -1,16 +1,19 @@
-# EKBLOOM — `OrANS-RANS0` (machine 2), `OrANS-Store` (machine 3) and `OrANS-RANS0I` (machine 4)
+# EKBLOOM — `OrANS-RANS0` (machine 2), `OrANS-Store` (machine 3), `OrANS-RANS0I` (machine 4) and `OrANS-PACK` (machine 5)
 
 The visible-representation machines. Where the authoritative machine `OrANS-NL2`
 (`machine_id = 1`) is expansion-only (`V = N`), machine 2 **compresses** skewed
 sources (`V < N`), machine 3 is the **identity** codec (`V = N`, no model
-header, never larger than raw), and machine 4 is the **interleaved** order-0 rANS —
+header, never larger than raw), machine 4 is the **interleaved** order-0 rANS —
 the same `V < N` compression as machine 2 but with `K` independent lane states, so
-the decode rate escapes machine 2's inherently serial state chain. Machine 1 is
+the decode rate escapes machine 2's inherently serial state chain — and machine 5
+(`OrANS-PACK`) is the **directly-addressable** fixed-width packing: a position is an
+`O(1)` shift/mask with no replay, at a fixed `ceil(N*bits/8)` size. Machine 1 is
 unchanged in every respect (its semantics, wire behaviour and tests are
 bit-identical).
 
-Machine 2's contract is the first half of this document; machine 3, machine 4 and
-the `auto` representation policy that chooses between them are the rest.
+Machine 2's contract is the first half of this document; machine 3, machine 4,
+machine 5 and the `auto` representation policy that chooses between them are the
+rest.
 
 This document freezes the machine-2 contract. The implementation lives in
 `src/machine_rans.rs`; the codec is exercised by `tests/machine_rans.rs`.
@@ -303,6 +306,68 @@ on a 4 KiB cold read (9,929 → 9,378 at K = 4; 9,347 → 8,736 at K = 8) and �
 64 KiB. Neither tuning removes the residual — the ordered renormalising cursor and
 the per-symbol gather are inherent to rANS.
 
+## Machine 5 — `OrANS-PACK` (`machine_id = 5`): directly-addressable fixed-width packing
+
+Machines 2 and 4 compress, but their decode is a dependent chain and a positional
+read from a cold restart pays a block skip plus the requested reveals. Machine 5
+gives that up deliberately: each symbol is a fixed `bits`-wide **index into the
+source alphabet**, so revealing position `i` is an **O(1) shift/mask** — no
+division, no modulo, no replay, no allocation — at a fixed
+`ceil(N * bits / 8)`-byte size instead of order-0 entropy coding. Implementation:
+[`src/machine_pack.rs`](../src/machine_pack.rs); tests:
+[`tests/machine_pack.rs`](../tests/machine_pack.rs); full write-up:
+[`docs/PACKED_MACHINE.md`](PACKED_MACHINE.md).
+
+**Core layout (`core = encode(source)`).**
+
+```text
+[bits: u8][k: u8][alphabet: k bytes][logical_len: u64 LE][payload ...]
+```
+
+`bits ∈ [1, 8]` (the encoder picks the smallest of `{1, 2, 4, 8}` that fits; a
+general width is decodable and reachable via `encode_with_bits`), `k` is the
+alphabet size or `0` for the **identity alphabet** (all 256 byte values present, no
+bytes stored, `symbol = index`), and the payload packs symbols little-endian within
+the bit stream. Position `i` reads `bit = i*bits`, `byte = bit >> 3`, `off = bit & 7`
+and masks — no division or modulo. Two special renderings: a **constant** source
+(`k == 1`) stores just the symbol with **zero payload**; the **identity** rendering
+(`bits = 8`, `k = 0`, payload `= source`) is the raw fallback, selected whenever
+packing does not beat raw, so a machine-5 core is never larger than raw plus its
+10-byte header.
+
+**Semantics.** Genesis `Omega_0 = (0, 0)`; the cursor **equals** the logical position
+(`p_i = i`), exactly as machines 1 and 3, so a complete resumable snapshot is
+`Snapshot::new(state, i)` and every general checkpoint / block / tile / bloom path
+applies unchanged. `skip` is **O(1)** (one cursor addition). `bulk_unpack` is a
+scalar, compiler-friendly unpack loop (no `unsafe` SIMD).
+
+**Measured** (4 MiB `skewed`, `examples/frontier.rs`, `evidence/bench/frontier.json`
+`packed`, byte-exact asserted before timing):
+
+| contender | core B | retained B | 1 B p50 | 4 KiB p50 | 64 KiB p50 | bulk GB/s |
+|---|---:|---:|---:|---:|---:|---:|
+| `packed-m5` (2-bit, `k = 4`) | 1,048,590 | **1,048,590** | **30** | **3,546** | **56,285** | **1.16** |
+| `rans0-m2` (+index) | 829,911 | 842,315 | 6,592 | 13,515 | 216,193 | 0.30 |
+| `rans0i-k4` (+index) | 829,926 | 876,155 | 4,027 | 9,317 | 148,386 | 0.44 |
+| raw-vec | 4,194,304 | 4,194,304 | 30 | 70 | 861 | 81.3 |
+| lz4-block-4096 | 2,675,864 | 2,675,864 | 2,013 | 2,024 | 32,059 | 2.04 |
+
+The calculated 4-symbol packed core is `N/4` bytes — **1,048,576** for 4 MiB;
+with the 14-byte header the measured core is 1,048,590 B. Against the two *compressing*
+machines it wins **every access axis** (1 B, 4 KiB, 64 KiB, bulk) with no index, but
+it is **larger** than order-0 rANS on this low-entropy source (fixed 2 bits/symbol
+vs ≈1.49) and does not beat raw `memcpy` or indexed LZ4 on raw speed. On `mixed`
+(half uniform) the alphabet is all 256 bytes, packing does not help, and the machine
+falls back to the identity rendering (`N + 10` B) — the honest incompressible-data
+loss. Full tables in [`docs/PACKED_MACHINE.md`](PACKED_MACHINE.md).
+
+**Selection.** The historical `auto` policy is unchanged
+([`RepresentationPolicy::Auto`](../src/manifest.rs)). Machine 5 is admitted by the
+explicit [`RepresentationPolicy::Packed`](../src/manifest.rs) (machine 5 when its
+core is smaller than raw, else `Auto`), via `select_machine_policy`,
+`select_machine_packed`, `create_auto_with_policy` and `create_auto_packed`. No
+existing machine choice changes under `Auto`.
+
 ## The `auto` representation policy
 
 `create --machine auto` (the CLI default) and `manifest::create_auto` try machine 2
@@ -310,7 +375,11 @@ first; if the encoded core is **not** smaller than the source (`core_len >=
 source_len`) they use machine 3, so **EKBLOOM never stores more than raw for the
 base representation** (`V <= N` for every source). The chosen machine is recorded
 in the body (and therefore the `.ekb` header and `MANIFEST`) exactly as an explicit
-id. Explicit `--machine 1|2|3` overrides the policy.
+id. Explicit `--machine 1|2|3|4|5` overrides the policy. Machine 4 and machine 5 are
+deliberately **not** selected by `Auto` (machine 4's core is machine 2's plus a
+`4 + 4K` header; machine 5 trades size for `O(1)` access). Machine 5 is reachable
+through `RepresentationPolicy::Packed` / `create_auto_packed` (see the machine-5
+section), never by the default `Auto`.
 
 `create_auto` reuses the encoded core the decision already produced, so the winning
 encode runs **once** instead of twice; `create_auto_within_budget` does the same.
@@ -337,5 +406,7 @@ for skewed data machine 2 still wins (`V < N`).
 ```sh
 sh scripts/container-verify.sh          # fmt + clippy -D warnings + full suite
 sh scripts/container-test.sh --test machine_rans -- --nocapture
+sh scripts/container-test.sh --test machine_pack -- --nocapture
 sh scripts/run-rans.sh                  # writes evidence/bench/rans.json
+sh scripts/run-frontier.sh              # writes evidence/bench/frontier.json (incl. `packed`)
 ```

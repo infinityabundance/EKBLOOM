@@ -310,6 +310,34 @@ is that EKBLOOM holds the **footprint** game (and non-eviction *at* that footpri
 *narrows but does not close* the **cold decode-rate** game (≈5–7× → ≈4.7–4.9×
 behind LZ4).
 
+### 4.1 Machine 5 — packed direct addressing (`OrANS-PACK`)
+
+The `packed` section of [`frontier.json`](../evidence/bench/frontier.json) adds the
+**directly-addressable** machine 5 ([`docs/PACKED_MACHINE.md`](PACKED_MACHINE.md))
+to the same head-to-head. It stores each symbol as a fixed `bits`-wide index into
+the source alphabet, so a position is an `O(1)` shift/mask with **no index and no
+replay**. On the 4-symbol `skewed` corpus the calculated core is `N/4 = 1,048,576`
+bytes (measured `1,048,590` B with the 14-byte header) — a fixed 2 bits/symbol.
+
+| contender | core B | retained B | 1 B p50 | 4 KiB p50 | 4 KiB p99 | 64 KiB p50 | bulk GB/s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `packed-m5` (2-bit, `k=4`) | 1,048,590 | **1,048,590** | **30** | **3,546** | **3,567** | **56,285** | **1.16** |
+| `rans0-m2` (+index) | 829,911 | 842,315 | 6,592 | 13,515 | 16,551 | 216,193 | 0.30 |
+| `rans0i-k4` (+index) | 829,926 | 876,155 | 4,027 | 9,317 | 13,856 | 148,386 | 0.44 |
+| raw-vec | 4,194,304 | 4,194,304 | 30 | 70 | 100 | 861 | 81.3 |
+| lz4-block-4096 | 2,675,864 | 2,675,864 | 2,013 | 2,024 | 2,254 | 32,059 | 2.04 |
+
+**Where it wins.** Against the two *compressing* machines — the only contenders that
+also reduce the footprint below raw — machine 5 is faster on **every access axis**
+(1 B `30 ns` vs `4,027–6,592`; 4 KiB `3,546 ns` vs `9,317–13,515`; 64 KiB
+`56,285 ns` vs `148,386–216,193`; bulk `1.16 GB/s` vs `0.30–0.44`) with **no index**
+and 1-byte reads at raw-index parity. **Where it loses.** It is **larger** than
+order-0 rANS on this low-entropy source (fixed 2 bits/symbol vs ≈1.49) and does not
+beat raw `memcpy` (4 KiB `70 ns`, bulk `81 GB/s`) or indexed LZ4 (4 KiB `2,024 ns`,
+bulk `2.04 GB/s`). On `mixed` the uniform half makes the alphabet all 256 bytes, so
+packing does not help and the machine falls back to the identity rendering
+(`N + 10` B) — the honest incompressible-data loss.
+
 ## 5. What the numbers show
 
 - **Base footprint.** Under `auto`, `uniform` stores exactly `N` (machine 3, no

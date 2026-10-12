@@ -1,6 +1,6 @@
 //! The authoritative byte machines.
 //!
-//! EKBLOOM 0.3 ships four concrete machines. `OrANS-NL2` (`machine_id = 1`) is a
+//! EKBLOOM 0.3 ships five concrete machines. `OrANS-NL2` (`machine_id = 1`) is a
 //! deterministic, exactly invertible state-*expansion* machine (`V = N`); see
 //! `docs/DESIGN.md` §1 for the frozen contract. `OrANS-RANS0` (`machine_id = 2`)
 //! additionally *compresses* skewed sources (`V < N`); see `docs/CODEC.md` and
@@ -12,9 +12,14 @@
 //! `OrANS-RANS0I` (`machine_id = 4`) is the **interleaved** order-0 rANS: the same
 //! model and `V < N` as machine 2, but `K` independent lane states whose per-group
 //! steps are independent, so decode throughput escapes machine 2's serial chain.
-//! See [`crate::machine_rans_i`].
+//! See [`crate::machine_rans_i`]. `OrANS-PACK` (`machine_id = 5`) is the
+//! **directly-addressable** fixed-width packed representation: each symbol is a
+//! `bits`-wide index into the source alphabet, so any position is an O(1)
+//! shift/mask with no replay, at the cost of fixed-width size (`ceil(N*bits/8)`).
+//! See [`crate::machine_pack`].
 
 use crate::error::{EkbloomError, Result};
+use crate::machine_pack::{PackContext, PACK};
 use crate::machine_rans::{RansContext, RANS0};
 use crate::machine_rans_i::{RansIContext, RANS0I};
 use crate::machine_store::STORE;
@@ -31,6 +36,9 @@ pub const MACHINE_STORE: u32 = 3;
 
 /// Machine identifier for `OrANS-RANS0I` (interleaved order-0 rANS).
 pub const MACHINE_RANS0I: u32 = 4;
+
+/// Machine identifier for `OrANS-PACK` (directly-addressable fixed-width packing).
+pub const MACHINE_PACK: u32 = 5;
 
 const fn build_sbox() -> [u8; 256] {
     let mut s = [0u8; 256];
@@ -218,6 +226,8 @@ pub enum Prepared<'a> {
     Rans(Box<RansContext>),
     /// A prepared `OrANS-RANS0I` interleaved decoder context (machine 4).
     RansI(Box<RansIContext>),
+    /// A prepared `OrANS-PACK` packed decoder context (machine 5).
+    Pack(Box<PackContext>),
 }
 
 impl Prepared<'_> {
@@ -228,6 +238,7 @@ impl Prepared<'_> {
             Prepared::Delegated(machine) => machine.reveal(core, omega),
             Prepared::Rans(ctx) => ctx.reveal(core, omega),
             Prepared::RansI(ctx) => ctx.reveal(core, omega),
+            Prepared::Pack(ctx) => ctx.reveal(core, omega),
         }
     }
 
@@ -238,6 +249,7 @@ impl Prepared<'_> {
             Prepared::Delegated(machine) => machine.peek(core, omega),
             Prepared::Rans(ctx) => ctx.peek(core, omega),
             Prepared::RansI(ctx) => ctx.peek(core, omega),
+            Prepared::Pack(ctx) => ctx.peek(core, omega),
         }
     }
 
@@ -246,6 +258,7 @@ impl Prepared<'_> {
         match self {
             Prepared::Rans(ctx) => ctx.skip(core, omega, n),
             Prepared::RansI(ctx) => ctx.skip(core, omega, n),
+            Prepared::Pack(ctx) => ctx.skip(core, omega, n),
             _ => {
                 for _ in 0..n {
                     self.reveal(core, omega)?;
@@ -267,6 +280,9 @@ impl Prepared<'_> {
             return ctx.decode_into(core, omega, n, out);
         }
         if let Prepared::Rans(ctx) = self {
+            return ctx.decode_into(core, omega, n, out);
+        }
+        if let Prepared::Pack(ctx) = self {
             return ctx.decode_into(core, omega, n, out);
         }
         if let Ok(cap) = usize::try_from(n) {
@@ -294,6 +310,8 @@ impl Prepared<'_> {
         match self {
             Prepared::Rans(ctx) => ctx.header_bytes(),
             Prepared::RansI(ctx) => ctx.header_bytes(),
+            // `OrANS-PACK` is cursor==position: the minimal cursor is 0.
+            Prepared::Pack(_) => 0,
             Prepared::Delegated(_) => 0,
         }
     }
@@ -318,6 +336,7 @@ impl Prepared<'_> {
             }
             Prepared::RansI(ctx) => ctx.validate_snapshot(omega),
             Prepared::Delegated(_) => Ok(()),
+            Prepared::Pack(_) => Ok(()),
         }
     }
 }
@@ -331,6 +350,7 @@ pub fn prepare<'a>(machine: &'a dyn OrMachine, core: &[u8]) -> Result<Prepared<'
     match machine.machine_id() {
         MACHINE_RANS0 => Ok(Prepared::Rans(Box::new(RansContext::from_core(core)?))),
         MACHINE_RANS0I => Ok(Prepared::RansI(Box::new(RansIContext::from_core(core)?))),
+        MACHINE_PACK => Ok(Prepared::Pack(Box::new(PackContext::from_core(core)?))),
         _ => Ok(Prepared::Delegated(machine)),
     }
 }
@@ -342,6 +362,7 @@ pub fn machine_by_id(id: u32) -> Option<&'static dyn OrMachine> {
         MACHINE_RANS0 => Some(&RANS0),
         MACHINE_STORE => Some(&STORE),
         MACHINE_RANS0I => Some(&RANS0I),
+        MACHINE_PACK => Some(&PACK),
         _ => None,
     }
 }

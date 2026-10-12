@@ -16,13 +16,14 @@
 //! sequential scan** — the non-eviction property.
 
 use ekbloom::adapt::{Workload, WorkloadKind};
+use ekbloom::machine_rans::RansContext;
 use ekbloom::machine_rans_i::{decode_measured, encode_measured};
 use ekbloom::{
     create_auto, create_machine, encode_with_k, machine_by_id, now_ns, percentiles,
     pinned_block_count, prepare, select_machine, spread_offsets, AccessTrace, BlockIndex,
     DirectoryKind, EkbloomBody, Engine, HotBlockCache, ManifestationBudget, ManifestationProfile,
-    OrMachine, Percentiles, PinnedHotCache, RansIContext, ReadRequest, TileSet, MACHINE_RANS0I,
-    MACHINE_STORE, RANS0,
+    OrMachine, PackContext, Percentiles, PinnedHotCache, RansIContext, ReadRequest, TileSet,
+    MACHINE_PACK, MACHINE_RANS0, MACHINE_RANS0I, MACHINE_STORE, PACK, RANS0, RANS0I,
 };
 use std::path::Path;
 
@@ -1208,6 +1209,362 @@ fn measure_decode(source: &[u8]) -> ekbloom::Result<Vec<DecodeRate>> {
     Ok(rows)
 }
 
+// ---------------------------------------------------------------------------
+// MACHINE 5 — `OrANS-PACK`: fixed-width packed direct addressing vs order-0 rANS
+// (machines 2/4), raw storage and indexed/pinned LZ4. A packed position is an
+// `O(1)` shift/mask (cursor == position, no index, no replay); a cursor-divergent
+// rANS position needs a certified block restart plus the skipped symbols. Every
+// contender is asserted byte-exact before timing.
+// ---------------------------------------------------------------------------
+
+/// One packed-machine contender row.
+struct PackedContender {
+    name: String,
+    class: String,
+    core_bytes: u64,
+    retained_bytes: u64,
+    one_b_p50: f64,
+    one_b_p99: f64,
+    r4k_p50: f64,
+    r4k_p99: f64,
+    r64k_p50: f64,
+    r64k_p99: f64,
+    bulk_gb_s: f64,
+    exact: bool,
+    note: String,
+}
+
+/// The packed head-to-head for one corpus.
+struct PackedCorpus {
+    name: String,
+    source_len: u64,
+    alphabet: usize,
+    bits: u8,
+    packed_core_bytes: u64,
+    machine2_core_bytes: u64,
+    machine4_core_bytes: u64,
+    packed_retained_bytes: u64,
+    contenders: Vec<PackedContender>,
+}
+
+/// Assemble one packed contender from its measured percentiles and bulk time.
+#[allow(clippy::too_many_arguments)]
+fn packed_point(
+    name: &str,
+    class: &str,
+    core_bytes: u64,
+    retained: u64,
+    one: &Percentiles,
+    r4k: &Percentiles,
+    r64k: &Percentiles,
+    bulk_ns: u64,
+    n: u64,
+    exact: bool,
+    note: String,
+) -> PackedContender {
+    PackedContender {
+        name: name.to_string(),
+        class: class.to_string(),
+        core_bytes,
+        retained_bytes: retained,
+        one_b_p50: one.p50,
+        one_b_p99: one.p99,
+        r4k_p50: r4k.p50,
+        r4k_p99: r4k.p99,
+        r64k_p50: r64k.p50,
+        r64k_p99: r64k.p99,
+        bulk_gb_s: if bulk_ns > 0 {
+            n as f64 / bulk_ns as f64
+        } else {
+            0.0
+        },
+        exact,
+        note,
+    }
+}
+
+/// Direct `O(1)` positional read from a packed context: a single symbol is one
+/// shift/mask; a range is the tight sequential unpack kernel (no index, no replay).
+fn packed_direct_read(ctx: &PackContext, core: &[u8], off: u64, len: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len as usize);
+    if len == 1 {
+        out.push(ctx.byte_at(core, off).unwrap_or(0));
+    } else {
+        ctx.unpack_range(core, off, len, &mut out)
+            .expect("packed range");
+    }
+    out
+}
+
+/// Best-of-3 bulk reconstruction time of `decode` from genesis into a fresh buffer,
+/// folding byte-exactness into `exact`.
+fn bulk_ns(source: &[u8], exact: &mut bool, mut decode: impl FnMut(&mut Vec<u8>)) -> u64 {
+    let mut best = u64::MAX;
+    for _ in 0..3 {
+        let mut out = Vec::with_capacity(source.len());
+        let t = now_ns();
+        decode(&mut out);
+        best = best.min(now_ns().saturating_sub(t));
+        *exact &= out == source;
+    }
+    best
+}
+
+/// Measure the packed-machine head-to-head for one corpus.
+fn measure_packed(name: &str, source: &[u8]) -> ekbloom::Result<PackedCorpus> {
+    let n = source.len() as u64;
+    let offs1 = spread_offsets(0x9E51_0001, SAMPLES, n, 1);
+    let slots4 = (n / READ).max(1);
+    let offs4: Vec<u64> = (0..SAMPLES as u64)
+        .map(|i| i.wrapping_mul(7919) % slots4 * READ)
+        .collect();
+    let slots64 = (n / COLD64K).max(1);
+    let offs64: Vec<u64> = (0..SAMPLES as u64)
+        .map(|i| i.wrapping_mul(7919) % slots64 * COLD64K)
+        .collect();
+    let slice = |off: u64, len: u64| source[off as usize..(off + len) as usize].to_vec();
+    let mut contenders = Vec::new();
+
+    // ---- machine 5: packed, direct O(1), no index (cursor == position).
+    let m5 = machine_by_id(MACHINE_PACK).expect("machine 5 is registered");
+    let core5 = m5.encode(source)?;
+    let ctx5 = PackContext::from_core(&core5)?;
+    let bits5 = ctx5.bits();
+    let alphabet = if ctx5.alphabet_len() == 0 {
+        256
+    } else {
+        ctx5.alphabet_len()
+    };
+    let mut exact5 = true;
+    for &off in offs4.iter().take(16) {
+        exact5 &= packed_direct_read(&ctx5, &core5, off, READ) == slice(off, READ);
+    }
+    let one5 = time_reads(&offs1, |off| packed_direct_read(&ctx5, &core5, off, 1));
+    let r4_5 = time_reads(&offs4, |off| packed_direct_read(&ctx5, &core5, off, READ));
+    let r64_5 = time_reads(&offs64, |off| {
+        packed_direct_read(&ctx5, &core5, off, COLD64K)
+    });
+    let bulk5 = bulk_ns(source, &mut exact5, |out| {
+        PACK.bulk_unpack(&core5, out).expect("packed bulk");
+    });
+    contenders.push(packed_point(
+        "packed-m5",
+        "packed",
+        core5.len() as u64,
+        core5.len() as u64,
+        &one5,
+        &r4_5,
+        &r64_5,
+        bulk5,
+        n,
+        exact5,
+        format!(
+            "machine 5 OrANS-PACK, {bits5}-bit, alphabet {alphabet}, no index (cursor==position)"
+        ),
+    ));
+
+    // ---- machine 2 (single-state order-0 rANS) with a certified 4 KiB block index.
+    let core2 = RANS0.encode(source)?;
+    let idx2 = BlockIndex::build_machine(&core2, n, READ as u32, MACHINE_RANS0)?;
+    let idx2_bytes = idx2.directory_bytes() + idx2.restart_bytes();
+    let rans_ctx = RansContext::from_core(&core2)?;
+    let mut exact2 = true;
+    for &off in offs4.iter().take(16) {
+        exact2 &= idx2
+            .read_range_counted_rans(&core2, &rans_ctx, off, READ)?
+            .0
+            == slice(off, READ);
+    }
+    let one2 = time_reads(&offs1, |off| {
+        idx2.read_range_counted_rans(&core2, &rans_ctx, off, 1)
+            .unwrap()
+            .0
+    });
+    let r4_2 = time_reads(&offs4, |off| {
+        idx2.read_range_counted_rans(&core2, &rans_ctx, off, READ)
+            .unwrap()
+            .0
+    });
+    let r64_2 = time_reads(&offs64, |off| {
+        idx2.read_range_counted_rans(&core2, &rans_ctx, off, COLD64K)
+            .unwrap()
+            .0
+    });
+    let bulk2 = bulk_ns(source, &mut exact2, |out| {
+        let ctx = prepare(&RANS0, &core2).expect("prepare m2");
+        let mut omega = RANS0.init(&core2).expect("init m2");
+        ctx.decode_into(&core2, &mut omega, n, out)
+            .expect("decode m2");
+    });
+    contenders.push(packed_point(
+        "rans0-m2",
+        "rANS",
+        core2.len() as u64,
+        core2.len() as u64 + idx2_bytes,
+        &one2,
+        &r4_2,
+        &r64_2,
+        bulk2,
+        n,
+        exact2,
+        format!("machine 2 OrANS-RANS0 + {idx2_bytes} B certified 4 KiB block index"),
+    ));
+
+    // ---- machine 4 (interleaved order-0 rANS, K=4) with a certified block index.
+    let core4 = encode_with_k(source, 4)?;
+    let idx4 = BlockIndex::build_machine(&core4, n, READ as u32, MACHINE_RANS0I)?;
+    let idx4_bytes = idx4.directory_bytes() + idx4.restart_bytes();
+    let ictx = RansIContext::from_core(&core4)?;
+    let mut exact4 = true;
+    for &off in offs4.iter().take(16) {
+        exact4 &= idx4.read_range_counted_rans_i(&core4, &ictx, off, READ)?.0 == slice(off, READ);
+    }
+    let one4 = time_reads(&offs1, |off| {
+        idx4.read_range_counted_rans_i(&core4, &ictx, off, 1)
+            .unwrap()
+            .0
+    });
+    let r4_4 = time_reads(&offs4, |off| {
+        idx4.read_range_counted_rans_i(&core4, &ictx, off, READ)
+            .unwrap()
+            .0
+    });
+    let r64_4 = time_reads(&offs64, |off| {
+        idx4.read_range_counted_rans_i(&core4, &ictx, off, COLD64K)
+            .unwrap()
+            .0
+    });
+    let bulk4 = bulk_ns(source, &mut exact4, |out| {
+        let ctx = prepare(&RANS0I, &core4).expect("prepare m4");
+        let mut omega = RANS0I.init(&core4).expect("init m4");
+        ctx.decode_into(&core4, &mut omega, n, out)
+            .expect("decode m4");
+    });
+    contenders.push(packed_point(
+        "rans0i-k4",
+        "rANS",
+        core4.len() as u64,
+        core4.len() as u64 + idx4_bytes,
+        &one4,
+        &r4_4,
+        &r64_4,
+        bulk4,
+        n,
+        exact4,
+        format!("machine 4 OrANS-RANS0I K=4 + {idx4_bytes} B certified 4 KiB block index"),
+    ));
+
+    // ---- raw storage (the memcpy reference).
+    let raw = source.to_vec();
+    let one_raw = time_reads(&offs1, |off| slice(off, 1));
+    let r4_raw = time_reads(&offs4, |off| slice(off, READ));
+    let r64_raw = time_reads(&offs64, |off| slice(off, COLD64K));
+    let mut exact_raw = true;
+    let bulk_raw = bulk_ns(source, &mut exact_raw, |out| {
+        out.extend_from_slice(&raw);
+    });
+    contenders.push(packed_point(
+        "raw-vec",
+        "raw",
+        n,
+        n,
+        &one_raw,
+        &r4_raw,
+        &r64_raw,
+        bulk_raw,
+        n,
+        exact_raw,
+        "raw storage; a positional slice is a memcpy".to_string(),
+    ));
+
+    // ---- block-indexed LZ4 (4 KiB grid), and the pinned-hot variant.
+    let blocks: Vec<Vec<u8>> = source
+        .chunks(READ as usize)
+        .map(lz4_flex::compress)
+        .collect();
+    let lz4_index = blocks.len() as u64 * 4;
+    let lz4_storage = blocks.iter().map(|b| b.len() as u64).sum::<u64>() + lz4_index;
+    let mut exact_lz4 = true;
+    for &off in offs4.iter().take(16) {
+        exact_lz4 &=
+            lz4_read_blocked(&blocks, READ as usize, source.len(), off, READ) == slice(off, READ);
+    }
+    let one_lz4 = time_reads(&offs1, |off| {
+        lz4_read_blocked(&blocks, READ as usize, source.len(), off, 1)
+    });
+    let r4_lz4 = time_reads(&offs4, |off| {
+        lz4_read_blocked(&blocks, READ as usize, source.len(), off, READ)
+    });
+    let r64_lz4 = time_reads(&offs64, |off| {
+        lz4_read_blocked(&blocks, READ as usize, source.len(), off, COLD64K)
+    });
+    let bulk_lz4 = bulk_ns(source, &mut exact_lz4, |out| {
+        for (b, blk) in blocks.iter().enumerate() {
+            let start = b * READ as usize;
+            let full = (source.len() - start).min(READ as usize);
+            out.extend_from_slice(&lz4_flex::decompress(blk, full).expect("lz4 block"));
+        }
+    });
+    contenders.push(packed_point(
+        "lz4-block-4096",
+        "indexed",
+        lz4_storage,
+        lz4_storage,
+        &one_lz4,
+        &r4_lz4,
+        &r64_lz4,
+        bulk_lz4,
+        n,
+        exact_lz4,
+        format!("{READ} B LZ4 block grid + {lz4_index} B offset table"),
+    ));
+
+    let pin_count = pinned_block_count(HOT_BYTES, READ, blocks.len() as u64);
+    let mut pin_cache = PinnedHotCache::new(READ, pin_count as usize);
+    let pinned = pin_lz4_hot(&mut pin_cache, &blocks, source.len(), HOT_BYTES);
+    assert_eq!(pinned, pin_count, "all hot LZ4 blocks must pin");
+    let pinned_bytes = pin_cache.pinned_bytes();
+    let mut exact_pin = true;
+    for &off in offs4.iter().take(16) {
+        exact_pin &=
+            lz4_read_pinned(&mut pin_cache, &blocks, source.len(), off, READ) == slice(off, READ);
+    }
+    let one_pin = time_reads(&offs1, |off| {
+        lz4_read_pinned(&mut pin_cache, &blocks, source.len(), off, 1)
+    });
+    let r4_pin = time_reads(&offs4, |off| {
+        lz4_read_pinned(&mut pin_cache, &blocks, source.len(), off, READ)
+    });
+    let r64_pin = time_reads(&offs64, |off| {
+        lz4_read_pinned(&mut pin_cache, &blocks, source.len(), off, COLD64K)
+    });
+    contenders.push(packed_point(
+        "lz4-block-4096+pinned",
+        "indexed",
+        lz4_storage,
+        lz4_storage + pinned_bytes,
+        &one_pin,
+        &r4_pin,
+        &r64_pin,
+        bulk_lz4,
+        n,
+        exact_pin,
+        format!("same storage + {pinned_bytes} B pinned decoded hot set (non-evicting)"),
+    ));
+
+    Ok(PackedCorpus {
+        name: name.to_string(),
+        source_len: n,
+        alphabet,
+        bits: bits5,
+        packed_core_bytes: core5.len() as u64,
+        machine2_core_bytes: core2.len() as u64,
+        machine4_core_bytes: core4.len() as u64,
+        packed_retained_bytes: core5.len() as u64,
+        contenders,
+    })
+}
+
 /// One measured contender.
 #[derive(Clone)]
 struct Row {
@@ -1792,6 +2149,7 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_json(
     corpora: &[CorpusReport],
     hot: &HotIndex,
@@ -1800,6 +2158,7 @@ fn render_json(
     auto: &AutoReuse,
     cold: &[ColdReport],
     decode: &[DecodeRate],
+    packed: &[PackedCorpus],
 ) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
@@ -1994,6 +2353,59 @@ fn render_json(
         s.push('\n');
     }
     s.push_str("  ],\n");
+    s.push_str("  \"packed\": [\n");
+    for (pi, p) in packed.iter().enumerate() {
+        s.push_str("    {\n");
+        let _ = writeln!(s, "      \"name\": \"{}\",", json_escape(&p.name));
+        let _ = writeln!(s, "      \"source_len\": {},", p.source_len);
+        let _ = writeln!(s, "      \"alphabet\": {},", p.alphabet);
+        let _ = writeln!(s, "      \"bits\": {},", p.bits);
+        let _ = writeln!(s, "      \"packed_core_bytes\": {},", p.packed_core_bytes);
+        let _ = writeln!(
+            s,
+            "      \"machine2_core_bytes\": {},",
+            p.machine2_core_bytes
+        );
+        let _ = writeln!(
+            s,
+            "      \"machine4_core_bytes\": {},",
+            p.machine4_core_bytes
+        );
+        let _ = writeln!(
+            s,
+            "      \"packed_retained_bytes\": {},",
+            p.packed_retained_bytes
+        );
+        s.push_str("      \"contenders\": [\n");
+        for (ri, r) in p.contenders.iter().enumerate() {
+            s.push_str("        {\n");
+            let _ = writeln!(s, "          \"name\": \"{}\",", json_escape(&r.name));
+            let _ = writeln!(s, "          \"class\": \"{}\",", r.class);
+            let _ = writeln!(s, "          \"core_bytes\": {},", r.core_bytes);
+            let _ = writeln!(s, "          \"retained_bytes\": {},", r.retained_bytes);
+            let _ = writeln!(s, "          \"one_b_p50_ns\": {:.1},", finite(r.one_b_p50));
+            let _ = writeln!(s, "          \"one_b_p99_ns\": {:.1},", finite(r.one_b_p99));
+            let _ = writeln!(s, "          \"r4k_p50_ns\": {:.1},", finite(r.r4k_p50));
+            let _ = writeln!(s, "          \"r4k_p99_ns\": {:.1},", finite(r.r4k_p99));
+            let _ = writeln!(s, "          \"r64k_p50_ns\": {:.1},", finite(r.r64k_p50));
+            let _ = writeln!(s, "          \"r64k_p99_ns\": {:.1},", finite(r.r64k_p99));
+            let _ = writeln!(s, "          \"bulk_gb_s\": {:.3},", finite(r.bulk_gb_s));
+            let _ = writeln!(s, "          \"exact\": {},", r.exact);
+            let _ = writeln!(s, "          \"note\": \"{}\"", json_escape(&r.note));
+            let _ = write!(s, "        }}");
+            if ri + 1 < p.contenders.len() {
+                s.push(',');
+            }
+            s.push('\n');
+        }
+        s.push_str("      ]\n");
+        let _ = write!(s, "    }}");
+        if pi + 1 < packed.len() {
+            s.push(',');
+        }
+        s.push('\n');
+    }
+    s.push_str("  ],\n");
     s.push_str("  \"corpora\": [\n");
     for (ci, c) in corpora.iter().enumerate() {
         s.push_str("    {\n");
@@ -2171,6 +2583,48 @@ fn print_decode_table(decode: &[DecodeRate]) {
     }
 }
 
+fn print_packed_table(packed: &[PackedCorpus]) {
+    for p in packed {
+        println!(
+            "\n== PACKED machine 5 vs rANS vs raw vs LZ4 (corpus {}) ==  alphabet {}, {}-bit, packed core {} B, machine2 core {} B, machine4 core {} B",
+            p.name,
+            p.alphabet,
+            p.bits,
+            p.packed_core_bytes,
+            p.machine2_core_bytes,
+            p.machine4_core_bytes
+        );
+        println!(
+            "{:<22} {:<8} {:>10} {:>10} {:>9} {:>9} {:>9} {:>10} {:>9} {:>6}",
+            "contender",
+            "class",
+            "core",
+            "retained",
+            "1B p50",
+            "4k p50",
+            "4k p99",
+            "64k p50",
+            "bulk GB/s",
+            "exact"
+        );
+        for r in &p.contenders {
+            println!(
+                "{:<22} {:<8} {:>10} {:>10} {:>9.0} {:>9.0} {:>9.0} {:>10.0} {:>9.2} {:>6}",
+                r.name,
+                r.class,
+                r.core_bytes,
+                r.retained_bytes,
+                r.one_b_p50,
+                r.r4k_p50,
+                r.r4k_p99,
+                r.r64k_p50,
+                r.bulk_gb_s,
+                r.exact
+            );
+        }
+    }
+}
+
 fn main() -> ekbloom::Result<()> {
     let skew_src = skewed(0xE7B0_0000_00CC_0001, N);
     let hot_index = measure_hot_index(&skew_src)?;
@@ -2188,10 +2642,16 @@ fn main() -> ekbloom::Result<()> {
         .collect::<ekbloom::Result<Vec<_>>>()?;
     let decode = measure_decode(&skew_src)?;
     let auto_reuse = measure_auto_reuse(&skew_src)?;
+    let packed: Vec<PackedCorpus> = corpus_list
+        .iter()
+        .filter(|(name, _)| *name == "skewed" || *name == "mixed")
+        .map(|(name, source)| measure_packed(name, source))
+        .collect::<ekbloom::Result<Vec<_>>>()?;
 
     print_table(&corpora);
     print_cold_table(&cold);
     print_decode_table(&decode);
+    print_packed_table(&packed);
 
     println!("\n== hot index (fully resident, allocation-parity) ==");
     println!(
@@ -2279,6 +2739,36 @@ fn main() -> ekbloom::Result<()> {
     println!("  reproducible advantage over indexed codecs: {advantage_win}");
     println!("  HOLDS: {holds}");
 
+    println!("\n== PACKED summary (machine 5) ==");
+    for p in &packed {
+        let packed_8 = p.source_len / 8;
+        let packed_4 = p.source_len / 4;
+        let best_retained = p
+            .contenders
+            .iter()
+            .map(|c| c.retained_bytes)
+            .min()
+            .unwrap_or(0);
+        let best_bulk = p
+            .contenders
+            .iter()
+            .map(|c| c.bulk_gb_s)
+            .fold(0.0f64, f64::max);
+        println!(
+            "  {:<7}: alphabet {}, {}-bit; core {} B (N/4 = {}, N/8 = {}); machine2 core {} B; smallest retained {} B; best bulk {:.2} GB/s; all exact {}",
+            p.name,
+            p.alphabet,
+            p.bits,
+            p.packed_core_bytes,
+            packed_4,
+            packed_8,
+            p.machine2_core_bytes,
+            best_retained,
+            best_bulk,
+            p.contenders.iter().all(|c| c.exact)
+        );
+    }
+
     let json = render_json(
         &corpora,
         &hot_index,
@@ -2287,6 +2777,7 @@ fn main() -> ekbloom::Result<()> {
         &auto_reuse,
         &cold,
         &decode,
+        &packed,
     );
     let out = Path::new("evidence/bench/frontier.json");
     if let Some(parent) = out.parent() {

@@ -35,7 +35,9 @@ use crate::bloom_region::build_regional_with;
 use crate::checkpoint::CheckpointSet;
 use crate::error::{EkbloomError, Result};
 use crate::history::History;
-use crate::machine::{machine_by_id, OrMachine, MACHINE_NL2, MACHINE_RANS0, MACHINE_STORE};
+use crate::machine::{
+    machine_by_id, OrMachine, MACHINE_NL2, MACHINE_PACK, MACHINE_RANS0, MACHINE_STORE,
+};
 use crate::state::Snapshot;
 use crate::tiles::TileSet;
 use crate::{ManifestationBudget, ManifestationProfile};
@@ -297,6 +299,78 @@ fn select_machine_with_core(source: &[u8]) -> Result<(u32, Vec<u8>)> {
 pub fn create_auto(source: &[u8], profile: ManifestationProfile) -> Result<EkbloomBody> {
     let (machine_id, core) = select_machine_with_core(source)?;
     build_body(core, source.len() as u64, machine_id, profile)
+}
+
+/// The representation policy for the `auto` family.
+///
+/// [`RepresentationPolicy::Auto`] is the historical policy (machine 2 when it
+/// shrinks the source, else machine 3) and is unchanged. [`RepresentationPolicy::Packed`]
+/// additionally admits machine 5 (`OrANS-PACK`, directly addressable, `O(1)` per
+/// position) whenever its core is smaller than raw, trading a possibly larger core
+/// than order-0 rANS for constant-time positional access; when packing does not
+/// beat raw it falls back to [`RepresentationPolicy::Auto`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RepresentationPolicy {
+    /// Machine 2 when it shrinks the source, else machine 3 (the default).
+    #[default]
+    Auto,
+    /// Machine 5 (`OrANS-PACK`) when its core is smaller than raw, else `Auto`.
+    Packed,
+}
+
+/// The machine chosen by `policy` for `source` (the policy-aware [`select_machine`]).
+///
+/// [`RepresentationPolicy::Auto`] is byte-identical to [`select_machine`]; existing
+/// machine choices are unchanged.
+pub fn select_machine_policy(source: &[u8], policy: RepresentationPolicy) -> Result<u32> {
+    Ok(select_machine_with_core_policy(source, policy)?.0)
+}
+
+/// [`select_machine_policy`] for [`RepresentationPolicy::Packed`]: machine 5 when
+/// its core is smaller than raw, else the `Auto` policy.
+pub fn select_machine_packed(source: &[u8]) -> Result<u32> {
+    select_machine_policy(source, RepresentationPolicy::Packed)
+}
+
+/// The policy decision together with the encoded core it was made against, so
+/// [`create_auto_with_policy`] never encodes the winning machine twice.
+fn select_machine_with_core_policy(
+    source: &[u8],
+    policy: RepresentationPolicy,
+) -> Result<(u32, Vec<u8>)> {
+    match policy {
+        RepresentationPolicy::Auto => select_machine_with_core(source),
+        RepresentationPolicy::Packed => {
+            let machine = machine_by_id(MACHINE_PACK)
+                .ok_or(EkbloomError::UnknownMachine { id: MACHINE_PACK })?;
+            let core = machine.encode(source)?;
+            if core.len() < source.len() {
+                Ok((MACHINE_PACK, core))
+            } else {
+                select_machine_with_core(source)
+            }
+        }
+    }
+}
+
+/// Build a fresh body from `source` with the machine selected by `policy`.
+///
+/// [`RepresentationPolicy::Auto`] is byte-identical to [`create_auto`], so no
+/// existing machine choice changes; [`RepresentationPolicy::Packed`] may choose
+/// machine 5 (see [`RepresentationPolicy`]).
+pub fn create_auto_with_policy(
+    source: &[u8],
+    profile: ManifestationProfile,
+    policy: RepresentationPolicy,
+) -> Result<EkbloomBody> {
+    let (machine_id, core) = select_machine_with_core_policy(source, policy)?;
+    build_body(core, source.len() as u64, machine_id, profile)
+}
+
+/// [`create_auto`] for [`RepresentationPolicy::Packed`]: prefer machine 5
+/// (`OrANS-PACK`) when it is smaller than raw, else the historical `auto` choice.
+pub fn create_auto_packed(source: &[u8], profile: ManifestationProfile) -> Result<EkbloomBody> {
+    create_auto_with_policy(source, profile, RepresentationPolicy::Packed)
 }
 
 /// Assemble a body from an already-encoded `core` and apply `profile`.
