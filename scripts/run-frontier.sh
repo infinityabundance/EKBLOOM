@@ -1,8 +1,9 @@
 #!/bin/sh
 # Competitive frontier: the unified bounded-access engine vs established indexed
-# codecs (block-indexed LZ4, chunked/seekable Zstandard — each with and without a
-# conventional hot-block cache) and raw storage, under one equal total physical
-# budget per corpus.
+# codecs (block-indexed LZ4, chunked/seekable Zstandard — each with no cache, a
+# conventional LRU hot-block cache, and a PINNED-HOT set decompressed once and
+# retained permanently) and raw storage, under one equal total physical budget per
+# corpus.
 #
 # Produces:
 #   evidence/bench/frontier.json — per corpus (skewed, mixed, uniform, 4 MiB each):

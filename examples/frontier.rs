@@ -6,17 +6,21 @@
 //! Writes `evidence/bench/frontier.json`. No number is estimated.
 //!
 //! Every contender is byte-exact (asserted here against the source before any
-//! timing). Each indexed-codec contender is measured both **without** and **with**
-//! a conventional byte-budgeted hot-block cache, so the comparison is not a
-//! cache-less straw man. Latency is exact random 4 KiB reads; we record warm hot
-//! reads (inside the hot working set), cold reads (outside it), and reads of the
-//! hot set **after a full sequential scan** — the non-eviction property.
+//! timing). Each indexed-codec contender is measured **without** a cache, **with**
+//! a conventional byte-budgeted hot-block cache (LRU, for contrast), and with a
+//! **pinned-hot** set that is decompressed once and retained permanently (never
+//! evicted) — the strongest non-evicting conventional competitor. Its retained
+//! footprint is fair: compressed bytes + block index + pinned decoded bytes.
+//! Latency is exact random 4 KiB reads; we record warm hot reads (inside the hot
+//! working set), cold reads (outside it), and reads of the hot set **after a full
+//! sequential scan** — the non-eviction property.
 
 use ekbloom::adapt::{Workload, WorkloadKind};
 use ekbloom::{
-    create_auto, encode_with_k, machine_by_id, now_ns, percentiles, prepare, spread_offsets,
-    AccessTrace, BlockIndex, DirectoryKind, Engine, HotBlockCache, ManifestationBudget,
-    ManifestationProfile, OrMachine, Percentiles, ReadRequest, TileSet, MACHINE_STORE, RANS0,
+    create_auto, encode_with_k, machine_by_id, now_ns, percentiles, pinned_block_count, prepare,
+    spread_offsets, AccessTrace, BlockIndex, DirectoryKind, Engine, HotBlockCache,
+    ManifestationBudget, ManifestationProfile, OrMachine, Percentiles, PinnedHotCache, ReadRequest,
+    TileSet, MACHINE_STORE, RANS0,
 };
 use std::path::Path;
 
@@ -552,6 +556,91 @@ fn zstd_read_cached(
     out
 }
 
+/// Decompress and permanently pin the leading blocks covering `hot_bytes` of an
+/// LZ4 block grid. Each pinned block is decompressed exactly once here and never
+/// evicted; the pinned decoded bytes are counted in the codec's footprint.
+/// Returns the number of blocks pinned.
+fn pin_lz4_hot(cache: &mut PinnedHotCache, blocks: &[Vec<u8>], n: usize, hot_bytes: u64) -> u64 {
+    let count = pinned_block_count(hot_bytes, LZ4_BLOCK as u64, blocks.len() as u64);
+    for (b, block) in blocks.iter().enumerate().take(count as usize) {
+        let start = b * LZ4_BLOCK;
+        let full = (n - start).min(LZ4_BLOCK);
+        let decoded = lz4_flex::decompress(block, full).expect("lz4 block");
+        assert!(cache.pin(b as u64, decoded), "pin must admit block {b}");
+    }
+    count
+}
+
+/// Block-indexed LZ4 read through a **pinned-hot** cache: a pinned block is served
+/// from the permanent decoded set; a non-pinned block is decompressed **on demand**
+/// and **not** retained (recorded as a miss). There is no eviction — a cold read
+/// cannot displace a pinned block.
+fn lz4_read_pinned(
+    cache: &mut PinnedHotCache,
+    blocks: &[Vec<u8>],
+    n: usize,
+    offset: u64,
+    len: u64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len as usize);
+    let mut pos = offset as usize;
+    let end = pos + len as usize;
+    while pos < end {
+        let b = pos / LZ4_BLOCK;
+        let start = b * LZ4_BLOCK;
+        let seg_end = end.min(start + LZ4_BLOCK);
+        if cache.is_pinned(b as u64) {
+            let decoded = cache.get(b as u64).expect("pinned block");
+            out.extend_from_slice(&decoded[pos - start..seg_end - start]);
+        } else {
+            let full = (n - start).min(LZ4_BLOCK);
+            let decoded = lz4_flex::decompress(&blocks[b], full).expect("lz4 block");
+            cache.note_miss();
+            out.extend_from_slice(&decoded[pos - start..seg_end - start]);
+        }
+        pos = seg_end;
+    }
+    out
+}
+
+/// Decompress and permanently pin the leading chunks covering `hot_bytes` of a
+/// chunked Zstandard stream. Returns the number of chunks pinned.
+fn pin_zstd_hot(cache: &mut PinnedHotCache, frames: &[Vec<u8>], hot_bytes: u64) -> u64 {
+    let count = pinned_block_count(hot_bytes, ZSTD_CHUNK as u64, frames.len() as u64);
+    for (c, frame) in frames.iter().enumerate().take(count as usize) {
+        let decoded = zstd::stream::decode_all(&frame[..]).expect("zstd frame");
+        assert!(cache.pin(c as u64, decoded), "pin must admit chunk {c}");
+    }
+    count
+}
+
+/// Chunked Zstandard read through a **pinned-hot** cache (see [`lz4_read_pinned`]).
+fn zstd_read_pinned(
+    cache: &mut PinnedHotCache,
+    frames: &[Vec<u8>],
+    offset: u64,
+    len: u64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len as usize);
+    let mut pos = offset as usize;
+    let end = pos + len as usize;
+    while pos < end {
+        let c = pos / ZSTD_CHUNK;
+        let start = c * ZSTD_CHUNK;
+        let seg_end = end.min(start + ZSTD_CHUNK);
+        if cache.is_pinned(c as u64) {
+            let decoded = cache.get(c as u64).expect("pinned chunk");
+            out.extend_from_slice(&decoded[pos - start..seg_end - start]);
+        } else {
+            let decoded = zstd::stream::decode_all(&frames[c][..]).expect("zstd frame");
+            cache.note_miss();
+            out.extend_from_slice(&decoded[pos - start..seg_end - start]);
+        }
+        pos = seg_end;
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // COLD (uncached) read head-to-head at one footprint per contender.
 //
@@ -975,6 +1064,7 @@ struct Row {
     retained_bytes: u64,
     storage_bytes: u64,
     cache_bytes: u64,
+    pinned_bytes: u64,
     build_ns: u64,
     hot_p50: f64,
     hot_p99: f64,
@@ -994,6 +1084,7 @@ impl Row {
             retained_bytes: retained,
             storage_bytes: storage,
             cache_bytes: 0,
+            pinned_bytes: 0,
             build_ns: 0,
             hot_p50: 0.0,
             hot_p99: 0.0,
@@ -1015,6 +1106,7 @@ struct CorpusReport {
     budget_bytes: u64,
     hot_bytes: u64,
     ekbloom_smaller_than_raw: bool,
+    ekbloom_smaller_than_pinned: bool,
     ekbloom_hot_p99_best: bool,
     ekbloom_cold_p99_best: bool,
     ekbloom_thrash_hot_p99_best: bool,
@@ -1192,6 +1284,62 @@ fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
         );
         rows.push(row);
     }
+    {
+        // PINNED-HOT LZ4: the hot blocks are decompressed ONCE and retained
+        // permanently (never evicted); a cold block decodes on demand and is not
+        // retained. The retained footprint is FAIR: compressed blocks + the
+        // per-block offset table + the pinned decoded bytes.
+        let pin_count = pinned_block_count(HOT_BYTES, LZ4_BLOCK as u64, lz4_blocks.len() as u64);
+        let mut cache = PinnedHotCache::new(LZ4_BLOCK as u64, pin_count as usize);
+        let t = now_ns();
+        let pinned = pin_lz4_hot(&mut cache, &lz4_blocks, source.len(), HOT_BYTES);
+        let pin_ns = now_ns().saturating_sub(t);
+        assert_eq!(pinned, pin_count, "all hot blocks must pin");
+        let pinned_bytes = cache.pinned_bytes();
+        let retained = lz4_storage.saturating_add(pinned_bytes);
+        assert!(
+            retained <= budget,
+            "pinned lz4 retained {retained} > budget {budget}"
+        );
+        for &off in hot_offsets.iter().chain(cold_offsets.iter()).take(16) {
+            assert_eq!(
+                lz4_read_pinned(&mut cache, &lz4_blocks, source.len(), off, READ),
+                &source[off as usize..(off + READ) as usize],
+                "pinned lz4 byte-exact"
+            );
+        }
+        let mut row = Row::new("lz4-block+pinned", "indexed", retained, lz4_storage);
+        row.cache_bytes = pinned_bytes;
+        row.pinned_bytes = pinned_bytes;
+        row.build_ns = lz4_build_ns.saturating_add(pin_ns);
+        let hot = time_reads(&hot_offsets, |off| {
+            lz4_read_pinned(&mut cache, &lz4_blocks, source.len(), off, READ)
+        });
+        let cold = time_reads(&cold_offsets, |off| {
+            lz4_read_pinned(&mut cache, &lz4_blocks, source.len(), off, READ)
+        });
+        // A full scan cannot evict a pinned block; the post-scan hot read is
+        // unchanged. Cold blocks are decoded on demand and dropped.
+        for &off in &scan_offsets {
+            let _ = lz4_read_pinned(&mut cache, &lz4_blocks, source.len(), off, READ);
+        }
+        let thrash = time_reads(&hot_offsets, |off| {
+            lz4_read_pinned(&mut cache, &lz4_blocks, source.len(), off, READ)
+        });
+        row.hot_p50 = hot.p50;
+        row.hot_p99 = hot.p99;
+        row.cold_p50 = cold.p50;
+        row.cold_p99 = cold.p99;
+        row.thrash_hot_p50 = thrash.p50;
+        row.thrash_hot_p99 = thrash.p99;
+        row.hit_rate = cache.hit_rate();
+        row.note = format!(
+            "{pinned} pinned {:.0} KiB blocks retained (non-evicting) + {} B index; cold blocks decode on demand",
+            pinned_bytes as f64 / 1024.0,
+            lz4_index_bytes
+        );
+        rows.push(row);
+    }
 
     // ---- Chunked Zstandard (with and without a hot-block cache).
     let t = now_ns();
@@ -1200,7 +1348,8 @@ fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
         .map(|c| zstd::stream::encode_all(c, 0).unwrap())
         .collect();
     let zstd_build_ns = now_ns().saturating_sub(t);
-    let zstd_storage = zstd_frames.iter().map(|f| f.len() as u64).sum::<u64>();
+    let zstd_index_bytes = zstd_frames.len() as u64 * 4;
+    let zstd_storage = zstd_frames.iter().map(|f| f.len() as u64).sum::<u64>() + zstd_index_bytes;
     for &off in hot_offsets.iter().chain(cold_offsets.iter()).take(16) {
         assert_eq!(
             zstd_read(&zstd_frames, off, READ),
@@ -1259,6 +1408,58 @@ fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
         row.note = format!("same storage + {cache_budget} B LRU cache");
         rows.push(row);
     }
+    {
+        // PINNED-HOT Zstandard (see the pinned LZ4 row): a FAIR footprint of
+        // compressed frames + the chunk offset table + the pinned decoded chunks.
+        let pin_count = pinned_block_count(HOT_BYTES, ZSTD_CHUNK as u64, zstd_frames.len() as u64);
+        let mut cache = PinnedHotCache::new(ZSTD_CHUNK as u64, pin_count as usize);
+        let t = now_ns();
+        let pinned = pin_zstd_hot(&mut cache, &zstd_frames, HOT_BYTES);
+        let pin_ns = now_ns().saturating_sub(t);
+        assert_eq!(pinned, pin_count, "all hot chunks must pin");
+        let pinned_bytes = cache.pinned_bytes();
+        let retained = zstd_storage.saturating_add(pinned_bytes);
+        assert!(
+            retained <= budget,
+            "pinned zstd retained {retained} > budget {budget}"
+        );
+        for &off in hot_offsets.iter().chain(cold_offsets.iter()).take(16) {
+            assert_eq!(
+                zstd_read_pinned(&mut cache, &zstd_frames, off, READ),
+                &source[off as usize..(off + READ) as usize],
+                "pinned zstd byte-exact"
+            );
+        }
+        let mut row = Row::new("zstd-chunk+pinned", "indexed", retained, zstd_storage);
+        row.cache_bytes = pinned_bytes;
+        row.pinned_bytes = pinned_bytes;
+        row.build_ns = zstd_build_ns.saturating_add(pin_ns);
+        let hot = time_reads(&hot_offsets, |off| {
+            zstd_read_pinned(&mut cache, &zstd_frames, off, READ)
+        });
+        let cold = time_reads(&cold_offsets, |off| {
+            zstd_read_pinned(&mut cache, &zstd_frames, off, READ)
+        });
+        for &off in &scan_offsets {
+            let _ = zstd_read_pinned(&mut cache, &zstd_frames, off, READ);
+        }
+        let thrash = time_reads(&hot_offsets, |off| {
+            zstd_read_pinned(&mut cache, &zstd_frames, off, READ)
+        });
+        row.hot_p50 = hot.p50;
+        row.hot_p99 = hot.p99;
+        row.cold_p50 = cold.p50;
+        row.cold_p99 = cold.p99;
+        row.thrash_hot_p50 = thrash.p50;
+        row.thrash_hot_p99 = thrash.p99;
+        row.hit_rate = cache.hit_rate();
+        row.note = format!(
+            "{pinned} pinned {:.0} KiB chunks retained (non-evicting) + {} B index; cold chunks decode on demand",
+            pinned_bytes as f64 / 1024.0,
+            zstd_index_bytes
+        );
+        rows.push(row);
+    }
 
     // ---- EKBLOOM engine row.
     {
@@ -1310,6 +1511,14 @@ fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
             .fold(f64::INFINITY, f64::min)
     };
     let ek = rows.iter().find(|r| r.name == "ekbloom-engine").unwrap();
+    // The strongest non-evicting conventional competitor is the pinned-hot codec,
+    // so the footprint verdict is measured against it, not against a cache-less
+    // codec: does EKBLOOM retain fewer bytes than the smallest pinned contender?
+    let best_pinned_retained = rows
+        .iter()
+        .filter(|r| r.name.ends_with("+pinned"))
+        .map(|r| r.retained_bytes)
+        .fold(u64::MAX, u64::min);
     let best_indexed_hot_p99 = indexed(&|r| r.hot_p99, "indexed");
     let best_indexed_cold_p99 = indexed(&|r| r.cold_p99, "indexed");
     let best_indexed_thrash_hot_p99 = {
@@ -1328,6 +1537,7 @@ fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
         budget_bytes: budget,
         hot_bytes: HOT_BYTES,
         ekbloom_smaller_than_raw: (ek.retained_bytes as f64) < 0.9 * n as f64,
+        ekbloom_smaller_than_pinned: ek.retained_bytes < best_pinned_retained,
         ekbloom_hot_p99_best: ek.hot_p99 < best_indexed_hot_p99,
         ekbloom_cold_p99_best: ek.cold_p99 < best_indexed_cold_p99,
         ekbloom_thrash_hot_p99_best: ek.thrash_hot_p99 < best_indexed_thrash_hot_p99,
@@ -1570,6 +1780,11 @@ fn render_json(
         );
         let _ = writeln!(
             s,
+            "        \"ekbloom_smaller_than_pinned\": {},",
+            c.ekbloom_smaller_than_pinned
+        );
+        let _ = writeln!(
+            s,
             "        \"ekbloom_hot_p99_best\": {},",
             c.ekbloom_hot_p99_best
         );
@@ -1592,6 +1807,7 @@ fn render_json(
             let _ = writeln!(s, "          \"retained_bytes\": {},", r.retained_bytes);
             let _ = writeln!(s, "          \"storage_bytes\": {},", r.storage_bytes);
             let _ = writeln!(s, "          \"cache_bytes\": {},", r.cache_bytes);
+            let _ = writeln!(s, "          \"pinned_bytes\": {},", r.pinned_bytes);
             let _ = writeln!(s, "          \"build_ns\": {},", r.build_ns);
             let _ = writeln!(s, "          \"hot_p50_ns\": {:.1},", finite(r.hot_p50));
             let _ = writeln!(s, "          \"hot_p99_ns\": {:.1},", finite(r.hot_p99));
@@ -1667,8 +1883,9 @@ fn print_table(corpora: &[CorpusReport]) {
             );
         }
         println!(
-            "   verdict: smaller_than_raw={} hot_p99_best={} cold_p99_best={} thrash_hot_p99_best={}",
+            "   verdict: smaller_than_raw={} smaller_than_pinned={} hot_p99_best={} cold_p99_best={} thrash_hot_p99_best={}",
             c.ekbloom_smaller_than_raw,
+            c.ekbloom_smaller_than_pinned,
             c.ekbloom_hot_p99_best,
             c.ekbloom_cold_p99_best,
             c.ekbloom_thrash_hot_p99_best
@@ -1801,13 +2018,23 @@ fn main() -> ekbloom::Result<()> {
     );
 
     let footprint_win = corpora.iter().any(|c| c.ekbloom_smaller_than_raw);
-    let advantage_win = corpora.iter().any(|c| {
-        c.ekbloom_hot_p99_best || c.ekbloom_cold_p99_best || c.ekbloom_thrash_hot_p99_best
-    });
+    let smaller_than_pinned = corpora.iter().any(|c| c.ekbloom_smaller_than_pinned);
+    let hot_latency_win = corpora.iter().any(|c| c.ekbloom_hot_p99_best);
+    let cold_latency_win = corpora.iter().any(|c| c.ekbloom_cold_p99_best);
+    let non_evict_win = corpora.iter().any(|c| c.ekbloom_thrash_hot_p99_best);
+    // The honest reproducible advantage: EKBLOOM retains fewer bytes than the
+    // strongest *non-evicting* conventional competitor (the pinned-hot codec) on at
+    // least one corpus, or wins a latency axis outright. The pinned codec makes
+    // non-eviction alone insufficient, so the footprint axis is the load-bearing one.
+    let advantage_win = smaller_than_pinned || non_evict_win || hot_latency_win || cold_latency_win;
     let holds = footprint_win && advantage_win;
     println!("\n== milestone acceptance ==");
     println!("  byte-exact all contenders: true (asserted before timing)");
     println!("  materially smaller footprint than raw: {footprint_win}");
+    println!("  smaller retained footprint than the pinned-hot codec: {smaller_than_pinned}");
+    println!("  absolute hot p99 best of indexed codecs: {hot_latency_win}");
+    println!("  cold p99 best of indexed codecs: {cold_latency_win}");
+    println!("  post-scan hot p99 best of indexed codecs: {non_evict_win}");
     println!("  reproducible advantage over indexed codecs: {advantage_win}");
     println!("  HOLDS: {holds}");
 
