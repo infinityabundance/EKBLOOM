@@ -1087,4 +1087,52 @@ override is fuzzed through the public trait. (fuzz-only edit; campaign re-run gr
   (intro, §1.3) likewise says "machines 1–8". Correct to include machine 9 and
   re-point the example at an unused id. **(Addressed in the follow-up commit:** both
   docs now say machines 1–9 and the worked example allocates `MACHINE_NL2P = 10`.)**
+
+  ## Revision 10 — Q/R rounds: compat fixtures (Q1), scalar/aarch64 CI (Q2), Loom RCU (Q4), dictionary (R1), faults + cross-FS (R2) (verdict **NO LIBRARY DEFECT FOUND; one test-hardening fix, one honesty observation**)
+
+  All tooling ran in the pinned container with every `docker run` memory-capped at
+  4 GiB. Results: `container-verify.sh` **805 passed / 0 failed**, 0 clippy
+  warnings, fmt + safety clean; `container-reproduce.sh` clean `--locked
+  --release` build + **53** evidence JSON OK; `container-loom.sh` **6 models** green
+  (OrFs index 20/206/12; RCU 274/33/100 interleavings); `run-faults.sh`
+  **5,933/5,933 fault points (100 %)**, **0** torn containers readable;
+  `run-matrix.sh` `{x86_64-simd, x86_64-scalar, aarch64}` **PASS** with identical
+  footprint **15,478 B** in all three (aarch64 Miri-subset 66 passed);
+  `container-fuzz.sh` **19/19** targets; `run-crossfs.sh` **3** filesystems
+  byte-identical.
+
+  ### Finding L (**Low**, test hardening, FIXED) — the fixtures were asserted only by fields + sampled bytes
+
+  `expected.json` recorded header fields, length, `physical_bytes`,
+  `logical_len`/`machine_id`, `byte_at` at 12 sampled positions + a hash over those
+  samples, and `verify`/`verify_deep` — but no **whole-file digest**, so a fixture
+  regenerated to preserve exactly those fields/samples would pass. Fixed without
+  touching any frozen `.ekb`: added a `file_blake3` per record and
+  `tests/compat_fixtures.rs` now asserts `blake3(file) == file_blake3` before
+  opening, so **any** altered byte (even an otherwise-uninterpreted inert byte)
+  fails. Green (3 compat tests).
+
+  ### Attacks that held
+
+  * **Q1 fixtures** — `open` reproduces the recorded `byte_at`/`physical_bytes`/header; a tampered core byte and a tampered footer byte are refused at `open`; reading never rewrites the artifact. The byte-identical v0.3/v0.4 pair is intentional and documented (`MIGRATION.md` §6.1). **(held)**
+  * **Q2 scalar** — `is_x86_feature_detected!` appears only in `simd.rs`'s `*_available()` probes (all gated by `force_scalar()`) and in `fastpath::cpu_features()` (reporting only, not a dispatch); every other `std::arch` intrinsic is inside a probe-gated kernel. `EKB_NO_SIMD=1` is byte-identical across the SIMD-vs-scalar suite and the whole 15,478 B court. **(held)**
+  * **Q4 Loom RCU** — `tests/loom_rcu.rs` drives the **real** `ObjectCache`/`OpenObject`/`OrFs`/`append_generation` (no toy); `handle.rs`/`filesystem.rs` compile their `Mutex` against loom's under `--cfg loom`. No schedule yields a torn read: publication is an `Arc` swap under the map mutex, `OpenObject` is immutable, and it holds an open `File` fd, so a `rename`/append cannot retarget an old snapshot. **(held)**
+  * **R1 dictionary** — wrong/absent/tampered/relabelled id, a bad embedded table, an out-of-range state and a length mismatch are typed `Err`; `train`→`create_with_dict` and embedded/referenced round-trips are exact for every record shape; `from_core` guards the declared length with `checked_default`. **(held)**
+  * **R2 faults** — every stream byte offset (incl. 2,832 in `finish`), every append truncation, and the publish fsync/rename boundaries leave no torn generation readable and the previous generation byte-exact. **(held)**
+  * **R2 cross-FS** — the FS set is discovered by `stat -f` (**overlayfs**, **tmpfs**, **ext2/ext3**); loopback **xfs/btrfs are honestly blocked** (no `mkfs`, needs `CAP_SYS_ADMIN`). All three are byte-identical. **(held)**
+
+  ### Observation (reported, not changed) — `force_scalar()` is not reflected in `cpu_features()`
+
+  `fastpath::cpu_features()` calls `is_x86_feature_detected!` directly, so under
+  `EKB_NO_SIMD=1` an artifact recording `cpu.avx2` (`baseline.rs`/`sweep.rs`) would
+  report native AVX2 while every decode path is scalar. No committed scalar-arm
+  artifact records `cpu` (`run-scalar.sh` emits none) and it never changes a byte,
+  so this is a documentation/honesty gap, not a correctness defect; folding
+  `force_scalar` into it would misreport the hardware.
+
+  ### Residual risk (Revision 10)
+
+  * The harness injects **truncation-style** crash images; an `fsync` that fails *after a full write* (correct length, possibly partial durability) is unmodellable and is covered instead by the corruption court and `crash_recovery.rs`. A completed-but-unflushed append can leave a wholly valid new generation while the writer returned an error — never torn.
+  * `file_blake3` is a manifest value, not embedded in the `.ekb`: a regeneration that also edits `expected.json` still passes, which is a deliberate manifest edit carrying the same trust as the fixtures.
+  * The `cpu_features()` observation above.
  

@@ -9,9 +9,9 @@
   "court_pass": true,
   "footprint_bytes": 15478,
   "byte_at_p50_ns": 1583,
-  "byte_at_p99_ns": 2325,
-  "byte_at_p99_9_ns": 3256,
-  "byte_at_p99_99_ns": 5169,
-  "court": {"corpora": 5, "n": 20480, "physical_bytes": 15478, "e_v": 0.7558, "samples": 10000, "byte_at_p50_ns": 1583, "byte_at_p99_ns": 2325, "byte_at_p99_9_ns": 3256, "byte_at_p99_99_ns": 5169},
+  "byte_at_p99_ns": 2234,
+  "byte_at_p99_9_ns": 6292,
+  "byte_at_p99_99_ns": 14237,
+  "court": {"corpora": 5, "n": 20480, "physical_bytes": 15478, "e_v": 0.7558, "samples": 10000, "byte_at_p50_ns": 1583, "byte_at_p99_ns": 2234, "byte_at_p99_9_ns": 6292, "byte_at_p99_99_ns": 14237},
   "note": "bounded, offline, Silesia/Calgary-derived court (tests/ci_bench.rs); byte_at percentiles over deterministic samples, each read byte-checked"
 }

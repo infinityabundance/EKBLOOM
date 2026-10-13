@@ -781,3 +781,41 @@ now called for machines 1–9. (fuzz-only edit.)
   "machines 1–8", and `MIGRATION.md`'s worked example reuses `id = 9`, now
   `OrANS-DICT`. **(Addressed in the follow-up commit:** both docs now say machines
   1–9 and the worked example allocates `MACHINE_NL2P = 10`.)**
+
+  ## Revision 10 — Q/R rounds (verdict **NO LIBRARY DEFECT FOUND; one test-hardening fix, one honesty observation**)
+
+  Independent attacks over the Q/R surface, executable in the committed suites
+  (`tests/compat_fixtures.rs`, `tests/simd.rs`, `tests/loom_rcu.rs`,
+  `tests/dictionary.rs`, `tests/faults.rs`, `tests/crossfs.rs`) and re-run in the
+  pinned 4 GiB container: verify **805/0**, reproduce clean `--locked` + 53
+  evidence JSON, loom 6 models, faults **5,933/5,933**, matrix `{simd,scalar,arm64}`
+  PASS (footprint 15,478 B identical), fuzz **19/19**, cross-FS 3 filesystems.
+
+  ### Finding L (**Low**, test coverage, FIXED) — fixtures not pinned by a whole-file digest
+
+  The frozen-fixture manifest asserted header fields, length, `physical_bytes`,
+  `logical_len`/`machine_id`, 12 sampled `byte_at`s + their hash, and
+  `verify`/`verify_deep` — **not** the whole file. A regenerated fixture preserving
+  those fields would have passed. FIXED: `tests/fixtures/expected.json` gained
+  `file_blake3` per record and `tests/compat_fixtures.rs` asserts
+  `blake3(file) == file_blake3` **before** `open`, so any changed byte fails. The
+  frozen `.ekb` bytes were not touched; 3 compat tests green; fmt clean.
+
+  ### Attacks tried
+
+  * **Q1 fixture tamper** — flip a core byte and a footer byte → `open` refuses both; a byte-identical read-back proves the artifact is never rewritten; `every_fixture_file_is_recorded_in_the_manifest` forbids add/drop. Regeneration now also fails the new whole-file digest. **(held)**
+  * **Q2 forced-scalar hunt** — grepped every `is_x86_feature_detected!`/`std::arch`/`_mm*` site: all SIMD is probe-gated in `simd.rs`; `cpu_features()` only reports. `EKB_NO_SIMD=1` byte-identical everywhere. **(held)**
+  * **Q4 torn-read schedule** — RCU swap of an immutable `Arc<OpenObject>` under the map mutex; the handle holds an fd, so neither append nor rename retargets it. Loom explores the real types; no torn read. **(held)**
+  * **R1 dictionary** — unregistered/wrong/tampered/relabelled id, bad table, bad state, length mismatch → typed `Err`; shapes + embedded/referenced exact; declared-length guard present. **(held)**
+  * **R2 fault offsets** — every stream byte (incl. `finish`), every append truncation, publish fsync/rename boundaries; previous generation always intact, recovery clean, 0 torn. **(held)**
+  * **R2 cross-FS** — overlayfs/tmpfs/ext2-ext3 discovered honestly; **xfs/btrfs blocked** (no `mkfs`); all identical. **(held)**
+
+  ### Residual risk (Revision 10)
+
+  * Fault images are truncation-shaped; a full-length-but-partially-durable `fsync`
+  failure is unmodellable (covered by the corruption court / `crash_recovery.rs`).
+  * `file_blake3` lives in the manifest, not inside the `.ekb`; regenerating and
+  editing the manifest together still passes (a deliberate, trusted edit).
+  * `fastpath::cpu_features()` ignores `force_scalar()`, so a `cpu`-recording
+  artifact produced under `EKB_NO_SIMD=1` would misreport AVX2 (no committed
+  scalar artifact does; it never changes a byte).

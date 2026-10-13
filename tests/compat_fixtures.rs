@@ -13,6 +13,9 @@
 //!   `logical_len` and `machine_id` match;
 //! * asserts `byte_at` at every recorded sampled position returns the recorded
 //!   byte, and that the BLAKE3 hash over those bytes matches;
+//! * asserts the **whole-file BLAKE3** matches the recorded `file_blake3`, so a
+//!   regenerated or otherwise altered fixture fails even if its header fields,
+//!   length and sampled bytes were preserved;
 //! * asserts both `verify` and `verify_deep` pass;
 //! * asserts the artifact's bytes are **unchanged** by the read (it must never
 //!   be rewritten).
@@ -223,6 +226,7 @@ struct Case {
     file_bytes: u64,
     samples: Vec<(u64, u8)>,
     sample_hash: String,
+    file_blake3: String,
 }
 
 fn load_cases() -> Vec<Case> {
@@ -254,6 +258,7 @@ fn load_cases() -> Vec<Case> {
                 })
                 .collect(),
             sample_hash: f.get("sample_hash").as_str().to_string(),
+            file_blake3: f.get("file_blake3").as_str().to_string(),
         })
         .collect()
 }
@@ -321,6 +326,14 @@ fn frozen_old_version_fixtures_open_read_and_verify_byte_identically() {
             case.name
         );
         assert_eq!(&before[0..8], b"EKBLOOM\0", "{}: magic", case.name);
+        // The frozen bytes themselves: a regenerated or altered fixture is refused
+        // here even when every recorded field above was preserved.
+        assert_eq!(
+            hex(blake3::hash(&before).as_bytes()),
+            case.file_blake3,
+            "{}: whole-file BLAKE3 (frozen bytes changed)",
+            case.name
+        );
         assert_eq!(
             u16_at(&before, 8),
             case.format_major,
