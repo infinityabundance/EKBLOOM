@@ -729,3 +729,52 @@ passed** (all-features).
   unchanged (public-API-only); the same `saturating_add` would close it.
 * In-range-but-inconsistent restart cursors are still not re-derived at read time
   (integrity, not authenticity) — unchanged.
+
+## Revision 9 — P1–P8 (verdict **NO LIBRARY DEFECT FOUND; one fuzz-coverage gap fixed, two doc defects reported**)
+
+Attacks are executable in `tests/adversarial_p.rs` (7 tests, green), written against
+the public API as an independent oracle. Results: verify gate green (all-features
+**779 passed / 0 failed**), gates **G1–G5 PASS**, fuzz **17/17 targets PASS**,
+reproduce clean + **46** evidence JSON OK (release **765 passed / 0 failed**).
+
+### Finding K (**Low**, fuzz coverage, FIXED) — the machine-6 workaround hid the new decode
+
+`fuzz_roundtrip` skipped machine 6 and called `SegContext::decode_into` directly
+(a leftover from when the trait `decode` was `O(N^2)`), so the SEG-linear commit's
+`Seg::decode`/`state_log` overrides were **not** fuzzed. Removed: `machine.decode` is
+now called for machines 1–9. (fuzz-only edit.)
+
+### Attacks tried
+
+* **P1 versioning** — machines **1–9** write→read→verify byte-exact; future
+  `format_major`/`minor` and future `core_version` typed-rejected for every machine
+  (incl. 9); legacy version-0 reads. **(held)**
+* **P2 streaming** — variable (checkpointed) layout: `read_at` at every block edge,
+  the final partial block, arbitrary spans, `read_sequential` == source; tampered
+  payload/directory and truncation typed `Err`; builder memory one block +
+  documented O(blocks) directory. **(held)**
+* **P5 dictionary** — wrong/absent/tampered/relabelled id, bad state, length
+  mismatch all typed `Err`; embedded vs referenced exact; relabelled referenced core
+  rejected by core linkage in a body. **(held)**
+* **P3 corruption** — independent >2000 single-bit flips over core + manifest payload
+  + full footer, **all detected**; padding/inert bytes never interpreted. **(held)**
+* **P4 unsafe/alloc gate** — `unsafe` confined to the three sanctioned modules and
+  the script fails closed; production `.unwrap()/.expect(/panic` allowlist minimal
+  (0/4/0). **(held by inspection)**
+* **SEG linearity** — `decode`/`state_log` byte-equal to the unmodified per-symbol
+  `reveal` reference (incl. non-power-of-two n), mismatch rejected; reader/verify/
+  stream all route through it. **(held)**
+
+### Residual risk (Revision 9)
+
+* `read_sequential` reserves `Vec::with_capacity(block logical_len)` (attacker-
+  controlled to `block_bytes`, `u32`) *before* the per-machine `checked_default`
+  guard; the decode still returns `AllocationTooLarge`, but a crafted container can
+  transiently request up to ≈4 GiB of address space. Add a `checked_default` before
+  the reservation.
+* A referenced dictionary core relabelled to a *different registered* id has no
+  in-core binding (caught by the body's `core_hash` linkage, not by the bare machine)
+  — integrity ≠ authenticity; only `AUTH` covers it.
+* Doc drift reported (not fixed): `MIGRATION.md` / `CORE-LAYOUT.md` still say
+  "machines 1–8", and `MIGRATION.md`'s worked example reuses `id = 9`, now
+  `OrANS-DICT`.

@@ -1017,4 +1017,71 @@ passed / 0 failed**, **33** evidence JSON files OK. Verify gate (`fmt --check`,
   clean `Err`; the DoS was limited to overflow-checked builds. A restart cursor that
   is in range but state-inconsistent is still not re-derived at read time (integrity,
   not authenticity) — unchanged.
+
+## Revision 9 — P1–P8 (verdict **NO LIBRARY DEFECT FOUND; one fuzz-coverage gap fixed, two doc defects reported**)
+
+Independent, executable attacks in `tests/adversarial_p.rs` (**7 tests**, green;
+written against the public API, not the round's own helpers). Verified:
+`container-verify.sh` (safety gate + `fmt --check` + `clippy -D warnings` +
+all-features tests **779 passed / 0 failed**), `run-gates.sh` **G1–G5 all PASS**,
+`container-fuzz.sh` **17/17 targets PASS**, `container-reproduce.sh` clean
+`--locked --release` build + **46** evidence JSON OK; release suite **765 passed /
+0 failed**.
+
+### Finding K (**Low**, fuzz coverage, FIXED) — `fuzz_roundtrip` bypassed the new machine-6 decode
+
+`fuzz/fuzz_targets/fuzz_roundtrip.rs` still carried the pre-fix workaround that
+skipped machine 6 and called `SegContext::decode_into` directly, because the trait
+`decode` was `O(N^2)`. After the SEG-linear commit (`Seg::decode`/`state_log`
+overrides) that workaround silently stopped fuzzing the new code. Removed it: the
+target now calls `machine.decode(core, n)` for every machine 1–9, so the linear
+override is fuzzed through the public trait. (fuzz-only edit; campaign re-run green.)
+
+### Attacks that held
+
+* **P1 versioning** — write→read→verify is byte-exact for machines **1–9** (the
+  shipped `format_version.rs` covers only 1–8); a future `format_minor` and a future
+  per-machine `core_version` are typed rejects for **every** machine incl. the
+  shared-dictionary machine 9 (`UnsupportedVersion` / `UnsupportedCoreVersion`); a
+  legacy (`core_version = 0`) core still reads exactly. `supported_core_versions`
+  includes the DICT id.
+* **P2 streaming** — `read_at`/`read_sequential` are byte-exact at adversarial
+  offsets through a **variable** (mid-stream `checkpoint`) layout, every block
+  boundary, the final partial block and the empty-at-end case; tampered payload
+  (content-id), tampered directory (BLAKE3) and truncation are typed `Err`. The
+  builder holds one block plus the documented O(blocks) directory.
+* **P5 dictionary** — absent/unregistered id, tampered embedded table, relabelled
+  frame, out-of-range state and length mismatch are all typed `Err`; embedded and
+  referenced cores are byte-exact; the shipped dictionary tests are green.
+* **P3 corruption** — an independent single-bit sweep (core + manifest payload +
+  the whole 64-byte footer; **>2000** flips) detects **every** flip;
+  padding/inert metadata remain uninterpreted.
+* **P4 unsafe/alloc gate** — `check-safety.sh` confines `unsafe` to
+  `{simd,async_io,mapped}.rs` and fails closed on a new module; the production
+  allowlist is exactly the four audited `.expect(` sites (0 `.unwrap()`, 0
+  panic-family) — minimal.
+* **SEG linearity** — `Seg::decode`/`state_log` equal the *unmodified* per-symbol
+  `reveal` reference byte-for-byte (n = 1…65537, incl. non-power-of-two), reject a
+  declared-length mismatch, and are used by `verify`, `reader` and the stream
+  `Segmented` policy.
+
+### Residual risk (Revision 9)
+
+* **`read_sequential` reserves before the policy guard.** It does
+  `Vec::with_capacity(block logical_len)` (attacker-controlled up to `block_bytes`,
+  `u32`) *before* the per-machine `checked_default(n)` inside `decode_into`. The
+  semantic decode still returns `AllocationTooLarge`, but the reservation itself is
+  not policy-bounded: a crafted container can transiently request up to ≈4 GiB of
+  address space. Recommend a `checked_default(e.logical_len)?` before the
+  reservation.
+* **Dictionary id is not cryptographically bound in-core.** Relabelling a
+  referenced core to a *different registered* id is caught by the manifest
+  `core_hash` linkage in a manifested body, but the bare machine API would decode
+  against the wrong model — the documented **integrity ≠ authenticity** boundary;
+  only `AUTH` closes it.
+* **Documentation drift (reported, not fixed — outside review scope).**
+  `docs/MIGRATION.md` still says machines 1–8 and its worked example allocates
+  `MACHINE_NL2P = 9`, an id now taken by `OrANS-DICT` (P5); `docs/CORE-LAYOUT.md`
+  (intro, §1.3) likewise says "machines 1–8". Correct to include machine 9 and
+  re-point the example at an unused id.
  

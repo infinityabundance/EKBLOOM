@@ -16,8 +16,6 @@
 //! (machines 5/6/9 declare it in the core and reject a mismatch).
 
 use ekbloom::machine::{machine_by_id, OrMachine};
-use ekbloom::machine_seg::{SegContext, SEG};
-use ekbloom::MACHINE_SEG;
 use libfuzzer_sys::fuzz_target;
 
 /// The advertised logical-length domain (`2^20`).
@@ -66,18 +64,9 @@ fuzz_target!(|data: &[u8]| {
             // A machine may decline a source; nothing to check.
             continue;
         };
-        if id == MACHINE_SEG {
-            // `Seg` does not override the reference `OrMachine::decode`, which
-            // re-parses the core per symbol (O(n^2)); use the linear segment-wise
-            // `SegContext::decode_into` the read API uses.
-            let ctx = SegContext::from_core(&core).expect("seg ctx from an encoded core");
-            let mut omega = SEG.init(&core).expect("seg init");
-            let mut out = Vec::new();
-            ctx.decode_into(&core, &mut omega, n, &mut out)
-                .unwrap_or_else(|e| panic!("machine 6: decode_into failed (n={n}): {e:?}"));
-            assert_eq!(out, src, "machine 6: roundtrip mismatch (n={n})");
-            continue;
-        }
+        // `Seg` (machine 6) now overrides `OrMachine::decode` to parse the
+        // container once and dispatch segment-wise (linear in N), so the trait
+        // decode is exercised directly for every machine 1–9.
         let out = machine
             .decode(&core, n)
             .unwrap_or_else(|e| panic!("machine {id}: decode failed after encode (n={n}): {e:?}"));
