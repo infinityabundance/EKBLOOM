@@ -33,11 +33,12 @@ use crate::bloom_global::build_global_shell_with;
 use crate::bloom_path::PathBloom;
 use crate::bloom_region::build_regional_with;
 use crate::checkpoint::CheckpointSet;
+use crate::dictionary::Dictionary;
 use crate::error::{EkbloomError, Result};
 use crate::history::History;
 use crate::machine::{
-    machine_by_id, OrMachine, MACHINE_NL2, MACHINE_PACK, MACHINE_RANS0, MACHINE_RANS0IL,
-    MACHINE_RANS0W, MACHINE_SEG, MACHINE_STORE,
+    machine_by_id, OrMachine, MACHINE_DICT, MACHINE_NL2, MACHINE_PACK, MACHINE_RANS0,
+    MACHINE_RANS0IL, MACHINE_RANS0W, MACHINE_SEG, MACHINE_STORE,
 };
 use crate::state::Snapshot;
 use crate::tiles::TileSet;
@@ -459,6 +460,27 @@ pub fn create_auto_independent(
     profile: ManifestationProfile,
 ) -> Result<EkbloomBody> {
     create_auto_with_policy(source, profile, RepresentationPolicy::IndependentLanes)
+}
+
+/// Build a fresh body whose machine-9 (`OrANS-DICT`) core **references** a shared
+/// trained `dict`.
+///
+/// The dictionary is registered in the process-wide registry so the reader can
+/// resolve the core's dictionary id, and each record is stored as a compact
+/// header-less core ([`Dictionary::encode`]). This is the small-record path: one
+/// `dict` is stored (and accounted) once, and every record pays only its framing
+/// plus its entropy-coded bytes instead of a per-record 512-byte model header.
+/// A reader that cannot resolve the id fails with a typed error rather than
+/// decoding against the wrong model.
+pub fn create_dictionary(
+    source: &[u8],
+    profile: ManifestationProfile,
+    dict: &Dictionary,
+) -> Result<EkbloomBody> {
+    crate::dictionary::register(dict)?;
+    let record = dict.encode(source)?;
+    let core = crate::machine_dict::frame_reference(dict, &record);
+    build_body(core, source.len() as u64, MACHINE_DICT, profile)
 }
 
 /// Assemble a body from an already-encoded `core` and apply `profile`.

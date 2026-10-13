@@ -35,6 +35,7 @@ pub mod bloom_path;
 pub mod bloom_region;
 pub mod checkpoint;
 pub mod court;
+pub mod dictionary;
 pub mod engine;
 pub mod error;
 pub mod fastpath;
@@ -47,6 +48,7 @@ pub mod history;
 pub mod history_store;
 pub mod kernels;
 pub mod machine;
+pub mod machine_dict;
 pub mod machine_pack;
 pub mod machine_rans;
 pub mod machine_rans_i;
@@ -105,6 +107,11 @@ pub use court::{
     spread_offsets, write_court_json, Candidate, Court, CourtConfig, CourtEnv, CourtReport, Dist,
     ParetoPoint, Row,
 };
+pub use dictionary::{
+    lookup as lookup_dictionary, register as register_dictionary,
+    registered as dictionary_registered, train_dictionary, Dictionary, DICT_BYTES, DICT_MAGIC,
+    DICT_RECORD_HEADER_BYTES, DICT_VERSION,
+};
 pub use engine::{
     AccessPlan as EngineAccessPlan, BoundedEngine, Engine, Path as EnginePath,
     RegionPath as EngineRegionPath, StructureRef, ENGINE_REGION_BYTES, MAX_ENGINE_REGION_BYTES,
@@ -130,9 +137,13 @@ pub use kernels::{
     window_start_states,
 };
 pub use machine::{
-    machine_by_id, prepare, state_log_with, OrMachine, Prepared, MACHINE_NL2, MACHINE_PACK,
-    MACHINE_RANS0, MACHINE_RANS0I, MACHINE_RANS0IL, MACHINE_RANS0W, MACHINE_SEG, MACHINE_STORE,
-    NL2,
+    machine_by_id, prepare, state_log_with, OrMachine, Prepared, MACHINE_DICT, MACHINE_NL2,
+    MACHINE_PACK, MACHINE_RANS0, MACHINE_RANS0I, MACHINE_RANS0IL, MACHINE_RANS0W, MACHINE_SEG,
+    MACHINE_STORE, NL2,
+};
+pub use machine_dict::{
+    frame_embedded as frame_dictionary_embedded, frame_reference as frame_dictionary_reference,
+    DictContext, DictMachine, DICT, DICT_FRAME_PREFIX_BYTES,
 };
 pub use machine_pack::{Pack, PackContext, PACK};
 pub use machine_rans::{encoded_window_bound, Rans0, RANS0, RENORM_MAX_PER_STEP, WINDOW_MARGIN};
@@ -154,8 +165,8 @@ pub use machine_seg::{
 pub use machine_store::{Store, STORE};
 pub use manifest::{
     create, create_auto, create_auto_independent, create_auto_packed, create_auto_segmented,
-    create_auto_with_policy, create_auto_within_budget, create_auto_word16, create_machine,
-    create_machine_within_budget, create_within_budget, estimate_physical_bytes,
+    create_auto_with_policy, create_auto_within_budget, create_auto_word16, create_dictionary,
+    create_machine, create_machine_within_budget, create_within_budget, estimate_physical_bytes,
     estimate_physical_bytes_for_core, grow, inspect, manifest, manifest_within_budget,
     select_machine, select_machine_independent, select_machine_packed, select_machine_policy,
     select_machine_segmented, select_machine_word16, select_profile_within_budget, ComponentReport,

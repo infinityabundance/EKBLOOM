@@ -1,0 +1,43 @@
+{
+  "generated_by": "examples/dictionary.rs (sh scripts/run-dictionary.sh)",
+  "machine": "OrANS-DICT (machine_id=9)",
+  "records": 4096,
+  "avg_record_bytes": 100.000,
+  "dictionary_bytes": 540,
+  "dictionary_id": "f3c0f614838b17198b4643ecb1330854",
+  "peak_rss_bytes": 23654400,
+  "footprint": [
+    { "method": "dictionary_machine9", "total_bytes": 341947, "bytes_per_record": 83.483 },
+    { "method": "machine2_per_record", "total_bytes": 2416529, "bytes_per_record": 589.973 },
+    { "method": "raw_records", "total_bytes": 409600, "bytes_per_record": 100.000 },
+    { "method": "zstd_dictionary", "total_bytes": 269938, "bytes_per_record": 65.903 },
+    { "method": "zstd_per_record", "total_bytes": 351928, "bytes_per_record": 85.920 }
+  ],
+  "break_even": {
+    "vs_machine2_records": 2,
+    "vs_zstd_dictionary_records": null
+  },
+  "latency": [
+    { "method": "dictionary_machine9_prepared", "decode_p50_ns": 721 },
+    { "method": "machine2_per_record", "decode_p50_ns": 1403 },
+    { "method": "zstd_dictionary", "decode_p50_ns": 311 },
+    { "method": "zstd_per_record", "decode_p50_ns": 942 }
+  ],
+  "size_sweep": [
+    { "record_bytes": 64, "dictionary_bytes_per_record": 63.805, "machine2_bytes_per_record": 566.130, "zstd_dict_bytes_per_record": 71.211, "raw_bytes_per_record": 64.000, "dictionary_wins": true },
+    { "record_bytes": 128, "dictionary_bytes_per_record": 99.475, "machine2_bytes_per_record": 607.770, "zstd_dict_bytes_per_record": 101.591, "raw_bytes_per_record": 128.000, "dictionary_wins": true },
+    { "record_bytes": 256, "dictionary_bytes_per_record": 170.934, "machine2_bytes_per_record": 685.340, "zstd_dict_bytes_per_record": 153.229, "raw_bytes_per_record": 256.000, "dictionary_wins": true },
+    { "record_bytes": 512, "dictionary_bytes_per_record": 313.797, "machine2_bytes_per_record": 832.343, "zstd_dict_bytes_per_record": 236.996, "raw_bytes_per_record": 512.000, "dictionary_wins": true },
+    { "record_bytes": 1024, "dictionary_bytes_per_record": 599.445, "machine2_bytes_per_record": 1120.824, "zstd_dict_bytes_per_record": 329.844, "raw_bytes_per_record": 1024.000, "dictionary_wins": true },
+    { "record_bytes": 2048, "dictionary_bytes_per_record": 1170.700, "machine2_bytes_per_record": 1695.158, "zstd_dict_bytes_per_record": 538.454, "raw_bytes_per_record": 2048.000, "dictionary_wins": true },
+    { "record_bytes": 4096, "dictionary_bytes_per_record": 2313.710, "machine2_bytes_per_record": 2840.758, "zstd_dict_bytes_per_record": 964.527, "raw_bytes_per_record": 4096.000, "dictionary_wins": true }
+  ],
+  "size_sweep_heterogeneous": [
+    { "record_bytes": 256, "dictionary_bytes_per_record": 273.914, "machine2_bytes_per_record": 597.441, "dictionary_wins": true },
+    { "record_bytes": 1024, "dictionary_bytes_per_record": 1006.949, "machine2_bytes_per_record": 758.309, "dictionary_wins": false },
+    { "record_bytes": 4096, "dictionary_bytes_per_record": 3939.125, "machine2_bytes_per_record": 1370.996, "dictionary_wins": false },
+    { "record_bytes": 16384, "dictionary_bytes_per_record": 15666.934, "machine2_bytes_per_record": 3800.773, "dictionary_wins": false },
+    { "record_bytes": 65536, "dictionary_bytes_per_record": 62579.766, "machine2_bytes_per_record": 13513.359, "dictionary_wins": false }
+  ],
+  "verdict": "shared structure wins on small records: dictionary 83.5 B/rec vs per-record machine 2 590.0 B/rec (raw 100.0 B/rec); break-even at 2 records"
+}

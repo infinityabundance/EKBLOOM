@@ -24,6 +24,7 @@
 //! [`crate::machine_seg`].
 
 use crate::error::{EkbloomError, Result};
+use crate::machine_dict::{DictContext, DICT};
 use crate::machine_pack::{PackContext, PACK};
 use crate::machine_rans::{RansContext, RANS0};
 use crate::machine_rans_i::{RansIContext, RANS0I};
@@ -57,6 +58,9 @@ pub const MACHINE_RANS0W: u32 = 7;
 /// Machine identifier for `OrANS-RANS0IL` (order-0 rANS with independent-lane
 /// streams).
 pub const MACHINE_RANS0IL: u32 = 8;
+
+/// Machine identifier for `OrANS-DICT` (shared trained dictionary records).
+pub const MACHINE_DICT: u32 = 9;
 
 const fn build_sbox() -> [u8; 256] {
     let mut s = [0u8; 256];
@@ -272,6 +276,8 @@ pub enum Prepared<'a> {
     Pack(Box<PackContext>),
     /// A prepared `OrANS-SEG` segmented-container decoder context (machine 6).
     Seg(Box<SegContext>),
+    /// A prepared `OrANS-DICT` shared-dictionary decoder context (machine 9).
+    Dict(Box<DictContext>),
 }
 
 impl Prepared<'_> {
@@ -291,6 +297,7 @@ impl Prepared<'_> {
             }
             Prepared::Pack(ctx) => ctx.reveal(core, omega),
             Prepared::Seg(ctx) => ctx.reveal(core, omega),
+            Prepared::Dict(ctx) => ctx.reveal(core, omega),
         }
     }
 
@@ -308,6 +315,7 @@ impl Prepared<'_> {
             }
             Prepared::Pack(ctx) => ctx.peek(core, omega),
             Prepared::Seg(ctx) => ctx.peek(core, omega),
+            Prepared::Dict(ctx) => ctx.peek(core, omega),
         }
     }
 
@@ -325,6 +333,7 @@ impl Prepared<'_> {
             }
             Prepared::Pack(ctx) => ctx.skip(core, omega, n),
             Prepared::Seg(ctx) => ctx.skip(core, omega, n),
+            Prepared::Dict(ctx) => ctx.skip(core, omega, n),
             _ => {
                 for _ in 0..n {
                     self.reveal(core, omega)?;
@@ -363,6 +372,9 @@ impl Prepared<'_> {
         if let Prepared::Seg(ctx) = self {
             return ctx.decode_into(core, omega, n, out);
         }
+        if let Prepared::Dict(ctx) = self {
+            return ctx.decode_into(core, omega, n, out);
+        }
         // A whole-object decode of `n` symbols (`n` is the declared length for a
         // `bulk_unpack`): bound it before reserving.
         crate::resource::checked_default(n)?;
@@ -397,6 +409,9 @@ impl Prepared<'_> {
             // cursor is 0.
             Prepared::Pack(_) => 0,
             Prepared::Seg(_) => 0,
+            // `OrANS-DICT` is cursor-divergent: the minimal cursor is the start of
+            // the record's renorm bytes.
+            Prepared::Dict(ctx) => ctx.header_bytes(),
             Prepared::Delegated(_) => 0,
         }
     }
@@ -433,6 +448,7 @@ impl Prepared<'_> {
             Prepared::Delegated(_) => Ok(()),
             Prepared::Pack(_) => Ok(()),
             Prepared::Seg(_) => Ok(()),
+            Prepared::Dict(ctx) => ctx.validate_restart(omega),
         }
     }
 }
@@ -450,6 +466,7 @@ pub fn prepare<'a>(machine: &'a dyn OrMachine, core: &[u8]) -> Result<Prepared<'
         MACHINE_RANS0IL => Ok(Prepared::RansIL(Box::new(IlContext::from_core(core)?))),
         MACHINE_PACK => Ok(Prepared::Pack(Box::new(PackContext::from_core(core)?))),
         MACHINE_SEG => Ok(Prepared::Seg(Box::new(SegContext::from_core(core)?))),
+        MACHINE_DICT => Ok(Prepared::Dict(Box::new(DictContext::from_core(core)?))),
         _ => Ok(Prepared::Delegated(machine)),
     }
 }
@@ -465,6 +482,7 @@ pub fn machine_by_id(id: u32) -> Option<&'static dyn OrMachine> {
         MACHINE_RANS0IL => Some(&RANS0IL),
         MACHINE_PACK => Some(&PACK),
         MACHINE_SEG => Some(&SEG),
+        MACHINE_DICT => Some(&DICT),
         _ => None,
     }
 }
