@@ -1,7 +1,7 @@
 # EKBLOOM
 
 EKBLOOM is a **concealed-expansion codec**: a native-Rust implementation of the
-EKBLOOM 0.3 engineering candidate. It presents a logical object through a small
+EKBLOOM 0.4 engineering candidate. It presents a logical object through a small
 visible surface while maintaining a deliberately larger *manifested operational
 body* behind that surface.
 
@@ -15,7 +15,7 @@ preserves exact correctness, accounts for the bytes it actually manifests, and
 converts manifested space into access speed.
 
 This crate is a single Cargo package (`ekbloom`), shipping one library and one
-binary (`ekbloom`), and **`ekbloom` v0.3.0 is published on
+binary (`ekbloom`), and **`ekbloom` v0.4.0 is published on
 [crates.io](https://crates.io/crates/ekbloom)**. The frozen internal contract is
 `docs/DESIGN.md`; the original specification lives in `research/`.
 
@@ -526,9 +526,9 @@ publication and pays submit/completion round-trips. See
 
 ---
 
-## Research phases (v0.3): reconstruction, packing, tiles, handles, kernels, court, planner & mmap
+## Research phases (v0.4): reconstruction, packing, tiles, handles, kernels, court, planner & mmap
 
-The 0.3 round is organised around a **three-role separation**: *machine semantics*
+The 0.4 round is organised around a **three-role separation**: *machine semantics*
 (`src/machine.rs`), the *manifestation engine* (exact certified structures), and an
 *execution planner* (`src/planner.rs`) that is the only impure part. The phases
 below are each documented, implemented, measured and independently reviewed; every
@@ -902,7 +902,8 @@ by P34–P40 in [`docs/PROOFS.md`](docs/PROOFS.md), and independently reviewed
 - **N8 — resource policy + fuzzing.** `src/resource.rs` bounds every whole-object
   allocation driven by a declared/core-derived length at **1 GiB** by default
   `AllocationTooLarge`). The bounded file-backed paths are unaffected. The campaign
-  now runs **13** libFuzzer targets (`+fuzz_pack`, `fuzz_seg`, `fuzz_resource`)
+  now runs **15** libFuzzer targets (`+fuzz_pack`, `fuzz_seg`, `fuzz_resource` in
+  this round; `fuzz_rans_w`/`fuzz_rans_il` in the O-round)
   ([`docs/SECURITY.md`](docs/SECURITY.md)).
 
 ### O-round: decoder court, uniform-footprint gate, OrFS compaction, review fixes (O1–O3)
@@ -946,8 +947,8 @@ verdict **TWO DEFECTS, BOTH FIXED**, in
   cursor in machines 7/8 and the SIMD kernel — a read path for machine 7) and
   **Finding J**; the same hardening was applied to **14** unchecked `cursor + N`
   sites across machines 1–4, so no read path panics on a crafted cursor. The campaign
-  runs **fifteen** fuzz targets, `container-reproduce.sh` passes **684/0** with **33**
-  evidence JSON `OK`, and the verify gate is green at **698 passed**.
+  runs **fifteen** fuzz targets, `container-reproduce.sh` passes **687/0** with **33**
+  evidence JSON `OK`, and the verify gate is green at **701 passed**.
 
 ---
 
@@ -1039,7 +1040,7 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 (libFuzzer — runs **every** target declared in `fuzz/Cargo.toml`:
 `fuzz_machine`, `fuzz_open`, `fuzz_bloom`, `fuzz_history_store`, `fuzz_packed`,
 `fuzz_tiles`, `fuzz_blocks`, `fuzz_batch`, `fuzz_rans_i`, `fuzz_region`,
-`fuzz_pack`, `fuzz_seg`, `fuzz_resource`), `scripts/container-miri.sh` (UB),
+`fuzz_pack`, `fuzz_seg`, `fuzz_resource`, `fuzz_rans_w`, `fuzz_rans_il`), `scripts/container-miri.sh` (UB),
 `scripts/container-sanitize.sh` (AddressSanitizer), and `scripts/container-fuse.sh`
 (read-only FUSE mount).
 
@@ -1278,7 +1279,7 @@ Documentation map:
 | [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | The 10 hard gates mapped to tests and commands. |
 | [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties P1–P44 (machine 1 + machine 2 + the round-3/round-4 modules + the L1–L4 closure + the M1–M5 closure + the N1–N8 closure + the O1–O3 closure) and honest limitations. |
 | [`docs/RESULTS.md`](docs/RESULTS.md) | Measured results and the 65,536 research outcome. |
-| [`docs/CODEC.md`](docs/CODEC.md) | Machine 2 (`OrANS-RANS0`), machine 3 (`OrANS-Store`, identity) and machine 4 (`OrANS-RANS0I`, interleaved) codecs + the `auto` policy. |
+| [`docs/CODEC.md`](docs/CODEC.md) | Machines 2–8 (`OrANS-RANS0`/`OrANS-Store`/`OrANS-RANS0I`/`OrANS-PACK`/`OrANS-SEG`/`OrANS-RANS0W`/`OrANS-RANS0IL`) codecs + the `auto` policy. |
 | [`docs/BASELINES.md`](docs/BASELINES.md) | Conventional baseline comparison (`RawVec`/`RawFile`/…). |
 | [`docs/COMPETITIVE.md`](docs/COMPETITIVE.md) | Region-scoped manifestation vs an ordinary LRU cache and raw. |
 | [`docs/ASYNC.md`](docs/ASYNC.md) | The `io_uring` asynchronous publication backend. |

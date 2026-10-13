@@ -332,7 +332,7 @@ handling, and transparent fallback — not throughput for small single-file writ
 
 ---
 
-## Research phases (v0.3 additions)
+## Research phases (v0.4 additions)
 
 Seven later artifacts measure the round-3 modules. Each is read from its committed
 `evidence/bench/*.json` and detailed in its own doc; the numbers below are the
@@ -539,7 +539,7 @@ and the surface is reviewed in **Revision 7** (`tests/adversarial_r7.rs`, 11 tes
 | N5 OrFS single store | payload stored **exactly once**; real on-disk **+1.54 % (`skewed`) / +0.58 % (`mixed`)** over the in-memory engine (O-round compaction, from +1.89 %/+0.70 %); genuine `ReadMode::Machine` **382×** the dispatch | [`ORFS.md`](ORFS.md) | `orfs.json` |
 | N6 joint optimiser | held-out p99 **10.07 µs vs greedy 13.58 µs** (budget `N`); **9.84 vs 13.19 µs** (`1.5·N`); deterministic; only `all_certified` plans | [`OPTIMIZER.md`](OPTIMIZER.md) | `optimizer.json` |
 | N7 E2E real data | `beats_raw_store = true` on `text`/`elf`/`mixed` (0.74×/0.98×/0.78× raw; hot 4 KiB 120–130 ns vs raw 160–170 ns; non-evicting); `holds_vs_pinned = false` | [`E2E.md`](E2E.md) | `e2e.json` |
-| N8 resource policy | whole-object allocations bounded at **1 GiB** default (`AllocationTooLarge`); **13** fuzz targets; bounded read paths unaffected | [`SECURITY.md`](SECURITY.md) §Resource policy | `src/resource.rs` |
+| N8 resource policy | whole-object allocations bounded at **1 GiB** default (`AllocationTooLarge`); **15** fuzz targets (three added in N8, two in O3); bounded read paths unaffected | [`SECURITY.md`](SECURITY.md) §Resource policy | `src/resource.rs` |
 
 **Honest reading.** The N-round adds bounded resource use and real capabilities
 (identity-bound plans, bounded windows, machines 5/6, a single-store OrFS, a
@@ -592,8 +592,8 @@ on-disk excess over the in-memory engine from **+1.89 % / +0.70 %** to **+1.54 %
   **both fixed** (`saturating_add` per site; base built before the guard). The same
   hardening was applied to **14 unchecked `cursor + N` sites across machines 1–4**, so
   no read path panics on a crafted cursor. `container-fuzz.sh` runs **fifteen**
-  targets; `container-reproduce.sh` passes **684/0** with **33** evidence JSON OK and
-  the verify gate green at **698 passed**.
+  targets; `container-reproduce.sh` passes **687/0** with **33** evidence JSON OK and
+  the verify gate green at **701 passed**.
 
 **Honest reading.** The decoder court is **complete and closed**: no variant (
 word16, independent lanes, SIMD kernel) beat machine 4 `K = 8`, which is the best

@@ -1,4 +1,4 @@
-# EKBLOOM 0.3 — Frozen Engineering Contract
+# EKBLOOM 0.4 — Frozen Engineering Contract
 
 This document is the authoritative internal contract. Every module must conform to it.
 It freezes machine semantics, state log semantics, bloom definitions, the data model,
@@ -266,10 +266,10 @@ ekbloom bench    <file.ekb> --workload <seq|random-1b|rand-4k|range-64k|mixed>
 
 ---
 
-## 9. Addenda (v0.3 research)
+## 9. Addenda (v0.4 research)
 
 This section is **additive**. It records the modules and interfaces added by the
-0.3 research round. It does **not** change the frozen machine contract in §1, the
+0.4 research round. It does **not** change the frozen machine contract in §1, the
 state-log/history semantics in §2, the bloom definitions in §3, the data model in
 §4 (except that new additive structures may be appended to a body), or the wire
 layout in §5 (except for one new section kind). Where an addendum and the frozen

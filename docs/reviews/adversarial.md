@@ -1,4 +1,4 @@
-# Adversarial review — EKBLOOM 0.3
+# Adversarial review — EKBLOOM 0.4
 
 Independent "try to break correctness" pass over the frozen contract
 (`docs/DESIGN.md`, `docs/PROOFS.md`) and the machine, reader, fast paths,
@@ -418,7 +418,7 @@ REPORT; the one non-test change was a chore (below).
 
 ### Attack 9 — `ResidentView`
 
-Byte-exact against `reader::read` for **all four machines** over both a whole-object
+Byte-exact against `reader::read` for **machines 1–4** over both a whole-object
 `HotTile` plan and a `Path`/`DirectStorage` plan, at start/end/boundary offsets
 (`{0,1,4095,4096,4097,8191,n/2,n-2,n-1}`) and a 300-byte cross-tile window.
 `get_checked(n)`, `get_checked(u64::MAX)`, `copy_range(n,..)`, `copy_range(u64::MAX,..)`
@@ -719,7 +719,7 @@ checks on `base_reference.is_none()`. Pinned by
 ### Fuzz + evidence (Revision 8)
 
 `container-fuzz.sh`: **fifteen** targets PASS. `container-reproduce.sh`: clean build,
-**684 passed / 0 failed**, **33** evidence JSON OK. Verify gate green at **698
+**687 passed / 0 failed**, **33** evidence JSON OK. Verify gate green at **701
 passed** (all-features).
 
 ### Residual risk (Revision 8)

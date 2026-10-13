@@ -13,7 +13,7 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`ACCEPTANCE.md`](ACCEPTANCE.md) | The **10 hard acceptance gates**, each mapped to its implementing module, artifact and exact reproduction command, plus additional evidence. |
 | [`PROOFS.md`](PROOFS.md) | **Proved properties P1–P44** (machine 1 + machine 2 + the round-3/round-4 modules + the L1–L4 closure + the M1–M5 closure + the N1–N8 closure + the O1–O3 closure, tagged PROVED / EMPIRICALLY OBSERVED) and the honest limitations (resolved in L1–L4, M1–M5, N1–N8 and O1–O3, plus the remaining ones). |
 | [`RESULTS.md`](RESULTS.md) | **Measured results** — the speed-vs-space frontier, budget frontier, curves, hardware counters, machine 2, baselines, the cache competition, the 65,536-entry `T_4[x]` research outcome, the L1–L4 limits closures, and the M1–M5, N1–N8 and O1–O3 rounds. |
-| [`CODEC.md`](CODEC.md) | **Machine 2** (`OrANS-RANS0`, compressing), **machine 3** (`OrANS-Store`, identity `V = N`), **machine 4** (`OrANS-RANS0I`, interleaved), **machine 5** (`OrANS-PACK`, directly-addressable fixed-width packing) and **machine 6** (`OrANS-SEG`, versioned segmented container) plus the `auto` representation policy. |
+| [`CODEC.md`](CODEC.md) | **Machine 2** (`OrANS-RANS0`, compressing), **machine 3** (`OrANS-Store`, identity `V = N`), **machine 4** (`OrANS-RANS0I`, interleaved), **machine 5** (`OrANS-PACK`, directly-addressable fixed-width packing), **machine 6** (`OrANS-SEG`, versioned segmented container), **machine 7** (`OrANS-RANS0W`, 16-bit word renorm) and **machine 8** (`OrANS-RANS0IL`, independent lanes) plus the `auto` representation policy. |
 | [`PACKED_MACHINE.md`](PACKED_MACHINE.md) | **Machine 5** (`OrANS-PACK`, `machine_id = 5`): the directly-addressable fixed-width packed core (`ceil(N·bits/8)`, `O(1)` per position, constant/identity renderings), its `RepresentationPolicy::Packed` selection, and the packed-vs-rANS/raw/LZ4 frontier. |
 | [`SEGMENTS.md`](SEGMENTS.md) | **Machine 6** (`OrANS-SEG`, `machine_id = 6`): the versioned segmented container (96 B header + fixed/variable directory over per-segment constant/raw/packed representations) and the heterogeneous-object footprint win (**−10.1 %** vs machine 2 on `mixed`). |
 | [`BASELINES.md`](BASELINES.md) | **Conventional baseline comparison** (`RawVec`/`RawFile`/`Predecoded`/`IndexedArray`) plus machine 2 vs `raw`. |
@@ -123,7 +123,7 @@ sh scripts/run-orfs.sh              # orfs.json (OrFS single authoritative store
 sh scripts/run-optimizer.sh         # optimizer.json (physical-budget-aware joint planner)
 sh scripts/run-e2e.sh               # e2e.json (end-to-end real-data proof)
 sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (33 files)
-sh scripts/container-fuzz.sh        # all libFuzzer targets (fuzz_machine/open/bloom/history_store/packed/tiles/blocks/batch/rans_i)
+sh scripts/container-fuzz.sh        # all 15 libFuzzer targets (fuzz_machine/open/bloom/history_store/packed/tiles/blocks/batch/rans_i/region/pack/seg/resource/rans_w/rans_il)
 sh scripts/container-loom.sh        # Loom model checking
 sh scripts/capture-environment.sh   # environment.txt
 ```

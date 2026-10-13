@@ -244,7 +244,7 @@ Every branch re-implements the identical primitive `reader::read` would choose
 (`TileSet::read_bounded` / `read_hot`, `fastpath`'s hot slice,
 `CheckpointSet::restore_with` + `decode_into`, `BlockIndex::read_range`,
 `History::snapshot_at` + `reveal`). `tests/engine.rs` compares the engine against
-`reader::read` across machines 1 and 2, over the four machines' structures,
+`reader::read` across machines 1 and 2, over the structures of machines 1–4,
 for eleven requests including region-boundary crossings, a spanning read and a
 whole-object read; `tests/machine4_engine.rs` adds machine-4 bodies (three block
 sizes, every request shape), the planner's machine-4 `BlockRestart` choice, the
@@ -268,8 +268,8 @@ its byte-identity. `tests/engine_identity.rs` (6 tests) pins the core-identity
 binding: a different machine-4 body of identical length and block geometry (the
 reviewer's counterexample), a new generation of the same object, and machines 1/2
 are all rejected with `EkbloomError::EngineBodyMismatch`; `Engine::from_plan` keeps
-the identity; and `ReadyObject` reads are byte-exact vs `reader::read` on all four
-machines.
+the identity; and `ReadyObject` reads are byte-exact vs `reader::read` on machines
+1–4.
 
 ## 8. Reproduce
 

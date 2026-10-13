@@ -410,7 +410,7 @@ both fixed).
 | **N5** | OrFS one authoritative store + pointer views | authoritative payload stored **exactly once**; real on-disk excess **+1.89 % / +0.70 %** over the in-memory engine; genuine `ReadMode::Machine` decode **382×** the dispatch | `orfs.json`, [`ORFS.md`](ORFS.md), P38 |
 | **N6** | physical-budget-aware joint planner | held-out p99 **10.07 µs** vs greedy **13.58 µs** (budget `N`); **9.84** vs **13.19 µs** (`1.5·N`); `all_certified`, cap-rechecked, additive `grow_into` | `optimizer.json`, [`OPTIMIZER.md`](OPTIMIZER.md), P39 |
 | **N7** | end-to-end real-data verdict | `beats_raw_store = true` on all three corpora (0.74×/0.98×/0.78× raw; hot 4 KiB 120–130 ns vs raw 160–170 ns; non-evicting); `holds_vs_pinned = false` (behind pinned LZ4/Zstd, and behind raw/LZ4 cold + sequential) | `e2e.json`, [`E2E.md`](E2E.md) |
-| **N8** | resource policy + fuzzing | every whole-object allocation driven by a declared/core-derived length bounded at **1 GiB** (`AllocationTooLarge`); **13** libFuzzer targets | [`SECURITY.md`](SECURITY.md), `src/resource.rs`, P40 |
+| **N8** | resource policy + fuzzing | every whole-object allocation driven by a declared/core-derived length bounded at **1 GiB** (`AllocationTooLarge`); **15** libFuzzer targets (three added in N8, two in O3) | [`SECURITY.md`](SECURITY.md), `src/resource.rs`, P40 |
 
 **Honest reading.** The N-round adds real capabilities and bounded resource use —
 identity-bound plans, bounded windows, two directly-addressable machines, a
@@ -464,7 +464,7 @@ the optimiser tight-budget base defect (**J**) and the `cursor + N` overflow
 |---|---|---|---|
 | **O1** | the **decoder court** — word16 (machine 7), independent lanes (machine 8), an AVX2 rANS kernel | all **REJECTED**: machine 7 ≈**6 %** over machine 2 but ≈**37 %** under `K = 8`; machine 8 **+30 %**; kernel **+25–27 %**. Best stays **machine 4 `K = 8`** (cold 4 KiB p50 **8,997 ns**, 45-byte restart), **3.2× smaller** than LZ4 but ≈4.3× slower cold; every variant byte-exact, machines 1–6 wire-hash pinned | `decoders.json`, [`DECODERS.md`](DECODERS.md), P41, P42 |
 | **O2** | uniform-footprint gate + OrFS compaction | uniform plan `committed_bytes == raw_bytes == 4,194,304`, no p99 regression (130.9 == 130.9 ns), sequential raw-like (**69.6 GB/s**); OrFS on-disk excess **+1.89 %/+0.70 % → +1.54 %/+0.58 %** (payload stored once) | `optimizer.json`, `orfs.json`, [`OPTIMIZER.md`](OPTIMIZER.md), [`ORFS.md`](ORFS.md), P43, P44 |
-| **O3** | review fixes + cursor hardening | Finding **I** (cursor overflow, machines 7/8 + SIMD kernel) and Finding **J** (gate aborted when only the base fit) fixed; **14** unchecked `cursor + N` sites hardened to `saturating_add` across machines 1–4; 15 fuzz targets, **684/0**, **33** JSON, verify green at **698** | `tests/adversarial_o.rs`, [`reviews/security.md`](reviews/security.md) Revision 8 |
+| **O3** | review fixes + cursor hardening | Finding **I** (cursor overflow, machines 7/8 + SIMD kernel) and Finding **J** (gate aborted when only the base fit) fixed; **14** unchecked `cursor + N` sites hardened to `saturating_add` across machines 1–4; 15 fuzz targets, **687/0**, **33** JSON, verify green at **701** | `tests/adversarial_o.rs`, [`reviews/security.md`](reviews/security.md) Revision 8 |
 
 **Honest reading.** The decoder court is **complete with all variants rejected**
 (a word16 renorm, independent per-lane streams and a SIMD gather kernel all lose to

@@ -949,7 +949,7 @@ by `fuzz/fuzz_targets/fuzz_rans_i.rs`.
 **Claim.** `ResidentView::new(&engine, &body)` resolves the certified hot plan
 **once** (the `Arc<AccessPlan>` deref, the resident-index `match`, the tile/bloom
 index and the `hot_surface()` re-validation) and borrows a `(&[u8], base)`;
-`get(i)` is byte-identical to `reader::read` for **all four machines** over both a
+`get(i)` is byte-identical to `reader::read` for **machines 1–4** over both a
 whole-object `HotTile` plan and a certified `Path`/`DirectStorage` plan, and
 out-of-range `get_checked`/`copy_range` are `None`/`false` (`get` past the end
 panics exactly as slice indexing does).

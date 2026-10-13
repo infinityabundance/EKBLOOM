@@ -374,8 +374,9 @@ No attempt produced a corrupt or partially-published generation readable by
 `sh scripts/container-async-io.sh`: probe works end-to-end under
 `--security-opt seccomp=unconfined` (byte-identical, `durability_ordered: true`,
 6/6 tests pass in both stage 0 fallback and stage 1). `sh scripts/container-fuzz.sh`:
-all four targets PASS (`fuzz_machine`, `fuzz_open`, `fuzz_bloom`,
-`fuzz_history_store` @100k runs, cov 1121). **Verdict: SAFE — no memory-safety or
+all four targets then in the campaign PASS (`fuzz_machine`, `fuzz_open`, `fuzz_bloom`,
+`fuzz_history_store` @100k runs, cov 1121; the campaign now runs **fifteen**).
+**Verdict: SAFE — no memory-safety or
 durability defect found.**
 
 ---
@@ -669,7 +670,7 @@ manifested structure.
 
 ### `ResidentView` — **held**
 
-Byte-exact vs `reader::read` for **all four machines** over two surfaces (a
+Byte-exact vs `reader::read` for **machines 1–4** over two surfaces (a
 whole-object `HotTile` plan and a certified `Path`/`DirectStorage` plan) at
 `{0, 1, 4095, 4096, 4097, 8191, n/2, n-2, n-1}` plus a 300-byte tile-crossing
 window; `get_checked`/`copy_range` past the end are `None`/`false`; `get` panics only
@@ -1002,9 +1003,9 @@ tight and loose budgets; a compressible/constant corpus does not expand past raw
 
 `sh scripts/container-fuzz.sh`: **fifteen** targets PASS (`fuzz_rans_w`,
 `fuzz_rans_il` added and wired into `fuzz/Cargo.toml` + the campaign).
-`sh scripts/container-reproduce.sh`: clean `--locked --release` build, **684
+`sh scripts/container-reproduce.sh`: clean `--locked --release` build, **687
 passed / 0 failed**, **33** evidence JSON files OK. Verify gate (`fmt --check`,
-`clippy -D warnings`, `cargo test --all-features`) green at **698 passed**.
+`clippy -D warnings`, `cargo test --all-features`) green at **701 passed**.
 
 ### Residual risk (Revision 8)
 

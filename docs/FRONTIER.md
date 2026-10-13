@@ -225,7 +225,7 @@ The one place EKBLOOM still lost to a bare codec was the **cold** (uncached)
 operation: a read outside the hot set pays a full machine decode, where LZ4 pays
 a copy-based block decompress. `examples/frontier.rs` now measures this directly
 for a **4 KiB** and a **64 KiB** read at offsets past the 256 KiB hot prefix
-(256 samples each), across EKBLOOM's four machines × three block sizes and a
+(256 samples each), across machines 1–4 × three block sizes and a
 **fair** competitor set whose index overhead is counted in its footprint.
 
 EKBLOOM rows are the authoritative core plus an independently-certified
