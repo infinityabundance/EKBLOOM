@@ -6,3 +6,8 @@
 /research
 /fuzz/target
 /fuzz/Cargo.lock
+
+# Frozen wire-format compatibility fixtures are committed deliberately: they are
+# `.ekb` files written by older releases that current code must open
+# byte-identically (see docs/MIGRATION.md §6, tests/compat_fixtures.rs).
+!tests/fixtures/**/*.ekb

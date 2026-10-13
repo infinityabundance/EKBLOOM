@@ -135,3 +135,71 @@ file (`core_version` reads as legacy `0`), and the only byte difference a 0.5 wr
 introduces is the two-byte `core_version` field in the genesis header (plus the
 reserved bytes it no longer needs). The `0.4` release was a documentation/packaging
 release on the same wire line `0.3` (machines 1–8).
+
+---
+
+## 6. Frozen fixtures
+
+The compatibility claims in §2 and §5 are not just prose: they are pinned by
+**frozen `.ekb` fixtures written by older releases**, checked in under
+[`tests/fixtures/`](../tests/fixtures) and asserted by
+[`tests/compat_fixtures.rs`](../tests/compat_fixtures.rs).
+
+### 6.1 What is checked in
+
+`tests/fixtures/expected.json` records, per fixture, the writer release and the
+expectations the current build must reproduce:
+
+| file | writer | source | machine | profile | core_version | logical_len | physical_bytes |
+|---|---|---|---|---|---:|---:|---:|
+| `v0.3_elf_root_m1.ekb` | 0.3.0 | 256-B ELF prefix | 1 (`OrANS-NL2`) | root | 0 | 256 | 256 |
+| `v0.3_text_root_m2.ekb` | 0.3.0 | 512-B text | 2 (`OrANS-RANS0`) | root | 0 | 512 | 872 |
+| `v0.3_skew_root_m2.ekb` | 0.3.0 | 4-KiB skewed 4-symbol | 2 | root | 0 | 4096 | 1371 |
+| `v0.3_skew_path_m2.ekb` | 0.3.0 | 4-KiB skewed 4-symbol | 2 | path(D=4) | 0 | 4096 | 9798 |
+| `v0.3_empty_root_m1.ekb` | 0.3.0 | empty | 1 | root | 0 | 0 | 0 |
+| `v0.3_one_root_m1.ekb` | 0.3.0 | 1 byte (`0x5A`) | 1 | root | 0 | 1 | 1 |
+| `v0.4_*` (same six) | 0.4.0 | identical sources | identical | identical | 0 | identical | identical |
+
+The 0.3.0 and 0.4.0 artifacts are byte-identical, which is the frozen evidence
+that 0.4.0 was a documentation/packaging release on wire line `0.3`: their
+`format_major.minor` is `0.3` and their `core_version` field is `0` (the legacy,
+implicit value the old writers left in the formerly-reserved bytes).
+
+### 6.2 Genuine provenance
+
+These are **genuine old-version files**, not current-code output relabelled. They
+were written by the old releases' own `create_machine` / `write_body` by checking
+their release commits out into git worktrees and running a small emitter built
+*against that release's library*:
+
+* `0.4.0` → commit `8a9c217`; `0.3.0` → commit `b26a165` (the crates.io publish).
+* the emitter is [`examples/emit_fixtures.rs`](../examples/emit_fixtures.rs); it
+  uses only the API surface common to 0.3.0, 0.4.0 and the current build, so the
+  same source compiles inside each worktree as `src/bin/emit_fixtures.rs`.
+* the process is [`scripts/regen-fixtures.sh`](../scripts/regen-fixtures.sh).
+
+### 6.3 What current code guarantees
+
+For every fixture, `tests/compat_fixtures.rs` asserts that the current reader
+`open`s the file and reproduces, byte-for-byte: the genesis-header fields; the
+logical bytes at a recorded spread of sampled positions (through `byte_at`), and
+the BLAKE3 hash over them; `physical_bytes()`, `logical_len` and `machine_id`;
+and that both `verify` and `verify_deep` pass. It also asserts the artifact's
+bytes are **unchanged** by opening it. A second test tampers with a copy (a
+flipped core byte and a flipped footer byte) and requires `open` to refuse it, so
+the fixtures are demonstrably load-bearing.
+
+### 6.4 The rule
+
+**These fixtures are frozen.** They are never rewritten by the test suite; the
+only way to change them is to run `scripts/regen-fixtures.sh` deliberately.
+Changing the on-disk format therefore requires, in the same change:
+
+1. a new release commit that writes the new format, with the emitter run against
+   it (extending the fixture set with `v<next>_*` files and new `expected.json`
+   entries) — existing `v0.3_*`/`v0.4_*` files are **never** touched or removed;
+2. an entry in §5 version history and the §2 compatibility matrix; and
+3. a `tests/compat_fixtures.rs` that opens *both* the old and the new fixtures.
+
+A pull request that changes the wire format without new frozen fixtures, or that
+edits an existing fixture, is a migration-policy violation.
