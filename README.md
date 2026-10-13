@@ -1,7 +1,7 @@
 # EKBLOOM
 
 EKBLOOM is a **concealed-expansion codec**: a native-Rust implementation of the
-EKBLOOM 0.4 engineering candidate. It presents a logical object through a small
+EKBLOOM 0.5 engineering candidate. It presents a logical object through a small
 visible surface while maintaining a deliberately larger *manifested operational
 body* behind that surface.
 
@@ -15,7 +15,7 @@ preserves exact correctness, accounts for the bytes it actually manifests, and
 converts manifested space into access speed.
 
 This crate is a single Cargo package (`ekbloom`), shipping one library and one
-binary (`ekbloom`), and **`ekbloom` v0.4.0 is published on
+binary (`ekbloom`), and **`ekbloom` v0.5.0 is published on
 [crates.io](https://crates.io/crates/ekbloom)**. The frozen internal contract is
 `docs/DESIGN.md`; the original specification lives in `research/`.
 
@@ -172,6 +172,55 @@ binary (`ekbloom`), and **`ekbloom` v0.4.0 is published on
     and **14** unchecked cursor sites hardened across machines 1–4
     ([`docs/DECODERS.md`](docs/DECODERS.md), [`docs/OPTIMIZER.md`](docs/OPTIMIZER.md),
     [`docs/ORFS.md`](docs/ORFS.md)).
+21. **Wire-format versioning makes stored data safe to evolve (P1).** Every `.ekb`
+    carries an explicit `core_version` in the genesis header (`u16` at offset 68;
+    `0` legacy / `1` current) and a reader refuses any unknown `format_major`,
+    `format_minor` or `core_version` with a typed error — never guessing. The field
+    was carved from formerly-reserved header bytes, so **every machine's core output
+    is byte-identical** and a legacy file still reads exactly
+    ([`docs/MIGRATION.md`](docs/MIGRATION.md),
+    [`docs/CORE-LAYOUT.md`](docs/CORE-LAYOUT.md), P45).
+22. **Streaming with bounded builder memory (P2).** `StreamBuilder`/`StreamReader`
+    encode and seek a downstream-seekable container while holding **at most one
+    block** plus an `O(blocks)` directory: a **2 GiB** stream builds at **8.6 MiB
+    peak RSS** (build phase 4.5 MiB), with byte-exact `read_at` p50 **11.0 µs** /
+    p99 **20.8 µs** and sequential **1,076 MiB/s**
+    ([`docs/STREAMING.md`](docs/STREAMING.md), `stream.json`, P46).
+23. **Corruption detection is 100 % and localized (P3).** A rich body (18 sections,
+    584,152 B) with **1024 single-bit flips per structure** is detected
+    **1024/1024** everywhere covered and localized to a **≤ 4096 B** window; the deep
+    verifier reports `Corrupt { section, offset }` with the first divergent logical
+    symbol ([`docs/CORRUPTION.md`](docs/CORRUPTION.md), `corruption.json`, P47).
+24. **`unsafe` is an audited budget (P4).** The crate is safe Rust except exactly
+    **three** sanctioned modules (`src/simd.rs`, `src/async_io.rs`, `src/mapped.rs`);
+    a gate (`scripts/check-safety.sh`) fails closed on a new module and the read path
+    has **0** production `.unwrap()`/`panic!`; Miri covers **61** unit tests
+    ([`docs/SAFETY.md`](docs/SAFETY.md), [`docs/ALLOC.md`](docs/ALLOC.md)).
+25. **Shared dictionaries for small records (P5).** Machine 9 (`OrANS-DICT`) factors a
+    trained order-0 model out of the record: **83.5 B/record vs machine 2's 590.0**
+    (raw 100.0), break-even at **2 records**, decode **721 ns vs 1,403 ns**; an
+    absent/tampered/relabelled dictionary id is a typed error
+    ([`docs/DICTIONARY.md`](docs/DICTIONARY.md), `dictionary.json`, P49).
+26. **The standard-corpora court (P6).** On Silesia/enwik8/Calgary/text/ELF at an
+    equal (raw-size) budget EKBLOOM is **`E_V` 0.988–0.998** (never larger than raw),
+    with `byte_at` ~**1.1–3.3 µs** vs zstd 8.6–16.1 µs, **39.1 instructions/byte**
+    (8.1 cycles) for a single-byte read, and a worst-case step bound that holds over
+    **1,000,000** positions with **zero** violations (all 1.2 M samples)
+    ([`docs/CORPORA.md`](docs/CORPORA.md), `corpora.json`/`counters.json`/`bound.json`, P50).
+27. **The machine catalogue and the budget chooser (P7).**
+    [`docs/MACHINES.md`](docs/MACHINES.md) specifies machines 1–9 exactly;
+    `ekbloom::choose_plan` plus [`docs/BUDGET-GUIDE.md`](docs/BUDGET-GUIDE.md) pick
+    machine × segment size × restart `K`/`B` × path `D` × tiles under a byte budget;
+    [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) consolidates every honest non-claim
+    in one place.
+28. **Trust infrastructure: fuzz, cross-arch determinism and gates (P8).** **17**
+    libFuzzer targets all PASS; cross-architecture determinism is **identical**
+    (x86_64 == arm64, equal output sha256 over 70 lines); and the machine-checked
+    gates **G1–G5** are **all PASS** (invertibility, prefix composition, worst-case
+    bound over 1,000,000 positions, corruption detection, physical accounting). The
+    SEG trait `decode` is now **linear** (was `O(n²)`: **415 s → 0.5 ms** at
+    `n = 2²⁰`) ([`docs/TESTING.md`](docs/TESTING.md), [`docs/GATES.md`](docs/GATES.md),
+    P48).
 
 ---
 
@@ -532,7 +581,7 @@ publication and pays submit/completion round-trips. See
 
 ---
 
-## Research phases (v0.4): reconstruction, packing, tiles, handles, kernels, court, planner & mmap
+## Research phases (v0.4–v0.5): reconstruction, packing, tiles, handles, kernels, court, planner & mmap
 
 The 0.4 round is organised around a **three-role separation**: *machine semantics*
 (`src/machine.rs`), the *manifestation engine* (exact certified structures), and an
@@ -673,9 +722,11 @@ affix parser (`tiles::parse_tile_set_prefix`, including the `tile_shift` guard)
 is shared by the in-memory and file-backed readers, so parsing happens in exactly
 one place. `sh scripts/validate-evidence.sh`
 (`examples/validate_evidence.rs`, dependency-free) validates every
-`evidence/**/*.json`: **33** files `OK` (up from 24; `batch.json` added in L4,
-`window.json`/`orfs.json`/`optimizer.json`/`e2e.json` added in the N-round, and
-`decoders.json` added in the O-round).
+`evidence/**/*.json`: **46** files `OK` (up from 24; `batch.json` added in L4,
+`window.json`/`orfs.json`/`optimizer.json`/`e2e.json` added in the N-round,
+`decoders.json` in the O-round, and `stream`/`corruption`/`dictionary`/`corpora`/
+`counters`/`concurrency`/`bound`/`aarch64-determinism` plus the gates `G1`–`G5` in
+the P-round).
 - **R2 — machine-2 prepared decode context, encode-first budgets, bounded cold
 reconstruction, cache single-flight.** A validated `RansContext` (frequencies,
 prefix sums, 4096-entry slot table) is built **once** per bulk decode instead of
@@ -908,8 +959,9 @@ by P34–P40 in [`docs/PROOFS.md`](docs/PROOFS.md), and independently reviewed
 - **N8 — resource policy + fuzzing.** `src/resource.rs` bounds every whole-object
   allocation driven by a declared/core-derived length at **1 GiB** by default
   `AllocationTooLarge`). The bounded file-backed paths are unaffected. The campaign
-  now runs **15** libFuzzer targets (`+fuzz_pack`, `fuzz_seg`, `fuzz_resource` in
-  this round; `fuzz_rans_w`/`fuzz_rans_il` in the O-round)
+  now runs **17** libFuzzer targets (`+fuzz_pack`, `fuzz_seg`, `fuzz_resource` in
+  this round; `fuzz_rans_w`/`fuzz_rans_il` in the O-round; `fuzz_roundtrip`/`fuzz_stream`
+  in the P-round)
   ([`docs/SECURITY.md`](docs/SECURITY.md)).
 
 ### O-round: decoder court, uniform-footprint gate, OrFS compaction, review fixes (O1–O3)
@@ -953,8 +1005,79 @@ verdict **TWO DEFECTS, BOTH FIXED**, in
   cursor in machines 7/8 and the SIMD kernel — a read path for machine 7) and
   **Finding J**; the same hardening was applied to **14** unchecked `cursor + N`
   sites across machines 1–4, so no read path panics on a crafted cursor. The campaign
-  runs **fifteen** fuzz targets, `container-reproduce.sh` passes **687/0** with **33**
-  evidence JSON `OK`, and the verify gate is green at **701 passed**.
+  runs **seventeen** fuzz targets, `container-reproduce.sh` passes **766/0** with **46**
+  evidence JSON `OK`, and the verify gate is green at **780 passed**.
+
+### P-round: versioning, streaming, corruption, safety, dictionaries, corpora, machines & gates (P1–P8)
+
+The P-round makes the stored format **safe to evolve**, adds a **streaming**
+container, audits **corruption, `unsafe` and allocation**, adds a **shared-dictionary**
+machine, and closes the loop with a **standard-corpora court**, a **machine catalogue
+and budget chooser**, and **fuzz + cross-architecture + gate** trust infrastructure.
+Every item is measured by a committed artifact, covered by P45–P50 in
+[`docs/PROOFS.md`](docs/PROOFS.md), and independently reviewed in **Revision 9**
+([`docs/reviews/adversarial.md`](docs/reviews/adversarial.md),
+[`docs/reviews/security.md`](docs/reviews/security.md); verdict **NO LIBRARY DEFECT
+FOUND — one fuzz-coverage gap fixed, two doc defects reported**; 7 tests in
+`tests/adversarial_p.rs`).
+
+- **P1 — versioned wire format.** An explicit `core_version` (`u16` at genesis-header
+offset 68; `0` legacy / `1` current) joins `format_major.minor` and `machine_id`;
+a reader rejects any unknown version with a typed error (`UnsupportedVersion`,
+`UnsupportedCoreVersion`, `UnknownMachine`, `UnsupportedManifestVersion`) and never
+guesses. Machines' core payloads are byte-identical to before and a legacy file reads
+exactly ([`docs/MIGRATION.md`](docs/MIGRATION.md),
+[`docs/CORE-LAYOUT.md`](docs/CORE-LAYOUT.md), P45).
+- **P2 — streaming container.** `StreamBuilder`/`StreamReader` ([`docs/STREAMING.md`](docs/STREAMING.md))
+encode and seek a container of independently-restartable blocks, holding one block +
+an `O(blocks)` directory: a **2 GiB** stream (`block_bytes` 64 KiB, 32,768 blocks)
+builds at **8.6 MiB peak RSS** (build 4.5 MiB) in 4.79 s (**428 MiB/s**), `read_at`
+p50/p99 **11,011 / 20,818 ns**, sequential **1,076 MiB/s**, every read byte-exact
+(`stream.json`, P46).
+- **P3 — corruption court.** A rich body (18 sections, 584,152 B) is given **1024
+single-bit flips per structure**; the fast path detects **1024/1024 = 1.0000** in
+every covered structure (inert padding/header metadata **0/1024**, uninterpreted), and
+the deep verifier detects **1024/1024** with located offsets, reporting
+`Corrupt { section, offset }`
+([`docs/CORRUPTION.md`](docs/CORRUPTION.md)). Detection
+granularity is the containing section/frame, **≤ 4096 B** for every structure
+(`corruption.json`, `gates/G4.json`, P47).
+- **P4 — `unsafe` + allocation audit.** The crate is safe Rust except exactly **three**
+sanctioned, independently-reviewed modules — `src/simd.rs` (AVX2/AVX-512 gathers and
+kernels), `src/async_io.rs` (`io_uring` SQEs) and `src/mapped.rs` (read-only
+`mmap`/`madvise`/`munmap`) — each with a byte-identical safe fallback.
+`scripts/check-safety.sh` fails closed on a new module, the production read path has
+**0** `.unwrap()`/`panic!` (four audited infallible `.expect(`), and Miri covers **61**
+unit tests ([`docs/SAFETY.md`](docs/SAFETY.md), [`docs/ALLOC.md`](docs/ALLOC.md)).
+- **P5 — shared trained dictionaries (machine 9).** `OrANS-DICT` stores a 540-byte
+order-0 model once and references it per record (or embeds it), keeping machine 2's
+exact semantics: **341,947 B / 83.5 B/rec** vs machine 2's **2,416,529 B / 590.0
+B/rec** (raw 100.0), decode **721 ns vs 1,403 ns**, break-even at **2 records**; an
+absent/unregistered id, a tampered embedded table and a relabelled core are typed
+errors ([`docs/DICTIONARY.md`](docs/DICTIONARY.md), `dictionary.json`, P49).
+- **P6 — standard-corpora, counters, concurrency and the worst-case bound.** On
+Silesia/enwik8/Calgary + text/ELF at an equal budget EKBLOOM is **`E_V` 0.988–0.998**
+(≤ raw; machine 4 chosen under budget), `byte_at` ~**1.1–3.3 µs** vs zstd-3/19
+8.6–16.1 µs, and a bounded encoded window (mean 7.2–8.6 KiB) per 4 KiB read; hardware
+counters show **39.14 instructions/byte** (8.1 cycles) for a 1-byte read; 64 concurrent
+readers measure **1.4e-3 locks/read** under a live publisher; and the worst-case step
+bound holds over **1,200,000** samples with **0** violations
+([`docs/CORPORA.md`](docs/CORPORA.md), `corpora.json`/`counters.json`/`concurrency.json`/`bound.json`, P50).
+- **P7 — machine catalogue + budget chooser + one limitations list.**
+[`docs/MACHINES.md`](docs/MACHINES.md) gives machines 1–9 (transition/encoding math,
+complete resumable state, decode, size table, wins/loses); `ekbloom::choose_plan`
+(same certified search as the joint optimiser) and [`docs/BUDGET-GUIDE.md`](docs/BUDGET-GUIDE.md)
+select machine × region/segment size × restart `K`/`B` × path `D` × tiles under a byte
+budget; [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) collects every honest non-claim
+with a pointer to its evidence.
+- **P8 — fuzz, cross-architecture determinism and machine-checked gates.** **17**
+libFuzzer targets all PASS (`+fuzz_roundtrip`, `fuzz_stream` in this round);
+cross-architecture determinism is **identical** (`evidence/bench/aarch64-determinism.json`:
+`identical: true`, equal output sha256 over 70 lines, x86_64 vs arm64/QEMU); and gates
+**G1–G5** are **all PASS** (`gates/G1.json`–`G5.json`). The machine-6 trait `decode` was
+fixed from `O(n²)` to **linear** (**415 s → 0.5 ms** at `n = 2²⁰`; `Seg::decode`/`state_log`
+byte-equal the per-symbol reference) ([`docs/TESTING.md`](docs/TESTING.md),
+[`docs/GATES.md`](docs/GATES.md), P48).
 
 ---
 
@@ -1070,9 +1193,9 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 
 ---
 
-## Limitations — resolved (L1–L4, M1–M5, N1–N8 and O1–O3) and remaining
+## Limitations — resolved (L1–L4, M1–M5, N1–N8, O1–O3 and P1–P8) and remaining
 
-### Resolved in rounds L1–L4, M1–M5, N1–N8 and O1–O3
+### Resolved in rounds L1–L4, M1–M5, N1–N8, O1–O3 and P1–P8
 
 - **The base representation never expands past raw** (L1). Machine 3
   (`OrANS-Store`) is the verbatim identity (`encode = source`, `V = N`), and the
@@ -1127,6 +1250,25 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
   planner returns the structureless machine-3 base on uniform data
   (`committed_bytes == raw_bytes == 4,194,304`), the held-out p99 equals the
   no-structure p99, and the sequential rate is raw-like (**69.6 GB/s**).
+- **The wire format is explicitly versioned and read-compatible** (P1). An unknown
+  `.ekb`/`core_version`/manifest version is a typed refusal, never a guess; a legacy
+  (`core_version = 0`) file reads exactly, and machines' cores are byte-identical
+  ([`docs/MIGRATION.md`](docs/MIGRATION.md), [`docs/CORE-LAYOUT.md`](docs/CORE-LAYOUT.md)).
+- **Streaming is bounded-memory** (P2). A 2 GiB stream builds at **8.6 MiB peak RSS**
+  (one block + `O(blocks)` directory), with byte-exact seekable reads
+  ([`docs/STREAMING.md`](docs/STREAMING.md)).
+- **Corruption is detected at 100 % and localized** (P3). Every covered structure is
+  **1024/1024** on single-bit flips, localized to ≤4096 B; the deep verifier reports
+  `Corrupt { section, offset }` ([`docs/CORRUPTION.md`](docs/CORRUPTION.md)).
+- **`unsafe` and allocation are an audited, machine-enforced budget** (P4). Three
+  sanctioned modules, a fail-closed gate, zero production `.unwrap()`/`panic!`, and
+  **61** Miri unit tests ([`docs/SAFETY.md`](docs/SAFETY.md), [`docs/ALLOC.md`](docs/ALLOC.md)).
+- **Small records share one trained dictionary** (P5). Machine 9 gives **83.5
+  B/record vs 590.0** and break-even at **2 records** ([`docs/DICTIONARY.md`](docs/DICTIONARY.md)).
+- **Cross-architecture determinism and machine-checked gates** (P8). x86_64 == arm64
+  (`identical: true`) and **G1–G5 all PASS**, including the 1,000,000-position
+  worst-case bound with **0** violations ([`docs/GATES.md`](docs/GATES.md),
+  [`docs/TESTING.md`](docs/TESTING.md)).
 
 ### Remaining (honest)
 
@@ -1241,6 +1383,18 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
   CRC + `core_hash` linkage (integrity, not authenticity); `verify`/`certify` is the
   gate for in-memory bodies ([`docs/WINDOW.md`](docs/WINDOW.md),
   [`docs/reviews/security.md`](docs/reviews/security.md) Revision 7).
+- **The dictionary id is not cryptographically bound in the bare machine** (P5).
+  Relabelling a *referenced* machine-9 core to a different **registered** id is not
+  caught by the machine API; a manifested body still catches it through the manifest
+  `core_hash` linkage. Integrity ≠ authenticity — only `AUTH` closes it
+  ([`docs/DICTIONARY.md`](docs/DICTIONARY.md), [`docs/reviews/security.md`](docs/reviews/security.md)
+  Revision 9).
+- **Miri covers the safe subset (machines 1–8), not the three `unsafe` modules or
+  machine 9** (P4). The SIMD intrinsics, `io_uring` syscalls and `mmap` are outside
+  Miri's model and are covered instead by `tests/simd.rs`/`tests/unsafe_review.rs`/
+  `tests/mmap.rs` and the SAFE review; the shared-dictionary machine is pinned by
+  `tests/dictionary.rs`, not Miri ([`docs/SAFETY.md`](docs/SAFETY.md),
+  [`docs/ALLOC.md`](docs/ALLOC.md)).
 
 ---
 
@@ -1277,6 +1431,13 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 - `evidence/bench/optimizer.json` — the physical-budget-aware **joint** planner vs greedy (held-out p99 **10.07** vs **13.58 µs**; **9.84** vs **13.19 µs**), plus the `uniform_evidence` footprint gate (`committed_bytes == raw`).
 - `evidence/bench/e2e.json` — the end-to-end real-data verdict (beats raw store; behind pinned-hot LZ4/Zstd).
 - `evidence/bench/decoders.json` — the decoder court (O1): machines 7/8 and the AVX2 rANS kernel vs machine 4 `K = 8` at equal stored bytes; all rejected.
+- `evidence/bench/stream.json` — the streaming container: 2 GiB at 8.6 MiB peak RSS, byte-exact seekable reads (P2).
+- `evidence/bench/corruption.json` — the corruption court: 1024 single-bit flips per structure, 100 % detected, ≤4096 B window (P3).
+- `evidence/bench/dictionary.json` — machine 9 `OrANS-DICT`: 83.5 B/rec vs machine 2's 590.0, break-even 2 records (P5).
+- `evidence/bench/corpora.json` — the standard-corpora court (Silesia/enwik8/Calgary/text/ELF) at an equal budget (P6).
+- `evidence/bench/counters.json` — hardware counters: 39.14 instructions/byte, 8.1 cycles for a 1-byte read (P6).
+- `evidence/bench/concurrency.json` — 64 readers vs a publishing writer: 1.4e-3 locks/read, non-spiking tails (P6).
+- `evidence/bench/bound.json` — the worst-case step bound: 1,200,000 samples, **0** violations (P6).
 - `evidence/counterexamples/` — rejected state-keyed blooms.
 - `evidence/model-search/` — finite-model sufficiency sweep.
 - `evidence/gates/G1.json` … `G5.json` — acceptance gates G1–G5 ([`docs/GATES.md`](docs/GATES.md)).
@@ -1289,7 +1450,7 @@ Documentation map:
 | [`docs/INDEX.md`](docs/INDEX.md) | One-page index of all docs and evidence. |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Frozen internal engineering contract. |
 | [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | The 10 hard gates mapped to tests and commands. |
-| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties P1–P44 (machine 1 + machine 2 + the round-3/round-4 modules + the L1–L4 closure + the M1–M5 closure + the N1–N8 closure + the O1–O3 closure) and honest limitations. |
+| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties P1–P50 (machine 1 + machine 2 + the round-3/round-4 modules + the L1–L4 closure + the M1–M5 closure + the N1–N8 closure + the O1–O3 closure + the P1–P8 closure) and honest limitations. |
 | [`docs/RESULTS.md`](docs/RESULTS.md) | Measured results and the 65,536 research outcome. |
 | [`docs/CODEC.md`](docs/CODEC.md) | Machines 2–8 (`OrANS-RANS0`/`OrANS-Store`/`OrANS-RANS0I`/`OrANS-PACK`/`OrANS-SEG`/`OrANS-RANS0W`/`OrANS-RANS0IL`) codecs + the `auto` policy. |
 | [`docs/BASELINES.md`](docs/BASELINES.md) | Conventional baseline comparison (`RawVec`/`RawFile`/…). |
@@ -1319,14 +1480,22 @@ Documentation map:
 | [`docs/OPTIMIZER.md`](docs/OPTIMIZER.md) | The physical-budget-aware joint planner (`src/optimize.rs`), held-out and certified. |
 | [`docs/E2E.md`](docs/E2E.md) | End-to-end EKBLOOM/OrFS proof on real data vs raw / pinned-hot LZ4 / Zstd. |
 | [`docs/DECODERS.md`](docs/DECODERS.md) | The decoder court (O1): machines 7/8 and the AVX2 rANS kernel vs machine 4 `K = 8` at equal stored bytes — all rejected. |
+| [`docs/MIGRATION.md`](docs/MIGRATION.md) | Wire-format migration & compatibility (P1): version tags, the read/write matrix, and the policy that makes stored `.ekb` data safe across releases. |
+| [`docs/CORE-LAYOUT.md`](docs/CORE-LAYOUT.md) | Implementable `.ekb`/core byte layout for machines 1–9 (enough to reimplement a decoder from the text alone). |
+| [`docs/STREAMING.md`](docs/STREAMING.md) | The streaming, downstream-seekable container (`StreamBuilder`/`StreamReader`) with bounded builder memory (P2). |
+| [`docs/CORRUPTION.md`](docs/CORRUPTION.md) | What a single bit flip does per `.ekb` structure: 100 % detection, ≤4096 B granularity, `Corrupt { section, offset }` (P3). |
+| [`docs/SAFETY.md`](docs/SAFETY.md) | The audited `unsafe` budget (P4): the three sanctioned modules, their SAFETY arguments and their safe fallbacks. |
+| [`docs/ALLOC.md`](docs/ALLOC.md) | The allocation/panic audit (P4): allocation-free hot path, policy-ceilinged whole-object allocations, the Miri subset. |
+| [`docs/DICTIONARY.md`](docs/DICTIONARY.md) | Machine 9 (`OrANS-DICT`): the shared trained order-0 dictionary for many small records (P5). |
+| [`docs/CORPORA.md`](docs/CORPORA.md) | The standard-corpora court, hardware counters, 64-reader concurrency p99, and the worst-case step bound (P6). |
 | [`docs/MACHINES.md`](docs/MACHINES.md) | The machine catalogue (ids 1–9): exact transition/encoding math, complete resumable state, decode algorithm, size table and wins/loses per machine, plus a relationship map. |
 | [`docs/BUDGET-GUIDE.md`](docs/BUDGET-GUIDE.md) | The budget chooser guide (`choose_plan`): budget × workload decision table, how to pick machine / segment / restart `K` / block `B` / path `D` / tiles, and worked examples. |
 | [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) | The consolidated honest non-claims, each with a one-line pointer to its evidence. |
 | [`docs/GATES.md`](docs/GATES.md) | The machine-checked acceptance gates **G1–G5** (invertibility, prefix composition, worst-case bound, corruption detection, physical accounting) and their runner. |
 | [`docs/TESTING.md`](docs/TESTING.md) | The trust-building test infrastructure: fuzz roundtrips, cross-architecture determinism, the nightly scale job, and the gates. |
-| [`docs/reviews/adversarial.md`](docs/reviews/adversarial.md) | Adversarial correctness review (through **Revision 8**, O1–O2: two defects, both fixed). |
+| [`docs/reviews/adversarial.md`](docs/reviews/adversarial.md) | Adversarial correctness review (through **Revision 9**, P1–P8: one fuzz-coverage gap fixed, verdict **no library defect found**). |
 | [`docs/reviews/concurrency.md`](docs/reviews/concurrency.md) | Concurrency audit + Loom model checking. |
 | [`docs/reviews/mathematics.md`](docs/reviews/mathematics.md) | Independent re-derivation of the proofs. |
 | [`docs/reviews/performance.md`](docs/reviews/performance.md) | Locality & SIMD investigation. |
 | [`docs/reviews/reproducibility.md`](docs/reviews/reproducibility.md) | Independent reproducibility review. |
-| [`docs/reviews/security.md`](docs/reviews/security.md) | Wire-form / `unsafe` security review (three `unsafe` modules), through **Revision 8** (O1–O2: two defects, both fixed). |
+| [`docs/reviews/security.md`](docs/reviews/security.md) | Wire-form / `unsafe` security review (three `unsafe` modules), through **Revision 9** (P1–P8: one fuzz-coverage gap fixed, two doc defects reported). |

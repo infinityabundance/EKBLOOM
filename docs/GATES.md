@@ -48,17 +48,16 @@ byte-for-byte. `G1` also checks the affine-prefix property where it applies.
 **Result (PASS).**
 
 ```text
-GATE G1 invertibility: PASS — machines=1..9 cases=144 max_len=1048576 seg_large_path=SegContext::decode_into
+GATE G1 invertibility: PASS — machines=1..9 cases=144 max_len=1048576
 ```
 
-**Honest note (library performance issue, not a correctness failure).**
-`OrANS-SEG` (`machine_id = 6`) does **not** override the reference
-`OrMachine::decode`; its `Seg::reveal` re-parses the whole core on **every**
-symbol (`src/machine_seg.rs`), so the trait `decode` is `O(n^2)` — measured at
-**415 s for n = 2^20**. The linear segment-wise `SegContext::decode_into` (the
-path the read API uses) is used for the large lengths in G1. Invertibility holds
-on both paths; the trait `decode` is the slow one. This is reported, not patched
-(the library modules are owned elsewhere).
+**Honest note (fixed in the P-round).** `OrANS-SEG` (`machine_id = 6`) previously
+inherited the reference `OrMachine::decode`, whose `Seg::reveal` re-parsed the whole
+core on **every** symbol, so the trait `decode` was `O(n^2)` — measured at **415 s for
+n = 2^20**. `Seg` now overrides `decode`/`state_log` with a **linear** segment-wise path
+(parse the container once, one lookup per segment crossed; `Seg::decode`/`state_log`
+byte-equal the per-symbol reference), so the trait `decode` runs in ~**0.5 ms** at
+`n = 2^20` and `G1` calls `machine.decode` directly for every machine 1–9.
 
 ## G2 — prefix composition (affine block composition exact)
 

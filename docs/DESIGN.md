@@ -1,4 +1,4 @@
-# EKBLOOM 0.4 — Frozen Engineering Contract
+# EKBLOOM 0.5 — Frozen Engineering Contract
 
 This document is the authoritative internal contract. Every module must conform to it.
 It freezes machine semantics, state log semantics, bloom definitions, the data model,
@@ -266,10 +266,10 @@ ekbloom bench    <file.ekb> --workload <seq|random-1b|rand-4k|range-64k|mixed>
 
 ---
 
-## 9. Addenda (v0.4 research)
+## 9. Addenda (v0.4–v0.5 research)
 
 This section is **additive**. It records the modules and interfaces added by the
-0.4 research round. It does **not** change the frozen machine contract in §1, the
+0.4–0.5 research rounds. It does **not** change the frozen machine contract in §1, the
 state-log/history semantics in §2, the bloom definitions in §3, the data model in
 §4 (except that new additive structures may be appended to a body), or the wire
 layout in §5 (except for one new section kind). Where an addendum and the frozen
@@ -329,3 +329,25 @@ These addenda were each implemented, measured and independently reviewed (see
 [`docs/reviews/adversarial.md`](reviews/adversarial.md) Revision 3 and
 [`docs/reviews/security.md`](reviews/security.md) Finding D). Their proved/observed
 properties are recorded as P11–P14 in [`docs/PROOFS.md`](PROOFS.md).
+
+### 9.5 P-round (v0.5) additions
+
+The v0.5 round is **additive**: it does not change the frozen machine contract in §1,
+the state-log/history semantics in §2, the bloom definitions in §3, or the data model
+in §4, and the `.ekb` **wire line stays `0.3`**. It adds:
+
+| Module / interface | Role | Doc |
+|---|---|---|
+| `format::core_version` (genesis-header `u16` at offset 68) | explicit, machine-identifying core versions (`0` legacy / `1` current) | [`MIGRATION.md`](MIGRATION.md), [`CORE-LAYOUT.md`](CORE-LAYOUT.md) |
+| `src/stream.rs` (`StreamBuilder`/`StreamReader`) | streaming, downstream-seekable container with bounded builder memory | [`STREAMING.md`](STREAMING.md) |
+| `src/dictionary.rs`, `src/machine_dict.rs` (`machine_id = 9`, `OrANS-DICT`) | shared trained order-0 dictionary records (referenced or embedded) | [`DICTIONARY.md`](DICTIONARY.md) |
+| `scripts/check-safety.sh` + [`SAFETY.md`](SAFETY.md), [`ALLOC.md`](ALLOC.md) | the audited, machine-enforced `unsafe`/allocation budget | [`SAFETY.md`](SAFETY.md), [`ALLOC.md`](ALLOC.md) |
+
+The machine catalogue ([`MACHINES.md`](MACHINES.md)), the budget chooser `choose_plan`
+([`BUDGET-GUIDE.md`](BUDGET-GUIDE.md)), the consolidated non-claims
+([`LIMITATIONS.md`](LIMITATIONS.md)), the machine-checked gates ([`GATES.md`](GATES.md))
+and the trust infrastructure ([`TESTING.md`](TESTING.md)) are recorded in their own
+docs. The round's proved/observed properties are **P45–P50** in
+[`PROOFS.md`](PROOFS.md); it is reviewed in Revision 9
+([`docs/reviews/adversarial.md`](reviews/adversarial.md),
+[`docs/reviews/security.md`](reviews/security.md)).

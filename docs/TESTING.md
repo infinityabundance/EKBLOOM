@@ -32,8 +32,8 @@ Measured on the pinned image (`rust:1.99.0`, `ekbloom-rust:1.99.0`):
 
 | run | tests passed | failed |
 |---|---:|---:|
-| `cargo test --all-features` (debug) | **770** | 0 |
-| `cargo test --release --locked` (reproduce) | **756** | 0 |
+| `cargo test --all-features` (debug) | **780** | 0 |
+| `cargo test --release --locked` (reproduce) | **766** | 0 |
 
 (The release run has fewer tests because it does not enable the optional
 `fuse`/`io-uring` features.) New in this work: `tests/gates.rs` (G1–G5) and

@@ -1073,7 +1073,9 @@ override is fuzzed through the public trait. (fuzz-only edit; campaign re-run gr
   semantic decode still returns `AllocationTooLarge`, but the reservation itself is
   not policy-bounded: a crafted container can transiently request up to ≈4 GiB of
   address space. Recommend a `checked_default(e.logical_len)?` before the
-  reservation.
+  reservation. **(Addressed in the follow-up commit:** `read_sequential` now calls
+  `resource::checked_default(e.logical_len)?` immediately before the
+  `Vec::with_capacity`.)**
 * **Dictionary id is not cryptographically bound in-core.** Relabelling a
   referenced core to a *different registered* id is caught by the manifest
   `core_hash` linkage in a manifested body, but the bare machine API would decode
@@ -1083,5 +1085,6 @@ override is fuzzed through the public trait. (fuzz-only edit; campaign re-run gr
   `docs/MIGRATION.md` still says machines 1–8 and its worked example allocates
   `MACHINE_NL2P = 9`, an id now taken by `OrANS-DICT` (P5); `docs/CORE-LAYOUT.md`
   (intro, §1.3) likewise says "machines 1–8". Correct to include machine 9 and
-  re-point the example at an unused id.
+  re-point the example at an unused id. **(Addressed in the follow-up commit:** both
+  docs now say machines 1–9 and the worked example allocates `MACHINE_NL2P = 10`.)**
  

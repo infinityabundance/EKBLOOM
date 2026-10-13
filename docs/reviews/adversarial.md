@@ -1,4 +1,4 @@
-# Adversarial review — EKBLOOM 0.4
+# Adversarial review — EKBLOOM 0.5
 
 Independent "try to break correctness" pass over the frozen contract
 (`docs/DESIGN.md`, `docs/PROOFS.md`) and the machine, reader, fast paths,
@@ -771,10 +771,13 @@ now called for machines 1–9. (fuzz-only edit.)
   controlled to `block_bytes`, `u32`) *before* the per-machine `checked_default`
   guard; the decode still returns `AllocationTooLarge`, but a crafted container can
   transiently request up to ≈4 GiB of address space. Add a `checked_default` before
-  the reservation.
+  the reservation. **(Addressed in the follow-up commit:** `read_sequential` now
+  calls `resource::checked_default(e.logical_len)?` immediately before the
+  `Vec::with_capacity`.)**
 * A referenced dictionary core relabelled to a *different registered* id has no
   in-core binding (caught by the body's `core_hash` linkage, not by the bare machine)
   — integrity ≠ authenticity; only `AUTH` covers it.
 * Doc drift reported (not fixed): `MIGRATION.md` / `CORE-LAYOUT.md` still say
   "machines 1–8", and `MIGRATION.md`'s worked example reuses `id = 9`, now
-  `OrANS-DICT`.
+  `OrANS-DICT`. **(Addressed in the follow-up commit:** both docs now say machines
+  1–9 and the worked example allocates `MACHINE_NL2P = 10`.)**

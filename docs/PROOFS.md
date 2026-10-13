@@ -1480,7 +1480,175 @@ in-memory = **+17,525 B (+1.54 %)** for `skewed`; **3,317,760 B** vs **3,298,721
 
 ---
 
-## Limitations — resolved (L1–L4, M1–M5, N1–N8 and O1–O3) and remaining (honest)
+## P45. A reader accepts exactly the versions it knows and never guesses — **PROVED** (reader checks), **EMPIRICALLY OBSERVED** (the compatibility matrix)
+
+**Claim.** Every stored `.ekb` names its versions explicitly, and a reader accepts
+only the exact set it implements, refusing everything else with a typed error: an
+`.ekb` whose `format_major != 0` or `format_minor > 3` is `UnsupportedVersion`; a
+`core_version` outside `{0, 1}` for a known `machine_id` (1–9) is
+`UnsupportedCoreVersion`; an unknown `machine_id` is `UnknownMachine`; a manifest
+record whose version is not `1` is `UnsupportedManifestVersion`. A legacy file
+(`core_version = 0`, the formerly-reserved header bytes left zero) reads and verifies
+exactly, and no machine's core payload changed to introduce the field.
+
+**Proof.** `format::scan`/`reader::open_bytes` check `header_len == 80`, magic,
+`format_major.minor`, `feature_flags == 0`, then `core_version` against
+`format::supported_core_versions(machine_id)`, before any decode. The `core_version`
+field occupies two formerly-reserved bytes in the 80-byte `GenesisHeader` (offset
+68), so every machine's `encode` output is byte-identical to a pre-field build and
+old cores decode byte-exactly as the implicit version `0`. There is no speculative
+or partial parse: an unknown version is an `Err`, never a best-effort read. ∎
+
+**Corroboration.** `tests/format_version.rs` (the write→read→verify matrix for
+machines 1–8), `tests/adversarial_p.rs` (machines 1–9 write→read→verify byte-exact;
+future `format_minor` and per-machine `core_version` typed-rejected incl. machine 9;
+legacy version-0 reads), and [`docs/MIGRATION.md`](MIGRATION.md) (the read/write
+matrix and the `S(v)`-change policy). The wire format line stays `0.3`; only the
+`core_version` field is new.
+
+**Tested:** `tests/format_version.rs`, `tests/adversarial_p.rs`, `src/format.rs`.
+
+---
+
+## P46. The streaming container is byte-exact, bounded-memory and downstream-seekable — **PROVED** (one block + `O(blocks)` directory), **EMPIRICALLY OBSERVED** (2 GiB at 8.6 MiB)
+
+**Claim.** `StreamBuilder` encodes a logical stream into independently decodable
+blocks (each a complete restart) while retaining **at most one block** plus a
+directory of one 56-byte entry per block, so peak builder memory is bounded by
+`block_bytes` and is **independent of the stream length**; `StreamReader` seeks to any
+logical offset through the directory and decodes only the blocks a request touches,
+returning bytes identical to the source.
+
+**Proof.** `write` flushes a full block immediately; `finish` streams the directory +
+160-byte footer, so `finish`/`open` need `O(num_blocks) = O(N / block_bytes)`, not
+`O(N)`. Every block carries a 16-byte BLAKE3 content id verified on read; the
+directory carries a BLAKE3 digest verified at open; a crafted or truncated container
+is a typed `Err` (`BadMagic`, `UnsupportedVersion`, `Truncated`, `ChecksumMismatch`,
+`OutOfBounds`). ∎
+
+**Corroboration.** `evidence/bench/stream.json`: a **2 GiB** stream (`block_bytes`
+64 KiB, **32,768** blocks) built in 4.79 s at **8,622,080 B (8.6 MiB) peak RSS**
+(build phase 4,714,496 B), `read_at` p50 **11,011** / p99 **20,818 ns** over 2,000
+byte-checked 4 KiB reads, sequential **1,076 MiB/s** equal to the container's
+`source_hash`. `tests/stream.rs`, `tests/adversarial_p.rs`, `fuzz_stream`.
+
+**Tested:** `src/stream.rs`, `tests/stream.rs`, `tests/adversarial_p.rs`, `fuzz/fuzz_targets/fuzz_stream.rs`, `evidence/bench/stream.json`.
+
+---
+
+## P47. Corruption is detected with 100 % coverage, localized to ≤4096 B, and reported as `Corrupt { section, offset }` — **PROVED** (CRC-32/BLAKE3 coverage), **EMPIRICALLY OBSERVED** (1024/1024 per structure)
+
+**Claim.** A single-bit flip anywhere in a *covered* serialized structure is detected
+by the fast path (`reader::open_bytes` → per-section CRC-32, core BLAKE3 `core_hash`,
+footer CRC-32) at the containing section/frame granularity (**≤4096 B** for every
+covered structure); the deep verifier (`verify_deep_located`) detects an in-memory
+tamper to a *semantically* corrupt structure and reports the exact divergent logical
+offset as `EkbloomError::Corrupt { section, offset }`. Alignment padding and the
+section-header `flags`/`reserved`/`generation` fields are **inert**: flipping one is a
+no-op, never interpreted (and covered only by the opt-in `AUTH` MAC).
+
+**Proof.** Every section payload is covered by its 40-byte frame's CRC-32; the core is
+covered by the manifest `core_hash` (linked to the footer); the footer is covered by
+its own CRC-32 over `[0,56) ++ [60,64)`. `verify::section_span_at(bytes, offset)` maps
+an absolute file offset back to its containing section, so a detected flip is
+attributed to the `(section, exact byte)` pair. ∎
+
+**Corroboration.** The corruption court (18 sections, 584,152 B) applies **1024
+single-bit flips per structure**: fast path **1024/1024 = 1.0000** for every covered
+structure (core, history, checkpoints, all blooms, tiles, blocks, manifest,
+commit-footer, section-directory) and **0/1024** for inert bytes; deep verifier
+**1024/1024** with non-zero located offsets for history/checkpoint/path/blocks.
+`reported_window_bytes ≤ 4096` for all structures. Gate **G4**: `sections=18
+flips=1152 detected=1152 max_reported_window=4096`. `tests/corruption.rs`.
+
+**Tested:** `src/verify.rs`, `src/reader.rs`, `tests/corruption.rs`, `examples/corruption_court.rs`, `evidence/bench/corruption.json`.
+
+---
+
+## P48. Cross-architecture determinism and the machine-checked gates — **PROVED** (integer-only encode), **EMPIRICALLY OBSERVED** (identical; G1–G5 PASS)
+
+**Claim.** For the same source and machine, `physical_bytes()`, the BLAKE3
+`core_hash`, the decoded bytes and the `auto`/`Full` plan are **identical** on x86_64
+and arm64, and the five acceptance gates hold: **G1** invertibility
+(`decode∘encode = id`, machines 1–9), **G2** affine prefix composition is exact and
+associative, **G3** the worst-case step bound holds over 1,000,000 positions (**0**
+violations), **G4** single-bit corruption is detected (≤4096 B), **G5** physical
+accounting is exact. The machine-6 trait `decode` is **linear** in `n` (it was
+`O(n²)`, measured **415 s** at `n = 2²⁰`, and now runs in ~**0.5 ms**).
+
+**Proof (determinism).** Every machine step is integer arithmetic over a fixed byte
+alphabet with no floating point, no data-dependent allocation order and no clock/HashMap
+input, so the encode is a pure function of `(source, machine)`; `arch_determinism.rs`
+prints the same canonical line on both targets. (Gates G1–G5 are executable
+properties: a violation panics and the runner exits non-zero.) ∎
+
+**Corroboration.** `evidence/bench/aarch64-determinism.json`: `identical: true`, both
+outputs sha256 `0fc33046…0fcb49c` over 70 lines. `evidence/gates/G1.json`…`G5.json`:
+all `PASS` (G1 `machines=1..9 cases=144`; G2 `affine_checks=4811`; G3 `samples=1000000
+… violations=0`; G4 `flips=1152 detected=1152`; G5 `structures=46 …`).
+`tests/gates.rs`, `tests/arch_determinism.rs`, `scripts/run-gates.sh`.
+
+**Tested:** `tests/gates.rs`, `tests/arch_determinism.rs`, `src/machine_seg.rs` (linear `decode`/`state_log`), `evidence/gates/*.json`, `evidence/bench/aarch64-determinism.json`.
+
+---
+
+## P49. A machine-9 record is decoded only against its intended dictionary — **PROVED** (id recompute + registry), **EMPIRICALLY OBSERVED** (typed rejects)
+
+**Claim.** A `Dictionary` carries a content identity
+`id = blake3("ekbloom.dictionary-id.v1" ++ version ++ freq[256])[0..16]`. An
+**embedded** dictionary (`dict_len > 0`) is validated against the framing `dict_id`
+(which recomputes the content id), and a **referenced** dictionary (`dict_len == 0`)
+is resolved from the process-wide registry — an id that is **not registered is a typed
+error**, so a record is never silently decoded against the wrong model. A wrong,
+absent, tampered, relabelled or length-mismatched dictionary is a typed `Err`.
+
+**Proof.** `Dictionary::from_bytes` recomputes the id and rejects a bad magic, an
+unknown version, a table that does not sum to `M = 4096` or contains a zero, and a
+content-id mismatch. `DictContext::from_core` keys the shared model on the core's
+`dict_len`/`dict_id`, delegates the `logical_len` to `resource::checked_default`
+(bounded allocation), and reconstructs through machine 2's prepared step, so a
+machine-9 record decodes byte-exact (genesis `Ω₀ = (initial_state, record_offset+8)`).
+The bare machine API has **no in-core cryptographic binding** of the id — a *relabel*
+to a different *registered* id is caught only by a manifested body's `core_hash`
+linkage (integrity ≠ authenticity; `AUTH` closes it). ∎
+
+**Corroboration.** `evidence/bench/dictionary.json`: **83.5 B/rec** (machine 9) vs
+**590.0 B/rec** (per-record machine 2), raw 100.0, zstd-dictionary 65.9; decode p50
+721 vs 1,403 ns; break-even **2 records**; heterogeneous crossing between 256 B and
+1 KiB. `tests/dictionary.rs`, `tests/adversarial_p.rs`, `fuzz_roundtrip` (machines 1–9).
+
+**Tested:** `src/dictionary.rs`, `src/machine_dict.rs`, `tests/dictionary.rs`, `tests/adversarial_p.rs`, `evidence/bench/dictionary.json`.
+
+---
+
+## P50. The worst-case step bound holds for every read and every request — **PROVED** (bound), **EMPIRICALLY OBSERVED** (0 violations over 1,200,000)
+
+**Claim.** Every read served from a certified restart performs
+`positioning ≤ worst_case_steps_for(request)`: a per-region `worst_case_steps`
+(`B − 1` for a block `B`, `K − 1` for a checkpoint `K`) and a request-level
+`worst_case_steps_for` that sums the per-segment bounds of the dispatch (so a
+multi-region request pays one restart per dispatched segment — `O(segments)`, never
+`O(prefix)`). `read_counted_steps` reports the **actual** positioning.
+
+**Proof.** The bound is a closed-form property of the certified geometry: a restart
+at offset `j·B` bounds a read at position `p` to `p − j·B ≤ B − 1` steps, and a
+dispatched request visits finitely many certified segments, each bounded by its own
+geometry; the engine rejects a body with no certified bounded path rather than
+replaying from genesis. The harness asserts the inequality for **every** sample and
+byte-checks each decoded range. ∎
+
+**Corroboration.** `evidence/bench/bound.json`: **1,200,000** total samples, **0**
+violations, **0** mismatches — 1,000,000 on a 1 MiB block restart (worst ratio
+`1.000000`), 50,000 on a `K = 65,536` rANS-2 checkpoint, and 150,000 on a multi-path
+cold→hot→cold 256 KiB request (actual 126,960 ≤ claimed 131,070, above the per-region
+65,535). Gate **G3** (`samples=1000000 … violations=0`). `examples/worstcase_bound.rs`,
+`tests/corpora_bench.rs`.
+
+**Tested:** `src/engine.rs`, `tests/corpora_bench.rs`, `examples/worstcase_bound.rs`, `evidence/bench/bound.json`, `evidence/gates/G3.json`.
+
+---
+
+## Limitations — resolved (L1–L4, M1–M5, N1–N8, O1–O3 and P1–P8) and remaining (honest)
 
 **Resolved in rounds L1–L4** (P24–P28): the base representation never expands past
 raw (machine 3 + the `auto` policy, P24); the 1-byte fully-resident read is within
@@ -1520,6 +1688,19 @@ that rejects the shared-cursor wide structures rather than drop them; the kernel
 byte-for-byte its scalar reference and on no default path (P41, P42). The joint
 planner keeps uniform data at `≤ raw` with no p99 regression (P43), and the compacted
 OrFS framing round-trips with a bounded residual of **+1.54 % / +0.58 %** (P44).
+
+**Resolved in the P-round** (P45–P50): the wire format is **explicitly versioned**
+and a reader refuses any version it does not know, never guessing (P45); the
+**streaming container** is byte-exact, bounded-memory (**2 GiB at 8.6 MiB peak RSS**)
+and downstream-seekable (P46); **corruption detection is 100 %** and localized to
+≤4096 B with a typed `Corrupt { section, offset }` (P47); the crate's `unsafe` is an
+audited, machine-enforced budget of **three** sanctioned modules with zero production
+`.unwrap()`/`panic!` and **61** Miri unit tests (P4, P47-adjacent); **machine 9**
+decodes a small record only against its intended shared dictionary (**83.5 vs 590.0
+B/rec**) (P49); and **cross-architecture determinism** (x86_64 == arm64) and the
+machine-checked gates **G1–G5** hold, including the **1,200,000-sample worst-case
+bound with 0 violations** (P48, P50). The machine-6 trait `decode` was fixed from
+`O(n²)` to linear (**415 s → 0.5 ms** at `n = 2²⁰`, P48).
 
 **Remaining (honest):**
 
@@ -1673,3 +1854,15 @@ OrFS framing round-trips with a bounded residual of **+1.54 % / +0.58 %** (P44).
     two concealed directories and the logical pointer artifact), which a finer
     allocation unit (or a single-file view layout) would remove (P38, P44;
     `docs/ORFS.md`).
+23. **The dictionary id is not cryptographically bound in the bare machine API.**
+    Relabelling a *referenced* machine-9 core to a different **registered** id is not
+    caught by the machine API (the record then decodes against the wrong model); a
+    manifested body still catches it through the manifest `core_hash` linkage, and only
+    the opt-in keyed-MAC `AUTH` closes it — the same *integrity ≠ authenticity* boundary
+    as everywhere (P49; `docs/DICTIONARY.md`, `docs/reviews/security.md` Revision 9).
+24. **Miri covers the safe subset (machines 1–8), not the three `unsafe` modules or
+    machine 9.** The SIMD intrinsics, the `io_uring` syscalls and the `mmap`/`madvise`
+    surface are outside Miri's model, and the shared-dictionary machine is not in the
+    Miri filter; they are pinned instead by `tests/simd.rs`/`tests/unsafe_review.rs`/
+    `tests/mmap.rs`, the SAFE review and `tests/dictionary.rs` (P4; `docs/SAFETY.md`,
+    `docs/ALLOC.md`).

@@ -125,9 +125,24 @@ spent is only worth it where the evidence shows a real win — those boundaries 
     (`Engine`/`reader`/`BlockIndex`/tiles) are the recommended untrusted-input route.
     Pointer: [`SECURITY.md`](SECURITY.md), `src/resource.rs`, P40, limitation 20.
 
+## P-round non-claims (v0.5)
+
+22. **The dictionary id is not cryptographically bound in the bare machine.** Relabelling
+    a *referenced* machine-9 core to a different **registered** id is not caught by the
+    machine API (the record then decodes against the wrong model); a manifested body still
+    catches it through the manifest `core_hash` linkage, and only the opt-in keyed-MAC
+    `AUTH` closes it. Pointer: [`DICTIONARY.md`](DICTIONARY.md),
+    [`reviews/security.md`](reviews/security.md) Revision 9, P49, limitation 23.
+23. **Miri covers the safe subset (machines 1–8), not the three `unsafe` modules or machine
+    9.** The SIMD intrinsics, the `io_uring` syscalls and the `mmap`/`madvise` surface are
+    outside Miri's model, and the shared-dictionary machine is not in the Miri filter; they
+    are pinned by `tests/simd.rs`/`tests/unsafe_review.rs`/`tests/mmap.rs`, the SAFE review
+    and `tests/dictionary.rs`. Pointer: [`SAFETY.md`](SAFETY.md), [`ALLOC.md`](ALLOC.md),
+    P4, limitation 24.
+
 ## See also
 
-[`PROOFS.md`](PROOFS.md) §Limitations (the origin of items 1–22 above),
-[`ACCEPTANCE.md`](ACCEPTANCE.md) (rounds L1–L4, M1–M5, N1–N8, O1–O3),
+[`PROOFS.md`](PROOFS.md) §Limitations (the origin of items 1–23 above),
+[`ACCEPTANCE.md`](ACCEPTANCE.md) (rounds L1–L4, M1–M5, N1–N8, O1–O3, P1–P8),
 [`MACHINES.md`](MACHINES.md) (per-machine wins/loses) and
 [`BUDGET-GUIDE.md`](BUDGET-GUIDE.md) §4 (when **not** to spend bytes).

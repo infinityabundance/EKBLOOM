@@ -65,6 +65,8 @@ index) with no per-byte dispatch or allocation. `fastpath::read_sequential`,
   `state_log` (L680);
 * `machine_pack.rs` (machine 5) — `unpack_range`/`bulk_unpack` (L484);
 * `machine_seg.rs` (machine 6) — `from_core` directory (L592), `decode_into` (L973);
+* `machine_dict.rs` (machine 9) — `DictContext::from_core` and `DictMachine::decode`/
+  `state_log` guard the declared `logical_len` with `checked_default`;
 * `history.rs` — `from_bytes` (L207), `extend_with` (L257);
 * `checkpoint.rs` — `from_bytes_with` (L429);
 * `bloom_path.rs` (L89), `bloom_region.rs` (L236), `tiles.rs` `assemble` (L1036);
@@ -72,7 +74,7 @@ index) with no per-byte dispatch or allocation. `fastpath::read_sequential`,
 * `main.rs` `stream --length` CLI buffer (L512).
 
 This is the same guard list documented in `docs/SECURITY.md` §"Resource policy",
-covering every machine (1–8). `tests/resource.rs` exercises forged `u64::MAX`
+covering every machine (1–9). `tests/resource.rs` exercises forged `u64::MAX`
 cores for machines 5/6 and `u64::MAX` lengths for machines 2/4, plus forged
 history/checkpoint counts, asserting a typed `AllocationTooLarge` — never an
 abort, panic or OOM — and that legitimate sizes still work.

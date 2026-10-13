@@ -332,7 +332,7 @@ handling, and transparent fallback — not throughput for small single-file writ
 
 ---
 
-## Research phases (v0.4 additions)
+## Research phases (v0.4–v0.5 additions)
 
 Seven later artifacts measure the round-3 modules. Each is read from its committed
 `evidence/bench/*.json` and detailed in its own doc; the numbers below are the
@@ -380,9 +380,11 @@ artifact.
   machine adapter and stores the **complete successor cursor** for a
   cursor-divergent machine; `tiles::parse_tile_set_prefix` is the single guard
   shared by the in-memory and file-backed readers. `sh scripts/validate-evidence.sh`
-  validates every `evidence/**/*.json` and reports **33** files `OK` (up from 24;
+  validates every `evidence/**/*.json` and reports **46** files `OK` (up from 24;
   `batch.json` added in L4, `window`/`orfs`/`optimizer`/`e2e` added in the N-round,
-  and `decoders.json` added in the O-round).
+  `decoders.json` added in the O-round, and `stream`/`corruption`/`dictionary`/
+  `corpora`/`counters`/`concurrency`/`bound`/`aarch64-determinism` plus the gates
+  `G1`–`G5` added in the P-round).
 - **R2 — machine-2 prepared context, encode-first budgets, bounded cold
   reconstruction, cache single-flight.** A validated `RansContext` reused for the
   whole decode is **165×** the per-symbol rebuild on skewed data
@@ -539,7 +541,7 @@ and the surface is reviewed in **Revision 7** (`tests/adversarial_r7.rs`, 11 tes
 | N5 OrFS single store | payload stored **exactly once**; real on-disk **+1.54 % (`skewed`) / +0.58 % (`mixed`)** over the in-memory engine (O-round compaction, from +1.89 %/+0.70 %); genuine `ReadMode::Machine` **382×** the dispatch | [`ORFS.md`](ORFS.md) | `orfs.json` |
 | N6 joint optimiser | held-out p99 **10.07 µs vs greedy 13.58 µs** (budget `N`); **9.84 vs 13.19 µs** (`1.5·N`); deterministic; only `all_certified` plans | [`OPTIMIZER.md`](OPTIMIZER.md) | `optimizer.json` |
 | N7 E2E real data | `beats_raw_store = true` on `text`/`elf`/`mixed` (0.74×/0.98×/0.78× raw; hot 4 KiB 120–130 ns vs raw 160–170 ns; non-evicting); `holds_vs_pinned = false` | [`E2E.md`](E2E.md) | `e2e.json` |
-| N8 resource policy | whole-object allocations bounded at **1 GiB** default (`AllocationTooLarge`); **15** fuzz targets (three added in N8, two in O3); bounded read paths unaffected | [`SECURITY.md`](SECURITY.md) §Resource policy | `src/resource.rs` |
+| N8 resource policy | whole-object allocations bounded at **1 GiB** default (`AllocationTooLarge`); **17** fuzz targets (three added in N8, two in O3, two in the P-round); bounded read paths unaffected | [`SECURITY.md`](SECURITY.md) §Resource policy | `src/resource.rs` |
 
 **Honest reading.** The N-round adds bounded resource use and real capabilities
 (identity-bound plans, bounded windows, machines 5/6, a single-store OrFS, a
@@ -591,15 +593,46 @@ on-disk excess over the in-memory engine from **+1.89 % / +0.70 %** to **+1.54 %
   7/8 and the SIMD kernel — a read path for machine 7) and **Finding J** (above),
   **both fixed** (`saturating_add` per site; base built before the guard). The same
   hardening was applied to **14 unchecked `cursor + N` sites across machines 1–4**, so
-  no read path panics on a crafted cursor. `container-fuzz.sh` runs **fifteen**
-  targets; `container-reproduce.sh` passes **687/0** with **33** evidence JSON OK and
-  the verify gate green at **701 passed**.
+  no read path panics on a crafted cursor. `container-fuzz.sh` runs **seventeen**
+  targets; `container-reproduce.sh` passes **766/0** with **46** evidence JSON OK and
+  the verify gate green at **780 passed**.
 
 **Honest reading.** The decoder court is **complete and closed**: no variant (
 word16, independent lanes, SIMD kernel) beat machine 4 `K = 8`, which is the best
 EKBLOOM decoder and remains **≈3.2× smaller but ≈4.3× slower** cold than LZ4. The
 O-round adds no new speed ceiling; it removes two sharp edges and one redundant
 manifested structure.
+
+### Rounds P1–P8 — versioning, streaming, corruption, safety, dictionaries, corpora, machines & gates
+
+The P-round makes the stored format **safe to evolve**, adds a **streaming** container,
+audits **corruption / `unsafe` / allocation**, adds a **shared-dictionary** machine, and
+closes the loop with a **standard-corpora court**, a **machine catalogue + budget
+chooser**, and **fuzz + cross-architecture + gate** trust infrastructure. Every number
+below is read from its committed artifact, the properties are P45–P50 in
+[`PROOFS.md`](PROOFS.md), and the surface is reviewed in **Revision 9**
+([`reviews/adversarial.md`](reviews/adversarial.md),
+[`reviews/security.md`](reviews/security.md); verdict **NO LIBRARY DEFECT FOUND — one
+fuzz-coverage gap fixed, two doc defects reported**).
+
+| Item | Headline measured result | Doc | Evidence |
+|---|---|---|---|
+| **P1** versioning | `core_version` (`u16` @68; `0` legacy / `1` current) + `format 0.3` + `machine_id` 1–9; an unknown version is a **typed refusal**, never a guess; legacy reads exactly; machine cores byte-identical | [`MIGRATION.md`](MIGRATION.md), [`CORE-LAYOUT.md`](CORE-LAYOUT.md) | `tests/format_version.rs` |
+| **P2** streaming | a **2 GiB** stream builds at **8,622,080 B (8.6 MiB)** peak RSS (build 4.5 MiB, 4.79 s, 428 MiB/s); `read_at` p50 **11,011** / p99 **20,818 ns**; sequential **1,076 MiB/s**; every read byte-exact | [`STREAMING.md`](STREAMING.md) | `stream.json` |
+| **P3** corruption | **1024** single-bit flips per structure → fast path **1024/1024**, deep verifier **1024/1024**, localized **≤4096 B**, typed `Corrupt { section, offset }`; inert bytes 0/1024 | [`CORRUPTION.md`](CORRUPTION.md) | `corruption.json` |
+| **P4** unsafe/alloc | exactly **three** sanctioned `unsafe` modules; the gate fails closed; **0** production `.unwrap()`/`panic!` (4 audited `.expect(`); Miri covers **61** unit tests | [`SAFETY.md`](SAFETY.md), [`ALLOC.md`](ALLOC.md) | `check-safety.sh`, `container-miri.sh` |
+| **P5** dictionary | machine 9: **83.5 B/rec** vs machine 2 **590.0** (raw 100.0, zstd-dict 65.9); decode 721 vs 1,403 ns; break-even **2 records** | [`DICTIONARY.md`](DICTIONARY.md) | `dictionary.json` |
+| **P6** corpora | **`E_V` 0.988–0.998** (≤ raw) on Silesia/enwik8/Calgary/text/ELF; `byte_at` 1.1–3.3 µs vs zstd 8.6–16.1; **39.14 instr/byte** (8.1 cycles); **1.4e-3 locks/read** for 64 readers; **1,200,000** bound samples, **0** violations | [`CORPORA.md`](CORPORA.md) | `corpora.json`, `counters.json`, `concurrency.json`, `bound.json` |
+| **P7** machines & guide | machines 1–9 specified exactly; `choose_plan` + the budget guide pick machine × segment × restart × path × tiles under a byte budget; one consolidated non-claim list | [`MACHINES.md`](MACHINES.md), [`BUDGET-GUIDE.md`](BUDGET-GUIDE.md), [`LIMITATIONS.md`](LIMITATIONS.md) | `tests/budget_chooser.rs` |
+| **P8** trust infra | **17/17** fuzz targets PASS; **x86_64 == arm64** (`identical: true`, equal sha256); gates **G1–G5 all PASS**; machine-6 trait `decode` fixed from `O(n²)` to **linear** (**415 s → 0.5 ms** at `n = 2²⁰`) | [`TESTING.md`](TESTING.md), [`GATES.md`](GATES.md) | `aarch64-determinism.json`, `gates/G1.json`–`G5.json` |
+
+**Honest reading.** The P-round adds **no new speed ceiling**. It makes the format safe
+to evolve, bounds streaming memory, proves 100 % + localized corruption detection,
+confines and audits `unsafe`/allocation, and factors a shared model out of small records
+(machine 9 vs per-record machine 2 — **not** vs zstd). The end-to-end verdict of the N/O
+rounds is unchanged: on real data EKBLOOM wins against raw (space + hot latency,
+non-evicting) and **loses** to the pinned-hot LZ4/Zstd codecs and on the cold/sequential
+axes ([`CORPORA.md`](CORPORA.md), [`E2E.md`](E2E.md)).
 
 ---
 
@@ -802,7 +835,7 @@ sh scripts/run-window.sh             # window.json (bounded encoded-window reads
 sh scripts/run-orfs.sh               # orfs.json (OrFS single authoritative store)
 sh scripts/run-optimizer.sh          # optimizer.json (joint budget-aware planner)
 sh scripts/run-e2e.sh                # e2e.json (end-to-end real-data proof)
-sh scripts/validate-evidence.sh      # validate every evidence/**/*.json (33 files)
+sh scripts/validate-evidence.sh      # validate every evidence/**/*.json (46 files)
 sh scripts/container-loom.sh         # Loom model checking
 sh scripts/container-bench.sh        # Divan microbenchmarks (benches/ekbloom.rs)
 sh scripts/capture-environment.sh    # refresh evidence/environment.txt

@@ -36,7 +36,7 @@ byte-identical to before.
 
 ## 2. Read/write compatibility matrix
 
-This build is **release 0.4.0 on wire format line 0.3**.
+This build is **release 0.5.0 on wire format line 0.3**.
 
 | artifact | versions this build **READS** | this build **WRITES** |
 |---|---|---|
@@ -127,10 +127,11 @@ writers emit `2`.
 
 | release | wire format | machine core `core_version` | notes |
 |---|---|---|---|
-| 0.3 | `0.3` | (field absent; reads as `0`) | machines 1–8 (machine 9 arrives in 0.4); checkpoints v2, blocks v1, tiles, segments v1 |
-| 0.4 | `0.3` | `1` written, `{0,1}` read | adds machine 9 (`OrANS-DICT`, the shared-dictionary record machine) and explicit `core_version` (formerly-reserved header bytes), plus typed `UnsupportedCoreVersion` / `UnsupportedManifestVersion` errors; machine cores byte-identical; machine semantics unchanged |
+| 0.3 | `0.3` | (field absent; reads as `0`) | machines 1–8 (machine 9 arrives in 0.5); checkpoints v2, blocks v1, tiles, segments v1 |
+| 0.5 | `0.3` | `1` written, `{0,1}` read | adds machine 9 (`OrANS-DICT`, the shared-dictionary record machine) and explicit `core_version` (formerly-reserved header bytes), plus typed `UnsupportedCoreVersion` / `UnsupportedManifestVersion` errors; machine cores byte-identical; machine semantics unchanged |
 
-The `0.4` change is **backward-compatible on read**: a 0.4 reader opens every 0.3
-file (`core_version` reads as legacy `0`), and the only byte difference a 0.4 writer
+The `0.5` change is **backward-compatible on read**: a 0.5 reader opens every 0.3/0.4
+file (`core_version` reads as legacy `0`), and the only byte difference a 0.5 writer
 introduces is the two-byte `core_version` field in the genesis header (plus the
-reserved bytes it no longer needs).
+reserved bytes it no longer needs). The `0.4` release was a documentation/packaging
+release on the same wire line `0.3` (machines 1–8).
