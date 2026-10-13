@@ -1,0 +1,18 @@
+{
+  "generated_by": "examples/concurrency_p99.rs (sh scripts/run-corpora.sh)",
+  "design": "64 PlannerReader threads read while (busy arm) 1 publisher thread builds + swaps fresh certified generations through a Publication; a reader holds a cached Arc<PublishedBody> and reads it with no lock (refresh is one acquire load when the version is unchanged). The quiet arm runs the identical readers with no publisher, so the difference isolates the publisher's effect from scheduler noise.",
+  "readers": 64,
+  "observed_parallelism": 8,
+  "logical_len": 1048576,
+  "single_byte": {
+    "reads_per_reader": 40000,
+    "quiet": {"n": 2560000, "reads": 2560000, "publications": 0, "shared_lock_acquisitions": 64, "locks_per_read": 2.500e-5, "min_ns": 50, "p50_ns": 861, "p99_ns": 335646, "p99_9_ns": 10727525, "max_ns": 87291179, "mean_ns": 78585.1},
+    "busy": {"n": 2560000, "reads": 2560000, "publications": 85, "shared_lock_acquisitions": 3664, "locks_per_read": 1.431e-3, "min_ns": 50, "p50_ns": 852, "p99_ns": 334094, "p99_9_ns": 9962288, "max_ns": 100437848, "mean_ns": 80588.4}
+  },
+  "read4k": {
+    "reads_per_reader": 20000,
+    "quiet": {"n": 1280000, "reads": 1280000, "publications": 0, "shared_lock_acquisitions": 64, "locks_per_read": 5.000e-5, "min_ns": 14477, "p50_ns": 27431, "p99_ns": 5203690, "p99_9_ns": 50738047, "max_ns": 96963785, "mean_ns": 278841.7},
+    "busy": {"n": 1280000, "reads": 1280000, "publications": 237, "shared_lock_acquisitions": 10364, "locks_per_read": 8.097e-3, "min_ns": 14657, "p50_ns": 27311, "p99_ns": 5178381, "p99_9_ns": 50093434, "max_ns": 96960439, "mean_ns": 270312.9}
+  },
+  "verdict": "the read path is lock-free: shared-lock acquisitions are O(publications), never O(reads), and the busy-arm tail tracks the quiet-arm scheduler baseline rather than spiking on publication"
+}

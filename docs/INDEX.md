@@ -41,6 +41,7 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`OPTIMIZER.md`](OPTIMIZER.md) | The **physical-budget-aware joint planner** (`src/optimize.rs`): machine × region/segment × restart × tile × hot-region as one held-out, certified decision under `CommittedBytes ≤ B`. |
 | [`E2E.md`](E2E.md) | The **end-to-end** EKBLOOM/OrFS proof on real text/ELF/mixed data vs raw and pinned-hot LZ4/Zstd at an equal on-disk budget (the honest win/lose verdict). |
 | [`DECODERS.md`](DECODERS.md) | The **decoder court** (O1): machines 7 (`OrANS-RANS0W`, word16) and 8 (`OrANS-RANS0IL`, independent lanes) and an AVX2 rANS kernel measured at equal stored bytes against machine 4 `K = 8` — **all rejected**; best stays machine 4 `K = 8`. |
+| [`CORPORA.md`](CORPORA.md) | **Standard-corpora court**: EKBLOOM vs LZ4/zstd/pinned-hot/raw on Silesia/enwik8/Calgary/text/ELF at an equal budget, plus hardware counters, 64-reader concurrency p99, and the machine-checked worst-case step bound (1,000,000 samples, zero violations). |
 | [`INDEX.md`](INDEX.md) | This file. |
 
 ## Independent reviews (`docs/reviews/`)
@@ -90,6 +91,10 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`bench/optimizer.json`](../evidence/bench/optimizer.json) | The physical-budget-aware joint planner vs greedy/machine-only (held-out p99 **10.07** vs **13.58 µs**; **9.84** vs **13.19 µs**). |
 | [`bench/e2e.json`](../evidence/bench/e2e.json) | End-to-end real-data proof: EKBLOOM/OrFS vs raw and pinned-hot LZ4/Zstd at an equal on-disk budget (`beats_raw_store = true`; `holds_vs_pinned = false`). |
 | [`bench/decoders.json`](../evidence/bench/decoders.json) | The **decoder court** (O1): machines 7/8 and the AVX2 rANS kernel vs machine 4 `K = 8` at equal stored bytes — all rejected; best stays machine 4 `K = 8`. |
+| [`bench/corpora.json`](../evidence/bench/corpora.json) | **Standard-corpora court**: per corpus (Silesia/enwik8/Calgary/text/ELF) at an equal budget — `physical_bytes/N`, `byte_at` and 4 KiB p50/p99, and the real `FileBody` encoded-window counters, vs LZ4/zstd-19/zstd-3/raw/pinned-hot. |
+| [`bench/counters.json`](../evidence/bench/counters.json) | **Hardware counters** (`CAP_PERFMON`) for 1-byte and 4 KiB reads: instructions/byte, cycles/read, cache-miss rate, L1 misses/read. |
+| [`bench/concurrency.json`](../evidence/bench/concurrency.json) | **Concurrency p99**: 64 readers vs a publishing writer — p50/p99/p99.9 for byte_at and 4 KiB reads, quiet vs busy, and the shared-lock-per-read ratio. |
+| [`bench/bound.json`](../evidence/bench/bound.json) | **Worst-case bound verification**: 1,000,000 random positions (plus rANS and multi-path passes), `measured_steps ≤ worst_case_steps_for`, **zero** violations. |
 | [`counterexamples/bloom-key-0001.json`](../evidence/counterexamples/bloom-key-0001.json) | The rejected universal `T_4[x]` witness (key `175`, two equal-state/different-outcome positions). |
 | [`model-search/model-search-sweep.json`](../evidence/model-search/model-search-sweep.json) | The `D = 4` finite-model sufficiency sweep (`k = 0..4` conflicts `64/256/1024/4096/0`). |
 
@@ -122,6 +127,9 @@ sh scripts/run-batch.sh             # batch.json (batched reconstruction + GPU v
 sh scripts/run-orfs.sh              # orfs.json (OrFS single authoritative store)
 sh scripts/run-optimizer.sh         # optimizer.json (physical-budget-aware joint planner)
 sh scripts/run-e2e.sh               # e2e.json (end-to-end real-data proof)
+sh scripts/run-corpora.sh           # corpora.json + concurrency.json (standard corpora; downloads inside the container)
+sh scripts/run-counters.sh          # counters.json (hardware counters, CAP_PERFMON)
+sh scripts/run-bound.sh             # bound.json (worst-case step bound, 1,000,000 samples)
 sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (33 files)
 sh scripts/container-fuzz.sh        # all 15 libFuzzer targets (fuzz_machine/open/bloom/history_store/packed/tiles/blocks/batch/rans_i/region/pack/seg/resource/rans_w/rans_il)
 sh scripts/container-loom.sh        # Loom model checking

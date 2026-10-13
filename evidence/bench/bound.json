@@ -1,0 +1,56 @@
+{
+  "generated_by": "examples/worstcase_bound.rs (sh scripts/run-bound.sh)",
+  "promise": "for every sample, measured positioning steps <= worst_case_steps_for(request); the request-level bound is O(segments), never O(prefix)",
+  "logical_len": 4194304,
+  "total_samples": 1200000,
+  "total_violations": 0,
+  "total_mismatches": 0,
+  "passes": [
+    {
+      "name": "block-1MiB-1byte",
+      "machine_id": 3,
+      "structure": "block-restart(block_bytes=1048576)",
+      "logical_len": 4194304,
+      "per_region_bound": 1048575,
+      "read_lengths": [1],
+      "plan_paths": "block-restart=1024",
+      "samples": 1000000,
+      "max_measured_steps": 1048575,
+      "max_bound_steps": 1048575,
+      "violations": 0,
+      "mismatches": 0,
+      "worst_ratio": 1.000000
+    },
+    {
+      "name": "checkpoint-65536-rANS-1byte",
+      "machine_id": 2,
+      "structure": "checkpoint(interval=65536)",
+      "logical_len": 4194304,
+      "per_region_bound": 65535,
+      "read_lengths": [1],
+      "plan_paths": "packed-restart=1024",
+      "samples": 50000,
+      "max_measured_steps": 65535,
+      "max_bound_steps": 65535,
+      "violations": 0,
+      "mismatches": 0,
+      "worst_ratio": 1.000000
+    },
+    {
+      "name": "multi-path-cold-hot-cold",
+      "machine_id": 3,
+      "structure": "block-restart(65536) + hot-tiles(60 KiB band)",
+      "logical_len": 4194304,
+      "per_region_bound": 65535,
+      "read_lengths": [262144],
+      "plan_paths": "hot-tile=15 + block-restart=1009",
+      "samples": 150000,
+      "max_measured_steps": 126960,
+      "max_bound_steps": 131070,
+      "violations": 0,
+      "mismatches": 0,
+      "worst_ratio": 1.000000
+    }
+  ],
+  "verdict": "every measured positioning count was <= its claimed request-level bound (0 violations across 1200000 samples); every decoded range was byte-exact"
+}

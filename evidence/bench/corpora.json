@@ -1,0 +1,126 @@
+{
+  "generated_by": "examples/corpora.rs (sh scripts/run-corpora.sh)",
+  "method": "per corpus: best body from OptimizedPlan::optimize under a budget equal to the raw size, read through the bounded engine, vs block-indexed LZ4, chunked zstd-19/zstd-3, raw Vec, and pinned-hot LZ4/zstd-19 retaining a 256 KiB decoded prefix; byte_at and 4 KiB latencies are nearest-rank percentiles of deterministic random samples; EKBLOOM window counters are the real FileBody fetched_bytes/fetched_reads deltas",
+  "corpus_cap_bytes": 4194304,
+  "hot_bytes_pinned": 262144,
+  "samples": {"byte_at": 4096, "read4k": 512, "file4k": 256},
+  "archives": [{"name": "silesia.zip", "sha256": "7d1dd71bfecda66a0ca30d863ed031809f67ecf12717a60fe72c1cc39e28434e"}, {"name": "enwik8.zip", "sha256": "547994d9980ebed1288380d652999f38a14fe291a6247c157c3d33d4932534bc"}, {"name": "calgary.zip", "sha256": "89e1a01703d24172787330275fb9f738cad356e02f806b98e3d12a4efbf2f8b9"}],
+  "corpora": [
+    {
+      "name": "silesia",
+      "kind": "standard/silesia",
+      "origin": "12 standard file(s) under /corpora/silesia",
+      "source_len": 4194300,
+      "full_bytes": 211938580,
+      "full_blake3": "c787bcefc76386827a7111a077614a476bfc1a68738de3857f3c143e919ab528",
+      "used_blake3": "e5b124336cb2737a2215506098d32d4cb770c5e94e2fe75c1c227f338353795d",
+      "budget_bytes": 4194300,
+      "engine_physical_bytes": 4185391,
+      "over_budget": false,
+      "plan": "optimize: machine 4 / region 65536 B / 4185391 committed B / p99 130.9 ns",
+      "file_4k": {"fetched_bytes_max": 20460, "fetched_bytes_mean": 8608.0, "syscalls_max": 4, "syscalls_mean": 1.85},
+      "rows": [
+        {"name": "ekbloom", "class": "ekbloom", "physical_bytes": 4185391, "e_v": 0.9979, "byte_at_p50_ns": 1092, "byte_at_p99_ns": 2485, "r4k_p50_ns": 11081, "r4k_p99_ns": 13355, "fetched_bytes_per_4k": 20460, "syscalls_per_4k": 4},
+        {"name": "raw-vec", "class": "baseline", "physical_bytes": 4194300, "e_v": 1.0000, "byte_at_p50_ns": 110, "byte_at_p99_ns": 250, "r4k_p50_ns": 200, "r4k_p99_ns": 401, "fetched_bytes_per_4k": 4096, "syscalls_per_4k": 0},
+        {"name": "lz4", "class": "baseline", "physical_bytes": 2838528, "e_v": 0.6768, "byte_at_p50_ns": 1372, "byte_at_p99_ns": 2074, "r4k_p50_ns": 2574, "r4k_p99_ns": 3918, "fetched_bytes_per_4k": 7524, "syscalls_per_4k": 2},
+        {"name": "zstd-19", "class": "baseline", "physical_bytes": 1822720, "e_v": 0.4346, "byte_at_p50_ns": 12754, "byte_at_p99_ns": 25307, "r4k_p50_ns": 14327, "r4k_p99_ns": 49201, "fetched_bytes_per_4k": 14677, "syscalls_per_4k": 1},
+        {"name": "zstd-3", "class": "baseline", "physical_bytes": 1994752, "e_v": 0.4756, "byte_at_p50_ns": 11010, "byte_at_p99_ns": 15078, "r4k_p50_ns": 11301, "r4k_p99_ns": 27592, "fetched_bytes_per_4k": 14845, "syscalls_per_4k": 1},
+        {"name": "pinned-lz4", "class": "baseline", "physical_bytes": 3100672, "e_v": 0.7393, "byte_at_p50_ns": 1282, "byte_at_p99_ns": 2054, "r4k_p50_ns": 2465, "r4k_p99_ns": 3667, "fetched_bytes_per_4k": 7524, "syscalls_per_4k": 2},
+        {"name": "pinned-zstd-19", "class": "baseline", "physical_bytes": 2084864, "e_v": 0.4971, "byte_at_p50_ns": 12173, "byte_at_p99_ns": 25327, "r4k_p50_ns": 13746, "r4k_p99_ns": 49141, "fetched_bytes_per_4k": 14677, "syscalls_per_4k": 1}
+      ]
+    },
+    {
+      "name": "enwik8",
+      "kind": "standard/enwik8",
+      "origin": "1 standard file(s) under /corpora/enwik8",
+      "source_len": 4194304,
+      "full_bytes": 100000000,
+      "full_blake3": "ba3eb478ad88c752bab4fe01438461475e342f887fc00eeae82f062ca050fc7b",
+      "used_blake3": "dfef7ad7602bdd43174d2fbd77fa6af3fa6e9ed3666c446439cb534d75519faa",
+      "budget_bytes": 4194304,
+      "engine_physical_bytes": 4145907,
+      "over_budget": false,
+      "plan": "optimize: machine 4 / region 65536 B / 4145907 committed B / p99 130.9 ns",
+      "file_4k": {"fetched_bytes_max": 16972, "fetched_bytes_mean": 7375.7, "syscalls_max": 4, "syscalls_mean": 1.73},
+      "rows": [
+        {"name": "ekbloom", "class": "ekbloom", "physical_bytes": 4145907, "e_v": 0.9885, "byte_at_p50_ns": 1803, "byte_at_p99_ns": 2835, "r4k_p50_ns": 13265, "r4k_p99_ns": 17713, "fetched_bytes_per_4k": 16972, "syscalls_per_4k": 4},
+        {"name": "raw-vec", "class": "baseline", "physical_bytes": 4194304, "e_v": 1.0000, "byte_at_p50_ns": 110, "byte_at_p99_ns": 260, "r4k_p50_ns": 220, "r4k_p99_ns": 411, "fetched_bytes_per_4k": 4096, "syscalls_per_4k": 0},
+        {"name": "lz4", "class": "baseline", "physical_bytes": 2899968, "e_v": 0.6914, "byte_at_p50_ns": 1412, "byte_at_p99_ns": 1853, "r4k_p50_ns": 2505, "r4k_p99_ns": 3065, "fetched_bytes_per_4k": 5013, "syscalls_per_4k": 2},
+        {"name": "zstd-19", "class": "baseline", "physical_bytes": 1691648, "e_v": 0.4033, "byte_at_p50_ns": 12623, "byte_at_p99_ns": 14627, "r4k_p50_ns": 12994, "r4k_p99_ns": 27271, "fetched_bytes_per_4k": 6167, "syscalls_per_4k": 1},
+        {"name": "zstd-3", "class": "baseline", "physical_bytes": 1802240, "e_v": 0.4297, "byte_at_p50_ns": 11351, "byte_at_p99_ns": 16561, "r4k_p50_ns": 11642, "r4k_p99_ns": 25267, "fetched_bytes_per_4k": 6617, "syscalls_per_4k": 1},
+        {"name": "pinned-lz4", "class": "baseline", "physical_bytes": 3162112, "e_v": 0.7539, "byte_at_p50_ns": 1223, "byte_at_p99_ns": 1974, "r4k_p50_ns": 2465, "r4k_p99_ns": 3176, "fetched_bytes_per_4k": 5013, "syscalls_per_4k": 2},
+        {"name": "pinned-zstd-19", "class": "baseline", "physical_bytes": 1953792, "e_v": 0.4658, "byte_at_p50_ns": 12774, "byte_at_p99_ns": 19887, "r4k_p50_ns": 12954, "r4k_p99_ns": 27862, "fetched_bytes_per_4k": 6167, "syscalls_per_4k": 1}
+      ]
+    },
+    {
+      "name": "calgary",
+      "kind": "standard/calgary",
+      "origin": "14 standard file(s) under /corpora/calgary",
+      "source_len": 2070042,
+      "full_bytes": 3141622,
+      "full_blake3": "ff67cf60b4997c59368675d9cbfe1e5a23d034d2ecdb32e8cf65c1ac409846bc",
+      "used_blake3": "b5e2216fb13cec40d6518555bfe6451851fbafee71f2a2d3f7e39348a3dd3f68",
+      "budget_bytes": 2070042,
+      "engine_physical_bytes": 2060071,
+      "over_budget": false,
+      "plan": "optimize: machine 4 / region 65536 B / 2060071 committed B / p99 130.9 ns",
+      "file_4k": {"fetched_bytes_max": 16604, "fetched_bytes_mean": 7579.4, "syscalls_max": 4, "syscalls_mean": 1.78},
+      "rows": [
+        {"name": "ekbloom", "class": "ekbloom", "physical_bytes": 2060071, "e_v": 0.9952, "byte_at_p50_ns": 1773, "byte_at_p99_ns": 2685, "r4k_p50_ns": 13365, "r4k_p99_ns": 16220, "fetched_bytes_per_4k": 16604, "syscalls_per_4k": 4},
+        {"name": "raw-vec", "class": "baseline", "physical_bytes": 2070042, "e_v": 1.0000, "byte_at_p50_ns": 30, "byte_at_p99_ns": 211, "r4k_p50_ns": 150, "r4k_p99_ns": 331, "fetched_bytes_per_4k": 4096, "syscalls_per_4k": 0},
+        {"name": "lz4", "class": "baseline", "physical_bytes": 1290240, "e_v": 0.6233, "byte_at_p50_ns": 1173, "byte_at_p99_ns": 2094, "r4k_p50_ns": 2394, "r4k_p99_ns": 3907, "fetched_bytes_per_4k": 8040, "syscalls_per_4k": 2},
+        {"name": "zstd-19", "class": "baseline", "physical_bytes": 733184, "e_v": 0.3542, "byte_at_p50_ns": 12503, "byte_at_p99_ns": 26069, "r4k_p50_ns": 13144, "r4k_p99_ns": 41608, "fetched_bytes_per_4k": 10824, "syscalls_per_4k": 1},
+        {"name": "zstd-3", "class": "baseline", "physical_bytes": 794624, "e_v": 0.3839, "byte_at_p50_ns": 10850, "byte_at_p99_ns": 13375, "r4k_p50_ns": 11281, "r4k_p99_ns": 25197, "fetched_bytes_per_4k": 11546, "syscalls_per_4k": 1},
+        {"name": "pinned-lz4", "class": "baseline", "physical_bytes": 1552384, "e_v": 0.7499, "byte_at_p50_ns": 1173, "byte_at_p99_ns": 2074, "r4k_p50_ns": 2364, "r4k_p99_ns": 3907, "fetched_bytes_per_4k": 8040, "syscalls_per_4k": 2},
+        {"name": "pinned-zstd-19", "class": "baseline", "physical_bytes": 995328, "e_v": 0.4808, "byte_at_p50_ns": 12203, "byte_at_p99_ns": 25347, "r4k_p50_ns": 12804, "r4k_p99_ns": 43421, "fetched_bytes_per_4k": 10824, "syscalls_per_4k": 1}
+      ]
+    },
+    {
+      "name": "text",
+      "kind": "text-like",
+      "origin": "290 real file(s); first /usr/share/common-licenses/Apache-2.0",
+      "source_len": 3377228,
+      "full_bytes": 3377228,
+      "full_blake3": "2d631c70076eebc39887907faa04d64d76f29b4ebadfa973ee6e47a61202f415",
+      "used_blake3": "2d631c70076eebc39887907faa04d64d76f29b4ebadfa973ee6e47a61202f415",
+      "budget_bytes": 3377228,
+      "engine_physical_bytes": 3371442,
+      "over_budget": false,
+      "plan": "optimize: machine 4 / region 65536 B / 3371442 committed B / p99 130.9 ns",
+      "file_4k": {"fetched_bytes_max": 17184, "fetched_bytes_mean": 7169.6, "syscalls_max": 4, "syscalls_mean": 1.69},
+      "rows": [
+        {"name": "ekbloom", "class": "ekbloom", "physical_bytes": 3371442, "e_v": 0.9983, "byte_at_p50_ns": 1743, "byte_at_p99_ns": 2655, "r4k_p50_ns": 13645, "r4k_p99_ns": 18023, "fetched_bytes_per_4k": 17184, "syscalls_per_4k": 4},
+        {"name": "raw-vec", "class": "baseline", "physical_bytes": 3377228, "e_v": 1.0000, "byte_at_p50_ns": 100, "byte_at_p99_ns": 240, "r4k_p50_ns": 140, "r4k_p99_ns": 370, "fetched_bytes_per_4k": 4096, "syscalls_per_4k": 0},
+        {"name": "lz4", "class": "baseline", "physical_bytes": 1777664, "e_v": 0.5264, "byte_at_p50_ns": 1203, "byte_at_p99_ns": 1643, "r4k_p50_ns": 2395, "r4k_p99_ns": 2986, "fetched_bytes_per_4k": 4016, "syscalls_per_4k": 2},
+        {"name": "zstd-19", "class": "baseline", "physical_bytes": 872448, "e_v": 0.2583, "byte_at_p50_ns": 10048, "byte_at_p99_ns": 14247, "r4k_p50_ns": 10960, "r4k_p99_ns": 23273, "fetched_bytes_per_4k": 2682, "syscalls_per_4k": 1},
+        {"name": "zstd-3", "class": "baseline", "physical_bytes": 954368, "e_v": 0.2826, "byte_at_p50_ns": 8616, "byte_at_p99_ns": 11903, "r4k_p50_ns": 9408, "r4k_p99_ns": 21951, "fetched_bytes_per_4k": 2897, "syscalls_per_4k": 1},
+        {"name": "pinned-lz4", "class": "baseline", "physical_bytes": 2039808, "e_v": 0.6040, "byte_at_p50_ns": 1172, "byte_at_p99_ns": 1614, "r4k_p50_ns": 2275, "r4k_p99_ns": 2925, "fetched_bytes_per_4k": 4016, "syscalls_per_4k": 2},
+        {"name": "pinned-zstd-19", "class": "baseline", "physical_bytes": 1134592, "e_v": 0.3360, "byte_at_p50_ns": 9507, "byte_at_p99_ns": 13305, "r4k_p50_ns": 10259, "r4k_p99_ns": 23534, "fetched_bytes_per_4k": 2682, "syscalls_per_4k": 1}
+      ]
+    },
+    {
+      "name": "elf",
+      "kind": "elf-executable",
+      "origin": "target/release/ekbloom",
+      "source_len": 1089584,
+      "full_bytes": 1089584,
+      "full_blake3": "c7f8fabff66d4b190ca47aadb758c9fa23c2c96c3be0367bd435d9ea68b3cbdf",
+      "used_blake3": "c7f8fabff66d4b190ca47aadb758c9fa23c2c96c3be0367bd435d9ea68b3cbdf",
+      "budget_bytes": 1089584,
+      "engine_physical_bytes": 1087947,
+      "over_budget": false,
+      "plan": "optimize: machine 4 / region 4096 B / 1087947 committed B / p99 130.9 ns",
+      "file_4k": {"fetched_bytes_max": 16912, "fetched_bytes_mean": 8013.6, "syscalls_max": 4, "syscalls_mean": 1.74},
+      "rows": [
+        {"name": "ekbloom", "class": "ekbloom", "physical_bytes": 1087947, "e_v": 0.9985, "byte_at_p50_ns": 3326, "byte_at_p99_ns": 6422, "r4k_p50_ns": 14006, "r4k_p99_ns": 18464, "fetched_bytes_per_4k": 16912, "syscalls_per_4k": 4},
+        {"name": "raw-vec", "class": "baseline", "physical_bytes": 1089584, "e_v": 1.0000, "byte_at_p50_ns": 20, "byte_at_p99_ns": 160, "r4k_p50_ns": 60, "r4k_p99_ns": 270, "fetched_bytes_per_4k": 4096, "syscalls_per_4k": 0},
+        {"name": "lz4", "class": "baseline", "physical_bytes": 708608, "e_v": 0.6503, "byte_at_p50_ns": 1103, "byte_at_p99_ns": 2044, "r4k_p50_ns": 2204, "r4k_p99_ns": 3466, "fetched_bytes_per_4k": 6468, "syscalls_per_4k": 2},
+        {"name": "zstd-19", "class": "baseline", "physical_bytes": 462848, "e_v": 0.4248, "byte_at_p50_ns": 16070, "byte_at_p99_ns": 26539, "r4k_p50_ns": 16601, "r4k_p99_ns": 37150, "fetched_bytes_per_4k": 17312, "syscalls_per_4k": 2},
+        {"name": "zstd-3", "class": "baseline", "physical_bytes": 516096, "e_v": 0.4737, "byte_at_p50_ns": 11812, "byte_at_p99_ns": 14397, "r4k_p50_ns": 12543, "r4k_p99_ns": 26530, "fetched_bytes_per_4k": 19417, "syscalls_per_4k": 2},
+        {"name": "pinned-lz4", "class": "baseline", "physical_bytes": 970752, "e_v": 0.8909, "byte_at_p50_ns": 982, "byte_at_p99_ns": 2004, "r4k_p50_ns": 1913, "r4k_p99_ns": 3366, "fetched_bytes_per_4k": 6468, "syscalls_per_4k": 2},
+        {"name": "pinned-zstd-19", "class": "baseline", "physical_bytes": 724992, "e_v": 0.6654, "byte_at_p50_ns": 14497, "byte_at_p99_ns": 20799, "r4k_p50_ns": 15289, "r4k_p99_ns": 35526, "fetched_bytes_per_4k": 17312, "syscalls_per_4k": 2}
+      ]
+    }
+  ],
+  "note": "pinned-* rows with byte_at/4k equal to their unpinned counterpart are serving the pinned hot prefix; the honest comparison is footprint vs latency, not a single score"
+}
