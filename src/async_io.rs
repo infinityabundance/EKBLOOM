@@ -65,7 +65,8 @@
 //!
 //! # Safety
 //!
-//! This is, besides `crate::simd`, the only module permitted to contain `unsafe`.
+//! This is one of the crate's three sanctioned `unsafe` modules (besides
+//! `crate::simd` and `crate::mapped`).
 //! The unsafety is confined to the raw-buffer pointers handed to
 //! `SubmissionQueue::push`, each guarded by a `// SAFETY:` justification stating
 //! that the buffer outlives the submission and is only read by the kernel until
@@ -799,6 +800,7 @@ fn serialize_fresh(body: &EkbloomBody) -> Result<Vec<u8>> {
         logical_bytes: body.logical_len,
         core_len: body.core.len() as u64,
         core_machine_id: body.machine_id,
+        core_version: format::core_version_for_machine(body.machine_id),
     };
     let header_bytes = header.encode();
 

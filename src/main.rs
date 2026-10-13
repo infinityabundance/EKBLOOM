@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use ekbloom::bloom_context::certify_context;
@@ -18,6 +18,7 @@ use ekbloom::metrics::{now_ns, percentiles};
 use ekbloom::{
     read_random_1b, read_ranges, read_sequential, Counterexample, EkbloomError,
     ManifestationBudget, ManifestationProfile, ManifestationReport, ReadRequest,
+    RepresentationPolicy, StreamBuilder, StreamOptions, StreamReader, STREAM_DEFAULT_BLOCK_BYTES,
 };
 use ekbloom::{reader, recovery, verify, writer};
 
@@ -35,6 +36,8 @@ usage:
   ekbloom certify  <file.ekb> [--bloom universal|contextual|regional] [--depth D] [--region-bytes R]
   ekbloom recover  <file.ekb>
   ekbloom bench    <file.ekb> --workload <seq|random-1b|random-4k|range-64k|mixed|hot-set> [--iterations N]
+  ekbloom stream   <in> -o <out.ekb> [--block-bytes B] [--machine auto|packed|segmented|word16|independent]
+  ekbloom stream   <file.ekb> --info | --offset O --length L [-o <out.bin>]
 
 profiles:
   root, sparse, dense, full, bloom4, bloom8, bloom16, bloom32, regional, path, max-speed
@@ -254,7 +257,7 @@ fn hex_val(c: u8) -> Option<u8> {
 }
 
 /// Options that take no value.
-const SWITCHES: [&str; 3] = ["json", "deep", "require-auth"];
+const SWITCHES: [&str; 4] = ["json", "deep", "require-auth", "info"];
 
 /// Parse `args` (already stripped of the program and command) into [`Parsed`].
 fn parse_args(args: &[String]) -> Result<Parsed, CliError> {
@@ -325,6 +328,7 @@ fn dispatch(argv: &[String]) -> Result<i32, CliError> {
         "certify" => cmd_certify(&parsed),
         "recover" => cmd_recover(&parsed),
         "bench" => cmd_bench(&parsed),
+        "stream" => cmd_stream(&parsed),
         other => Err(CliError::usage(format!(
             "unknown command '{other}' (try --help)"
         ))),
@@ -461,6 +465,110 @@ fn cmd_manifest(parsed: &Parsed, grow: bool) -> Result<i32, CliError> {
     println!("generation: {generation}");
     println!("profile: {}", profile.label());
     println!("physical_bytes: {}", body.physical_bytes());
+    Ok(0)
+}
+
+/// Map a `--machine` value for `stream` to a representation policy.
+fn stream_policy(name: &str) -> Result<RepresentationPolicy, CliError> {
+    use RepresentationPolicy::*;
+    Ok(match name {
+        "auto" => Auto,
+        "packed" => Packed,
+        "segmented" => Segmented,
+        "word16" => Word16,
+        "independent" | "independent-lanes" => IndependentLanes,
+        other => {
+            return Err(CliError::usage(format!(
+                "--machine expects auto|packed|segmented|word16|independent, got '{other}'"
+            )))
+        }
+    })
+}
+
+/// A stable human label for a representation policy.
+fn policy_label(policy: RepresentationPolicy) -> &'static str {
+    match policy {
+        RepresentationPolicy::Auto => "auto",
+        RepresentationPolicy::Packed => "packed",
+        RepresentationPolicy::Segmented => "segmented",
+        RepresentationPolicy::Word16 => "word16",
+        RepresentationPolicy::IndependentLanes => "independent",
+    }
+}
+
+/// `ekbloom stream`: build a streaming container from an input file (bounded
+/// memory), read a logical range from one, or print its summary.
+fn cmd_stream(parsed: &Parsed) -> Result<i32, CliError> {
+    let input = parsed.positional(0, "input")?;
+    let path = Path::new(input);
+    let building = parsed.option("o").is_some()
+        && parsed.option("offset").is_none()
+        && !parsed.has_flag("info");
+
+    if !building {
+        let reader = StreamReader::open(std::io::BufReader::new(fs::File::open(path)?))?;
+        if let Some(offset) = parsed.parse_u64("offset")? {
+            let length = parsed.require_u64("length")?;
+            ekbloom::resource::checked_default(length)?;
+            let cap = usize::try_from(length)
+                .map_err(|_| CliError::usage("length does not fit in memory"))?;
+            let mut buf = vec![0u8; cap];
+            reader.read_at(offset, &mut buf)?;
+            match parsed.option("o") {
+                Some(out) => {
+                    fs::write(out, &buf)?;
+                    println!("wrote {} bytes to {out}", buf.len());
+                }
+                None => {
+                    let stdout = std::io::stdout();
+                    let mut lock = stdout.lock();
+                    lock.write_all(&buf)?;
+                    lock.flush()?;
+                }
+            }
+            return Ok(0);
+        }
+        println!("logical_len: {}", reader.len());
+        println!("block_bytes: {}", reader.block_bytes());
+        println!("blocks: {}", reader.block_count());
+        println!("policy: {}", policy_label(reader.policy()));
+        println!("container_bytes: {}", reader.container_bytes());
+        println!("payload_bytes: {}", reader.payload_bytes());
+        println!("directory_bytes: {}", reader.directory_bytes());
+        return Ok(0);
+    }
+
+    let out = parsed
+        .option("o")
+        .ok_or_else(|| CliError::usage("stream requires -o <out.ekb>"))?;
+    let block_bytes = parsed
+        .parse_u32("block-bytes")?
+        .unwrap_or(STREAM_DEFAULT_BLOCK_BYTES);
+    let policy = stream_policy(parsed.option("machine").unwrap_or("auto"))?;
+    let opts = StreamOptions {
+        block_bytes,
+        machine: policy,
+    };
+    let sink = std::io::BufWriter::new(fs::File::create(out)?);
+    let mut builder = StreamBuilder::new(sink, opts)?;
+    let mut input_file = fs::File::open(path)?;
+    let mut chunk = vec![0u8; 1 << 20];
+    loop {
+        let n = input_file.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        builder.write(&chunk[..n])?;
+    }
+    let manifest = builder.finish()?;
+    println!("streamed {out}");
+    println!("logical_len: {}", manifest.logical_len);
+    println!("block_bytes: {}", manifest.block_bytes);
+    println!("blocks: {}", manifest.block_count);
+    println!("policy: {}", policy_label(manifest.policy));
+    println!("physical_bytes: {}", manifest.physical_bytes());
+    println!("payload_bytes: {}", manifest.visible_bytes());
+    println!("directory_bytes: {}", manifest.directory_bytes);
     Ok(0)
 }
 

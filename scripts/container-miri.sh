@@ -9,8 +9,21 @@
 # system rustup home; the container therefore runs as root and keeps every build
 # artifact in `/tmp` so the mounted source tree is never written to.
 #
-# A bounded subset of the fast, pure library unit tests is selected to keep the
-# runtime and memory footprint small.
+# A broadened but bounded subset of the fast, pure library unit tests is selected
+# to keep the runtime and memory footprint small while covering every machine and
+# codec:
+#
+#   * machines 1-8 and the decode paths  -> `machine` (matches machine::,
+#     machine_pack::, machine_seg::, machine_store::, machine_rans::,
+#     machine_rans_i::, machine_rans_il::, machine_rans_w::);
+#   * stream / checkpoint / bloom / resource unit tests.
+#
+# The three sanctioned `unsafe` modules are EXPLICITLY EXCLUDED (no filter below
+# matches them): `simd::` (Miri cannot execute the x86 AVX2/AVX-512/SSE
+# intrinsics), `async_io::` (feature-gated; `io_uring` ring syscalls) and
+# `mapped::` (`mmap`/`madvise`/`munmap` libc calls Miri does not model). They
+# remain covered by `tests/simd.rs`, `tests/unsafe_review.rs`, `tests/mmap.rs` and
+# the review in docs/reviews/security.md.
 set -eu
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,13 +33,25 @@ NIGHTLY_IMAGE="rustlang/rust:nightly-bookworm-slim@sha256:2fe113dd3b9f9f36f3993f
 EKB_MEM_LIMIT="${EKB_MEM_LIMIT:-8g}"
 EKB_MEMSWAP_LIMIT="${EKB_MEMSWAP_LIMIT:-8g}"
 
-# Bounded subset: the machine module's fast unit tests.
-MIRI_FILTER="${EKB_MIRI_FILTER:-machine::}"
+# libtest matches a test iff its name contains ANY of these substrings (OR).
+MIRI_FILTER="${EKB_MIRI_FILTER:-machine stream:: checkpoint:: bloom resource::}"
+
+# Three unit tests have loop/allocation bounds that are Miri-infeasible (Miri is
+# an interpreter, ~100-1000x slower): they build/parse 100k-300k-byte streams or
+# replay every position at every checkpoint interval. They remain fully covered
+# by `sh scripts/container-verify.sh`; here they are skipped by exact name so the
+# broadened Miri pass stays bounded.
+MIRI_SKIP="${EKB_MIRI_SKIP:---skip stream::tests::roundtrip_various_sizes --skip stream::tests::truncated_and_crafted_are_typed_errors --skip checkpoint::tests::restore_matches_state_log_all_intervals}"
+
+# Deterministic: the `resource::` unit tests mutate the process-wide default
+# allocation ceiling (an `AtomicU64`), so serialise the harness to keep every
+# machine/stream/bloom test off a temporarily-lowered cap.
+MIRI_TEST_THREADS="${EKB_MIRI_TEST_THREADS:-1}"
 
 echo "ekbloom-miri: pulling pinned nightly image ($NIGHTLY_IMAGE)"
 docker pull "$NIGHTLY_IMAGE" >/dev/null
 
-echo "ekbloom-miri: running 'cargo miri test --lib -- $MIRI_FILTER' (memory-capped)"
+echo "ekbloom-miri: running 'cargo miri test --lib -- --test-threads=$MIRI_TEST_THREADS $MIRI_SKIP $MIRI_FILTER' (memory-capped)"
 docker run --rm \
     --memory="$EKB_MEM_LIMIT" \
     --memory-swap="$EKB_MEMSWAP_LIMIT" \
@@ -45,5 +70,5 @@ docker run --rm \
     "$NIGHTLY_IMAGE" sh -c '
         set -eu
         rustup component add miri
-        cargo miri test --locked --lib -- '"$MIRI_FILTER"'
+        cargo miri test --locked --lib -- --test-threads='"$MIRI_TEST_THREADS"' '"$MIRI_SKIP"' '"$MIRI_FILTER"'
     '

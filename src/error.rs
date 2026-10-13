@@ -14,10 +14,24 @@ pub enum EkbloomError {
     BadMagic,
     /// Format version not supported by this build.
     UnsupportedVersion { major: u16, minor: u16 },
+    /// A core version not supported by this build for the named machine.
+    ///
+    /// A machine's core semantics are identified by `(machine_id, core_version)`;
+    /// an unrecognised pair is refused rather than reinterpreted.
+    UnsupportedCoreVersion { machine_id: u32, core_version: u16 },
+    /// A manifest record version not supported by this build.
+    UnsupportedManifestVersion { version: u32 },
     /// A declared length or offset exceeded the actually available bytes.
     Truncated { needed: u64, available: u64 },
     /// A section or record failed its checksum.
     ChecksumMismatch { section: &'static str },
+    /// A single structure was detected corrupt: the section/frame name and the
+    /// logical offset at which the corruption was located. Produced by the deep
+    /// verifier ([`crate::verify::verify_deep_located`]) and by the corruption
+    /// court; it refines [`EkbloomError::ChecksumMismatch`] with a byte offset so
+    /// a caller can attribute a corruption to a structure *and* a location
+    /// (see `docs/CORRUPTION.md`).
+    Corrupt { section: &'static str, offset: u64 },
     /// A section header or body was structurally invalid.
     BadSection { reason: String },
     /// Checked integer arithmetic overflowed.
@@ -66,11 +80,24 @@ impl fmt::Display for EkbloomError {
             EkbloomError::UnsupportedVersion { major, minor } => {
                 write!(f, "unsupported format version {major}.{minor}")
             }
+            EkbloomError::UnsupportedCoreVersion {
+                machine_id,
+                core_version,
+            } => write!(
+                f,
+                "unsupported core version {core_version} for machine {machine_id}"
+            ),
+            EkbloomError::UnsupportedManifestVersion { version } => {
+                write!(f, "unsupported manifest record version {version}")
+            }
             EkbloomError::Truncated { needed, available } => {
                 write!(f, "truncated: needed {needed} bytes, {available} available")
             }
             EkbloomError::ChecksumMismatch { section } => {
                 write!(f, "checksum mismatch in section {section}")
+            }
+            EkbloomError::Corrupt { section, offset } => {
+                write!(f, "corrupt {section} at logical offset {offset}")
             }
             EkbloomError::BadSection { reason } => write!(f, "bad section: {reason}"),
             EkbloomError::Overflow { what } => write!(f, "integer overflow: {what}"),

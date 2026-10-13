@@ -35,6 +35,20 @@ pub struct CheckOutcome {
     pub passed: bool,
     /// Human-readable explanation.
     pub detail: String,
+    /// Logical offset of the first divergence, when the check can localise it
+    /// (a symbol position for history/checkpoint/path/block checks). `None` for
+    /// checks that are not position-specific (e.g. a parse failure or a digest).
+    pub offset: Option<u64>,
+}
+
+/// A located corruption verdict: the structure/frame name and the logical offset
+/// at which the divergence was detected (see `docs/CORRUPTION.md`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CorruptLocation {
+    /// Stable section/frame name (e.g. `"history"`, `"bloom-path"`, `"core"`).
+    pub section: &'static str,
+    /// Logical offset of the first divergence (`0` when not position-specific).
+    pub offset: u64,
 }
 
 /// The aggregate verdict of a verification run.
@@ -48,13 +62,117 @@ pub struct VerificationReport {
     pub checks: Vec<CheckOutcome>,
 }
 
-/// Construct a [`CheckOutcome`].
+/// Construct a [`CheckOutcome`] with no localised offset.
 fn check(name: impl Into<String>, passed: bool, detail: impl Into<String>) -> CheckOutcome {
+    check_at(name, passed, detail, None)
+}
+
+/// Construct a [`CheckOutcome`] carrying the logical offset of the divergence.
+fn check_at(
+    name: impl Into<String>,
+    passed: bool,
+    detail: impl Into<String>,
+    offset: Option<u64>,
+) -> CheckOutcome {
     CheckOutcome {
         name: name.into(),
         passed,
         detail: detail.into(),
+        offset,
     }
+}
+
+/// Map a verification check name to a stable section/frame name.
+fn section_of_check(name: &str) -> &'static str {
+    if name == "core_hash" || name == "decode_length" {
+        "core"
+    } else if name == "history" {
+        "history"
+    } else if name.starts_with("checkpoints[") {
+        "checkpoint"
+    } else if name.contains(":path") {
+        "bloom-path"
+    } else if name.contains(":universal") {
+        "bloom-global"
+    } else if name.contains(":regional") {
+        "bloom-region"
+    } else if name.contains(":contextual") {
+        "bloom-context"
+    } else if name.starts_with("bloom[") {
+        "bloom"
+    } else if name.starts_with("tiles[") {
+        "tiles"
+    } else if name.starts_with("blocks[") {
+        "blocks"
+    } else if name == "certificates" {
+        "certificate"
+    } else if name == "deep_symbols" {
+        "deep-symbols"
+    } else {
+        "unknown"
+    }
+}
+
+/// Deep-verify `body`, returning a typed [`EkbloomError::Corrupt`] naming the
+/// first failing structure and the logical offset of the divergence.
+///
+/// This is [`verify_deep`] with precise error reporting: rather than a
+/// [`VerificationReport`] whose `ok` is `false`, it returns the section/frame and
+/// offset of the first failure. A clean body returns the same report
+/// [`verify_deep`] would.
+///
+/// [`EkbloomError::Corrupt`]: crate::error::EkbloomError::Corrupt
+pub fn verify_deep_located(body: &EkbloomBody) -> Result<VerificationReport> {
+    let report = verify_deep(body)?;
+    if report.ok {
+        return Ok(report);
+    }
+    let first = report
+        .checks
+        .iter()
+        .find(|c| !c.passed)
+        .expect("a non-ok report has a failing check");
+    Err(EkbloomError::Corrupt {
+        section: section_of_check(&first.name),
+        offset: first.offset.unwrap_or(0),
+    })
+}
+
+/// A scanned section's location: its stable name and the absolute span of its
+/// payload. Used to attribute a corruption to a containing frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SectionSpan {
+    /// Stable section kind name (e.g. `"bloom-path"`, `"history-full"`).
+    pub name: &'static str,
+    /// Absolute offset of the section payload.
+    pub payload_offset: u64,
+    /// Payload length in bytes (the detection granularity of the section frame).
+    pub payload_len: u64,
+}
+
+/// Locate the section whose payload contains absolute file offset `offset`, using
+/// the file's own section directory. `None` when `offset` lies in the core, a
+/// section header, or alignment padding.
+///
+/// This is the *reporting* half of the corruption model: given the byte offset a
+/// caller already knows is corrupt, it names the containing section/frame and its
+/// span, so a typed error can carry `(section, offset)` (see `docs/CORRUPTION.md`).
+/// It scans a **clean** image; on a corrupt image use the `open`/`verify` errors.
+pub fn section_span_at(bytes: &[u8], offset: u64) -> Option<SectionSpan> {
+    let scan = crate::format::scan(bytes).ok()?;
+    for commit in &scan.commits {
+        for section in &commit.sections {
+            let end = section.payload_offset.saturating_add(section.payload_len);
+            if offset >= section.payload_offset && offset < end {
+                return Some(SectionSpan {
+                    name: section.kind.name(),
+                    payload_offset: section.payload_offset,
+                    payload_len: section.payload_len,
+                });
+            }
+        }
+    }
+    None
 }
 
 /// Verify a manifested body against the authoritative machine.
@@ -147,17 +265,23 @@ fn run(body: &EkbloomBody, deep: bool) -> Result<VerificationReport> {
 
     // History.
     if let Some(history) = &body.history {
-        let passed = history.logical_len == body.logical_len
+        let consistent = history.logical_len == body.logical_len
             && history.verify_against_with(machine, &body.core).is_ok();
-        checks.push(check(
-            "history",
-            passed,
-            if passed {
-                "history matches recomputed state log".to_string()
-            } else {
-                "history does not match recomputed state log".to_string()
-            },
-        ));
+        if consistent {
+            checks.push(check(
+                "history",
+                true,
+                "history matches recomputed state log",
+            ));
+        } else {
+            let offset = history_first_divergence(history, logs.as_deref(), body.logical_len);
+            checks.push(check_at(
+                "history",
+                false,
+                "history does not match recomputed state log",
+                offset,
+            ));
+        }
     }
 
     // Checkpoints.
@@ -226,10 +350,11 @@ fn check_checkpoint(
             None => return check(name, false, "ordinal overflow"),
         };
         if target > body.logical_len {
-            return check(
+            return check_at(
                 name,
                 false,
                 format!("ordinal {target} exceeds logical length"),
+                Some(target),
             );
         }
         while pos < target {
@@ -241,13 +366,21 @@ fn check_checkpoint(
         match cp.restore_with(machine, &body.core, target) {
             Ok(got) if got == omega => {}
             Ok(got) => {
-                return check(
+                return check_at(
                     name,
                     false,
                     format!("restart at {target} restored {got:?}, expected {omega:?}"),
+                    Some(target),
                 )
             }
-            Err(e) => return check(name, false, format!("restart at {target} failed: {e}")),
+            Err(e) => {
+                return check_at(
+                    name,
+                    false,
+                    format!("restart at {target} failed: {e}"),
+                    Some(target),
+                )
+            }
         }
     }
     check(
@@ -255,6 +388,42 @@ fn check_checkpoint(
         true,
         format!("all {} restart ordinals exact", cp.count),
     )
+}
+
+/// The first logical position at which a manifested `history` disagrees with the
+/// authoritative state log, if the history covers the whole object.
+fn history_first_divergence(
+    history: &crate::history::History,
+    logs: Option<&[u32]>,
+    logical_len: u64,
+) -> Option<u64> {
+    let logs = logs?;
+    if history.logical_len != logical_len {
+        return None;
+    }
+    for i in 0..=logical_len {
+        match (history.state_at(i), logs.get(i as usize)) {
+            (Some(a), Some(&b)) if a == b => {}
+            _ => return Some(i),
+        }
+    }
+    None
+}
+
+/// The first logical position at which a block index's restart records disagree
+/// with a fresh authoritative pass.
+fn block_first_divergence(block: &crate::blocks::BlockIndex, core: &[u8]) -> Option<u64> {
+    let machine = machine_by_id(block.machine_id())?;
+    let rebuilt =
+        crate::machine::block_restarts_with(machine, core, block.logical_len(), block.block_bytes)
+            .ok()?;
+    let stride = u64::from(block.block_bytes);
+    for (j, (got, want)) in block.entries.iter().zip(rebuilt.iter()).enumerate() {
+        if got != want {
+            return (j as u64).checked_mul(stride);
+        }
+    }
+    Some(0)
 }
 
 fn check_bloom(
@@ -302,10 +471,11 @@ fn check_path(
         match bloom.symbol_at(pos as u64) {
             Ok(got) if got == want => {}
             Ok(got) => {
-                return check(
+                return check_at(
                     name,
                     false,
                     format!("path symbol {pos} = {got}, expected {want}"),
+                    Some(pos as u64),
                 )
             }
             Err(e) => return check(name, false, format!("path symbol {pos} failed: {e}")),
@@ -317,10 +487,11 @@ fn check_path(
             .saturating_mul(block as u64 + 1)
             .min(bloom.logical_len);
         if logs[end as usize] != cold {
-            return check(
+            return check_at(
                 name,
                 false,
                 format!("path block {block} successor mismatch"),
+                Some(end),
             );
         }
     }
@@ -644,10 +815,11 @@ fn check_blocks(body: &EkbloomBody, block: &crate::blocks::BlockIndex, idx: usiz
                 block.block_count()
             ),
         ),
-        Ok(false) => check(
+        Ok(false) => check_at(
             name,
             false,
             "a block restart disagrees with the authoritative machine",
+            block_first_divergence(block, &body.core),
         ),
         Err(e) => check(name, false, e.to_string()),
     }
@@ -694,29 +866,32 @@ fn check_deep_symbols(
         };
         for (pos, &want) in decoded.iter().enumerate() {
             if history.state_at(pos as u64) != Some(omega.state) {
-                return check(
+                return check_at(
                     "deep_symbols",
                     false,
                     format!("history state {pos} disagrees with the machine"),
+                    Some(pos as u64),
                 );
             }
             match machine.reveal(&body.core, &mut omega) {
                 Ok(symbol) if symbol == want => {}
                 Ok(symbol) => {
-                    return check(
+                    return check_at(
                         "deep_symbols",
                         false,
                         format!("history symbol {pos} = {symbol}, expected {want}"),
+                        Some(pos as u64),
                     )
                 }
-                Err(e) => return check("deep_symbols", false, e.to_string()),
+                Err(e) => return check_at("deep_symbols", false, e.to_string(), Some(pos as u64)),
             }
         }
         if history.state_at(decoded.len() as u64) != Some(omega.state) {
-            return check(
+            return check_at(
                 "deep_symbols",
                 false,
                 "history terminal state disagrees with the machine".to_string(),
+                Some(decoded.len() as u64),
             );
         }
     }
@@ -726,23 +901,25 @@ fn check_deep_symbols(
             let mut omega = match cp.restore_with(machine, &body.core, pos as u64) {
                 Ok(omega) => omega,
                 Err(e) => {
-                    return check(
+                    return check_at(
                         "deep_symbols",
                         false,
                         format!("checkpoint[{idx}] restore {pos} failed: {e}"),
+                        Some(pos as u64),
                     )
                 }
             };
             match machine.reveal(&body.core, &mut omega) {
                 Ok(symbol) if symbol == want => {}
                 Ok(symbol) => {
-                    return check(
+                    return check_at(
                         "deep_symbols",
                         false,
                         format!("checkpoint[{idx}] symbol {pos} = {symbol}, expected {want}"),
+                        Some(pos as u64),
                     )
                 }
-                Err(e) => return check("deep_symbols", false, e.to_string()),
+                Err(e) => return check_at("deep_symbols", false, e.to_string(), Some(pos as u64)),
             }
         }
     }
@@ -765,13 +942,14 @@ fn check_deep_symbols(
             match bloom.symbol_at(pos as u64) {
                 Ok(symbol) if symbol == want => {}
                 Ok(symbol) => {
-                    return check(
+                    return check_at(
                         "deep_symbols",
                         false,
                         format!("path[{idx}] symbol {pos} = {symbol}, expected {want}"),
+                        Some(pos as u64),
                     )
                 }
-                Err(e) => return check("deep_symbols", false, e.to_string()),
+                Err(e) => return check_at("deep_symbols", false, e.to_string(), Some(pos as u64)),
             }
         }
     }

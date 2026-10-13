@@ -249,3 +249,59 @@ fn missing_file_is_rejected() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn stream_subcommand_builds_reads_and_reports() {
+    let dir = temp_dir("stream");
+    let src: Vec<u8> = (0..50_000u32)
+        .map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8)
+        .collect();
+    let input = dir.join("input.bin");
+    fs::write(&input, &src).unwrap();
+    let ekb = dir.join("stream.ekb");
+    let input_s = input.to_str().unwrap();
+    let ekb_s = ekb.to_str().unwrap();
+
+    // Build a streaming container with 4 KiB blocks.
+    let out = run(&[
+        "stream",
+        input_s,
+        "-o",
+        ekb_s,
+        "--block-bytes",
+        "4096",
+        "--machine",
+        "auto",
+    ]);
+    assert!(
+        out.status.success(),
+        "stream build failed: {}",
+        stderr(&out)
+    );
+    assert!(ekb.exists(), "stream build produced no file");
+    assert!(stdout(&out).contains("logical_len: 50000"));
+
+    // Inspect.
+    let out = run(&["stream", ekb_s, "--info"]);
+    assert!(out.status.success(), "stream info failed: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("logical_len: 50000"), "info: {text}");
+    assert!(text.contains("blocks: "), "info missing blocks: {text}");
+
+    // Range read to a file, compared byte-for-byte.
+    let range = dir.join("range.bin");
+    let out = run(&[
+        "stream",
+        ekb_s,
+        "--offset",
+        "12345",
+        "--length",
+        "4096",
+        "-o",
+        range.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "stream read failed: {}", stderr(&out));
+    assert_eq!(fs::read(&range).unwrap(), src[12345..12345 + 4096].to_vec());
+
+    let _ = fs::remove_dir_all(&dir);
+}

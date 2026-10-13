@@ -520,3 +520,30 @@ sh scripts/container-test.sh --test machine_seg -- --nocapture
 sh scripts/run-rans.sh                  # writes evidence/bench/rans.json
 sh scripts/run-frontier.sh              # writes evidence/bench/frontier.json and evidence/bench/decoders.json
 ```
+
+## Explicit core versions (v0.4)
+
+Every machine's core is now explicitly versioned so any encoded core is
+self-describing. The version is carried in the `.ekb` **genesis header**
+(`core_version: u16`, offset 68; see [`CORE-LAYOUT.md`](CORE-LAYOUT.md)), alongside
+`core_machine_id`; the pair `(core_machine_id, core_version)` identifies the core's
+semantics.
+
+- `CORE_VERSION_LEGACY = 0` is the implicit version: files written before the field
+existed leave the formerly-reserved header bytes zero, and read back as version 0.
+- `CORE_VERSION_CURRENT = 1` is written by this build for every machine 1–8.
+- `supported_core_versions(machine_id)` returns `{0, 1}` for machines 1–8 and is
+empty for an unknown id; `core_version_supported(machine_id, v)` is the predicate.
+- An unknown core version for a known machine is rejected with
+`EkbloomError::UnsupportedCoreVersion { machine_id, core_version }`; no core is ever
+reinterpreted.
+
+**No machine's core payload layout changed.** The field lives in the container
+header, not in the machine core, so every `encode` output is byte-identical to
+before: machine 1 (`V = N`, no header), machines 2/7 (516-byte header), machine 3
+(identity), machine 4 (`freq ++ K ++ K states`), machine 5 (`bits/k/alphabet/len`),
+machine 6 (the `ESEG` container, whose own internal `SEG_VERSION` remains `1`), and
+machine 8 (`freq ++ K ++ lane_len ++ states`). Because the field was added where
+there was previously a zero reserved region, existing cores stay readable as the
+legacy/implicit version. See [`MIGRATION.md`](MIGRATION.md) for the compatibility
+matrix and the policy for changing `S(v)` or any transition.

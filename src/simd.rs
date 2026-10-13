@@ -24,15 +24,17 @@
 //! for a later random offset) and [`gather_bytes_avx512`] (an `avx512f` gather
 //! using `_mm512_i32gather_epi32`).
 //!
-//! # Why this is the crate's only `unsafe` module
+//! # Why this module contains `unsafe`
 //!
 //! x86 SIMD intrinsics (`_mm256_i32gather_epi32`, `_mm512_i32gather_epi32`,
 //! `_mm_prefetch`, `_mm256_loadu_si256`, ...) are `unsafe` by nature. The
-//! unsafety is confined to three functions in this module — `gather_bytes_avx2`,
-//! `gather_bytes_prefetch_sse` and `gather_bytes_avx512_impl` — each guarded by
+//! unsafety is confined to six functions in this module — `gather_bytes_avx2`,
+//! `gather_bytes_prefetch_sse`, `gather_bytes_avx512_impl`, `rans_step8_avx2_impl`,
+//! `rans_decode8_independent_avx2` and `nl2_windows16_avx2_impl` — each guarded by
 //! `#[cfg(target_arch = "x86_64")]` and a runtime `is_x86_feature_detected!`
-//! check, each with a single `// SAFETY:` justification. No other module contains
-//! `unsafe`.
+//! check, each with a single `// SAFETY:` justification. This is one of the
+//! crate's three sanctioned `unsafe` modules (`simd`, `async_io`, `mapped`); no
+//! other module contains `unsafe`.
 
 use crate::error::{EkbloomError, Result};
 

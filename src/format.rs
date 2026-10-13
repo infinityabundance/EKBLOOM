@@ -5,9 +5,9 @@
 //! are rejected with a specific [`EkbloomError`] and nothing is silently skipped.
 //!
 //! ```text
-//! offset 0                       GenesisHeader (fixed 64 bytes)
-//! offset 64                      core bytes (core_len)
-//! align8(64 + core_len)          commit blocks, repeated:
+//! offset 0                       GenesisHeader (fixed 80 bytes)
+//! offset 80                      core bytes (core_len)
+//! align8(80 + core_len)          commit blocks, repeated:
 //!                                  [ SectionHeader (40) ++ payload ]...
 //!                                  CommitFooter (fixed 64 bytes)
 //! ```
@@ -21,16 +21,33 @@
 //!
 //! - `GenesisHeader` is exactly 80 bytes and carries every field of
 //!   `docs/DESIGN.md` §5, including `logical_bytes` (which equals
-//!   `logical_symbols` for the byte machine) and the full 12-byte zero
-//!   `reserved`.
+//!   `logical_symbols` for the byte machine), the explicit `core_version`
+//!   (formerly the first two reserved bytes), and a 10-byte zero `reserved`.
 //! - `CommitFooter` is exactly 64 bytes as specified; its trailing `reserved`
 //!   is 4 bytes (the spec fixes the footer at 64 but not the reserved width).
+//!
+//! # Explicit versioning
+//!
+//! Three independent version tags gate reading:
+//!
+//! - the genesis header `format_major`/`format_minor` (the `.ekb` container
+//!   format line), rejected with [`EkbloomError::UnsupportedVersion`];
+//! - the genesis header `core_version` (the machine core encoding), validated per
+//!   machine and rejected with [`EkbloomError::UnsupportedCoreVersion`];
+//! - the manifest record `MANIFEST_RECORD_VERSION`, rejected with
+//!   [`EkbloomError::UnsupportedManifestVersion`].
+//!
+//! A reader never guesses: an unknown tag is a typed error.
 //!
 //! The core hash is not carried in the header (the spec header has no such
 //! field); it lives in the `MANIFEST` record and in every manifested structure,
 //! and the reader cross-checks all of them.
 
 use crate::error::{EkbloomError, Result};
+use crate::machine::{
+    MACHINE_NL2, MACHINE_PACK, MACHINE_RANS0, MACHINE_RANS0I, MACHINE_RANS0IL, MACHINE_RANS0W,
+    MACHINE_SEG, MACHINE_STORE,
+};
 
 /// File magic: `EKBLOOM\0`.
 pub const MAGIC: [u8; 8] = *b"EKBLOOM\0";
@@ -41,6 +58,52 @@ pub const COMMIT_MARKER: [u8; 8] = *b"EKBCOMM\0";
 pub const FORMAT_MAJOR: u16 = 0;
 /// Minor format version written by this build.
 pub const FORMAT_MINOR: u16 = 3;
+
+/// Legacy/implicit core version.
+///
+/// A `.ekb` file written before the explicit `core_version` field existed leaves
+/// the genesis header's formerly-reserved bytes zero, which decodes as this
+/// version. It is the version recorded for every machine's original layout.
+pub const CORE_VERSION_LEGACY: u16 = 0;
+
+/// Core version written by this build for every machine.
+///
+/// Bumped per machine only when that machine's *core payload layout* changes; no
+/// machine's core layout changed to introduce this field (the field lives in the
+/// `.ekb` genesis header, not in the machine core), so every machine records the
+/// same current version `1`.
+pub const CORE_VERSION_CURRENT: u16 = 1;
+
+/// The core versions this build understands for a machine: its legacy/implicit
+/// layout and the current layout. A machine's core semantics are identified by
+/// `(machine_id, core_version)`; a reader must refuse an unknown pair.
+pub const SUPPORTED_CORE_VERSIONS: &[u16] = &[CORE_VERSION_LEGACY, CORE_VERSION_CURRENT];
+
+/// The core versions this build understands for `machine_id`.
+///
+/// An empty slice means the machine identifier is unknown to this build (the
+/// machine lookup, not the version check, is responsible for rejecting it).
+pub fn supported_core_versions(machine_id: u32) -> &'static [u16] {
+    match machine_id {
+        MACHINE_NL2 | MACHINE_RANS0 | MACHINE_STORE | MACHINE_RANS0I | MACHINE_PACK
+        | MACHINE_SEG | MACHINE_RANS0W | MACHINE_RANS0IL => SUPPORTED_CORE_VERSIONS,
+        _ => &[],
+    }
+}
+
+/// Whether `machine_id` supports `core_version`.
+pub fn core_version_supported(machine_id: u32, core_version: u16) -> bool {
+    supported_core_versions(machine_id).contains(&core_version)
+}
+
+/// The core version this build writes for `machine_id`.
+///
+/// Every known machine writes [`CORE_VERSION_CURRENT`]; an unknown machine id is
+/// recorded with the current version too (the reader rejects the unknown id
+/// itself, never the version).
+pub fn core_version_for_machine(_machine_id: u32) -> u16 {
+    CORE_VERSION_CURRENT
+}
 
 /// Fixed size of the [`GenesisHeader`].
 pub const HEADER_LEN: usize = 80;
@@ -230,6 +293,10 @@ pub struct GenesisHeader {
     pub core_len: u64,
     /// Identifier of the machine that encoded the core.
     pub core_machine_id: u32,
+    /// Version of the machine's core encoding. Together with `core_machine_id`
+    /// this self-describes the core's semantics; `0` is the legacy/implicit
+    /// version recorded by files written before this field existed.
+    pub core_version: u16,
 }
 
 impl GenesisHeader {
@@ -246,7 +313,8 @@ impl GenesisHeader {
         w.u64(self.logical_bytes);
         w.u64(self.core_len);
         w.u32(self.core_machine_id);
-        w.zeros(12);
+        w.u16(self.core_version);
+        w.zeros(10);
         let v = w.into_vec();
         let mut out = [0u8; HEADER_LEN];
         out.copy_from_slice(&v);
@@ -256,9 +324,10 @@ impl GenesisHeader {
     /// Decode and validate a header from the start of `bytes`.
     ///
     /// Rejects a short buffer with [`EkbloomError::Truncated`], a wrong magic
-    /// with [`EkbloomError::BadMagic`], an unsupported version with
-    /// [`EkbloomError::UnsupportedVersion`], and a `header_len` other than
-    /// [`HEADER_LEN`] with [`EkbloomError::BadSection`].
+    /// with [`EkbloomError::BadMagic`], an unsupported `format_major`/`format_minor`
+    /// with [`EkbloomError::UnsupportedVersion`], an unsupported `core_version`
+    /// for the named machine with [`EkbloomError::UnsupportedCoreVersion`], and a
+    /// `header_len` other than [`HEADER_LEN`] with [`EkbloomError::BadSection`].
     pub fn decode(bytes: &[u8]) -> Result<GenesisHeader> {
         if bytes.len() < HEADER_LEN {
             return Err(EkbloomError::Truncated {
@@ -295,6 +364,18 @@ impl GenesisHeader {
         let logical_bytes = r.u64()?;
         let core_len = r.u64()?;
         let core_machine_id = r.u32()?;
+        let core_version = r.u16()?;
+        // Reject an unknown core version rather than reinterpreting it. An
+        // unknown *machine* has no supported set and is left for the machine
+        // lookup (which returns `UnknownMachine`), so the error is never
+        // ambiguous.
+        let supported = supported_core_versions(core_machine_id);
+        if !supported.is_empty() && !supported.contains(&core_version) {
+            return Err(EkbloomError::UnsupportedCoreVersion {
+                machine_id: core_machine_id,
+                core_version,
+            });
+        }
         Ok(GenesisHeader {
             format_major,
             format_minor,
@@ -304,6 +385,7 @@ impl GenesisHeader {
             logical_bytes,
             core_len,
             core_machine_id,
+            core_version,
         })
     }
 }
@@ -522,9 +604,7 @@ impl ManifestRecord {
         let mut r = Reader::new(bytes);
         let version = r.u32()?;
         if version != MANIFEST_RECORD_VERSION {
-            return Err(bad(format!(
-                "unsupported manifest record version {version}"
-            )));
+            return Err(EkbloomError::UnsupportedManifestVersion { version });
         }
         let generation = r.u64()?;
         let logical_len = r.u64()?;
@@ -1033,6 +1113,7 @@ mod tests {
             logical_bytes: 12345,
             core_len: 12345,
             core_machine_id: 1,
+            core_version: CORE_VERSION_CURRENT,
         }
     }
 

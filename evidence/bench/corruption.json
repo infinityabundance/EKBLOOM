@@ -1,0 +1,56 @@
+{
+  "generated_by": "examples/corruption_court.rs (sh scripts/run-corruption.sh)",
+  "model": "single random bit flip in one structure's serialized payload; detected via the frame CRC-32 / core BLAKE3 (fast path) and the deep verifier",
+  "corpus": {"seed":16938038201776218150,"logical_len":4096,"machine_id":1,"core_len":4096,"file_bytes":584152},
+  "flips_per_structure": 1024,
+  "localization": {"fast_path":"the containing section/frame (the CRC-32 unit) plus the exact flipped byte, so every detection is localized to a 4096-byte window or smaller","deep_verify":"the exact logical symbol offset of the first divergence"},
+  "algorithm_coverage": [
+    {"structure":"core (V)","checksum":"BLAKE3 core_hash in MANIFEST + footer linkage","granularity":"whole core"},
+    {"structure":"history (L)","checksum":"section frame CRC-32","granularity":"section payload"},
+    {"structure":"checkpoint","checksum":"section frame CRC-32","granularity":"section payload"},
+    {"structure":"bloom_global (T_D)","checksum":"section frame CRC-32","granularity":"section payload"},
+    {"structure":"bloom_contextual (T_D)","checksum":"section frame CRC-32","granularity":"section payload"},
+    {"structure":"bloom_regional (T_D)","checksum":"section frame CRC-32","granularity":"section payload"},
+    {"structure":"bloom_path (P_32)","checksum":"section frame CRC-32","granularity":"section payload"},
+    {"structure":"tiles (hot tiles)","checksum":"section frame CRC-32 + BLAKE3 content digest","granularity":"section payload"},
+    {"structure":"tile_directory","checksum":"section frame CRC-32 + content digest","granularity":"section payload"},
+    {"structure":"blocks","checksum":"section frame CRC-32 + BLAKE3 content digest","granularity":"section payload"},
+    {"structure":"block_directory","checksum":"section frame CRC-32 + content digest","granularity":"section payload"},
+    {"structure":"manifest","checksum":"section frame CRC-32 + footer BLAKE3 manifest_hash","granularity":"section payload"},
+    {"structure":"commit_footer","checksum":"footer CRC-32 over [0,56)++[60,64)","granularity":"footer"},
+    {"structure":"section_directory","checksum":"section frame CRC-32 (kind/offset/length/checksum)","granularity":"header fields"},
+    {"structure":"AUTH (opt-in)","checksum":"keyed BLAKE3 MAC over file[0..auth)","granularity":"whole covered prefix"}
+  ],
+  "fast_path": [
+    {"structure":"core","section":"core","span_bytes":4096,"flips":1024,"detected_by_open":1024,"detected_by_verify":0,"undetected":0,"reported_window_bytes":4096,"detection_rate":1.0000,"dominant_error":"CorruptGeneration(core hash mismatch) (x1024)"},
+    {"structure":"history","section":"history","span_bytes":16452,"flips":1024,"detected_by_open":1024,"detected_by_verify":0,"undetected":0,"reported_window_bytes":4096,"detection_rate":1.0000,"dominant_error":"ChecksumMismatch(history) (x1024)"},
+    {"structure":"checkpoint","section":"checkpoints","span_bytes":152,"flips":1024,"detected_by_open":1024,"detected_by_verify":0,"undetected":0,"reported_window_bytes":152,"detection_rate":1.0000,"dominant_error":"ChecksumMismatch(checkpoints) (x1024)"},
+    {"structure":"bloom_global (T_D)","section":"bloom-global","span_bytes":532576,"flips":1024,"detected_by_open":1024,"detected_by_verify":0,"undetected":0,"reported_window_bytes":4096,"detection_rate":1.0000,"dominant_error":"ChecksumMismatch(bloom-global) (x1024)"},
+    {"structure":"bloom_contextual (T_D)","section":"bloom-context","span_bytes":13766,"flips":1024,"detected_by_open":1024,"detected_by_verify":0,"undetected":0,"reported_window_bytes":4096,"detection_rate":1.0000,"dominant_error":"ChecksumMismatch(bloom-context) (x1024)"},
+    {"structure":"bloom_regional (T_D)","section":"bloom-region","span_bytes":4950,"flips":1024,"detected_by_open":1024,"detected_by_verify":0,"undetected":0,"reported_window_bytes":1280,"detection_rate":1.0000,"dominant_error":"ChecksumMismatch(bloom-region) (x1024)"},
+    {"structure":"bloom_path (P_32)","section":"bloom-path","span_bytes":4700,"flips":1024,"detected_by_open":1024,"detected_by_verify":0,"undetected":0,"reported_window_bytes":4096,"detection_rate":1.0000,"dominant_error":"ChecksumMismatch(bloom-path) (x1024)"},
+    {"structure":"tiles (hot tiles)","section":"tiles","span_bytes":4212,"flips":1024,"detected_by_open":1024,"detected_by_verify":0,"undetected":0,"reported_window_bytes":4096,"detection_rate":1.0000,"dominant_error":"ChecksumMismatch(tiles) (x1024)"},
+    {"structure":"tile_directory","section":"tiles","span_bytes":8,"flips":1024,"detected_by_open":1024,"detected_by_verify":0,"undetected":0,"reported_window_bytes":8,"detection_rate":1.0000,"dominant_error":"ChecksumMismatch(tiles) (x1024)"},
+    {"structure":"blocks","section":"blocks","span_bytes":138,"flips":1024,"detected_by_open":1024,"detected_by_verify":0,"undetected":0,"reported_window_bytes":138,"detection_rate":1.0000,"dominant_error":"ChecksumMismatch(blocks) (x1024)"},
+    {"structure":"block_directory","section":"blocks","span_bytes":104,"flips":1024,"detected_by_open":1024,"detected_by_verify":0,"undetected":0,"reported_window_bytes":104,"detection_rate":1.0000,"dominant_error":"ChecksumMismatch(blocks) (x1024)"},
+    {"structure":"manifest","section":"manifest","span_bytes":930,"flips":1024,"detected_by_open":1024,"detected_by_verify":0,"undetected":0,"reported_window_bytes":930,"detection_rate":1.0000,"dominant_error":"ChecksumMismatch(manifest) (x1024)"},
+    {"structure":"commit_footer","section":"commit-footer","span_bytes":64,"flips":1024,"detected_by_open":1024,"detected_by_verify":0,"undetected":0,"reported_window_bytes":64,"detection_rate":1.0000,"dominant_error":"ChecksumMismatch(commit-footer) (x896)"},
+    {"structure":"section_directory","section":"section-header","span_bytes":432,"flips":1024,"detected_by_open":1024,"detected_by_verify":0,"undetected":0,"reported_window_bytes":8,"detection_rate":1.0000,"dominant_error":"Truncated (x266)"}
+  ],
+  "deep_verify": [
+    {"structure":"core","flips":1024,"detected_shallow":1024,"detected_deep":1024,"deep_rate":1.0000,"shallow_rate":1.0000,"failing_sections":{"core":1024},"offsets_nonzero":0,"offset_max":0},
+    {"structure":"history","flips":1024,"detected_shallow":1024,"detected_deep":1024,"deep_rate":1.0000,"shallow_rate":1.0000,"failing_sections":{"history":1024},"offsets_nonzero":1024,"offset_max":4096},
+    {"structure":"checkpoint","flips":1024,"detected_shallow":1024,"detected_deep":1024,"deep_rate":1.0000,"shallow_rate":1.0000,"failing_sections":{"checkpoint":1024},"offsets_nonzero":1005,"offset_max":4096},
+    {"structure":"bloom_global (T_D)","flips":1024,"detected_shallow":1024,"detected_deep":1024,"deep_rate":1.0000,"shallow_rate":1.0000,"failing_sections":{"bloom-global":1024},"offsets_nonzero":0,"offset_max":0},
+    {"structure":"bloom_contextual (T_D)","flips":1024,"detected_shallow":1024,"detected_deep":1024,"deep_rate":1.0000,"shallow_rate":1.0000,"failing_sections":{"bloom-context":1024},"offsets_nonzero":0,"offset_max":0},
+    {"structure":"bloom_regional (T_D)","flips":1024,"detected_shallow":1024,"detected_deep":1024,"deep_rate":1.0000,"shallow_rate":1.0000,"failing_sections":{"bloom-region":1024},"offsets_nonzero":0,"offset_max":0},
+    {"structure":"bloom_path (P_32)","flips":1024,"detected_shallow":1024,"detected_deep":1024,"deep_rate":1.0000,"shallow_rate":1.0000,"failing_sections":{"bloom-path":1024},"offsets_nonzero":1019,"offset_max":4092},
+    {"structure":"blocks","flips":1024,"detected_shallow":1024,"detected_deep":1024,"deep_rate":1.0000,"shallow_rate":1.0000,"failing_sections":{"blocks":1024},"offsets_nonzero":0,"offset_max":0}
+  ],
+  "inert_bytes": [
+    {"structure":"alignment_padding","section":"padding","span_bytes":45,"flips":1024,"detected_by_open":0,"detected_by_verify":0,"undetected":1024,"reported_window_bytes":7,"detection_rate":0.0000,"dominant_error":"none"},
+    {"structure":"header_inert_metadata","section":"section-header-inert","span_bytes":288,"flips":1024,"detected_by_open":0,"detected_by_verify":0,"undetected":1024,"reported_window_bytes":8,"detection_rate":0.0000,"dominant_error":"none"}
+  ],
+  "acceptance": {"fast_path_all_detected":true,"deep_verify_all_detected":true,"inert_bytes_all_non_interpreted":true},
+  "verdict": "a single bit flip in any covered structure is detected at the containing section/frame granularity (CRC-32 / core BLAKE3 / footer CRC-32), never silently accepted; alignment padding and inert section-header metadata are not interpreted"
+}

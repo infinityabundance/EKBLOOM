@@ -68,6 +68,7 @@ pub mod region_adapt;
 pub mod resource;
 pub mod simd;
 pub mod state;
+pub mod stream;
 pub mod sweep;
 pub mod tiles;
 pub mod verify;
@@ -202,6 +203,11 @@ pub use simd::{
     rans_step8_avx2, rans_step8_scalar, sse_available, NL2_WINDOW_LANES, RANS_LANES8,
 };
 pub use state::Snapshot;
+pub use stream::{
+    StreamBuilder, StreamEntry, StreamManifest, StreamOptions, StreamReader,
+    STREAM_DEFAULT_BLOCK_BYTES, STREAM_ENTRY_BYTES, STREAM_FOOTER_BYTES, STREAM_FOOTER_MAGIC,
+    STREAM_HEADER_BYTES, STREAM_MAGIC, STREAM_VERSION,
+};
 pub use sweep::{
     depth_metrics, manifestation_sweep, memory_tiers, sweep_profiles, write_depth_metrics_json,
     write_evidence_json, write_memory_tiers_json, DepthMetrics, DepthPoint, MemoryTiersReport,
@@ -211,7 +217,10 @@ pub use tiles::{
     bounded_seed_steps, parse_tile_set_prefix, DirectoryKind, TileAdaptReport, TileDirectory,
     TileSet, TileSetPrefix, TileSummary, RADIX_GROUP_SHIFT, TILE_SET_PREFIX_LEN,
 };
-pub use verify::{verify, verify_deep, verify_file_require_auth, CheckOutcome, VerificationReport};
+pub use verify::{
+    section_span_at, verify, verify_deep, verify_deep_located, verify_file_require_auth,
+    CheckOutcome, CorruptLocation, SectionSpan, VerificationReport,
+};
 pub use worker::{available_parallelism, manifest_background, regional_parallel};
 pub use writer::{
     append_generation, append_generation_authenticated, history_segmented_payload, write_body,

@@ -68,6 +68,7 @@ fn write_body_impl(path: &Path, body: &EkbloomBody, key: Option<&[u8; 32]>) -> R
         logical_bytes: body.logical_len,
         core_len: body.core.len() as u64,
         core_machine_id: body.machine_id,
+        core_version: format::core_version_for_machine(body.machine_id),
     };
     let header_bytes = header.encode();
 
@@ -590,6 +591,7 @@ pub fn write_history_segmented(path: &Path, core: &[u8], store: &HistoryStore) -
         logical_bytes: logical_len,
         core_len: core.len() as u64,
         core_machine_id: crate::machine::MACHINE_NL2,
+        core_version: format::core_version_for_machine(crate::machine::MACHINE_NL2),
     };
     let header_bytes = header.encode();
 
