@@ -114,6 +114,7 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`model-search/model-search-sweep.json`](../evidence/model-search/model-search-sweep.json) | The `D = 4` finite-model sufficiency sweep (`k = 0..4` conflicts `64/256/1024/4096/0`). |
 | [`gates/G1.json`](../evidence/gates/G1.json) | … [`G5.json`](../evidence/gates/G5.json) — the acceptance gates G1–G5 (PASS) with their measured evidence ([`GATES.md`](GATES.md)). |
 | [`bench/aarch64-determinism.json`](../evidence/bench/aarch64-determinism.json) | Cross-architecture determinism: x86_64 vs arm64 (QEMU) produce **identical** `physical_bytes()` and content hashes (`identical: true`). |
+| [`bench/ci-matrix.json`](../evidence/bench/ci-matrix.json) | The **cross-platform CI matrix** (`scripts/run-matrix.sh`): `{x86_64-simd, x86_64-scalar, aarch64}` — each job's PASS/FAIL, footprint and `byte_at` p50/p99/p99.9/p99.99, plus the per-job `ci-*.json`. |
 
 ## Reproduce (inside the pinned container only)
 
@@ -154,7 +155,9 @@ sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (46 file
 sh scripts/container-fuzz.sh        # all 17 libFuzzer targets (fuzz_machine/open/bloom/history_store/packed/tiles/blocks/batch/rans_i/region/pack/seg/resource/rans_w/rans_il/roundtrip/stream)
 sh scripts/run-gates.sh             # acceptance gates G1-G5 (docs/GATES.md)
 sh scripts/run-scale.sh             # nightly 2^30 scale build (opt-in: EKB_RUN_SCALE=1)
-sh scripts/container-aarch64.sh     # cross-arch determinism (x86_64 == arm64 via QEMU)
+sh scripts/run-scalar.sh scalar     # x86_64 with EKB_NO_SIMD=1: equality + gates + bounded court
+sh scripts/run-matrix.sh            # cross-platform CI matrix {x86_64-simd, x86_64-scalar, aarch64} (ci-matrix.json)
+sh scripts/container-aarch64.sh     # cross-arch determinism (x86_64 == arm64 via QEMU) + the arm64 CI job
 sh scripts/container-loom.sh        # Loom model checking
 sh scripts/capture-environment.sh   # environment.txt
 ```

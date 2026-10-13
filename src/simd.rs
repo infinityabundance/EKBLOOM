@@ -16,7 +16,11 @@
 //! yields a clean [`EkbloomError`] rather than a panic or an out-of-bounds read.
 //! [`gather_bytes`] falls back to the scalar reference on non-x86_64 targets, when
 //! AVX2 is unavailable at runtime, or when the hot array is too large for 32-bit
-//! gather indices.
+//! gather indices. The same scalar fallback can be forced on SIMD-capable
+//! hardware at runtime with `EKB_NO_SIMD=1` / `EKB_FORCE_SCALAR=1` or
+//! [`set_force_scalar`] (see [`force_scalar`]); this is a *performance-only*
+//! override used by `scripts/run-scalar.sh` and the `tests/simd.rs` forced-scalar
+//! equality test, and it never changes a result.
 //!
 //! The module also carries two further §23 experiments, both measured in
 //! `benches/ekbloom.rs` and `docs/LAYOUT.md` and neither wired into the default
@@ -36,15 +40,61 @@
 //! crate's three sanctioned `unsafe` modules (`simd`, `async_io`, `mapped`); no
 //! other module contains `unsafe`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
 use crate::error::{EkbloomError, Result};
+
+/// Runtime override that forces the **scalar reference path** even on
+/// SIMD-capable hardware.
+///
+/// Set process-wide with the environment variable `EKB_NO_SIMD=1` (or
+/// `EKB_FORCE_SCALAR=1`; any value other than `0`/empty enables it), or
+/// programmatically with [`set_force_scalar`]. It only affects *performance*:
+/// every SIMD dispatch below already degrades to a byte-for-byte identical
+/// scalar fallback, so forcing scalar never changes a result — see
+/// `tests/simd.rs`'s forced-scalar equality test and `scripts/run-scalar.sh`.
+static FORCE_SCALAR_OVERRIDE: AtomicBool = AtomicBool::new(false);
+
+/// Whether `EKB_NO_SIMD`/`EKB_FORCE_SCALAR` requests the scalar path (read once).
+fn env_forces_scalar() -> bool {
+    static ENV: OnceLock<bool> = OnceLock::new();
+    *ENV.get_or_init(|| {
+        ["EKB_NO_SIMD", "EKB_FORCE_SCALAR"].iter().any(|name| {
+            std::env::var_os(name).is_some_and(|v| {
+                let v = v.to_string_lossy();
+                !v.is_empty() && v != "0"
+            })
+        })
+    })
+}
+
+/// Whether the scalar reference path is currently forced.
+///
+/// True when [`set_force_scalar`] has enabled the override or the process was
+/// started with `EKB_NO_SIMD=1` / `EKB_FORCE_SCALAR=1`.
+pub fn force_scalar() -> bool {
+    FORCE_SCALAR_OVERRIDE.load(Ordering::Relaxed) || env_forces_scalar()
+}
+
+/// Force the scalar reference path on or off, ignoring hardware detection.
+///
+/// A CI/test hook: `EKB_NO_SIMD=1` does the same for a whole process. When
+/// enabled, every `*_available` probe below reports `false`, so the dispatchers
+/// in this module take their scalar fallback. Performance-only: results are
+/// byte-for-byte identical on both paths.
+pub fn set_force_scalar(force: bool) {
+    FORCE_SCALAR_OVERRIDE.store(force, Ordering::Relaxed);
+}
 
 /// Whether AVX2 gather is usable on this machine.
 ///
 /// Uses the safe `std::is_x86_feature_detected!` macro on x86/x86_64 and returns
-/// `false` on every other architecture.
+/// `false` on every other architecture. Always `false` when
+/// [`force_scalar`] is set.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub fn avx2_available() -> bool {
-    std::is_x86_feature_detected!("avx2")
+    !force_scalar() && std::is_x86_feature_detected!("avx2")
 }
 
 /// Whether AVX2 gather is usable on this machine.
@@ -56,10 +106,11 @@ pub fn avx2_available() -> bool {
 /// Whether the SSE prefetch hint is usable on this machine.
 ///
 /// `_mm_prefetch` needs only SSE, which is baseline on every x86_64 CPU; the
-/// runtime check keeps the module total and honest on exotic targets.
+/// runtime check keeps the module total and honest on exotic targets. Always
+/// `false` when [`force_scalar`] is set.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub fn sse_available() -> bool {
-    std::is_x86_feature_detected!("sse")
+    !force_scalar() && std::is_x86_feature_detected!("sse")
 }
 
 /// Whether the SSE prefetch hint is usable on this machine.
@@ -69,9 +120,11 @@ pub fn sse_available() -> bool {
 }
 
 /// Whether AVX-512 Foundation gather is usable on this machine.
+///
+/// Always `false` when [`force_scalar`] is set.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub fn avx512_available() -> bool {
-    std::is_x86_feature_detected!("avx512f")
+    !force_scalar() && std::is_x86_feature_detected!("avx512f")
 }
 
 /// Whether AVX-512 Foundation gather is usable on this machine.
@@ -976,5 +1029,26 @@ mod tests {
         assert!(nl2_windows16_avx2(&mut states, &cols, 3, &mut out).is_err());
         let mut short = [0u16; NL2_WINDOW_LANES - 1];
         assert!(nl2_windows16_avx2(&mut short, &cols, 2, &mut out).is_err());
+    }
+
+    #[test]
+    fn force_scalar_overrides_every_detection_probe() {
+        let prev = force_scalar();
+        set_force_scalar(true);
+        assert!(force_scalar());
+        // Every probe must report unavailable while the override is set, so each
+        // dispatcher takes its scalar fallback regardless of the host CPU.
+        assert!(!avx2_available());
+        assert!(!sse_available());
+        assert!(!avx512_available());
+        assert!(!nl2_windows_avx2_available());
+        set_force_scalar(false);
+        // Restoring clears the override; an env-driven force stays in effect.
+        assert_eq!(force_scalar(), prev);
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        assert_eq!(
+            avx2_available(),
+            !prev && std::is_x86_feature_detected!("avx2")
+        );
     }
 }

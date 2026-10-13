@@ -1,0 +1,12 @@
+{
+  "generated_by": "scripts/run-matrix.sh",
+  "description": "cross-platform CI matrix: {x86_64-simd, x86_64-scalar, aarch64}; each job runs the SIMD-vs-scalar equality suite, gates G1-G5 and the bounded Silesia-derived byte_at court; aarch64 additionally runs the bounded Miri subset",
+  "matrix": ["x86_64-simd", "x86_64-scalar", "aarch64"],
+  "jobs": [
+    {"job": "x86_64-simd", "platform": "linux/amd64", "status": "PASS", "simd_forced_scalar": false, "footprint_bytes": 15478, "byte_at_p50_ns": 1583, "byte_at_p99_ns": 2325, "byte_at_p99_9_ns": 3256, "byte_at_p99_99_ns": 5169, "evidence": "evidence/bench/ci-x86_64-simd.json"},
+    {"job": "x86_64-scalar", "platform": "linux/amd64", "status": "PASS", "simd_forced_scalar": true, "footprint_bytes": 15478, "byte_at_p50_ns": 1583, "byte_at_p99_ns": 2234, "byte_at_p99_9_ns": 3797, "byte_at_p99_99_ns": 10048, "evidence": "evidence/bench/ci-x86_64-scalar.json"},
+    {"job": "aarch64", "platform": "linux/arm64", "status": "PASS", "simd_forced_scalar": false, "footprint_bytes": 15478, "byte_at_p50_ns": 14497, "byte_at_p99_ns": 18394, "byte_at_p99_9_ns": 19527, "byte_at_p99_99_ns": 34574, "note": "run under QEMU", "evidence": "evidence/bench/ci-aarch64.json"}
+  ],
+  "summary": {"x86_64-simd": "PASS", "x86_64-scalar": "PASS", "aarch64": "PASS"},
+  "verdict": "PASS"
+}

@@ -3,16 +3,18 @@
 **Runners:** [`scripts/container-verify.sh`](../scripts/container-verify.sh) ·
 [`scripts/container-fuzz.sh`](../scripts/container-fuzz.sh) ·
 [`scripts/container-aarch64.sh`](../scripts/container-aarch64.sh) ·
+[`scripts/run-matrix.sh`](../scripts/run-matrix.sh) ·
+[`scripts/run-scalar.sh`](../scripts/run-scalar.sh) ·
 [`scripts/run-gates.sh`](../scripts/run-gates.sh) ·
 [`scripts/run-scale.sh`](../scripts/run-scale.sh) ·
 [`scripts/container-reproduce.sh`](../scripts/container-reproduce.sh)
 **Gates:** [`docs/GATES.md`](GATES.md) · **Seeds:** [`fuzz/seeds/`](../fuzz/seeds)
 
-This document describes the four layers of EKBLOOM's trust-building test
-infrastructure: **fuzz roundtrips**, **cross-architecture determinism**, the
-**scale job**, and the **acceptance gates G1–G5**. Every number below is from a
-real run inside the pinned, memory-capped container; no project tooling ever runs
-on the host.
+This document describes the trust-building test infrastructure: **fuzz
+roundtrips**, **cross-architecture determinism**, the **cross-platform CI matrix**
+(the scalar fallback and the aarch64 build), the **scale job**, and the
+**acceptance gates G1–G5**. Every number below is from a real run inside the
+pinned, memory-capped container; no project tooling ever runs on the host.
 
 ---
 
@@ -127,7 +129,81 @@ Every docker run in the script is memory-capped; a separate `CARGO_TARGET_DIR`
 
 ---
 
-## 4. Scale job (nightly, opt-in)
+## 4. Cross-platform CI matrix — the scalar fallback and aarch64
+
+```sh
+sh scripts/run-matrix.sh          # the CI entry point: {x86_64-simd, x86_64-scalar, aarch64}
+sh scripts/run-scalar.sh scalar   # just the x86_64 scalar-fallback job
+sh scripts/container-aarch64.sh   # determinism + the arm64 CI job (QEMU)
+```
+
+`run-matrix.sh` exists to make two things impossible to rot: the **scalar
+(no-AVX2) fallback** and the **aarch64 build**. It runs three jobs and writes a
+single `evidence/bench/ci-matrix.json`:
+
+| job | platform | forces scalar | what it proves |
+|---|---|---|---|
+| `x86_64-simd` | `linux/amd64` | no | control arm: the native AVX2 dispatchers are correct |
+| `x86_64-scalar` | `linux/amd64` | `EKB_NO_SIMD=1` | the scalar fallback is correct (and not-too-slow) **on AVX2 hardware** |
+| `aarch64` | `linux/arm64` (QEMU) | n/a (no AVX2) | the scalar fallback and the whole crate stay correct on an AVX2-less architecture |
+
+**The scalar switch.** [`src/simd.rs`](../src/simd.rs) exposes a documented,
+performance-only runtime override: `force_scalar()` reports whether it is active
+and `set_force_scalar(bool)` toggles it; the process-wide `EKB_NO_SIMD=1` (or
+`EKB_FORCE_SCALAR=1`) does the same from the environment. When active, every
+`*_available()` probe returns `false`, so each dispatcher (`gather_bytes`,
+`gather_bytes_prefetch`, `gather_bytes_avx512`, `rans_step8_avx2`,
+`rans_decode8_independent`, `nl2_windows16_avx2`) takes its byte-identical scalar
+fallback. It never changes a result — `tests/simd.rs::
+forced_scalar_is_byte_identical_to_scalar_reference_for_every_kernel` asserts each
+kernel equals its scalar reference **and** the native result it produced before
+forcing.
+
+**What every job runs** (all inside the pinned, memory-capped containers):
+
+* the **SIMD-vs-scalar equality** suite (`cargo test --release --test simd`),
+* the **acceptance gates G1–G5** (`cargo test --release --test gates`, one gate at
+a time),
+* the **bounded Silesia-derived court** (`tests/ci_bench.rs`): the `auto` body over
+the committed real Silesia/Calgary 4 KiB prefixes in `fuzz/seeds/`, every read
+byte-checked, printing `byte_at` p50/p99/p99.9/p99.99 and the retained footprint.
+
+That court is bounded and **offline** on purpose: it stays feasible under QEMU and
+never overwrites the committed `evidence/bench/corpora.json`. The *full*
+standard-corpora court remains `scripts/run-corpora.sh` (it downloads multi-MiB
+corpora and is the P6 evidence), so it is not re-run here.
+
+The `aarch64` job additionally runs the **bounded Miri subset** — the same test
+set `scripts/container-miri.sh` covers — natively on arm64 (`cargo test --release
+--lib -- machine:: … resource::`). Sixty-five tests pass here; Miri additionally
+skips three Miri-infeasible tests, giving the documented 61. True Miri is a
+bytecode interpreter: executing it under QEMU emulation did not complete within a
+13-minute budget, so it is opt-in (`EKB_ARM64_MIRI=1`) and expected to be slow;
+true Miri remains an x86_64 guarantee (`sh scripts/container-miri.sh`).
+
+**Recorded matrix** (one run; exact values in `evidence/bench/ci-matrix.json`, and
+percentiles are run-to-run noisy):
+
+| job | status | footprint (`physical_bytes`, `E_V`) | `byte_at` p50 | p99.9 | p99.99 |
+|---|---|---:|---:|---:|---:|
+| `x86_64-simd` | PASS | 15,478 B, `E_V` 0.756 | 1.58 µs | 3.26 µs | 5.17 µs |
+| `x86_64-scalar` | PASS | 15,478 B, `E_V` 0.756 | 1.58 µs | 3.80 µs | 10.0 µs |
+| `aarch64` | PASS | 15,478 B, `E_V` 0.756 | 14.5 µs | 19.5 µs | 34.6 µs |
+
+The footprint is **identical to the byte** across all three jobs (over the same
+20,480 bytes of real Silesia/Calgary seed data) — the structural proof that forcing
+the scalar path and cross-compiling to aarch64 do not change a result. The arm64
+`byte_at` p50 is ~9× the x86_64 number, which is QEMU emulation overhead, not the
+code (the `physical_bytes`/hash equality above is the correctness claim).
+
+**QEMU requirement / best effort.** The `aarch64` job needs `qemu-aarch64` via
+`binfmt_misc`; if it is absent the job is recorded **`SKIPPED`** (not FAIL) and the
+matrix still passes on x86_64. `scripts/container-aarch64.sh` exits `3` for this
+case so the runner can tell "unavailable" from "failed".
+
+---
+
+## 5. Scale job (nightly, opt-in)
 
 ```sh
 sh scripts/run-scale.sh                 # SKIPPED by default
@@ -148,7 +224,7 @@ exits 0. It runs inside the pinned container under a tight memory cap
 
 ---
 
-## 5. Acceptance gates G1–G5
+## 6. Acceptance gates G1–G5
 
 See [`docs/GATES.md`](GATES.md) for the full definition and the recorded results.
 Summary (`sh scripts/run-gates.sh`, all PASS):
@@ -163,13 +239,15 @@ G5 physical-accounting structures=46 exact_equality=18 fixed_header_relation=28
 
 ---
 
-## 6. Reproduce everything
+## 7. Reproduce everything
 
 ```sh
 sh scripts/container-verify.sh    # GREEN: safety + fmt + clippy(-D warnings) + full suite
 sh scripts/container-fuzz.sh      # 17/17 libFuzzer targets PASS
 sh scripts/run-gates.sh           # G1–G5 all PASS; writes evidence/gates/*.json
-sh scripts/container-aarch64.sh   # x86_64 == arm64 (QEMU); writes aarch64-determinism.json
+sh scripts/container-aarch64.sh   # x86_64 == arm64 (QEMU); writes aarch64-determinism.json + ci-aarch64.json
+sh scripts/run-scalar.sh scalar   # x86_64 with EKB_NO_SIMD=1; writes ci-x86_64-scalar.json
+sh scripts/run-matrix.sh          # the {x86_64-simd, x86_64-scalar, aarch64} CI matrix; writes ci-matrix.json
 sh scripts/run-scale.sh           # nightly 2^30 build (opt-in: EKB_RUN_SCALE=1)
 sh scripts/container-reproduce.sh # clean release build + suite + evidence validation
 ```

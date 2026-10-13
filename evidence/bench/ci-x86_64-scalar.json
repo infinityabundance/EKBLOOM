@@ -1,0 +1,17 @@
+{
+  "generated_by": "scripts/run-scalar.sh",
+  "job": "x86_64-scalar",
+  "platform": "linux/amd64",
+  "simd_forced_scalar": true,
+  "pass": true,
+  "equality_pass": true,
+  "gates_pass": true,
+  "court_pass": true,
+  "footprint_bytes": 15478,
+  "byte_at_p50_ns": 1583,
+  "byte_at_p99_ns": 2234,
+  "byte_at_p99_9_ns": 3797,
+  "byte_at_p99_99_ns": 10048,
+  "court": {"corpora": 5, "n": 20480, "physical_bytes": 15478, "e_v": 0.7558, "samples": 10000, "byte_at_p50_ns": 1583, "byte_at_p99_ns": 2234, "byte_at_p99_9_ns": 3797, "byte_at_p99_99_ns": 10048},
+  "note": "bounded, offline, Silesia/Calgary-derived court (tests/ci_bench.rs); byte_at percentiles over deterministic samples, each read byte-checked"
+}

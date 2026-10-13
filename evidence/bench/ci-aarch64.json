@@ -1,0 +1,21 @@
+{
+  "generated_by": "scripts/container-aarch64.sh",
+  "job": "aarch64",
+  "platform": "linux/arm64",
+  "arm64_emulation": "qemu-aarch64 (binfmt_misc)",
+  "simd_forced_scalar": false,
+  "pass": true,
+  "miri_subset_pass": 1,
+  "true_miri_pass": false,
+  "miri_subset_tests_passed": 65,
+  "gates_pass": 1,
+  "court_pass": 1,
+  "footprint_bytes": 15478,
+  "byte_at_p50_ns": 14497,
+  "byte_at_p99_ns": 18394,
+  "byte_at_p99_9_ns": 19527,
+  "byte_at_p99_99_ns": 34574,
+  "court": {"corpora": 5, "n": 20480, "physical_bytes": 15478, "e_v": 0.7558, "samples": 10000, "byte_at_p50_ns": 14497, "byte_at_p99_ns": 18394, "byte_at_p99_9_ns": 19527, "byte_at_p99_99_ns": 34574},
+  "determinism": {"identical": true, "amd64_output_sha256": "0fc33046d0bd97ceb7e22c688d1750052d3f51a4771644969e1d4b5780fcb49c", "arm64_output_sha256": "0fc33046d0bd97ceb7e22c688d1750052d3f51a4771644969e1d4b5780fcb49c"},
+  "note": "arm64 has no AVX2, so every SIMD dispatch takes its scalar fallback; byte_at percentiles over deterministic samples, each read byte-checked"
+}

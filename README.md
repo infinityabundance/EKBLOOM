@@ -1162,7 +1162,9 @@ sh scripts/run-e2e.sh               # evidence/bench/e2e.json (end-to-end on rea
 sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (46 files)
 sh scripts/run-gates.sh             # acceptance gates G1-G5 (docs/GATES.md)
 sh scripts/run-scale.sh             # nightly 2^30 scale build (opt-in: EKB_RUN_SCALE=1)
-sh scripts/container-aarch64.sh     # cross-arch determinism: x86_64 == arm64 (QEMU)
+sh scripts/run-scalar.sh scalar     # x86_64 with EKB_NO_SIMD=1: equality + gates + bounded court
+sh scripts/run-matrix.sh            # cross-platform CI matrix {x86_64-simd, x86_64-scalar, aarch64} (ci-matrix.json)
+sh scripts/container-aarch64.sh     # cross-arch determinism (x86_64 == arm64, QEMU) + the arm64 CI job
 sh scripts/container-loom.sh        # Loom model checking (tests/loom.rs)
 sh scripts/container-reproduce.sh   # clean build + tests from scratch
 sh scripts/capture-environment.sh   # write evidence/environment.txt
@@ -1442,6 +1444,7 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 - `evidence/model-search/` — finite-model sufficiency sweep.
 - `evidence/gates/G1.json` … `G5.json` — acceptance gates G1–G5 ([`docs/GATES.md`](docs/GATES.md)).
 - `evidence/bench/aarch64-determinism.json` — x86_64 == arm64 determinism (QEMU).
+- `evidence/bench/ci-matrix.json` — the cross-platform CI matrix (`scripts/run-matrix.sh`): `{x86_64-simd, x86_64-scalar, aarch64}`, each with PASS/FAIL, footprint and `byte_at` p50/p99/p99.9/p99.99, plus per-job `ci-*.json`.
 
 Documentation map:
 
