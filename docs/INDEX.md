@@ -42,6 +42,9 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`E2E.md`](E2E.md) | The **end-to-end** EKBLOOM/OrFS proof on real text/ELF/mixed data vs raw and pinned-hot LZ4/Zstd at an equal on-disk budget (the honest win/lose verdict). |
 | [`DECODERS.md`](DECODERS.md) | The **decoder court** (O1): machines 7 (`OrANS-RANS0W`, word16) and 8 (`OrANS-RANS0IL`, independent lanes) and an AVX2 rANS kernel measured at equal stored bytes against machine 4 `K = 8` — **all rejected**; best stays machine 4 `K = 8`. |
 | [`CORPORA.md`](CORPORA.md) | **Standard-corpora court**: EKBLOOM vs LZ4/zstd/pinned-hot/raw on Silesia/enwik8/Calgary/text/ELF at an equal budget, plus hardware counters, 64-reader concurrency p99, and the machine-checked worst-case step bound (1,000,000 samples, zero violations). |
+| [`MACHINES.md`](MACHINES.md) | **The machine catalogue (ids 1–9)**: name, `machine_id`, `core_version`, exact transition/encoding math, complete resumable state, decode algorithm, size table and wins/loses, plus a relationship map — one section per machine. |
+| [`BUDGET-GUIDE.md`](BUDGET-GUIDE.md) | **The budget chooser guide**: how to pick machine / segment size / restart `K` / block `B` / path `D` / tiles, with a budget × workload decision table, the measured tradeoffs, and worked examples — backed by `choose_plan`. |
+| [`LIMITATIONS.md`](LIMITATIONS.md) | **The consolidated honest non-claims** (compression, latency, integrity/`AUTH`, backends, scope), each with a one-line pointer to its evidence. |
 | [`INDEX.md`](INDEX.md) | This file. |
 
 ## Independent reviews (`docs/reviews/`)

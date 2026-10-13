@@ -45,6 +45,15 @@
 //! numbers is never passed here; [`OptimizedPlan::trace_fingerprint`] lets a caller
 //! assert structurally that the plan was scored on the held-out trace alone.
 //!
+//! # Budget chooser
+//!
+//! [`choose_plan`] is the byte-budget + target-latency entry point. It runs the
+//! identical certified search as [`OptimizedPlan::optimize`] (no candidate logic is
+//! duplicated) but selects the **cheapest** plan whose held-out **p50** meets a
+//! target within the budget, falling back to the lowest-p50 plan that fits when the
+//! target is unattainable. It is the API behind [`crate`]'s budget guide
+//! (`docs/BUDGET-GUIDE.md`).
+//!
 //! # Transactionality and non-withdrawal
 //!
 //! [`OptimizedPlan::build`] materialises the plan into a fresh [`EkbloomBody`],
@@ -393,6 +402,20 @@ impl OptimizedPlan {
         budget: &ManifestationBudget,
         cfg: &CourtConfig,
     ) -> Result<(OptimizedPlan, Vec<PlanReceipt>)> {
+        Self::select(source, trace, budget, cfg, Selection::P99)
+    }
+
+    /// The shared certified bounded search and whole-plan evaluation. Both the p99
+    /// minimiser ([`OptimizedPlan::optimize`]) and the budget/p50-target chooser
+    /// ([`choose_plan`]) run exactly this search; they differ only in the final
+    /// [`Selection`] rule, so no candidate logic is duplicated.
+    fn select(
+        source: &[u8],
+        trace: &AccessTrace,
+        budget: &ManifestationBudget,
+        cfg: &CourtConfig,
+        selection: Selection,
+    ) -> Result<(OptimizedPlan, Vec<PlanReceipt>)> {
         let n = source.len() as u64;
         validate_trace(trace, n)?;
         let model = CostModel::measured_default();
@@ -718,36 +741,79 @@ impl OptimizedPlan {
             }
         }
 
-        // ---- Phase 3b: choose the lowest expected p99. ------------------------
-        // Ties (identical held-out p99) are broken by the higher sequential bulk
-        // throughput (the sequential dimension is first-class), then by fewer
-        // committed bytes and a deterministic seed-keyed label hash.
-        evaluated.sort_by(|a, b| {
-            a.2.p99
-                .partial_cmp(&b.2.p99)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| {
-                    sequential_ns_per_byte(a.0.machine_id)
-                        .partial_cmp(&sequential_ns_per_byte(b.0.machine_id))
-                        .unwrap_or(Ordering::Equal)
-                })
-                .then_with(|| a.1.cmp(&b.1))
-                .then_with(|| {
-                    seed_key(&a.0.label(), cfg.seed).cmp(&seed_key(&b.0.label(), cfg.seed))
-                })
-        });
-        let (chosen, committed, latency) = evaluated[0].clone();
+        // ---- Phase 3b: apply the selection rule. ------------------------------
+        // `P99` (the `optimize` rule) prioritises the lowest held-out p99. The
+        // budget chooser's `P50Target` prioritises the **cheapest** plan whose
+        // held-out p50 meets the target, falling back to the lowest p50 within
+        // budget when no admissible plan meets it. Both break ties by the
+        // (first-class) higher sequential bulk throughput, then fewer committed
+        // bytes, then a deterministic seed-keyed label hash.
+        let (chosen_idx, chosen_reason) = match selection {
+            Selection::P99 => {
+                sort_by_p99(&mut evaluated, cfg.seed);
+                let (_, bytes, lat) = &evaluated[0];
+                (
+                    0usize,
+                    format!(
+                        "chosen: lowest held-out p99 ({:.1} ns) at {bytes} committed bytes",
+                        lat.p99
+                    ),
+                )
+            }
+            Selection::P50Target(target_ns) => {
+                let target = target_ns as f64;
+                let mut meeting: Vec<usize> = (0..evaluated.len())
+                    .filter(|&i| evaluated[i].2.p50 <= target)
+                    .collect();
+                if meeting.is_empty() {
+                    sort_by_p50(&mut evaluated, cfg.seed);
+                    let (_, bytes, lat) = &evaluated[0];
+                    (
+                        0usize,
+                        format!(
+                            "chosen: lowest held-out p50 ({:.1} ns) within budget; target {:.0} ns unattainable at {bytes} committed bytes",
+                            lat.p50, target
+                        ),
+                    )
+                } else {
+                    meeting.sort_by(|&i, &j| {
+                        evaluated[i]
+                            .1
+                            .cmp(&evaluated[j].1)
+                            .then_with(|| {
+                                evaluated[i]
+                                    .2
+                                    .p99
+                                    .partial_cmp(&evaluated[j].2.p99)
+                                    .unwrap_or(Ordering::Equal)
+                            })
+                            .then_with(|| seq_cmp(&evaluated[i].0, &evaluated[j].0))
+                            .then_with(|| {
+                                seed_key(&evaluated[i].0.label(), cfg.seed)
+                                    .cmp(&seed_key(&evaluated[j].0.label(), cfg.seed))
+                            })
+                    });
+                    let idx = meeting[0];
+                    let (_, bytes, lat) = &evaluated[idx];
+                    (
+                        idx,
+                        format!(
+                            "chosen: meets target p50 {:.0} ns (p50 {:.1} ns) at {bytes} committed bytes",
+                            target, lat.p50
+                        ),
+                    )
+                }
+            }
+        };
+        let (chosen, committed, latency) = evaluated[chosen_idx].clone();
         let chosen_label = chosen.label();
         for (cand, bytes, lat) in &evaluated {
             let reason = if cand.label() == chosen_label {
-                format!(
-                    "chosen: lowest held-out p99 ({:.1} ns) at {bytes} committed bytes",
-                    lat.p99
-                )
+                chosen_reason.clone()
             } else {
                 format!(
-                    "evaluated: held-out p99 {:.1} ns (chosen {:.1} ns at {} bytes)",
-                    lat.p99, latency.p99, committed
+                    "evaluated: held-out p50 {:.1} ns / p99 {:.1} ns (plan p99 {:.1} ns at {} bytes)",
+                    lat.p50, lat.p99, latency.p99, committed
                 )
             };
             receipts.push(PlanReceipt {
@@ -1111,6 +1177,88 @@ fn sort_by_expected(bases: &mut [(PlanCandidate, Latency, u64)], seed: u64) {
             .then_with(|| a.2.cmp(&b.2))
             .then_with(|| seed_key(&a.0.label(), seed).cmp(&seed_key(&b.0.label(), seed)))
     });
+}
+
+/// Compare two candidates by their first-class sequential bulk throughput (higher
+/// is better → lower `ns/byte` first).
+fn seq_cmp(a: &PlanCandidate, b: &PlanCandidate) -> Ordering {
+    sequential_ns_per_byte(a.machine_id)
+        .partial_cmp(&sequential_ns_per_byte(b.machine_id))
+        .unwrap_or(Ordering::Equal)
+}
+
+/// Sort complete plans best-first by held-out **p99**, tie-broken by the higher
+/// sequential bulk throughput, then fewer committed bytes, then a deterministic
+/// seed-keyed label hash (the [`Selection::P99`] rule).
+fn sort_by_p99(evaluated: &mut [(PlanCandidate, u64, Latency)], seed: u64) {
+    evaluated.sort_by(|a, b| {
+        a.2.p99
+            .partial_cmp(&b.2.p99)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| seq_cmp(&a.0, &b.0))
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| seed_key(&a.0.label(), seed).cmp(&seed_key(&b.0.label(), seed)))
+    });
+}
+
+/// Sort complete plans best-first by held-out **p50**, tie-broken by fewer
+/// committed bytes, then the higher sequential bulk throughput, then a
+/// deterministic seed-keyed label hash (the [`Selection::P50Target`] fallback).
+fn sort_by_p50(evaluated: &mut [(PlanCandidate, u64, Latency)], seed: u64) {
+    evaluated.sort_by(|a, b| {
+        a.2.p50
+            .partial_cmp(&b.2.p50)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| seq_cmp(&a.0, &b.0))
+            .then_with(|| seed_key(&a.0.label(), seed).cmp(&seed_key(&b.0.label(), seed)))
+    });
+}
+
+/// The final selection rule applied after the shared bounded search.
+#[derive(Clone, Copy, Debug)]
+enum Selection {
+    /// Minimise the expected held-out p99 (the [`OptimizedPlan::optimize`] rule).
+    P99,
+    /// Meet a target held-out **p50** (ns) with the fewest committed bytes; when no
+    /// admissible plan meets it, minimise p50 within the budget (the
+    /// [`choose_plan`] rule).
+    P50Target(u64),
+}
+
+/// Choose a plan for a byte budget and a target p50 latency (ns) using a held-out trace.
+///
+/// This is the **budget chooser**: it runs the same certified, bounded joint search
+/// as [`OptimizedPlan::optimize`] — a plan is never admitted without a bounded
+/// certified cold path, and the footprint gate applies — but selects the
+/// **cheapest** plan whose held-out p50 is at most `target_p50_ns` within
+/// `budget_bytes`. When no admissible plan meets the target it returns the
+/// **lowest-p50** plan that fits the budget. Ties are broken by the higher
+/// sequential bulk throughput, then fewer committed bytes, then a deterministic
+/// seed-keyed label hash.
+///
+/// The returned plan respects the budget (`committed_bytes() <= budget_bytes`),
+/// references certified paths only, and is deterministic for a fixed `source`,
+/// `trace`, `budget_bytes` and `cfg.seed`; the receipts explain the choice.
+pub fn choose_plan(
+    source: &[u8],
+    budget_bytes: u64,
+    target_p50_ns: u64,
+    trace: &AccessTrace,
+    cfg: &CourtConfig,
+) -> Result<(OptimizedPlan, Vec<PlanReceipt>)> {
+    let budget = ManifestationBudget {
+        maximum_physical_bytes: budget_bytes,
+    };
+    // The empty object is mode-independent (p50 == 0 meets any target and only the
+    // budget constrains it); `select` short-circuits it before the selection rule.
+    OptimizedPlan::select(
+        source,
+        trace,
+        &budget,
+        cfg,
+        Selection::P50Target(target_p50_ns),
+    )
 }
 
 /// A deterministic 64-bit key over `(label, seed)` for final tie-breaking.

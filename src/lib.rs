@@ -178,7 +178,7 @@ pub use model_search::{
     canonical_state_only_counterexample, sufficiency_sweep, AbstractCounterexample, SufficiencyRow,
 };
 pub use optimize::{
-    evaluate, trace_fingerprint, Latency, OptimizedPlan, PlanReceipt, RestartGeometry,
+    choose_plan, evaluate, trace_fingerprint, Latency, OptimizedPlan, PlanReceipt, RestartGeometry,
     OPTIMIZER_READ_BYTES,
 };
 pub use packed::{state_from_hot, PackedHistory, PackedRestarts};

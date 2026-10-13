@@ -143,7 +143,9 @@ binary (`ekbloom`), and **`ekbloom` v0.4.0 is published on
     (`docs/OPTIMIZER.md`) chooses machine × region/segment size × restart geometry ×
     tile size × hot-region subset as one decision on a **held-out** trace, cutting
     held-out p99 to **10.07 µs** vs greedy **13.58 µs** (and **9.84** vs **13.19** at
-    `1.5·N`).
+    `1.5·N`). A byte-budget + target-latency entry point (`choose_plan`, see
+    [`docs/BUDGET-GUIDE.md`](docs/BUDGET-GUIDE.md)) reuses the identical certified
+    search.
 19. **End-to-end on real data: a defined win vs raw, honestly behind the pinned-hot
     codecs (N7).** On real text / ELF / mixed corpora at an equal on-disk budget the
     EKBLOOM/OrFS object is **smaller than a raw file** (0.74× / 0.98× / 0.78×) **and**
@@ -350,6 +352,10 @@ The crate root (`ekbloom`) exposes:
   `available_shells`, `ShellChoice`, `Workload`, `WorkloadKind`;
 - region-scoped adaptation (`region_adapt`): `manifest_hot_regions`,
   `read_region_scoped`, `RegionReader`, `AccessTrace`, `RegionAdaptReport`;
+- joint planner (`optimize`): `OptimizedPlan::optimize` (min-p99), **`choose_plan`**
+  (byte budget + target p50), `evaluate`, `trace_fingerprint` — the physical-budget-aware
+  held-out decision ([`docs/OPTIMIZER.md`](docs/OPTIMIZER.md),
+  [`docs/BUDGET-GUIDE.md`](docs/BUDGET-GUIDE.md));
 - async publication (`asyncpub`): `publish`, `append`, `detect_backend`,
   `Backend` (the `io-uring` feature adds `async_io`);
 - measurement: `sweep::manifestation_sweep`, `sweep::depth_metrics`,
@@ -1307,6 +1313,9 @@ Documentation map:
 | [`docs/OPTIMIZER.md`](docs/OPTIMIZER.md) | The physical-budget-aware joint planner (`src/optimize.rs`), held-out and certified. |
 | [`docs/E2E.md`](docs/E2E.md) | End-to-end EKBLOOM/OrFS proof on real data vs raw / pinned-hot LZ4 / Zstd. |
 | [`docs/DECODERS.md`](docs/DECODERS.md) | The decoder court (O1): machines 7/8 and the AVX2 rANS kernel vs machine 4 `K = 8` at equal stored bytes — all rejected. |
+| [`docs/MACHINES.md`](docs/MACHINES.md) | The machine catalogue (ids 1–9): exact transition/encoding math, complete resumable state, decode algorithm, size table and wins/loses per machine, plus a relationship map. |
+| [`docs/BUDGET-GUIDE.md`](docs/BUDGET-GUIDE.md) | The budget chooser guide (`choose_plan`): budget × workload decision table, how to pick machine / segment / restart `K` / block `B` / path `D` / tiles, and worked examples. |
+| [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) | The consolidated honest non-claims, each with a one-line pointer to its evidence. |
 | [`docs/reviews/adversarial.md`](docs/reviews/adversarial.md) | Adversarial correctness review (through **Revision 8**, O1–O2: two defects, both fixed). |
 | [`docs/reviews/concurrency.md`](docs/reviews/concurrency.md) | Concurrency audit + Loom model checking. |
 | [`docs/reviews/mathematics.md`](docs/reviews/mathematics.md) | Independent re-derivation of the proofs. |
