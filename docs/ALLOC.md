@@ -128,13 +128,19 @@ grep -rho --include='*.rs' 'panic!'     src/ | wc -l     # 1 (test-only)
 ## 5. Miri coverage of the safe subset
 
 `scripts/container-miri.sh` runs `cargo miri test --lib` over a broader **safe**
-subset, serialised (`--test-threads=1`), matching these filters:
+subset, serialised (`--test-threads=1`), matching these explicit module prefixes
+(a bare `machine` substring would also drag in clock-dependent
+`filesystem::…read_machine…` and `fuse::…machine_mode…` tests, which Miri's
+default isolation rejects at `SystemTime::now()`):
 
-* `machine` — machines 1–8 and the decode paths (`machine::`, `machine_pack::`,
+* machines 1–8 and the decode paths — `machine::`, `machine_pack::`,
   `machine_seg::`, `machine_store::`, `machine_rans::`, `machine_rans_i::`,
-  `machine_rans_il::`, `machine_rans_w::`);
-* `stream::`, `checkpoint::`, `bloom`, `resource::` — the stream/pack/seg/
-  checkpoint/bloom/resource unit tests.
+  `machine_rans_il::`, `machine_rans_w::`;
+* `blocks::` — the machine-1/2 block-decode unit tests;
+* `stream::`, `checkpoint::`, `bloom`, `resource::` — the stream/checkpoint/
+  bloom/resource unit tests.
+
+This selects **61 unit tests**, all of which pass under Miri (0 failed).
 
 The three sanctioned `unsafe` modules are **explicitly excluded**: `simd::`
 (Miri cannot execute the x86 intrinsics), `async_io::` (feature-gated ring

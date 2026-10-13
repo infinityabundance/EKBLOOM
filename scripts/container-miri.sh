@@ -13,10 +13,19 @@
 # to keep the runtime and memory footprint small while covering every machine and
 # codec:
 #
-#   * machines 1-8 and the decode paths  -> `machine` (matches machine::,
-#     machine_pack::, machine_seg::, machine_store::, machine_rans::,
-#     machine_rans_i::, machine_rans_il::, machine_rans_w::);
+#   * machines 1-8 and the decode paths -> the eight explicit machine-module
+#     prefixes (machine::, machine_pack::, machine_seg::, machine_store::,
+#     machine_rans::, machine_rans_i::, machine_rans_il::, machine_rans_w::) plus
+#     blocks:: (machine-1/2 decode);
 #   * stream / checkpoint / bloom / resource unit tests.
+#
+# The prefixes are EXPLICIT module qualifiers, not the bare substring `machine`.
+# A bare `machine` filter also matches `filesystem::tests::
+# read_machine_reconstructs_ignoring_manifested_structures` and
+# `fuse::tests::machine_mode_forces_reconstruction_and_attaches_no_surface`, whose
+# `temp_root` helpers call `SystemTime::now()` -> `clock_gettime(CLOCK_REALTIME)`,
+# which Miri's default isolation rejects. Those filesystem/fuse tests are covered
+# by the normal suite, not by Miri.
 #
 # The three sanctioned `unsafe` modules are EXPLICITLY EXCLUDED (no filter below
 # matches them): `simd::` (Miri cannot execute the x86 AVX2/AVX-512/SSE
@@ -34,7 +43,9 @@ EKB_MEM_LIMIT="${EKB_MEM_LIMIT:-8g}"
 EKB_MEMSWAP_LIMIT="${EKB_MEMSWAP_LIMIT:-8g}"
 
 # libtest matches a test iff its name contains ANY of these substrings (OR).
-MIRI_FILTER="${EKB_MIRI_FILTER:-machine stream:: checkpoint:: bloom resource::}"
+# Explicit module prefixes only (see above): no `async_io::`, `mapped::`, `simd::`,
+# and no filesystem/fuse clock-dependent test.
+MIRI_FILTER="${EKB_MIRI_FILTER:-machine:: machine_pack:: machine_seg:: machine_store:: machine_rans:: machine_rans_i:: machine_rans_il:: machine_rans_w:: blocks:: stream:: checkpoint:: bloom resource::}"
 
 # Three unit tests have loop/allocation bounds that are Miri-infeasible (Miri is
 # an interpreter, ~100-1000x slower): they build/parse 100k-300k-byte streams or
