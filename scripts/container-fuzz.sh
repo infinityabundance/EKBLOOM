@@ -37,6 +37,14 @@ FUZZ_CARGO_HOME="/work/target/nightly-cargo-home"
 FUZZ_SECS="${EKB_FUZZ_SECS:-60}"
 FUZZ_RUNS="${EKB_FUZZ_RUNS:-100000}"
 
+# Nightly opt-in: a longer campaign. `EKB_RUN_FUZZ=1` raises the per-target budget
+# (still overridable by EKB_FUZZ_SECS / EKB_FUZZ_RUNS).
+if [ "${EKB_RUN_FUZZ:-0}" = "1" ]; then
+    FUZZ_SECS="${EKB_FUZZ_SECS:-600}"
+    FUZZ_RUNS="${EKB_FUZZ_RUNS:-1000000}"
+    echo "ekbloom-fuzz: NIGHTLY mode (-runs=$FUZZ_RUNS -max_total_time=$FUZZ_SECS per target)"
+fi
+
 echo "ekbloom-fuzz: pulling pinned nightly image ($NIGHTLY_IMAGE)"
 docker pull "$NIGHTLY_IMAGE" >/dev/null
 
@@ -86,10 +94,22 @@ docker run --rm \
             done
         fi
 
+        # The curated, committed corpus (evidence/fuzz/<target>/*.bin): valid `.ekb`
+        # images, AUTH images, dictionary records, and stream containers built with
+        # random chunk sizes. See evidence/fuzz/README.md.
+        if [ -d /work/evidence/fuzz ]; then
+            for seed_dir in /work/evidence/fuzz/*/; do
+                [ -d "$seed_dir" ] || continue
+                SEED_TARGET=$(basename "$seed_dir")
+                mkdir -p "corpus/$SEED_TARGET"
+                cp "$seed_dir"*.bin "corpus/$SEED_TARGET/" 2>/dev/null || true
+            done
+        fi
+
         failed=0
         # Every target declared in fuzz/Cargo.toml. Keep this list in sync with
         # that manifest so the campaign covers the whole fuzz surface.
-        for TARGET in fuzz_machine fuzz_open fuzz_bloom fuzz_history_store fuzz_packed fuzz_tiles fuzz_blocks fuzz_batch fuzz_rans_i fuzz_region fuzz_pack fuzz_seg fuzz_resource fuzz_rans_w fuzz_rans_il fuzz_roundtrip fuzz_stream; do
+        for TARGET in fuzz_machine fuzz_open fuzz_bloom fuzz_history_store fuzz_packed fuzz_tiles fuzz_blocks fuzz_batch fuzz_rans_i fuzz_region fuzz_pack fuzz_seg fuzz_resource fuzz_rans_w fuzz_rans_il fuzz_roundtrip fuzz_stream fuzz_open_auth fuzz_dictionary; do
             start=$(date +%s)
             echo "ekbloom-fuzz: running $TARGET"
             if cargo fuzz run "$TARGET" -- -runs="$EKB_FUZZ_RUNS" -max_total_time="$EKB_FUZZ_SECS"; then

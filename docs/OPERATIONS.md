@@ -172,5 +172,65 @@ sh scripts/run-corpora.sh         # corpora.json  (E_V, byte_at, bytes_fetched)
 sh scripts/run-orfs.sh            # orfs.json     (real on-disk overhead)
 sh scripts/run-bound.sh           # bound.json    (worst-case step bound)
 sh scripts/run-optimizer.sh       # optimizer.json (choose_plan / footprint gate)
+sh scripts/run-faults.sh          # faults.json   (fault injection; 100% pass)
+sh scripts/run-crossfs.sh         # crossfs.json  (cross-filesystem determinism)
 sh scripts/run-gates.sh           # gates/G1..G5.json
 ```
+
+---
+
+## 6. Publication under I/O faults
+
+**Test:** [`tests/faults.rs`](../tests/faults.rs) · **Runner:**
+[`scripts/run-faults.sh`](../scripts/run-faults.sh) · **Evidence:**
+[`evidence/bench/faults.json`](../evidence/bench/faults.json)
+
+The durability model of §2 is proven under injected I/O faults. A failing `Write`
+(`WriteZero`, `ENOSPC`, `EIO`) fails after exactly `N` accepted bytes, and the
+exact crash image a failing write leaves is injected into the path-based writers.
+For **every** fault point:
+
+1. **No partially-visible generation is ever readable** — every torn image is a
+   typed error, never a body.
+2. **The previous committed generation remains intact** — `open` +
+   `open_authenticated` + `verify` + `byte_at`/`read` return the exact previous
+   bytes.
+3. **Recovery restores a clean state** — `recover` reports the previous generation
+   as newest-valid with a torn tail, and `truncate_to_valid` removes it.
+
+Measured: **5,933 fault points, 100 % pass** (5,151 stream offsets — 2,832 of them
+in the `finish` directory/footer phase, **0** torn containers readable; 778 append
+offsets with the previous generation intact 778/778 and 774 torn tails recovered
+clean; 4 publish filesystem boundaries leaving the destination absent or the
+previous valid version). A mid-`finish`/mid-publish failure never leaves the
+destination torn: `write_body*` writes a private `*.tmp` and only touches the
+destination by an atomic `rename`, so a failure at any byte leaves it absent or the
+old valid version. *(Operational note: if that final `rename` itself fails, the
+writer returns an error but the fully written `*.tmp` sibling is left behind; it is
+never visible at the destination and is never torn.)*
+
+---
+
+## 7. Cross-filesystem determinism
+
+**Test:** [`tests/crossfs.rs`](../tests/crossfs.rs) · **Runner:**
+[`scripts/run-crossfs.sh`](../scripts/run-crossfs.sh) · **Evidence:**
+[`evidence/bench/crossfs.json`](../evidence/bench/crossfs.json)
+
+Positional reads and physical accounting must not depend on the backing
+filesystem. The same `.ekb` and stream container are written on every available
+filesystem and reopened from each: the file BLAKE3, `physical_bytes()`, sampled
+`byte_at` values and the container bytes are asserted identical.
+
+**Filesystems actually used (3):** the container **overlayfs** (`/tmp`), the
+container **tmpfs** (`/dev/shm`) and the **ext4** bind mount of the workspace
+(`/work/target`; `stat -f` reports the ext family as `ext2/ext3`). All three are
+byte-identical: `physical_bytes = 65,666`, `.ekb` BLAKE3
+`5480d5bf…15adb477`, container BLAKE3 `e9ea4ea5…c7cdbeb6`, `identical = true`.
+
+A **loopback xfs/btrfs** attempt is made but is **blocked** in this environment:
+`mkfs.xfs`/`mkfs.btrfs` are not installed and the container is offline for `apt`,
+and mounting a loop device needs `CAP_SYS_ADMIN` (the default container drops all
+capabilities; `EKB_CROSSFS_PRIVILEGED=1` adds `--privileged`). The exact blocker is
+recorded in the artifact. The x86_64-vs-aarch64 comparison is separate and already
+covered by `scripts/container-aarch64.sh` (Q2 — identical).

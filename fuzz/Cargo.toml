@@ -133,3 +133,17 @@ path = "fuzz_targets/fuzz_stream.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_open_auth"
+path = "fuzz_targets/fuzz_open_auth.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_dictionary"
+path = "fuzz_targets/fuzz_dictionary.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,27 @@
+{
+  "generated_by": "tests/faults.rs (sh scripts/run-faults.sh)",
+  "fault_kinds": ["write-zero", "enospc", "eio"],
+  "stream": {
+    "container_bytes": 1716,
+    "fault_points": 5151,
+    "passed": 5151,
+    "pass_rate": 1.0000,
+    "finish_phase_points": 2832,
+    "torn_containers_readable": 0
+  },
+  "append": {
+    "fault_points": 778,
+    "previous_generation_intact": 778,
+    "previous_generation_recovered": 774
+  },
+  "publish": {
+    "fault_points": 4,
+    "destination_absent_or_old_valid": 4
+  },
+  "overall": {
+    "fault_points": 5933,
+    "passed": 5933,
+    "pass_rate": 1.0000
+  },
+  "verdict": "every injected fault leaves no partially-visible generation; the previous committed generation stays byte-identical and readable; recovery restores a clean state"
+}

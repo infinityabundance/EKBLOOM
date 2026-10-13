@@ -2,13 +2,16 @@
 
 **Runners:** [`scripts/container-verify.sh`](../scripts/container-verify.sh) ·
 [`scripts/container-fuzz.sh`](../scripts/container-fuzz.sh) ·
+[`scripts/run-fuzz-seeds.sh`](../scripts/run-fuzz-seeds.sh) ·
+[`scripts/run-faults.sh`](../scripts/run-faults.sh) ·
+[`scripts/run-crossfs.sh`](../scripts/run-crossfs.sh) ·
 [`scripts/container-aarch64.sh`](../scripts/container-aarch64.sh) ·
 [`scripts/run-matrix.sh`](../scripts/run-matrix.sh) ·
 [`scripts/run-scalar.sh`](../scripts/run-scalar.sh) ·
 [`scripts/run-gates.sh`](../scripts/run-gates.sh) ·
 [`scripts/run-scale.sh`](../scripts/run-scale.sh) ·
 [`scripts/container-reproduce.sh`](../scripts/container-reproduce.sh)
-**Gates:** [`docs/GATES.md`](GATES.md) · **Seeds:** [`fuzz/seeds/`](../fuzz/seeds)
+**Gates:** [`docs/GATES.md`](GATES.md) · **Seeds:** [`fuzz/seeds/`](../fuzz/seeds) · **Corpus:** [`evidence/fuzz/`](../evidence/fuzz)
 
 This document describes the trust-building test infrastructure: **fuzz
 roundtrips**, **cross-architecture determinism**, the **cross-platform CI matrix**
@@ -34,23 +37,28 @@ Measured on the pinned image (`rust:1.99.0`, `ekbloom-rust:1.99.0`):
 
 | run | tests passed | failed |
 |---|---:|---:|
-| `cargo test --all-features` (debug) | **780** | 0 |
-| `cargo test --release --locked` (reproduce) | **766** | 0 |
+| `cargo test --all-features` (debug) | **805** | 0 |
+| `cargo test --release --locked` (reproduce) | **791** | 0 |
 
 (The release run has fewer tests because it does not enable the optional
-`fuse`/`io-uring` features.) New in this work: `tests/gates.rs` (G1–G5) and
-`tests/arch_determinism.rs`.
+`fuse`/`io-uring` features.) New in this work: `tests/faults.rs` (transactional
+publication under I/O faults), `tests/crossfs.rs` (cross-filesystem determinism),
+and §8/§9 below.
 
 ---
 
 ## 2. Fuzz roundtrips
 
-Two new libFuzzer targets join the existing 15 (17 total):
+The campaign now runs **19** libFuzzer targets. The earlier rounds added the
+machine-roundtrip and streaming targets; this work adds the **authenticated-open**
+and **dictionary** targets:
 
 | target | property |
 |---|---|
 | `fuzz_roundtrip` ([`fuzz_targets/fuzz_roundtrip.rs`](../fuzz/fuzz_targets/fuzz_roundtrip.rs)) | For arbitrary input, `encode` then `decode` across **all** machines (ids 1–9); when `encode` succeeds, `decode` must succeed and equal the source byte-for-byte, and a shorter requested length must return the source prefix. |
 | `fuzz_stream` ([`fuzz_targets/fuzz_stream.rs`](../fuzz/fuzz_targets/fuzz_stream.rs)) | Arbitrary bytes into the streaming reader are total (never panic, incl. `u64::MAX`); a built `StreamBuilder` container must round-trip exactly (sequential + sampled positional reads). |
+| `fuzz_open_auth` ([`fuzz_targets/fuzz_open_auth.rs`](../fuzz/fuzz_targets/fuzz_open_auth.rs)) | `[key: 32 bytes][image]` into `open_bytes_authenticated` and the strict `open_bytes_require_auth`: total, never panicking, and a missing/mismatching `AUTH` is rejected — never silently accepted. |
+| `fuzz_dictionary` ([`fuzz_targets/fuzz_dictionary.rs`](../fuzz/fuzz_targets/fuzz_dictionary.rs)) | `Dictionary::from_bytes` (bad magic/version, bad frequency sum, zero, id mismatch) is total; a validated record can be registered, looked up and used to decode a forged machine-9 core without an unbounded allocation or panic. |
 
 `fuzz_roundtrip` reads the input as `[selector: up to 3 bytes][body]` and derives
 a requested length in `[0, 2^20]`, materialized by cyclically repeating the body.
@@ -66,25 +74,50 @@ because the trait `decode` is quadratic (see G1).
 [`fuzz/seeds/README.md`](../fuzz/seeds/README.md) for provenance and sha256s.
 Only these tiny prefixes are committed; the corpora themselves are downloaded and
 extracted inside a memory-capped container and removed on exit.
-`scripts/container-fuzz.sh` copies the seeds into `fuzz/corpus/<target>/` before
-the campaign (that directory is gitignored).
+
+### Committed curated corpus
+
+[`evidence/fuzz/`](../evidence/fuzz) additionally holds a small, curated, committed
+corpus (53 files, ~86 KiB) generated deterministically by
+[`examples/fuzz_seeds.rs`](../examples/fuzz_seeds.rs) (`sh scripts/run-fuzz-seeds.sh`).
+Each subdirectory is the corpus for one target and puts the campaign on the
+interesting paths from the first execution: valid unkeyed `.ekb` images for every
+profile (`fuzz_open/`), the same images under `[key: 48-byte][AUTH]` inputs for the
+authenticated path (`fuzz_open_auth/`), serialized dictionary records / record
+cores / machine-9 frames (`fuzz_dictionary/`), streaming containers built with
+**random chunk sizes** over every policy and block size (`fuzz_stream/`),
+machine-roundtrip inputs (`fuzz_roundtrip/`) and NL2 cores (`fuzz_machine/`).
+`scripts/container-fuzz.sh` copies `fuzz/seeds/*.bin` and then
+`evidence/fuzz/<target>/*.bin` into `fuzz/corpus/<target>/` before the campaign
+(that directory is gitignored).
 
 ### Campaign
 
 ```sh
-sh scripts/container-fuzz.sh    # pulls the pinned nightly, runs every target
+sh scripts/container-fuzz.sh                  # bounded campaign (60 s / 100k runs per target)
+EKB_RUN_FUZZ=1 sh scripts/container-fuzz.sh   # NIGHTLY: longer (600 s / 1M runs per target)
 ```
 
-Each target runs `-runs=100000 -max_total_time=60`. All **17/17 targets PASS**
-(bounded libFuzzer campaign, no crashes). Final libFuzzer coverage for the two new
-targets:
+Each target runs `-runs=100000 -max_total_time=60` by default. The **nightly** job
+is opt-in (`EKB_RUN_FUZZ=1`), which raises the per-target budget to
+`-runs=1000000 -max_total_time=600` (still overridable with `EKB_FUZZ_RUNS` /
+`EKB_FUZZ_SECS`). A run of the bounded campaign: **19/19 targets PASS**, no crash,
+emitted by the pinned nightly (`rustlang/rust:nightly-bookworm-slim`), every
+docker run memory-capped. Final libFuzzer coverage (`cov` = edges, `ft` =
+feature counters, `corp` = corpus entries):
 
-| target | coverage (`cov`) | features (`ft`) | corpus | exec/s | result |
-|---|---:|---:|---:|---:|---|
-| `fuzz_roundtrip` | 1548 | 4449 | 213 | 390 | PASS (61 s) |
-| `fuzz_stream` | 1066 | 5845 | 380 | 491 | PASS (62 s) |
-
-(`cov` = edges, `ft` = feature counters, at `-runs=100000 -max_total_time=60`.)
+| target | `cov` | `ft` | `corp` | target | `cov` | `ft` | `corp` |
+|---|---:|---:|---:|---|---:|---:|---:|
+| `fuzz_machine` | 65 | 211 | 16 | `fuzz_pack` | 296 | 929 | 166 |
+| `fuzz_open` | 1330 | 1894 | 57 | `fuzz_seg` | 577 | 2089 | 207 |
+| `fuzz_bloom` | 194 | 238 | 46 | `fuzz_resource` | 250 | 630 | 76 |
+| `fuzz_history_store` | 1188 | 2204 | 94 | `fuzz_rans_w` | 321 | 965 | 186 |
+| `fuzz_packed` | 291 | 688 | 63 | `fuzz_rans_il` | 576 | 1518 | 246 |
+| `fuzz_tiles` | 976 | 2862 | 204 | `fuzz_roundtrip` | 1546 | 4529 | 216 |
+| `fuzz_blocks` | 1118 | 3998 | 413 | `fuzz_stream` | 1409 | 6375 | 385 |
+| `fuzz_batch` | 338 | 1061 | 106 | `fuzz_open_auth` | 1300 | 1765 | 55 |
+| `fuzz_rans_i` | 541 | 1416 | 256 | `fuzz_dictionary` | 264 | 294 | 11 |
+| `fuzz_region` | 2198 | 6795 | 580 | | | | |
 
 ---
 
@@ -243,7 +276,10 @@ G5 physical-accounting structures=46 exact_equality=18 fixed_header_relation=28
 
 ```sh
 sh scripts/container-verify.sh    # GREEN: safety + fmt + clippy(-D warnings) + full suite
-sh scripts/container-fuzz.sh      # 17/17 libFuzzer targets PASS
+sh scripts/container-fuzz.sh      # 19/19 libFuzzer targets PASS
+sh scripts/run-fuzz-seeds.sh      # regenerate evidence/fuzz/ (curated corpus)
+sh scripts/run-faults.sh          # transactional-publication fault injection; evidence/bench/faults.json
+sh scripts/run-crossfs.sh         # cross-filesystem determinism; evidence/bench/crossfs.json
 sh scripts/run-gates.sh           # G1–G5 all PASS; writes evidence/gates/*.json
 sh scripts/container-aarch64.sh   # x86_64 == arm64 (QEMU); writes aarch64-determinism.json + ci-aarch64.json
 sh scripts/run-scalar.sh scalar   # x86_64 with EKB_NO_SIMD=1; writes ci-x86_64-scalar.json
@@ -254,3 +290,59 @@ sh scripts/container-reproduce.sh # clean release build + suite + evidence valid
 
 Every command runs only inside the pinned, memory-capped container, and every
 `docker run` is bounded by `--memory`/`--memory-swap` (see `scripts/lib.sh`).
+
+---
+
+## 8. Transactional-publication fault injection
+
+**Test:** [`tests/faults.rs`](../tests/faults.rs) · **Runner:**
+[`scripts/run-faults.sh`](../scripts/run-faults.sh) · **Evidence:**
+[`evidence/bench/faults.json`](../evidence/bench/faults.json)
+
+Proves `.ekb`/stream publication is atomic under I/O faults: a **failing `Write`**
+(`WriteZero`, `ENOSPC`, `EIO`) is injected after exactly `N` accepted bytes, and
+the **byte-exact crash image** (the committed prefix) is injected into the
+path-based writers. For every fault point the three invariants hold:
+
+* **(a)** no partially written generation is ever readable;
+* **(b)** the previous committed generation remains intact, verifies, and reads
+  byte-identical;
+* **(c)** `recover`/`truncate_to_valid` restore a clean state.
+
+`StreamBuilder` is generic over `std::io::Write`, so the failing writer is injected
+directly into `write`/`checkpoint`/`finish` over **every** byte offset of a
+container build (header, payloads, directory, footer). The path-based writers
+(`writer::write_body_*`, `writer::append_generation*`) construct their own `File`
+internally and no library seam is added (runtime behaviour is frozen), so the
+injection is the exact on-disk crash image a failing write leaves: for `append`
+that is the final file truncated to every `N` in the appended region; for
+`publish` the destination is only touched by the atomic `rename`, so the
+filesystem-boundary faults (blocked temp path, rename failure, stale torn temp)
+cover every point. **Result: 5,933 fault points, 100 % pass** — 5,151 stream
+(incl. 2,832 in the `finish` directory/footer phase, 0 torn containers readable),
+778 append (previous generation intact 778/778; 774 torn tails recovered clean),
+4 publish boundaries (destination absent or the previous valid version, never torn).
+
+---
+
+## 9. Cross-filesystem determinism
+
+**Test:** [`tests/crossfs.rs`](../tests/crossfs.rs) · **Runner:**
+[`scripts/run-crossfs.sh`](../scripts/run-crossfs.sh) · **Evidence:**
+[`evidence/bench/crossfs.json`](../evidence/bench/crossfs.json)
+
+The same `.ekb` (root + sparse gen-2) and the same stream container (random chunk
+sizes) are written on every available filesystem and reopened from each; the file
+BLAKE3, `physical_bytes()`, `byte_at` samples and the container bytes must be
+**identical**. Measured **3 filesystems**: the container **overlayfs** (`/tmp`), the
+container **tmpfs** (`/dev/shm`) and the **ext4** bind mount
+(`/work/target`; `stat -f` reports the ext family as `ext2/ext3`). All three give
+`physical_bytes = 65,666`, `.ekb` BLAKE3
+`5480d5bf99a6e7a5b03a18684101741e9eeab6b0f71802e1813b8d5d15adb477`, container
+BLAKE3 `e9ea4ea5f1908ce22bd1c96a5c7f8ea6e51d1b26576e74e793730c19c7cdbeb6` —
+`identical = true`. A loopback **xfs/btrfs** attempt is made
+(`scripts/crossfs-inner.sh`): it is **blocked** because `mkfs.xfs`/`mkfs.btrfs` are
+not installed and the container is offline for `apt` (and `mount` needs
+`CAP_SYS_ADMIN`, i.e. `EKB_CROSSFS_PRIVILEGED=1`). The blocker is recorded verbatim
+in the artifact. x86_64-vs-aarch64 determinism is covered separately by
+[`scripts/container-aarch64.sh`](../scripts/container-aarch64.sh) (Q2: identical).

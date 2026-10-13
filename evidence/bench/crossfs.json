@@ -1,0 +1,16 @@
+{
+  "generated_by": "tests/crossfs.rs (sh scripts/run-crossfs.sh)",
+  "filesystem_count": 3,
+  "file_blake3_identical": true,
+  "physical_bytes_identical": true,
+  "byte_at_samples_identical": true,
+  "stream_container_identical": true,
+  "loopback_note": "loopback xfs/btrfs; xfs: mkfs.xfs not installed; btrfs: mkfs.btrfs not installed",
+  "arch_note": "x86_64 vs aarch64 determinism is covered separately by scripts/container-aarch64.sh (Q2): identical",
+  "filesystems": [
+    { "label": "overlayfs", "ekb_physical_bytes": 65666, "ekb_len": 66088, "ekb_blake3": "5480d5bf99a6e7a5b03a18684101741e9eeab6b0f71802e1813b8d5d15adb477", "stream_container_bytes": 33976, "stream_blake3": "e9ea4ea5f1908ce22bd1c96a5c7f8ea6e51d1b26576e74e793730c19c7cdbeb6" },
+    { "label": "tmpfs", "ekb_physical_bytes": 65666, "ekb_len": 66088, "ekb_blake3": "5480d5bf99a6e7a5b03a18684101741e9eeab6b0f71802e1813b8d5d15adb477", "stream_container_bytes": 33976, "stream_blake3": "e9ea4ea5f1908ce22bd1c96a5c7f8ea6e51d1b26576e74e793730c19c7cdbeb6" },
+    { "label": "ext2/ext3", "ekb_physical_bytes": 65666, "ekb_len": 66088, "ekb_blake3": "5480d5bf99a6e7a5b03a18684101741e9eeab6b0f71802e1813b8d5d15adb477", "stream_container_bytes": 33976, "stream_blake3": "e9ea4ea5f1908ce22bd1c96a5c7f8ea6e51d1b26576e74e793730c19c7cdbeb6" }
+  ],
+  "verdict": "the same .ekb and stream container are byte-identical (BLAKE3) across every filesystem, and physical_bytes()/byte_at agree exactly"
+}
