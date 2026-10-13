@@ -4,7 +4,7 @@
 (the frozen wire contract), [`MIGRATION.md`](MIGRATION.md) (versions and compatibility).
 
 This document gives the **exact byte layout** of a `.ekb` file and of every machine's
-core payload (machines 1–8) at a level sufficient to reimplement a decoder from the
+core payload (machines 1–9) at a level sufficient to reimplement a decoder from the
 text alone — for example in Go, with no access to this Rust source.
 
 **Conventions used throughout.**
@@ -84,7 +84,8 @@ the last section of a commit is `MANIFEST` (wire 9), optionally followed by `AUT
 
 A core's semantics are identified by the pair **`(core_machine_id, core_version)`**
 from the genesis header. This build supports
-`core_version ∈ {0 (legacy/implicit), 1 (current)}` for each of machines 1–8; any
+`core_version ∈ {0 (legacy/implicit), 1 (current)}` for each of machines 1–9
+(including machine 9, `OrANS-DICT`); any
 other pair is refused with a typed *unsupported core version* error. Changing a
 machine's `S(v)` map or any transition requires a **new `core_machine_id`** (or a
 bumped `core_version` with the payload rewritten); an old core is never
@@ -293,7 +294,27 @@ stored reversed so the decoder reads it forward. `Σ lane_len` must equal
 `(states[K], per-lane cursors, lane)`; `IlState` packs as `K`×`u32` states ++
 `K`×`u64` cursors ++ `u8` lane (length `4K + 8K + 1`).
 
-### 2.9 Machine core size summary
+### 2.9 Machine 9 — `OrANS-DICT` (shared trained dictionary records)
+
+A record core that **references** a shared order-0 dictionary (or embeds one).
+
+| off | size | field |
+|---:|---:|---|
+| 0 | 16 | `dict_id` = BLAKE3(`"ekbloom.dictionary-id.v1"` ++ version ++ `freq[256]`)[0..16] |
+| 16 | 4 | `dict_len` (`u32` LE); `0` = referenced, `> 0` = embedded |
+| 20 | `dict_len` | `dict_bytes`: the dictionary record (present only when `dict_len > 0`) |
+| 20+`dict_len` | 4 | `logical_len` (`u32` LE) |
+| 24+`dict_len` | 4 | `initial_state` (`u32` LE) |
+| 28+`dict_len` | `R` | renorm bytes, reversed emission order |
+
+`header_bytes = 20 + dict_len`, `V = 20 + dict_len + R`. The shared model is keyed on
+`dict_len`: `dict_len == 0` resolves `dict_id` from the process-wide registry (an
+unregistered id is a typed error), while `dict_len > 0` validates the embedded bytes
+against `dict_id`. Genesis `Omega_0 = (initial_state, cursor = 20 + dict_len)`; the
+step is machine 2's prepared step exactly over the shared `freq[256]` model. See
+[`DICTIONARY.md`](DICTIONARY.md).
+
+### 2.10 Machine core size summary
 
 | id | machine | header bytes | `V` (core bytes) |
 |---:|---|---:|---|
@@ -305,6 +326,7 @@ stored reversed so the decoder reads it forward. `Σ lane_len` must equal
 | 6 | SEG | `96` (+ directory) | `96 + directory_bytes + payload_bytes` |
 | 7 | RANS0W | 516 | `516 + 2·W` (`W` = renorm words) |
 | 8 | RANS0IL | `516 + 8K` | `516 + 8K + Σ lane_len` |
+| 9 | DICT | `20 + dict_len` | `20 + dict_len + R` |
 
 ---
 

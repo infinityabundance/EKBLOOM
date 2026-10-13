@@ -839,12 +839,15 @@ impl<R: Read + Seek> StreamReader<R> {
             let local = pos - e.logical_start;
             let mut cache = self.seq_cache.borrow_mut();
             if cache.as_ref().map(|(i, _)| *i) != Some(idx) {
-                let mut bytes =
-                    Vec::with_capacity(usize::try_from(e.logical_len).map_err(|_| {
-                        EkbloomError::Overflow {
-                            what: "stream block length",
-                        }
-                    })?);
+                let cap = usize::try_from(e.logical_len).map_err(|_| EkbloomError::Overflow {
+                    what: "stream block length",
+                })?;
+                // `e.logical_len` comes from the (untrusted) directory: bound the
+                // block-sized reservation *before* making it, so a forged/oversized
+                // declared length is refused with `AllocationTooLarge` instead of
+                // forcing a transient allocation up to the block span.
+                crate::resource::checked_default(e.logical_len)?;
+                let mut bytes = Vec::with_capacity(cap);
                 self.decode_block(idx, 0, e.logical_len, &mut bytes)?;
                 *cache = Some((idx, bytes));
             }
@@ -1213,5 +1216,51 @@ mod tests {
         let n = f.len();
         f[n - STREAM_FOOTER_BYTES + F_CRC] ^= 0xFF;
         assert!(StreamReader::open(Cursor::new(f)).is_err());
+    }
+
+    #[test]
+    fn oversized_declared_block_length_is_refused_before_reserving() {
+        // A container whose directory declares a block larger than the process
+        // allocation ceiling must be refused with `AllocationTooLarge` *before* the
+        // reader reserves a block-sized buffer — never an OOM or panic.
+        let big: u64 = crate::resource::DEFAULT_MAX_SINGLE_ALLOCATION + (1 << 20);
+        assert!(big <= u32::MAX as u64, "block_bytes is a u32 field");
+
+        let src = lcg(11, 64);
+        let mut bytes = build(&src, 4096, RepresentationPolicy::Auto);
+
+        let footer = bytes.len() - STREAM_FOOTER_BYTES;
+        let dir_off = get_u64(&bytes, footer + F_DIRECTORY_OFFSET) as usize;
+        let block_bytes = big as u32;
+
+        // Header: enlarge the declared block span and repair its CRC.
+        put_u32(&mut bytes, H_BLOCK_BYTES, block_bytes);
+        let header_crc = crc32fast::hash(&bytes[..H_CRC]);
+        put_u32(&mut bytes, H_CRC, header_crc);
+
+        // Directory entry 0: declare a giant logical length, then repair the digest.
+        put_u64(&mut bytes, dir_off + E_LOGICAL_LEN, big);
+        let dir_hash = blake3::hash(&bytes[dir_off..dir_off + STREAM_ENTRY_BYTES]);
+        bytes[footer + F_DIRECTORY_HASH..footer + F_DIRECTORY_HASH + 32]
+            .copy_from_slice(dir_hash.as_bytes());
+
+        // Footer: agree with the header/entry and cover the declared total.
+        put_u32(&mut bytes, footer + F_BLOCK_BYTES, block_bytes);
+        put_u64(&mut bytes, footer + F_LOGICAL_LEN, big);
+        put_u32(&mut bytes, footer + F_HEADER_CRC, header_crc);
+        let crc = crc32fast::hash(&bytes[footer..footer + F_CRC]);
+        put_u32(&mut bytes, footer + F_CRC, crc);
+
+        // The header/footer/directory are internally consistent, so opening succeeds;
+        // the read path must refuse the oversized declared length before reserving.
+        let reader = StreamReader::open(Cursor::new(bytes)).unwrap();
+        // A raw `Store` block has no internal ceiling check, so only the guard placed
+        // ahead of the reservation can refuse this read.
+        assert_eq!(reader.entries()[0].machine_id, MACHINE_STORE);
+        let mut out = [0u8; 16];
+        assert!(matches!(
+            reader.read_sequential(&mut out),
+            Err(EkbloomError::AllocationTooLarge { .. })
+        ));
     }
 }

@@ -19,7 +19,7 @@ best-effort parsing.
 |---|---|---|---|
 | `format_major` / `format_minor` | `.ekb` genesis header (`u16` at 8 / 10) | `0` / `3` | `UnsupportedVersion { major, minor }` |
 | `core_version` | `.ekb` genesis header (`u16` at 68) | `1` | `UnsupportedCoreVersion { machine_id, core_version }` |
-| `machine_id` | `.ekb` genesis header (`u32` at 64) | machine-specific `1..8` | `UnknownMachine { id }` |
+| `machine_id` | `.ekb` genesis header (`u32` at 64) | machine-specific `1..9` | `UnknownMachine { id }` |
 | manifest record version | `MANIFEST` payload (first `u32`) | `1` | `UnsupportedManifestVersion { version }` |
 | checkpoint container | `EKBCKPT\0` `u8` version | `2` (plus legacy magic-less) | `BadSection` |
 | block index | `EKBKBLKS` `u8` version | `1` | `BadSection` |
@@ -41,7 +41,7 @@ This build is **release 0.4.0 on wire format line 0.3**.
 | artifact | versions this build **READS** | this build **WRITES** |
 |---|---|---|
 | `.ekb` container (`format_major.minor`) | `0.0`, `0.1`, `0.2`, `0.3` | `0.3` |
-| machine `core_version` (machines 1–8) | `0` (legacy), `1` (current) | `1` |
+| machine `core_version` (machines 1–9, incl. `OrANS-DICT`) | `0` (legacy), `1` (current) | `1` |
 | manifest record | `1` | `1` |
 | checkpoint container | `2` and legacy magic-less | `2` |
 | block index | `1` | `1` |
@@ -102,17 +102,18 @@ symbols for every stored object, with no error.
 **What is required:**
 
 1. Keep `MACHINE_NL2 = 1` decoding with `S` unchanged.
-2. Allocate a new identifier, e.g. `MACHINE_NL2P = 9`, whose `encode`/`reveal` use
+2. Allocate a new identifier, e.g. `MACHINE_NL2P = 10`, whose `encode`/`reveal` use
    `S'`; register it in `machine_by_id`, and give it a supported core-version set
-   `{1}` (it has no legacy cores).
+   `{1}` (it has no legacy cores). (Machine 9 is already `OrANS-DICT`; a new machine
+   must take a fresh id.)
 3. Register its `core_version` set in
    `format::supported_core_versions` (`{CORE_VERSION_CURRENT}`); an old reader that
-   does not know machine 9 rejects the file with `UnknownMachine`, and a reader that
-   knows machine 9 but not a future version rejects with `UnsupportedCoreVersion`.
+   does not know machine 10 rejects the file with `UnknownMachine`, and a reader that
+   knows machine 10 but not a future version rejects with `UnsupportedCoreVersion`.
 4. Document the new machine here and in `CODEC.md`.
 
 The stored bytes are then unambiguous: `(machine_id = 1)` ⇒ `S`,
-`(machine_id = 9)` ⇒ `S'`. No existing file changes meaning, and no reader has to
+`(machine_id = 10)` ⇒ `S'`. No existing file changes meaning, and no reader has to
 guess.
 
 **A layout-only change** (same semantics) is cheaper: keep the `machine_id`, bump
@@ -126,8 +127,8 @@ writers emit `2`.
 
 | release | wire format | machine core `core_version` | notes |
 |---|---|---|---|
-| 0.3 | `0.3` | (field absent; reads as `0`) | machines 1–8; checkpoints v2, blocks v1, tiles, segments v1 |
-| 0.4 | `0.3` | `1` written, `{0,1}` read | adds explicit `core_version` (formerly-reserved header bytes) and typed `UnsupportedCoreVersion` / `UnsupportedManifestVersion` errors; machine cores byte-identical; machine semantics unchanged |
+| 0.3 | `0.3` | (field absent; reads as `0`) | machines 1–8 (machine 9 arrives in 0.4); checkpoints v2, blocks v1, tiles, segments v1 |
+| 0.4 | `0.3` | `1` written, `{0,1}` read | adds machine 9 (`OrANS-DICT`, the shared-dictionary record machine) and explicit `core_version` (formerly-reserved header bytes), plus typed `UnsupportedCoreVersion` / `UnsupportedManifestVersion` errors; machine cores byte-identical; machine semantics unchanged |
 
 The `0.4` change is **backward-compatible on read**: a 0.4 reader opens every 0.3
 file (`core_version` reads as legacy `0`), and the only byte difference a 0.4 writer
