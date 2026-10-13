@@ -21,7 +21,7 @@ Captured by `scripts/capture-environment.sh` into
 - **toolchain** `rustc 1.99.0 (b940084d7 2026-09-28)`, `cargo 1.99.0`,
   host `x86_64-unknown-linux-gnu`;
 - **host** AMD Ryzen 7 9800X3D, `nproc 16`, kernel `7.2.9-2-cachyos`;
-- **source** `Cargo.lock` sha256 `f1cbc54f…`, git HEAD `4263f9e1…`;
+- **source** `Cargo.lock` sha256 `f1cbc54f…`, git HEAD `2ac1e62…`;
 - **nightly harness image** `rustlang/rust:nightly-bookworm-slim@sha256:2fe113dd…`.
 
 Detected CPU features for the sweep (`evidence/bench/cpu.json`): `sse2`, `avx2`,
@@ -380,8 +380,9 @@ artifact.
   machine adapter and stores the **complete successor cursor** for a
   cursor-divergent machine; `tiles::parse_tile_set_prefix` is the single guard
   shared by the in-memory and file-backed readers. `sh scripts/validate-evidence.sh`
-  validates every `evidence/**/*.json` and reports **32** files `OK` (up from 24;
-  `batch.json` added in L4, and `window`/`orfs`/`optimizer`/`e2e` added in the N-round).
+  validates every `evidence/**/*.json` and reports **33** files `OK` (up from 24;
+  `batch.json` added in L4, `window`/`orfs`/`optimizer`/`e2e` added in the N-round,
+  and `decoders.json` added in the O-round).
 - **R2 — machine-2 prepared context, encode-first budgets, bounded cold
   reconstruction, cache single-flight.** A validated `RansContext` reused for the
   whole decode is **165×** the per-symbol rebuild on skewed data
@@ -535,7 +536,7 @@ and the surface is reviewed in **Revision 7** (`tests/adversarial_r7.rs`, 11 tes
 | N2 bounded encoded window | 4 KiB of a 64 MiB machine-2 object **10,270,243 → 16,440 B** (**625×**) at the **same 2 `pread`s**; p99 **972 → 26.4 µs**; 1-byte **8,216 B** (1,250×); bound `2·(steps+symbols)+64` | [`WINDOW.md`](WINDOW.md) | `window.json` |
 | N3 machine 5 `OrANS-PACK` | 4-symbol core **`N/4`** (1,048,590 B); 1-byte p50 **30 ns** (raw parity, index-free); 4 KiB **3.5 µs vs 13.5 µs**; constant/identity exact; never > raw + 10 B | [`PACKED_MACHINE.md`](PACKED_MACHINE.md) | `frontier.json` `packed` |
 | N4 machine 6 `OrANS-SEG` | `mixed` **2,686,048 B = −10.1 %** vs machine 2, within **2.5 %** of the **2,621,440 B** oracle incl. metadata; 1-byte **40 ns** `O(1)` | [`SEGMENTS.md`](SEGMENTS.md) | `frontier.json` `segmented` |
-| N5 OrFS single store | payload stored **exactly once**; real on-disk **+1.89 % (`skewed`) / +0.70 % (`mixed`)** over the in-memory engine; genuine `ReadMode::Machine` **382×** the dispatch | [`ORFS.md`](ORFS.md) | `orfs.json`, `fuse-perf.json` |
+| N5 OrFS single store | payload stored **exactly once**; real on-disk **+1.54 % (`skewed`) / +0.58 % (`mixed`)** over the in-memory engine (O-round compaction, from +1.89 %/+0.70 %); genuine `ReadMode::Machine` **382×** the dispatch | [`ORFS.md`](ORFS.md) | `orfs.json` |
 | N6 joint optimiser | held-out p99 **10.07 µs vs greedy 13.58 µs** (budget `N`); **9.84 vs 13.19 µs** (`1.5·N`); deterministic; only `all_certified` plans | [`OPTIMIZER.md`](OPTIMIZER.md) | `optimizer.json` |
 | N7 E2E real data | `beats_raw_store = true` on `text`/`elf`/`mixed` (0.74×/0.98×/0.78× raw; hot 4 KiB 120–130 ns vs raw 160–170 ns; non-evicting); `holds_vs_pinned = false` | [`E2E.md`](E2E.md) | `e2e.json` |
 | N8 resource policy | whole-object allocations bounded at **1 GiB** default (`AllocationTooLarge`); **13** fuzz targets; bounded read paths unaffected | [`SECURITY.md`](SECURITY.md) §Resource policy | `src/resource.rs` |
@@ -546,6 +547,59 @@ certified joint planner), but it **adds no end-to-end win on real data**: N7's v
 is win-vs-raw / lose-vs-pinned, because the synthetic order-0 footprint win does
 **not** generalise to real text/binary data, where LZ77/FSE codecs dominate
 (§Remaining below).
+
+### Rounds O1–O3 — decoder court, uniform-footprint gate, OrFS compaction, review fixes
+
+The O-round is the **final programme track** (the decoder court) plus two
+correctness/economy closures. Every number is read from
+`evidence/bench/decoders.json`, `optimizer.json` and `orfs.json`, detailed in
+[`DECODERS.md`](DECODERS.md), [`OPTIMIZER.md`](OPTIMIZER.md) and [`ORFS.md`](ORFS.md),
+and reviewed in **Revision 8**
+([`reviews/adversarial.md`](reviews/adversarial.md),
+[`reviews/security.md`](reviews/security.md); verdict **TWO DEFECTS, BOTH FIXED**).
+The properties are P41–P44 in [`PROOFS.md`](PROOFS.md).
+
+- **O1 — the decoder court (all variants rejected; machine 4 `K = 8` stays best).**
+  Three decoder families were measured **same-host, at equal stored bytes**, against
+  the incumbent `OrANS-RANS0I` (machine 4, `K = 8`), each asserted byte-exact before
+  timing: **machine 7** (`OrANS-RANS0W`, 16-bit word renorm, ≤ 1 read/step), **machine
+  8** (`OrANS-RANS0IL`, `K` independent lanes each owning its own payload + cursor),
+  and an **AVX2 gather rANS kernel** driving machine 4/8. All three were **slower**
+  and are **rejected**: machine 7 is **≈6 %** faster than machine 2 but still **≈37 %**
+  slower than `K = 8` (it stays a single serial state chain); machine 8 is **+30 %**
+  (the per-lane payload bookkeeping costs more than the shared-cursor ordering it
+  removes); the kernel is **+25–27 %** (`vpgatherdd` is microcoded here). The **best
+  decoder remains machine 4, `K = 8`**: skewed **2.28 ns/byte** (0.44 GB/s), cold
+  4 KiB p50/p99 **8,997 / 10,500 ns** at a 45-byte restart. Against the indexed
+  competitor it stores **3.2× less** than LZ4 (829,939 B vs 2,675,864 B) but is
+  **≈4.3× slower** cold (8,997 vs 2,074 ns); machines 1–6 stay bit-identical
+  (FNV-1a wire hashes pinned). Machines 7/8 are kept as versioned machines, the
+  kernel stays in `src/simd.rs` unwired and byte-exact to its scalar reference
+  (`decoders.json`; [`DECODERS.md`](DECODERS.md)).
+- **O2 — uniform footprint gate and OrFS compaction.** The joint optimiser
+  (`src/optimize.rs`) now returns the structureless **machine-3** base on uniform
+data: `optimizer.json` `uniform_evidence` reports `committed_bytes == raw_bytes ==
+4,194,304`, `hot_regions = 0`, held-out p99 **130.9 ns** (equal to the no-structure
+plan — **no p99 regression**) and sequential **69.558 GB/s** (raw-like; the
+compressing plans are decode-bound at **≈0.3–0.6 GB/s**). Fixed defect **J** (the gate
+aborted with `AllocationTooLarge` when only the base fit the budget). The compacted
+OrFS views/framing (no redundant `core` view, 32-byte view records) cut the real
+on-disk excess over the in-memory engine from **+1.89 % / +0.70 %** to **+1.54 % /
++0.58 %** (`orfs.json`) with payload still stored exactly once.
+- **O3 — review fixes and hardening.** Revision 8 found **Finding I** (a
+  non-saturating `cursor + N` overflow on an attacker-controlled cursor in machines
+  7/8 and the SIMD kernel — a read path for machine 7) and **Finding J** (above),
+  **both fixed** (`saturating_add` per site; base built before the guard). The same
+  hardening was applied to **14 unchecked `cursor + N` sites across machines 1–4**, so
+  no read path panics on a crafted cursor. `container-fuzz.sh` runs **fifteen**
+  targets; `container-reproduce.sh` passes **684/0** with **33** evidence JSON OK and
+  the verify gate green at **698 passed**.
+
+**Honest reading.** The decoder court is **complete and closed**: no variant (
+word16, independent lanes, SIMD kernel) beat machine 4 `K = 8`, which is the best
+EKBLOOM decoder and remains **≈3.2× smaller but ≈4.3× slower** cold than LZ4. The
+O-round adds no new speed ceiling; it removes two sharp edges and one redundant
+manifested structure.
 
 ---
 
@@ -742,13 +796,13 @@ sh scripts/container-perf.sh         # perf.json (hardware counters)
 sh scripts/container-async-io.sh     # io-uring.json (seccomp=unconfined)
 sh scripts/run-rans.sh               # rans.json (machine-2 prepared decode context)
 sh scripts/run-blocks.sh             # blocks.json (machine-2 blocks + packed checkpoints)
-sh scripts/run-frontier.sh           # frontier.json (engine vs indexed codecs + packed/segmented)
+sh scripts/run-frontier.sh           # frontier.json (engine vs indexed codecs + packed/segmented) + decoders.json (decoder court)
 sh scripts/run-batch.sh              # batch.json (batched reconstruction + GPU verdict)
 sh scripts/run-window.sh             # window.json (bounded encoded-window reads, machines 2/4)
 sh scripts/run-orfs.sh               # orfs.json (OrFS single authoritative store)
 sh scripts/run-optimizer.sh          # optimizer.json (joint budget-aware planner)
 sh scripts/run-e2e.sh                # e2e.json (end-to-end real-data proof)
-sh scripts/validate-evidence.sh      # validate every evidence/**/*.json (32 files)
+sh scripts/validate-evidence.sh      # validate every evidence/**/*.json (33 files)
 sh scripts/container-loom.sh         # Loom model checking
 sh scripts/container-bench.sh        # Divan microbenchmarks (benches/ekbloom.rs)
 sh scripts/capture-environment.sh    # refresh evidence/environment.txt

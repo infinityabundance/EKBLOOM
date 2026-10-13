@@ -11,8 +11,8 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 |---|---|
 | [`DESIGN.md`](DESIGN.md) | **Frozen engineering contract** — machine semantics, state log, blooms, data model, `.ekb` wire layout, module interfaces. |
 | [`ACCEPTANCE.md`](ACCEPTANCE.md) | The **10 hard acceptance gates**, each mapped to its implementing module, artifact and exact reproduction command, plus additional evidence. |
-| [`PROOFS.md`](PROOFS.md) | **Proved properties P1–P40** (machine 1 + machine 2 + the round-3/round-4 modules + the L1–L4 closure + the M1–M5 closure + the N1–N8 closure, tagged PROVED / EMPIRICALLY OBSERVED) and the honest limitations (resolved in L1–L4, M1–M5 and N1–N8, plus the remaining ones). |
-| [`RESULTS.md`](RESULTS.md) | **Measured results** — the speed-vs-space frontier, budget frontier, curves, hardware counters, machine 2, baselines, the cache competition, the 65,536-entry `T_4[x]` research outcome, the L1–L4 limits closures, and the M1–M5 and N1–N8 rounds. |
+| [`PROOFS.md`](PROOFS.md) | **Proved properties P1–P44** (machine 1 + machine 2 + the round-3/round-4 modules + the L1–L4 closure + the M1–M5 closure + the N1–N8 closure + the O1–O3 closure, tagged PROVED / EMPIRICALLY OBSERVED) and the honest limitations (resolved in L1–L4, M1–M5, N1–N8 and O1–O3, plus the remaining ones). |
+| [`RESULTS.md`](RESULTS.md) | **Measured results** — the speed-vs-space frontier, budget frontier, curves, hardware counters, machine 2, baselines, the cache competition, the 65,536-entry `T_4[x]` research outcome, the L1–L4 limits closures, and the M1–M5, N1–N8 and O1–O3 rounds. |
 | [`CODEC.md`](CODEC.md) | **Machine 2** (`OrANS-RANS0`, compressing), **machine 3** (`OrANS-Store`, identity `V = N`), **machine 4** (`OrANS-RANS0I`, interleaved), **machine 5** (`OrANS-PACK`, directly-addressable fixed-width packing) and **machine 6** (`OrANS-SEG`, versioned segmented container) plus the `auto` representation policy. |
 | [`PACKED_MACHINE.md`](PACKED_MACHINE.md) | **Machine 5** (`OrANS-PACK`, `machine_id = 5`): the directly-addressable fixed-width packed core (`ceil(N·bits/8)`, `O(1)` per position, constant/identity renderings), its `RepresentationPolicy::Packed` selection, and the packed-vs-rANS/raw/LZ4 frontier. |
 | [`SEGMENTS.md`](SEGMENTS.md) | **Machine 6** (`OrANS-SEG`, `machine_id = 6`): the versioned segmented container (96 B header + fixed/variable directory over per-segment constant/raw/packed representations) and the heterogeneous-object footprint win (**−10.1 %** vs machine 2 on `mixed`). |
@@ -40,18 +40,19 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`ORFS.md`](ORFS.md) | **OrFS concealed namespace**: one authoritative `.ekb` store + tiny `EKBFSVW1` pointer views (payload stored exactly once), real `du`-style footprint, and the genuine `read_machine` decode baseline. |
 | [`OPTIMIZER.md`](OPTIMIZER.md) | The **physical-budget-aware joint planner** (`src/optimize.rs`): machine × region/segment × restart × tile × hot-region as one held-out, certified decision under `CommittedBytes ≤ B`. |
 | [`E2E.md`](E2E.md) | The **end-to-end** EKBLOOM/OrFS proof on real text/ELF/mixed data vs raw and pinned-hot LZ4/Zstd at an equal on-disk budget (the honest win/lose verdict). |
+| [`DECODERS.md`](DECODERS.md) | The **decoder court** (O1): machines 7 (`OrANS-RANS0W`, word16) and 8 (`OrANS-RANS0IL`, independent lanes) and an AVX2 rANS kernel measured at equal stored bytes against machine 4 `K = 8` — **all rejected**; best stays machine 4 `K = 8`. |
 | [`INDEX.md`](INDEX.md) | This file. |
 
 ## Independent reviews (`docs/reviews/`)
 
 | Review | One line |
 |---|---|
-| [`reviews/adversarial.md`](reviews/adversarial.md) | Try-to-break-correctness pass: 15 tests, a rev-2 segmented/budget/adaptive pass, a rev-3 `prefix`/`packed`/`tiles`/`handle`/`planner`/`court` pass (11 tests + `fuzz_packed`/`fuzz_tiles`), a rev-4 `blocks`/`engine`/region-cursor/`checkpoint` pass, a rev-5 pass over the L1–L4 surface (13 tests + `fuzz_batch`/`fuzz_rans_i`), a rev-6 pass over the M1–M5 surface (13 tests in `adversarial_m.rs` + `fuzz_region`), and a **rev-7** pass over the N1–N7 surface (11 tests in `adversarial_r7.rs` + `fuzz_pack`/`fuzz_seg`; verdict **two defects, both fixed**). |
+| [`reviews/adversarial.md`](reviews/adversarial.md) | Try-to-break-correctness pass: 15 tests, a rev-2 segmented/budget/adaptive pass, a rev-3 `prefix`/`packed`/`tiles`/`handle`/`planner`/`court` pass (11 tests + `fuzz_packed`/`fuzz_tiles`), a rev-4 `blocks`/`engine`/region-cursor/`checkpoint` pass, a rev-5 pass over the L1–L4 surface (13 tests + `fuzz_batch`/`fuzz_rans_i`), a rev-6 pass over the M1–M5 surface (13 tests in `adversarial_m.rs` + `fuzz_region`), a **rev-7** pass over the N1–N7 surface (11 tests in `adversarial_r7.rs` + `fuzz_pack`/`fuzz_seg`; verdict **two defects, both fixed**), and a **rev-8** pass over the O1–O2 surface (9 tests in `adversarial_o.rs` + `fuzz_rans_w`/`fuzz_rans_il`; verdict **two defects, both fixed**). |
 | [`reviews/concurrency.md`](reviews/concurrency.md) | Concurrency audit + **Loom** model checking of the `OrFs` index critical section. |
 | [`reviews/mathematics.md`](reviews/mathematics.md) | Independent re-derivation of P1–P6; only defect is a wording clause (benign). |
 | [`reviews/performance.md`](reviews/performance.md) | Locality & SIMD investigation of the certified path-bloom hot path. |
 | [`reviews/reproducibility.md`](reviews/reproducibility.md) | Independent reproducibility review: pinning, lockfile, clean-checkout, benchmark drift. |
-| [`reviews/security.md`](reviews/security.md) | Wire-form security review through rev 4 (`blocks`/`engine`/`region_adapt`/`machine_rans`/`checkpoint`), rev 5 (`machine_store`/`machine_rans_i`/`batch`/`ResidentView`/AUTH coverage), **rev 6** (M1–M5: machine-4 complete state, exact accounting, committed budgets, request-level bound, `create_auto` reuse) and **rev 7** (N1–N7: core-identity binding, bounded windows, machines 5/6, OrFS pointer views, the joint optimiser; two defects, both fixed), and the **three** sanctioned `unsafe` modules (`src/simd.rs`, `src/async_io.rs`, `src/mapped.rs`), all SAFE. |
+| [`reviews/security.md`](reviews/security.md) | Wire-form security review through rev 4 (`blocks`/`engine`/`region_adapt`/`machine_rans`/`checkpoint`), rev 5 (`machine_store`/`machine_rans_i`/`batch`/`ResidentView`/AUTH coverage), **rev 6** (M1–M5: machine-4 complete state, exact accounting, committed budgets, request-level bound, `create_auto` reuse), **rev 7** (N1–N7: core-identity binding, bounded windows, machines 5/6, OrFS pointer views, the joint optimiser; two defects, both fixed) and **rev 8** (O1–O2: machines 7/8, the unwired SIMD kernel, the optimiser footprint gate, OrFS compacted framing; two defects, both fixed), and the **three** sanctioned `unsafe` modules (`src/simd.rs`, `src/async_io.rs`, `src/mapped.rs`), all SAFE. |
 
 ## Evidence (`evidence/`)
 
@@ -85,9 +86,10 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`bench/frontier.json`](../evidence/bench/frontier.json) | The engine vs indexed LZ4/Zstd (no cache / LRU / **pinned-hot**) and raw: hot index ratio, footprint at non-evicting hot access (**not** latency — the corrected headline); plus the **`packed`** section (machine 5 vs rANS/raw/LZ4). |
 | [`bench/fuse-perf.json`](../evidence/bench/fuse-perf.json) | Measured FUSE read-path cost vs a direct read and the `FUSE` passthrough / `FUSE`-over-`io_uring` non-result. |
 | [`bench/batch.json`](../evidence/bench/batch.json) | Batched independent reconstruction: CPU-thread scaling (8.57× at 16 threads, every row byte-exact) and the GPU-unavailable verdict. |
-| [`bench/orfs.json`](../evidence/bench/orfs.json) | The OrFS concealed namespace's **real** on-disk bytes vs one `.ekb`/raw/pinned LZ4/Zstd, and the payload-stored-once excess (**+1.89 %** / **+0.70 %**). |
+| [`bench/orfs.json`](../evidence/bench/orfs.json) | The OrFS concealed namespace's **real** on-disk bytes vs one `.ekb`/raw/pinned LZ4/Zstd, and the payload-stored-once excess (**+1.54 %** / **+0.58 %**, O-round compaction from +1.89 %/+0.70 %). |
 | [`bench/optimizer.json`](../evidence/bench/optimizer.json) | The physical-budget-aware joint planner vs greedy/machine-only (held-out p99 **10.07** vs **13.58 µs**; **9.84** vs **13.19 µs**). |
 | [`bench/e2e.json`](../evidence/bench/e2e.json) | End-to-end real-data proof: EKBLOOM/OrFS vs raw and pinned-hot LZ4/Zstd at an equal on-disk budget (`beats_raw_store = true`; `holds_vs_pinned = false`). |
+| [`bench/decoders.json`](../evidence/bench/decoders.json) | The **decoder court** (O1): machines 7/8 and the AVX2 rANS kernel vs machine 4 `K = 8` at equal stored bytes — all rejected; best stays machine 4 `K = 8`. |
 | [`counterexamples/bloom-key-0001.json`](../evidence/counterexamples/bloom-key-0001.json) | The rejected universal `T_4[x]` witness (key `175`, two equal-state/different-outcome positions). |
 | [`model-search/model-search-sweep.json`](../evidence/model-search/model-search-sweep.json) | The `D = 4` finite-model sufficiency sweep (`k = 0..4` conflicts `64/256/1024/4096/0`). |
 
@@ -114,13 +116,13 @@ sh scripts/run-mmap.sh              # mmap.json
 sh scripts/run-rans.sh              # rans.json (machine-2 prepared decode context)
 sh scripts/run-blocks.sh            # blocks.json (machine-2 blocks + packed checkpoints)
 sh scripts/run-window.sh            # window.json (bounded encoded-window reads, machines 2/4)
-sh scripts/run-frontier.sh          # frontier.json (engine vs indexed codecs)
+sh scripts/run-frontier.sh          # frontier.json (engine vs indexed codecs) + decoders.json (decoder court)
 sh scripts/run-fuse-perf.sh         # fuse-perf.json (requires /dev/fuse)
 sh scripts/run-batch.sh             # batch.json (batched reconstruction + GPU verdict)
 sh scripts/run-orfs.sh              # orfs.json (OrFS single authoritative store)
 sh scripts/run-optimizer.sh         # optimizer.json (physical-budget-aware joint planner)
 sh scripts/run-e2e.sh               # e2e.json (end-to-end real-data proof)
-sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (32 files)
+sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (33 files)
 sh scripts/container-fuzz.sh        # all libFuzzer targets (fuzz_machine/open/bloom/history_store/packed/tiles/blocks/batch/rans_i)
 sh scripts/container-loom.sh        # Loom model checking
 sh scripts/capture-environment.sh   # environment.txt

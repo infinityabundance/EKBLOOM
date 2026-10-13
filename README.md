@@ -136,10 +136,10 @@ binary (`ekbloom`), and **`ekbloom` v0.3.0 is published on
     is bounded by `ResourcePolicy` (default **1 GiB**, `docs/SECURITY.md`).
 18. **OrFS stores its payload exactly once; a joint planner certifies the whole plan
     (N5 / N6).** The concealed OrFS namespace is small pointer views over **one**
-    authoritative `.ekb` store, so the on-disk footprint is real: **+1.89 %** over the
-    in-memory engine on `skewed` (bounded container framing, **no duplicated
-    payload**), with a genuine FUSE `ReadMode::Machine` baseline (**382×** the direct
-    read) (`docs/ORFS.md`). A physical-budget-aware **joint** planner
+    authoritative `.ekb` store, so the on-disk footprint is real: **+1.54 %** over the
+    in-memory engine on `skewed` after the O-round compaction (**+1.89 %** before it;
+    bounded container framing, **no duplicated payload**), with a genuine FUSE
+    `ReadMode::Machine` baseline (**382×** the direct read) (`docs/ORFS.md`). A physical-budget-aware **joint** planner
     (`docs/OPTIMIZER.md`) chooses machine × region/segment size × restart geometry ×
     tile size × hot-region subset as one decision on a **held-out** trace, cutting
     held-out p99 to **10.07 µs** vs greedy **13.58 µs** (and **9.84** vs **13.19** at
@@ -153,6 +153,23 @@ binary (`ekbloom`), and **`ekbloom` v0.3.0 is published on
     **loses** the cold-random and sequential axes to raw/LZ4 (`holds_vs_pinned =
     false`); the synthetic order-0 footprint win does **not** generalise to real data
     (`docs/E2E.md`).
+20. **The decoder court is complete — and every variant was rejected (O1–O3).** The
+    final programme track measured three decoder families same-host **at equal stored
+    bytes** against the incumbent interleaved machine 4 (`K = 8`): **machine 7**
+    (`OrANS-RANS0W`, 16-bit word renorm — ≈**6 %** faster than machine 2 but ≈**37 %**
+    slower than `K = 8`, since it stays a single serial state chain), **machine 8**
+    (`OrANS-RANS0IL`, `K` independent lanes — **+30 %**) and an **AVX2 gather rANS
+    kernel** (**+25–27 %**) — **all rejected**, so the **best decoder remains machine
+    4, `K = 8`** (cold 4 KiB p50 **8,997 ns**, 45-byte restart; **3.2× smaller** than
+    LZ4 but ≈**4.3× slower** cold). Alongside, the joint optimiser's footprint gate
+    keeps uniform data at `committed bytes == raw` (**4,194,304 B**) with **no p99
+    regression** and a raw-like sequential rate, and the compacted OrFS framing cut
+    the real on-disk excess over the in-memory engine from **+1.89 % / +0.70 %** to
+    **+1.54 % / +0.58 %** (payload still stored exactly once) — with Review Revision
+    8's two defects (a `cursor + N` overflow and the tight-budget base abort) fixed
+    and **14** unchecked cursor sites hardened across machines 1–4
+    ([`docs/DECODERS.md`](docs/DECODERS.md), [`docs/OPTIMIZER.md`](docs/OPTIMIZER.md),
+    [`docs/ORFS.md`](docs/ORFS.md)).
 
 ---
 
@@ -650,8 +667,9 @@ affix parser (`tiles::parse_tile_set_prefix`, including the `tile_shift` guard)
 is shared by the in-memory and file-backed readers, so parsing happens in exactly
 one place. `sh scripts/validate-evidence.sh`
 (`examples/validate_evidence.rs`, dependency-free) validates every
-`evidence/**/*.json`: **32** files `OK` (up from 24; `batch.json` added in L4, and
-`window.json`/`orfs.json`/`optimizer.json`/`e2e.json` added in the N-round).
+`evidence/**/*.json`: **33** files `OK` (up from 24; `batch.json` added in L4,
+`window.json`/`orfs.json`/`optimizer.json`/`e2e.json` added in the N-round, and
+`decoders.json` added in the O-round).
 - **R2 — machine-2 prepared decode context, encode-first budgets, bounded cold
 reconstruction, cache single-flight.** A validated `RansContext` (frequencies,
 prefix sums, 4096-entry slot table) is built **once** per bulk decode instead of
@@ -857,14 +875,16 @@ by P34–P40 in [`docs/PROOFS.md`](docs/PROOFS.md), and independently reviewed
   — **10.1 % smaller** than machine 2 (2,986,989 B) and within **2.5 %** of the
   2,621,440 B oracle including all metadata — while pure `skewed`/`uniform` pay a
   per-segment/directory tax ([`docs/SEGMENTS.md`](docs/SEGMENTS.md)).
-- **N5 — OrFS stores the authoritative payload exactly once.** The concealed
-  namespace is `EKBFSVW1` **pointer views** over the single `manifests` store (sidecars
-  < 512 B, no payload byte); `inspect_physical` equals an independent `du`-style walk,
-  so the real on-disk footprint is **+1.89 % (`skewed`) / +0.70 % (`mixed`)** over the
-  in-memory engine — bounded framing, **not** a duplicated payload. `OrFs::read_machine`
-  is the reference decode and the FUSE `ReadMode::Machine` baseline (**4.18 ms**
-  uncached 4 KiB = **382×** the dispatch) ([`docs/ORFS.md`](docs/ORFS.md),
-  [`docs/FUSE.md`](docs/FUSE.md)).
+- **N5 — OrFS stores the authoritative payload exactly once, and the O-round
+  compacted its framing.** The concealed namespace is `EKBFSVW1` **pointer views**
+  over the single `manifests` store (sidecars < 512 B, no payload byte);
+  `inspect_physical` equals an independent `du`-style walk, so the real on-disk
+  footprint is **+1.54 % (`skewed`) / +0.58 % (`mixed`)** over the in-memory engine
+  (down from **+1.89 % / +0.70 %** after dropping the redundant `core` view and
+  compacting the view record to 32 bytes) — bounded framing, **not** a duplicated
+  payload. `OrFs::read_machine` is the reference decode and the FUSE
+  `ReadMode::Machine` baseline (**4.18 ms** uncached 4 KiB = **382×** the dispatch)
+  ([`docs/ORFS.md`](docs/ORFS.md), [`docs/FUSE.md`](docs/FUSE.md)).
 - **N6 — physical-budget-aware joint planner.** `src/optimize.rs` chooses the whole
   plan (machine 1–6 × region/segment size × restart geometry × tile size ×
   hot-region subset) to minimise held-out p99 under `CommittedBytes ≤ B`, builds and
@@ -881,9 +901,53 @@ by P34–P40 in [`docs/PROOFS.md`](docs/PROOFS.md), and independently reviewed
   `evidence/bench/e2e.json`).
 - **N8 — resource policy + fuzzing.** `src/resource.rs` bounds every whole-object
   allocation driven by a declared/core-derived length at **1 GiB** by default
-  (`AllocationTooLarge`). The bounded file-backed paths are unaffected. The campaign
+  `AllocationTooLarge`). The bounded file-backed paths are unaffected. The campaign
   now runs **13** libFuzzer targets (`+fuzz_pack`, `fuzz_seg`, `fuzz_resource`)
   ([`docs/SECURITY.md`](docs/SECURITY.md)).
+
+### O-round: decoder court, uniform-footprint gate, OrFS compaction, review fixes (O1–O3)
+
+The O-round runs the **final programme track** (the decoder court) and folds in two
+correctness/economy closures. Every item is measured, covered by P41–P44 in
+[`docs/PROOFS.md`](docs/PROOFS.md), and independently reviewed (**Revision 8**,
+verdict **TWO DEFECTS, BOTH FIXED**, in
+[`docs/reviews/adversarial.md`](docs/reviews/adversarial.md) and
+[`docs/reviews/security.md`](docs/reviews/security.md); 9 tests in
+`tests/adversarial_o.rs` + the `fuzz_rans_w`/`fuzz_rans_il` targets).
+
+- **O1 — the decoder court: word16, independent lanes, and a SIMD kernel; all
+  rejected.** [`docs/DECODERS.md`](docs/DECODERS.md) measures three decoder families
+  same-host **at equal stored bytes** against the incumbent `OrANS-RANS0I` (machine 4,
+  `K = 8`), each asserted byte-exact before timing: **machine 7** (`OrANS-RANS0W`,
+  16-bit word renorm, ≤ 1 read/step) is ≈**6 %** faster than machine 2 but ≈**37 %**
+  slower than `K = 8`; **machine 8** (`OrANS-RANS0IL`, independent lanes owning their
+  own payload + cursor) is **+30 %**; and an **AVX2 gather rANS kernel** driving
+  machine 4/8 is **+25–27 %** (`vpgatherdd` is microcoded here). The **best decoder
+  stays machine 4, `K = 8`** — skewed **2.28 ns/byte** (0.44 GB/s), cold 4 KiB
+  p50/p99 **8,997 / 10,500 ns** at a 45-byte restart — while storing **3.2× less**
+  than LZ4 (829,939 B vs 2,675,864 B) yet reading it **≈4.3× slower** cold (8,997 vs
+  2,074 ns). Machines 7/8 are kept as versioned machines (neither is an `Auto`
+  default) and the kernel stays in `src/simd.rs` unwired and byte-exact to its scalar
+  reference; machines 1–6 remain bit-identical (FNV-1a wire hashes pinned).
+- **O2 — uniform footprint gate (the base never expands).** `src/optimize.rs` now
+  returns the structureless **machine-3** base on uniform data: the committed plan is
+  exactly `raw` (`optimizer.json` `uniform_evidence`: `committed_bytes == raw_bytes ==
+  4,194,304`, `hot_regions = 0`), the held-out p99 is **equal to the no-structure
+  plan** (**no regression**), and the sequential rate is **raw-like** (69.6 GB/s)
+  rather than the **decode-bound** ≈0.3–0.6 GB/s of the compressing plans. This also
+  fixed defect **J** (the gate aborted with `AllocationTooLarge` when only the base fit
+  a tight budget).
+- **O3 — OrFS compaction, review fixes and cursor hardening.** Dropping the always
+  present `core` view and compacting the view record to 32 bytes removed a whole
+  allocated 4 KiB inode, cutting the real on-disk excess from **+1.89 % / +0.70 %** to
+  **+1.54 % / +0.58 %** ([`docs/ORFS.md`](docs/ORFS.md)); the compacted framing is
+  byte-exact across write → scan → reopen and rejects corruption. Revision 8 fixed
+  **Finding I** (a non-saturating `cursor + N` overflow on an attacker-controlled
+  cursor in machines 7/8 and the SIMD kernel — a read path for machine 7) and
+  **Finding J**; the same hardening was applied to **14** unchecked `cursor + N`
+  sites across machines 1–4, so no read path panics on a crafted cursor. The campaign
+  runs **fifteen** fuzz targets, `container-reproduce.sh` passes **684/0** with **33**
+  evidence JSON `OK`, and the verify gate is green at **698 passed**.
 
 ---
 
@@ -958,14 +1022,14 @@ sh scripts/run-planner-bg.sh        # evidence/bench/planner-bg.json (background
 sh scripts/run-mmap.sh              # evidence/bench/mmap.json (mmap + huge pages)
 sh scripts/run-rans.sh              # evidence/bench/rans.json (machine-2 prepared decode context)
 sh scripts/run-blocks.sh            # evidence/bench/blocks.json (machine-2 blocks + packed checkpoints)
-sh scripts/run-frontier.sh          # evidence/bench/frontier.json (engine vs indexed codecs)
+sh scripts/run-frontier.sh          # evidence/bench/frontier.json (engine vs indexed codecs) + decoders.json (decoder court)
 sh scripts/run-fuse-perf.sh         # evidence/bench/fuse-perf.json (requires /dev/fuse)
 sh scripts/run-batch.sh             # evidence/bench/batch.json (batched reconstruction + GPU verdict)
 sh scripts/run-window.sh            # evidence/bench/window.json (bounded encoded-window reads, machines 2/4)
 sh scripts/run-orfs.sh              # evidence/bench/orfs.json (OrFS single-store real disk bytes)
 sh scripts/run-optimizer.sh         # evidence/bench/optimizer.json (joint budget-aware planner)
 sh scripts/run-e2e.sh               # evidence/bench/e2e.json (end-to-end on real data; uses FUSE when /dev/fuse exists)
-sh scripts/validate-evidence.sh     # validate every evidence/**/*.json
+sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (33 files)
 sh scripts/container-loom.sh        # Loom model checking (tests/loom.rs)
 sh scripts/container-reproduce.sh   # clean build + tests from scratch
 sh scripts/capture-environment.sh   # write evidence/environment.txt
@@ -995,9 +1059,9 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 
 ---
 
-## Limitations — resolved (L1–L4, M1–M5 and N1–N8) and remaining
+## Limitations — resolved (L1–L4, M1–M5, N1–N8 and O1–O3) and remaining
 
-### Resolved in rounds L1–L4, M1–M5 and N1–N8
+### Resolved in rounds L1–L4, M1–M5, N1–N8 and O1–O3
 
 - **The base representation never expands past raw** (L1). Machine 3
   (`OrANS-Store`) is the verbatim identity (`encode = source`, `V = N`), and the
@@ -1039,10 +1103,19 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 - **Whole-object allocations are bounded by policy** (N8). `src/resource.rs` caps
   every whole-object allocation driven by a declared/core-derived length at **1 GiB**
   by default (`AllocationTooLarge`); the bounded file-backed paths are unaffected.
-- **The OrFS namespace stores its authoritative payload exactly once** (N5). The
-  concealed structure is pointer views over one `.ekb` store, so the real on-disk
-  excess over the in-memory body is bounded framing (**+1.89 % / +0.70 %**), not a
-  duplicated payload.
+- **The OrFS namespace stores its authoritative payload exactly once, and the O-round
+  compacted its framing** (N5, O3). The concealed structure is pointer views over one
+  `.ekb` store, so the real on-disk excess over the in-memory body is bounded framing
+  (**+1.54 % / +0.58 %**, down from +1.89 % / +0.70 %), not a duplicated payload.
+- **The decoder programme track is complete, with every variant rejected** (O1).
+  Word16 (machine 7), independent lanes (machine 8) and an AVX2 rANS kernel were all
+  measured at equal stored bytes against machine 4 `K = 8` and all lose, so machine 4
+  `K = 8` stays the best decoder ([`docs/DECODERS.md`](docs/DECODERS.md)); both new
+  machines are exact, complete-state exact, and reject crafted headers.
+- **The uniform-data base never expands, with no p99 regression** (O2). The joint
+  planner returns the structureless machine-3 base on uniform data
+  (`committed_bytes == raw_bytes == 4,194,304`), the held-out p99 equals the
+  no-structure p99, and the sequential rate is raw-like (**69.6 GB/s**).
 
 ### Remaining (honest)
 
@@ -1068,10 +1141,32 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
   from the logical position, so the state-only projection is not resumable: only
   the complete resumable states restart, and the file reader replays for them.
   Uniform data is `V/N ≈ 1.015×` for machine 2 (machine 3 gives exactly `1.0000×`).
-- **Cold decode-rate still loses to bare LZ4** — narrowed (**≈4.7–4.9×**) by the
-  interleaved machine 4 but not closed: rANS keeps an ordered renormalising cursor
+- **Cold random-access still loses to LZ4, and the decoder court closed that track**
+  (O1). The decoder round measured word16 (machine 7), independent lanes (machine 8)
+  and an AVX2 rANS kernel at equal stored bytes against machine 4 (`K = 8`) and
+  **rejected all three**, so machine 4 `K = 8` remains the best EKBLOOM decoder: its
+  cold 4 KiB p50 is **8,997 ns** vs LZ4's **2,074 ns** (≈**4.3×** slower) while
+  storing **3.2× less** (829,939 B vs 2,675,864 B). The engine/block-index
+  measurement puts the residual at ≈4.7–4.9× (§Resolved L2/L2b). Closing it outright
+  would need a non-rANS symbol engine; rANS keeps an ordered renormalising cursor
   and a per-symbol table gather that LZ4's copy-based block decode avoids
-  ([`docs/CODEC.md`](docs/CODEC.md), `docs/FRONTIER.md` §4).
+  ([`docs/DECODERS.md`](docs/DECODERS.md), [`docs/CODEC.md`](docs/CODEC.md),
+  `docs/FRONTIER.md` §4).
+- **Sequential throughput is raw-like only for verbatim data** (O2). On
+  uniform/incompressible data the structureless machine-3 base is a direct slice
+  copy, so the rate is raw-like (`optimizer.json` **69.6 GB/s** vs raw **79.7**); on
+  compressible data the compressing machines are **decode-bound** (≈0.3–0.6 GB/s),
+  so the sequential axis is not a win where compression is used.
+- **The residual OrFS overhead is filesystem 4 KiB allocation granularity, not
+  container framing** (O3). After the O-round compaction the framing itself is only
+  **~1.1 KB per object**; the measured **+1.54 % / +0.58 %** is dominated by the four
+  allocated 4 KiB blocks (the registry, the two concealed directories and the
+  logical pointer artifact) ([`docs/ORFS.md`](docs/ORFS.md)).
+- **Integrity is not authenticity unless `AUTH` is used.** CRC-32/BLAKE3 detect
+  accidental corruption, not forgery — a writer with file access can recompute them
+  consistently; only the opt-in keyed-MAC `AUTH` mode (fail-closed under
+  `--require-auth`) is an authenticity boundary (see the footer/`AUTH`-tag residual
+  above and [`docs/SECURITY.md`](docs/SECURITY.md)).
 - **Uniform data has no space win in the manifested body, and the engine wins no
   latency axis there.** The *base* is exactly `N` (machine 3, never larger than
   raw), but the manifested hot body + block index retains **1.07× raw** on
@@ -1167,9 +1262,10 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 - `evidence/bench/fuse-perf.json` — measured FUSE read-path cost and the passthrough non-result.
 - `evidence/bench/batch.json` — batched independent reconstruction (8.57× at 16 threads) and the honest GPU-unavailable verdict.
 - `evidence/bench/window.json` — bounded encoded-window reads for machines 2/4 (4 KiB of a 64 MiB object: 10,270,243 B → 16,440 B, **625×**; p99 972 → 26.4 µs).
-- `evidence/bench/orfs.json` — the OrFS concealed namespace's **real** on-disk bytes vs one `.ekb`/raw/pinned codecs, with the payload-stored-once excess (**+1.89 %** / **+0.70 %**).
-- `evidence/bench/optimizer.json` — the physical-budget-aware **joint** planner vs greedy (held-out p99 **10.07** vs **13.58 µs**; **9.84** vs **13.19 µs**).
+- `evidence/bench/orfs.json` — the OrFS concealed namespace's **real** on-disk bytes vs one `.ekb`/raw/pinned codecs, with the payload-stored-once excess (**+1.54 %** / **+0.58 %**, O-round compaction).
+- `evidence/bench/optimizer.json` — the physical-budget-aware **joint** planner vs greedy (held-out p99 **10.07** vs **13.58 µs**; **9.84** vs **13.19 µs**), plus the `uniform_evidence` footprint gate (`committed_bytes == raw`).
 - `evidence/bench/e2e.json` — the end-to-end real-data verdict (beats raw store; behind pinned-hot LZ4/Zstd).
+- `evidence/bench/decoders.json` — the decoder court (O1): machines 7/8 and the AVX2 rANS kernel vs machine 4 `K = 8` at equal stored bytes; all rejected.
 - `evidence/counterexamples/` — rejected state-keyed blooms.
 - `evidence/model-search/` — finite-model sufficiency sweep.
 
@@ -1180,7 +1276,7 @@ Documentation map:
 | [`docs/INDEX.md`](docs/INDEX.md) | One-page index of all docs and evidence. |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Frozen internal engineering contract. |
 | [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | The 10 hard gates mapped to tests and commands. |
-| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties P1–P40 (machine 1 + machine 2 + the round-3/round-4 modules + the L1–L4 closure + the M1–M5 closure + the N1–N8 closure) and honest limitations. |
+| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties P1–P44 (machine 1 + machine 2 + the round-3/round-4 modules + the L1–L4 closure + the M1–M5 closure + the N1–N8 closure + the O1–O3 closure) and honest limitations. |
 | [`docs/RESULTS.md`](docs/RESULTS.md) | Measured results and the 65,536 research outcome. |
 | [`docs/CODEC.md`](docs/CODEC.md) | Machine 2 (`OrANS-RANS0`), machine 3 (`OrANS-Store`, identity) and machine 4 (`OrANS-RANS0I`, interleaved) codecs + the `auto` policy. |
 | [`docs/BASELINES.md`](docs/BASELINES.md) | Conventional baseline comparison (`RawVec`/`RawFile`/…). |
@@ -1209,9 +1305,10 @@ Documentation map:
 | [`docs/ORFS.md`](docs/ORFS.md) | The OrFS concealed namespace: one authoritative store + pointer views (no duplicated payload). |
 | [`docs/OPTIMIZER.md`](docs/OPTIMIZER.md) | The physical-budget-aware joint planner (`src/optimize.rs`), held-out and certified. |
 | [`docs/E2E.md`](docs/E2E.md) | End-to-end EKBLOOM/OrFS proof on real data vs raw / pinned-hot LZ4 / Zstd. |
-| [`docs/reviews/adversarial.md`](docs/reviews/adversarial.md) | Adversarial correctness review (through **Revision 7**, N1–N7: two defects, both fixed). |
+| [`docs/DECODERS.md`](docs/DECODERS.md) | The decoder court (O1): machines 7/8 and the AVX2 rANS kernel vs machine 4 `K = 8` at equal stored bytes — all rejected. |
+| [`docs/reviews/adversarial.md`](docs/reviews/adversarial.md) | Adversarial correctness review (through **Revision 8**, O1–O2: two defects, both fixed). |
 | [`docs/reviews/concurrency.md`](docs/reviews/concurrency.md) | Concurrency audit + Loom model checking. |
 | [`docs/reviews/mathematics.md`](docs/reviews/mathematics.md) | Independent re-derivation of the proofs. |
 | [`docs/reviews/performance.md`](docs/reviews/performance.md) | Locality & SIMD investigation. |
 | [`docs/reviews/reproducibility.md`](docs/reviews/reproducibility.md) | Independent reproducibility review. |
-| [`docs/reviews/security.md`](docs/reviews/security.md) | Wire-form / `unsafe` security review (three `unsafe` modules), through **Revision 7** (N1–N7: two defects, both fixed). |
+| [`docs/reviews/security.md`](docs/reviews/security.md) | Wire-form / `unsafe` security review (three `unsafe` modules), through **Revision 8** (O1–O2: two defects, both fixed). |

@@ -21,8 +21,21 @@ use ekbloom::{
     DEFAULT_MAX_SINGLE_ALLOCATION,
 };
 
-/// Serialises the two tests that read or mutate the process-wide default ceiling.
+/// Serialises every test in this file: each one (directly or via the
+/// whole-object APIs it exercises) reads the process-wide default ceiling,
+/// and one test mutates it. Held for the whole test body so the parallel
+/// harness cannot interleave a lowered/raised cap with another test's calls.
 static POLICY_LOCK: Mutex<()> = Mutex::new(());
+
+/// Take the shared [`POLICY_LOCK`] for the duration of a test body.
+///
+/// Poisoning is ignored: a genuinely failing test must not cascade lock
+/// failures into every other test in the file.
+fn lock_policy() -> std::sync::MutexGuard<'static, ()> {
+    POLICY_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn lcg(seed: u64, len: usize) -> Vec<u8> {
     let mut s = seed;
@@ -36,6 +49,8 @@ fn lcg(seed: u64, len: usize) -> Vec<u8> {
     out
 }
 
+/// Callers must hold [`POLICY_LOCK`]: the `limit` it checks against is the
+/// process-wide default ceiling.
 fn assert_too_large<T: std::fmt::Debug>(result: Result<T, EkbloomError>, requested: u64) {
     match result {
         Err(EkbloomError::AllocationTooLarge {
@@ -82,6 +97,7 @@ fn forged_constant_seg_core(n: u64) -> Vec<u8> {
 
 #[test]
 fn forged_u64_max_pack_core_is_refused_before_allocating() {
+    let _policy = lock_policy();
     let core = forged_constant_pack_core(u64::MAX);
     // Sanity: the forged core is accepted and declares `u64::MAX`.
     let ctx = PackContext::from_core(&core).unwrap();
@@ -110,6 +126,7 @@ fn forged_u64_max_pack_core_is_refused_before_allocating() {
 
 #[test]
 fn forged_u64_max_seg_core_is_refused_before_allocating() {
+    let _policy = lock_policy();
     let core = forged_constant_seg_core(u64::MAX);
     let ctx = SegContext::from_core(&core).unwrap();
     assert_eq!(ctx.logical_len(), u64::MAX);
@@ -131,6 +148,7 @@ fn forged_u64_max_seg_core_is_refused_before_allocating() {
 
 #[test]
 fn machine2_and_machine4_whole_object_decodes_are_refused() {
+    let _policy = lock_policy();
     let src = lcg(0x00A0_7001, 300);
 
     let c2 = RANS0.encode(&src).unwrap();
@@ -160,6 +178,7 @@ fn machine2_and_machine4_whole_object_decodes_are_refused() {
 
 #[test]
 fn legitimate_sizes_within_the_cap_still_work() {
+    let _policy = lock_policy();
     let src = lcg(0x00A0_7002, 256);
     let n = src.len() as u64;
 
@@ -201,7 +220,7 @@ fn legitimate_sizes_within_the_cap_still_work() {
 
 #[test]
 fn default_policy_is_one_gib_and_boundary_is_inclusive() {
-    let _lock = POLICY_LOCK.lock().unwrap();
+    let _policy = lock_policy();
     assert_eq!(max_single_allocation(), DEFAULT_MAX_SINGLE_ALLOCATION);
     assert_eq!(DEFAULT_MAX_SINGLE_ALLOCATION, 1 << 30);
 
@@ -218,7 +237,7 @@ fn default_policy_is_one_gib_and_boundary_is_inclusive() {
 
 #[test]
 fn a_lowered_cap_is_enforced_and_restored() {
-    let _lock = POLICY_LOCK.lock().unwrap();
+    let _policy = lock_policy();
     let src = vec![0x5Au8; 2048];
     let core = STORE.encode(&src).unwrap();
 
@@ -246,6 +265,7 @@ fn a_lowered_cap_is_enforced_and_restored() {
 /// checkpoints) reject a forged declared count without allocating.
 #[test]
 fn forged_history_and_checkpoint_counts_are_clean_errors() {
+    let _policy = lock_policy();
     // A history header declaring `u64::MAX` positions with no state bytes.
     let mut history = vec![0u8; 64];
     history[8..16].copy_from_slice(&u64::MAX.to_le_bytes()); // logical_len
