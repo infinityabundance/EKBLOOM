@@ -1,7 +1,7 @@
 # EKBLOOM
 
 EKBLOOM is a **concealed-expansion codec**: a native-Rust implementation of the
-EKBLOOM 0.5 engineering candidate. It presents a logical object through a small
+EKBLOOM 0.6 engineering candidate. It presents a logical object through a small
 visible surface while maintaining a deliberately larger *manifested operational
 body* behind that surface.
 
@@ -15,7 +15,7 @@ preserves exact correctness, accounts for the bytes it actually manifests, and
 converts manifested space into access speed.
 
 This crate is a single Cargo package (`ekbloom`), shipping one library and one
-binary (`ekbloom`), and **`ekbloom` v0.5.0 is published on
+binary (`ekbloom`), and **`ekbloom` v0.6.0 is published on
 [crates.io](https://crates.io/crates/ekbloom)**. The frozen internal contract is
 `docs/DESIGN.md`; the original specification lives in `research/`.
 
@@ -213,7 +213,7 @@ binary (`ekbloom`), and **`ekbloom` v0.5.0 is published on
     machine × segment size × restart `K`/`B` × path `D` × tiles under a byte budget;
     [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) consolidates every honest non-claim
     in one place.
-28. **Trust infrastructure: fuzz, cross-arch determinism and gates (P8).** **17**
+28. **Trust infrastructure: fuzz, cross-arch determinism and gates (P8).** **19**
     libFuzzer targets all PASS; cross-architecture determinism is **identical**
     (x86_64 == arm64, equal output sha256 over 70 lines); and the machine-checked
     gates **G1–G5** are **all PASS** (invertibility, prefix composition, worst-case
@@ -221,6 +221,27 @@ binary (`ekbloom`), and **`ekbloom` v0.5.0 is published on
     SEG trait `decode` is now **linear** (was `O(n²)`: **415 s → 0.5 ms** at
     `n = 2²⁰`) ([`docs/TESTING.md`](docs/TESTING.md), [`docs/GATES.md`](docs/GATES.md),
     P48).
+29. **Q-round: frozen reverse-compat fixtures, a scalar/aarch64 CI matrix, a
+    RocksDB-style skew court, and Loom-checked RCU publication (Q1–Q4).** Twelve
+    **genuine v0.3.0/v0.4.0 `.ekb` fixtures** (written by the old releases' own
+    libraries and pinned by a whole-file BLAKE3) read back byte-exact
+    ([`docs/MIGRATION.md`](docs/MIGRATION.md) §6, P51); the `{x86_64-simd,
+    x86_64-scalar, aarch64}` matrix is **all PASS with identical `physical_bytes`
+    (15,478 B)**, so forcing the scalar fallback and cross-compiling to aarch64
+    change no byte ([`docs/TESTING.md`](docs/TESTING.md) §4, P52); on a skewed
+    100-byte KV `get` workload machine 9 is a genuine **record-granular** store
+    (**81.8 B/get vs `zstd-dict`'s 578.0**, a **4.1× tighter p99.9**) at a **~5.2×
+    larger** footprint ([`docs/ROCKSDB.md`](docs/ROCKSDB.md)); and Loom
+    model-checks the real RCU handle/`OrFs` publication (**3 scenarios, 407
+    schedules**) with **no torn read** ([`docs/HANDLES.md`](docs/HANDLES.md), P54).
+30. **R-round: a one-line dictionary API, fault-atomic publication, and cross-FS
+    determinism (R1–R2).** A trained model is built and used in one line
+    (`Dictionary::train` / `create_with_dict`) with `SECURITY` v2, `OPERATIONS` and
+    `MACHINE_CONTRACT` documented ([`docs/DICTIONARY.md`](docs/DICTIONARY.md), P53);
+    `.ekb`/stream publication is **fault-atomic** — **5,933** injected fault points,
+    **100 %**, **0** torn containers or partially-visible generations (P55); and the
+    same `.ekb`/container is **byte-identical** across **overlayfs / tmpfs /
+    ext2-ext3** (P56), with loopback **xfs/btrfs honestly blocked** (no `mkfs`).
 
 ---
 
@@ -581,7 +602,7 @@ publication and pays submit/completion round-trips. See
 
 ---
 
-## Research phases (v0.4–v0.5): reconstruction, packing, tiles, handles, kernels, court, planner & mmap
+## Research phases (v0.4–v0.6): reconstruction, packing, tiles, handles, kernels, court, planner & mmap
 
 The 0.4 round is organised around a **three-role separation**: *machine semantics*
 (`src/machine.rs`), the *manifestation engine* (exact certified structures), and an
@@ -711,7 +732,7 @@ plain mapping faults in only 125 minor faults), so `MADV_HUGEPAGE` is a **1.00×
 no-op. Invariants: immutable-for-lifetime, rename-then-retain publication, explicit
 `munmap` on drop, and never wired into the untrusted `.ekb` parser.
 
-### Machine-2 blocks, packed checkpoints, and the unified engine (rounds R1–R4)
+### Machine-2 blocks, packed checkpoints, and the unified engine (rounds R1–R4, pre-Q)
 
 The final rounds fold four long-standing gaps into the certified body:
 
@@ -722,11 +743,12 @@ affix parser (`tiles::parse_tile_set_prefix`, including the `tile_shift` guard)
 is shared by the in-memory and file-backed readers, so parsing happens in exactly
 one place. `sh scripts/validate-evidence.sh`
 (`examples/validate_evidence.rs`, dependency-free) validates every
-`evidence/**/*.json`: **46** files `OK` (up from 24; `batch.json` added in L4,
+`evidence/**/*.json`: **53** files `OK` (up from 24; `batch.json` added in L4,
 `window.json`/`orfs.json`/`optimizer.json`/`e2e.json` added in the N-round,
-`decoders.json` in the O-round, and `stream`/`corruption`/`dictionary`/`corpora`/
+`decoders.json` in the O-round, `stream`/`corruption`/`dictionary`/`corpora`/
 `counters`/`concurrency`/`bound`/`aarch64-determinism` plus the gates `G1`–`G5` in
-the P-round).
+the P-round, and `rocksdb-skew.json`/`faults.json`/`crossfs.json` plus the
+`ci-matrix`/`ci-*` per-job files in the Q/R rounds).
 - **R2 — machine-2 prepared decode context, encode-first budgets, bounded cold
 reconstruction, cache single-flight.** A validated `RansContext` (frequencies,
 prefix sums, 4096-entry slot table) is built **once** per bulk decode instead of
@@ -959,9 +981,9 @@ by P34–P40 in [`docs/PROOFS.md`](docs/PROOFS.md), and independently reviewed
 - **N8 — resource policy + fuzzing.** `src/resource.rs` bounds every whole-object
   allocation driven by a declared/core-derived length at **1 GiB** by default
   `AllocationTooLarge`). The bounded file-backed paths are unaffected. The campaign
-  now runs **17** libFuzzer targets (`+fuzz_pack`, `fuzz_seg`, `fuzz_resource` in
+  now runs **19** libFuzzer targets (`+fuzz_pack`, `fuzz_seg`, `fuzz_resource` in
   this round; `fuzz_rans_w`/`fuzz_rans_il` in the O-round; `fuzz_roundtrip`/`fuzz_stream`
-  in the P-round)
+  in the P-round; `fuzz_open_auth`/`fuzz_dictionary` in the Q/R rounds)
   ([`docs/SECURITY.md`](docs/SECURITY.md)).
 
 ### O-round: decoder court, uniform-footprint gate, OrFS compaction, review fixes (O1–O3)
@@ -1005,8 +1027,8 @@ verdict **TWO DEFECTS, BOTH FIXED**, in
   cursor in machines 7/8 and the SIMD kernel — a read path for machine 7) and
   **Finding J**; the same hardening was applied to **14** unchecked `cursor + N`
   sites across machines 1–4, so no read path panics on a crafted cursor. The campaign
-  runs **seventeen** fuzz targets, `container-reproduce.sh` passes **766/0** with **46**
-  evidence JSON `OK`, and the verify gate is green at **780 passed**.
+  runs **19** fuzz targets, `container-reproduce.sh` passes **792/0** with **53**
+  evidence JSON `OK`, and the verify gate is green at **806 passed**.
 
 ### P-round: versioning, streaming, corruption, safety, dictionaries, corpora, machines & gates (P1–P8)
 
@@ -1070,14 +1092,85 @@ complete resumable state, decode, size table, wins/loses); `ekbloom::choose_plan
 select machine × region/segment size × restart `K`/`B` × path `D` × tiles under a byte
 budget; [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) collects every honest non-claim
 with a pointer to its evidence.
-- **P8 — fuzz, cross-architecture determinism and machine-checked gates.** **17**
-libFuzzer targets all PASS (`+fuzz_roundtrip`, `fuzz_stream` in this round);
+- **P8 — fuzz, cross-architecture determinism and machine-checked gates.** **19**
+libFuzzer targets all PASS (`+fuzz_roundtrip`, `fuzz_stream` in this round;
 cross-architecture determinism is **identical** (`evidence/bench/aarch64-determinism.json`:
 `identical: true`, equal output sha256 over 70 lines, x86_64 vs arm64/QEMU); and gates
 **G1–G5** are **all PASS** (`gates/G1.json`–`G5.json`). The machine-6 trait `decode` was
 fixed from `O(n²)` to **linear** (**415 s → 0.5 ms** at `n = 2²⁰`; `Seg::decode`/`state_log`
 byte-equal the per-symbol reference) ([`docs/TESTING.md`](docs/TESTING.md),
 [`docs/GATES.md`](docs/GATES.md), P48).
+
+### Q-round: frozen reverse-compat fixtures, scalar/aarch64 CI matrix, RocksDB skew, Loom RCU (Q1–Q4)
+
+The Q-round hardens the trust surface: it pins the reverse-compatibility claim with
+**genuine old-version fixtures**, makes the **scalar fallback and aarch64** an
+explicit CI matrix, answers the **key/value-engine** question directly, and
+extends Loom to the RCU publication path. Every item is measured by a committed
+artifact, covered by **P51–P54** in [`docs/PROOFS.md`](docs/PROOFS.md), and
+reviewed in **Revision 10** ([`docs/reviews/adversarial.md`](docs/reviews/adversarial.md),
+[`docs/reviews/security.md`](docs/reviews/security.md); verdict **NO LIBRARY
+DEFECT FOUND — one test-hardening fix, one honesty observation**).
+
+- **Q1 — frozen compatibility fixtures.** Twelve `.ekb` files (six written by
+  **v0.3.0**, six by **v0.4.0**, byte-identical between the two writers) are checked
+  in under [`tests/fixtures/`](tests/fixtures) and asserted by
+  [`tests/compat_fixtures.rs`](tests/compat_fixtures.rs): the current reader
+  reproduces the genesis header, sampled `byte_at` bytes and `physical_bytes()`
+  **byte-for-byte**, `verify`/`verify_deep` pass, and — new in this round — a
+  **whole-file BLAKE3** (`file_blake3` in `tests/fixtures/expected.json`) is asserted
+  *before* `open`, so any altered byte fails. The fixtures are written by the old
+  releases' own libraries (checked out into worktrees; `scripts/regen-fixtures.sh`),
+  not relabelled current output ([`docs/MIGRATION.md`](docs/MIGRATION.md) §6, P51).
+- **Q2 — cross-platform CI matrix (scalar fallback + aarch64).** `scripts/run-matrix.sh`
+  runs `{x86_64-simd, x86_64-scalar, aarch64}` — the SIMD-vs-scalar equality suite,
+  gates **G1–G5**, and a bounded Silesia/Calgary byte-`at` court, with the aarch64
+  job also running the Miri subset. All three **PASS** and produce an **identical
+  `physical_bytes` of 15,478 B**, the structural proof that forcing the scalar
+  fallback (`EKB_NO_SIMD=1`) and cross-compiling to aarch64 change no byte; the
+  arm64 `byte_at` tail (p99.9 **68,628 ns**, p99.99 **84,507 ns**) is QEMU overhead
+  ([`docs/TESTING.md`](docs/TESTING.md) §4, `ci-matrix.json`, P52).
+- **Q3 — RocksDB-style skewed KV court.** On 100-byte values with an 80/20 key skew,
+  machine 9 is **record-granular** where block codecs are not: a `get` fetches
+  **81.8 B** (0.82× the value) vs `zstd-dict`'s **578.0 B** (5.78×) — **7.1× less
+  I/O** — and its p99.9 **1,192 ns** is **4.1× tighter** than `zstd-dict`'s 4,839 ns,
+  but at a **~5.2× larger** footprint (0.903× vs 0.173× raw), and it loses outright
+  on 4 KiB block reads ([`docs/ROCKSDB.md`](docs/ROCKSDB.md), `rocksdb-skew.json`).
+- **Q4 — Loom model of RCU publication.** `tests/loom_rcu.rs` drives the **real**
+  `ObjectCache`/`OpenObject`/`OrFs`/`append_generation` code (the production `Mutex`
+  compiles against loom's under `--cfg loom`) through **3 scenarios / 407
+  interleavings** (274 publication + 33 single-flight + 100 index-vs-lock-free-read):
+  a reader always observes **one whole committed generation**, never a torn read, and
+  every thread joins (no deadlock). Publication *ordering* stays a filesystem
+  property covered by crash-recovery tests ([`docs/HANDLES.md`](docs/HANDLES.md),
+  [`docs/reviews/concurrency.md`](docs/reviews/concurrency.md), P54).
+
+### R-round: one-line dictionary API, fault atomicity, cross-FS determinism (R1–R2)
+
+The R-round (distinct from the earlier pre-Q **R1–R4** blocks/engine rounds) adds
+the production-facing dictionary entry points, proves publication atomicity under
+injected I/O faults, and checks filesystem independence. Covered by **P53, P55,
+P56** in [`docs/PROOFS.md`](docs/PROOFS.md) and **Revision 10**.
+
+- **R1 — one-line dictionary API + operator docs.** `Dictionary::train(&records)`
+  and `create_with_dict(&source, &dict, profile)` build and use a shared trained
+  order-0 model in one line; `docs/SECURITY.md` was revised to **v2** (per-section
+  coverage, the inert-padding proof, key management/rotation, the honest
+  non-coverage), and `docs/OPERATIONS.md` (metrics, recovery runbook, `choose_plan`)
+  and `docs/MACHINE_CONTRACT.md` (the machine-10 contributor contract) were added
+  ([`docs/DICTIONARY.md`](docs/DICTIONARY.md), [`docs/OPERATIONS.md`](docs/OPERATIONS.md),
+  [`docs/MACHINE_CONTRACT.md`](docs/MACHINE_CONTRACT.md), P53).
+- **R2 — fault-atomic publication + committed fuzz corpus + cross-FS determinism.**
+  `tests/faults.rs` injects `WriteZero`/`ENOSPC`/`EIO` after every accepted byte and
+  the exact truncation crash image at the publish fsync/rename boundaries: **5,933
+  fault points, 100 %** pass, **0** torn containers readable, the previous committed
+  generation byte-intact every time, `recover`/`truncate_to_valid` clean
+  ([`docs/OPERATIONS.md`](docs/OPERATIONS.md) §6, `faults.json`, P55). The curated
+  `evidence/fuzz/` corpus stays committed across **19** targets, and the same
+  `.ekb`/stream container is **byte-identical** across **overlayfs / tmpfs /
+  ext2-ext3** (loopback **xfs/btrfs** honestly blocked), with x86_64-vs-aarch64
+  covered separately by Q2 ([`docs/TESTING.md`](docs/TESTING.md) §9, `crossfs.json`,
+  P56).
 
 ---
 
@@ -1100,10 +1193,13 @@ The AVX2 gather (`simd::gather_bytes`) was likewise **~5–7% slower** than the
 scalar loop in independent runs and remains unwired; the certified hot path is a
 straight-line `memcpy`-lowered copy plus a scalar random-1b loop.
 
-**Loom** (`sh scripts/container-loom.sh`) exhaustively model-checks the crate's one
-genuine shared-mutable structure (`OrFs`'s index mutex): 330 schedules at
-preemptions = 2, 1,416 at preemptions = 3, all pass. Publication ordering is a
-filesystem property covered by crash-recovery tests, not Loom
+**Loom** (`sh scripts/container-loom.sh`) exhaustively model-checks the crate's
+genuine shared-mutable structures — the `OrFs` index mutex (`tests/loom.rs`) and,
+since the Q-round, the RCU handle/`OrFs` publication path (`tests/loom_rcu.rs`):
+330 schedules at preemptions = 2 and 1,416 at preemptions = 3 for the index model,
+plus **3 RCU scenarios / 407 interleavings** (274 publication + 33 single-flight +
+100 index-vs-lock-free-read), all pass with **no torn read**. Publication ordering
+is a filesystem property covered by crash-recovery tests, not Loom
 ([`docs/reviews/concurrency.md`](docs/reviews/concurrency.md)).
 
 ---
@@ -1159,13 +1255,22 @@ sh scripts/run-window.sh            # evidence/bench/window.json (bounded encode
 sh scripts/run-orfs.sh              # evidence/bench/orfs.json (OrFS single-store real disk bytes)
 sh scripts/run-optimizer.sh         # evidence/bench/optimizer.json (joint budget-aware planner)
 sh scripts/run-e2e.sh               # evidence/bench/e2e.json (end-to-end on real data; uses FUSE when /dev/fuse exists)
-sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (46 files)
+sh scripts/run-stream.sh            # evidence/bench/stream.json (streaming container)
+sh scripts/run-corruption.sh        # evidence/bench/corruption.json (corruption court)
+sh scripts/run-dictionary.sh        # evidence/bench/dictionary.json (machine 9 OrANS-DICT)
+sh scripts/run-corpora.sh           # evidence/bench/corpora.json + concurrency.json (downloads inside the container)
+sh scripts/run-rocksdb-skew.sh      # evidence/bench/rocksdb-skew.json (RocksDB-style skewed KV court)
+sh scripts/run-counters.sh          # evidence/bench/counters.json (hardware counters, CAP_PERFMON)
+sh scripts/run-bound.sh             # evidence/bench/bound.json (worst-case step bound)
+sh scripts/run-faults.sh            # evidence/bench/faults.json (fault injection; 100%)
+sh scripts/run-crossfs.sh           # evidence/bench/crossfs.json (cross-filesystem determinism)
+sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (53 files)
 sh scripts/run-gates.sh             # acceptance gates G1-G5 (docs/GATES.md)
 sh scripts/run-scale.sh             # nightly 2^30 scale build (opt-in: EKB_RUN_SCALE=1)
 sh scripts/run-scalar.sh scalar     # x86_64 with EKB_NO_SIMD=1: equality + gates + bounded court
 sh scripts/run-matrix.sh            # cross-platform CI matrix {x86_64-simd, x86_64-scalar, aarch64} (ci-matrix.json)
 sh scripts/container-aarch64.sh     # cross-arch determinism (x86_64 == arm64, QEMU) + the arm64 CI job
-sh scripts/container-loom.sh        # Loom model checking (tests/loom.rs)
+sh scripts/container-loom.sh        # Loom model checking (tests/loom.rs + tests/loom_rcu.rs)
 sh scripts/container-reproduce.sh   # clean build + tests from scratch
 sh scripts/capture-environment.sh   # write evidence/environment.txt
 ```
@@ -1175,16 +1280,20 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 `fuzz_machine`, `fuzz_open`, `fuzz_bloom`, `fuzz_history_store`, `fuzz_packed`,
 `fuzz_tiles`, `fuzz_blocks`, `fuzz_batch`, `fuzz_rans_i`, `fuzz_region`,
 `fuzz_pack`, `fuzz_seg`, `fuzz_resource`, `fuzz_rans_w`, `fuzz_rans_il`,
-`fuzz_roundtrip`, `fuzz_stream`), `scripts/container-miri.sh` (UB),
+`fuzz_roundtrip`, `fuzz_stream`, `fuzz_open_auth`, `fuzz_dictionary`), `scripts/container-miri.sh` (UB),
 `scripts/container-sanitize.sh` (AddressSanitizer), and `scripts/container-fuse.sh`
 (read-only FUSE mount). See [`docs/TESTING.md`](docs/TESTING.md).
 
 ### Verified tooling
 
-- **Loom** (`sh scripts/container-loom.sh`) exhaustively model-checks `OrFs`'s
-  index mutex: 330 schedules at preemptions = 2, 1,416 at preemptions = 3, all
-  pass; publication ordering is a filesystem property covered by crash-recovery
-  tests ([`docs/reviews/concurrency.md`](docs/reviews/concurrency.md)).
+- **Loom** (`sh scripts/container-loom.sh`) exhaustively model-checks the `OrFs`
+  index mutex and, since the Q-round, the **RCU publication path**
+  (`tests/loom.rs` + `tests/loom_rcu.rs`): 330 schedules at preemptions = 2, 1,416
+  at preemptions = 3 for the index model, and **3 RCU scenarios / 407 interleavings**
+  (274 publication + 33 single-flight + 100 index-vs-lock-free-read), all pass with
+  no torn read; publication ordering is a filesystem property covered by
+  crash-recovery tests
+  ([`docs/reviews/concurrency.md`](docs/reviews/concurrency.md)).
 - **Budgets** never under-estimate and are transactional; 1,419 builds asserted
   `estimate ≥ actual`
   ([`docs/reviews/security.md`](docs/reviews/security.md) rev 2).
@@ -1195,9 +1304,9 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 
 ---
 
-## Limitations — resolved (L1–L4, M1–M5, N1–N8, O1–O3 and P1–P8) and remaining
+## Limitations — resolved (L1–L4, M1–M5, N1–N8, O1–O3, P1–P8 and Q1–Q4/R1–R2) and remaining
 
-### Resolved in rounds L1–L4, M1–M5, N1–N8, O1–O3 and P1–P8
+### Resolved in rounds L1–L4, M1–M5, N1–N8, O1–O3, P1–P8 and Q1–Q4/R1–R2
 
 - **The base representation never expands past raw** (L1). Machine 3
   (`OrANS-Store`) is the verbatim identity (`encode = source`, `V = N`), and the
@@ -1271,6 +1380,25 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
   (`identical: true`) and **G1–G5 all PASS**, including the 1,000,000-position
   worst-case bound with **0** violations ([`docs/GATES.md`](docs/GATES.md),
   [`docs/TESTING.md`](docs/TESTING.md)).
+- **Frozen reverse-compat fixtures, a scalar/aarch64 CI matrix, and Loom-checked RCU
+  publication** (Q1–Q4). Twelve genuine v0.3.0/v0.4.0 `.ekb` fixtures read back
+  byte-exact and are pinned by a **whole-file BLAKE3** (Q1, P51); the
+  `{x86_64-simd, x86_64-scalar, aarch64}` matrix is **all PASS with identical
+  `physical_bytes` (15,478 B)** (Q2, P52); machine 9 is a record-granular skewed-KV
+  store (**81.8 vs 578.0 B/get**, **4.1× tighter p99.9**) at a **~5.2× larger**
+  footprint (Q3, [`docs/ROCKSDB.md`](docs/ROCKSDB.md)); and Loom model-checks the RCU
+  publication path over **3 scenarios / 407 schedules** with **no torn read** (Q4,
+  P54).
+- **A one-line dictionary API, fault-atomic publication, and cross-FS determinism**
+  (R1–R2). `Dictionary::train`/`create_with_dict` build and use a shared model in
+  one line, with `SECURITY` v2 / `OPERATIONS` / `MACHINE_CONTRACT` documented (R1,
+  P53); publication is **fault-atomic** over **5,933** injected fault points
+  (**100 %**, **0** torn) (R2, P55); and the `.ekb`/container is **byte-identical**
+  across **overlayfs / tmpfs / ext2-ext3** (R2, P56). The Q/R review's honesty
+  observation was fixed: `fastpath::cpu_features()` now reports the **effective**
+  (scalar-aware) capability — clearing the SIMD fields and setting `forced_scalar`
+  under `EKB_NO_SIMD=1` — with `hardware_features()` kept for the raw facts, so a
+  scalar-arm evidence artifact no longer misreports AVX2.
 
 ### Remaining (honest)
 
@@ -1397,6 +1525,12 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
   `tests/mmap.rs` and the SAFE review; the shared-dictionary machine is pinned by
   `tests/dictionary.rs`, not Miri ([`docs/SAFETY.md`](docs/SAFETY.md),
   [`docs/ALLOC.md`](docs/ALLOC.md)).
+- **Loopback xfs/btrfs cross-filesystem determinism is untested** (R2). The cross-FS
+  check covers **overlayfs / tmpfs / ext2-ext3**; a loopback xfs/btrfs attempt is
+  **blocked** in this environment (`mkfs.xfs`/`mkfs.btrfs` are not installed and
+  mounting a loop device needs `CAP_SYS_ADMIN`). The blocker is recorded verbatim
+  in `crossfs.json`; x86_64-vs-aarch64 determinism is covered separately (Q2)
+  ([`docs/TESTING.md`](docs/TESTING.md) §9).
 
 ---
 
@@ -1446,6 +1580,9 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 - `evidence/gates/G1.json` … `G5.json` — acceptance gates G1–G5 ([`docs/GATES.md`](docs/GATES.md)).
 - `evidence/bench/aarch64-determinism.json` — x86_64 == arm64 determinism (QEMU).
 - `evidence/bench/ci-matrix.json` — the cross-platform CI matrix (`scripts/run-matrix.sh`): `{x86_64-simd, x86_64-scalar, aarch64}`, each with PASS/FAIL, footprint and `byte_at` p50/p99/p99.9/p99.99, plus per-job `ci-*.json`.
+- `evidence/bench/faults.json` — transactional-publication fault injection: 5,933 fault points, 100 %, 0 torn (R2).
+- `evidence/bench/crossfs.json` — cross-filesystem determinism: the same `.ekb`/container byte-identical across overlayfs / tmpfs / ext2-ext3 (R2).
+- `tests/fixtures/` — 12 frozen v0.3.0/v0.4.0 `.ekb` reverse-compat fixtures + `expected.json` (whole-file BLAKE3) (Q1).
 
 Documentation map:
 
@@ -1454,7 +1591,7 @@ Documentation map:
 | [`docs/INDEX.md`](docs/INDEX.md) | One-page index of all docs and evidence. |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Frozen internal engineering contract. |
 | [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | The 10 hard gates mapped to tests and commands. |
-| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties P1–P50 (machine 1 + machine 2 + the round-3/round-4 modules + the L1–L4 closure + the M1–M5 closure + the N1–N8 closure + the O1–O3 closure + the P1–P8 closure) and honest limitations. |
+| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties P1–P56 (machine 1 + machine 2 + the round-3/round-4 modules + the L1–L4 closure + the M1–M5 closure + the N1–N8 closure + the O1–O3 closure + the P1–P8 closure + the Q1–Q4/R1–R2 closure) and honest limitations. |
 | [`docs/RESULTS.md`](docs/RESULTS.md) | Measured results and the 65,536 research outcome. |
 | [`docs/CODEC.md`](docs/CODEC.md) | Machines 2–8 (`OrANS-RANS0`/`OrANS-Store`/`OrANS-RANS0I`/`OrANS-PACK`/`OrANS-SEG`/`OrANS-RANS0W`/`OrANS-RANS0IL`) codecs + the `auto` policy. |
 | [`docs/BASELINES.md`](docs/BASELINES.md) | Conventional baseline comparison (`RawVec`/`RawFile`/…). |
@@ -1499,10 +1636,10 @@ Documentation map:
 | [`docs/BUDGET-GUIDE.md`](docs/BUDGET-GUIDE.md) | The budget chooser guide (`choose_plan`): budget × workload decision table, how to pick machine / segment / restart `K` / block `B` / path `D` / tiles, and worked examples. |
 | [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) | The consolidated honest non-claims, each with a one-line pointer to its evidence. |
 | [`docs/GATES.md`](docs/GATES.md) | The machine-checked acceptance gates **G1–G5** (invertibility, prefix composition, worst-case bound, corruption detection, physical accounting) and their runner. |
-| [`docs/TESTING.md`](docs/TESTING.md) | The trust-building test infrastructure: fuzz roundtrips, cross-architecture determinism, the nightly scale job, and the gates. |
-| [`docs/reviews/adversarial.md`](docs/reviews/adversarial.md) | Adversarial correctness review (through **Revision 9**, P1–P8: one fuzz-coverage gap fixed, verdict **no library defect found**). |
-| [`docs/reviews/concurrency.md`](docs/reviews/concurrency.md) | Concurrency audit + Loom model checking. |
+| [`docs/TESTING.md`](docs/TESTING.md) | The trust-building test infrastructure: fuzz roundtrips (19 targets), cross-architecture determinism, the scalar/aarch64 CI matrix, transactional-publication fault injection, cross-filesystem determinism, the nightly scale job, and the gates. |
+| [`docs/reviews/adversarial.md`](docs/reviews/adversarial.md) | Adversarial correctness review (through **Revision 10**, Q1–Q4/R1–R2: one test-hardening fix, verdict **no library defect found**). |
+| [`docs/reviews/concurrency.md`](docs/reviews/concurrency.md) | Concurrency audit + Loom model checking (the `OrFs` index and the RCU publication path). |
 | [`docs/reviews/mathematics.md`](docs/reviews/mathematics.md) | Independent re-derivation of the proofs. |
 | [`docs/reviews/performance.md`](docs/reviews/performance.md) | Locality & SIMD investigation. |
 | [`docs/reviews/reproducibility.md`](docs/reviews/reproducibility.md) | Independent reproducibility review. |
-| [`docs/reviews/security.md`](docs/reviews/security.md) | Wire-form / `unsafe` security review (three `unsafe` modules), through **Revision 9** (P1–P8: one fuzz-coverage gap fixed, two doc defects reported). |
+| [`docs/reviews/security.md`](docs/reviews/security.md) | Wire-form / `unsafe` security review (three `unsafe` modules), through **Revision 10** (Q1–Q4/R1–R2: one test-hardening fix, one honesty observation reported). |

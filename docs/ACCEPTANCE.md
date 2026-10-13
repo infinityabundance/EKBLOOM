@@ -367,7 +367,7 @@ with `sh scripts/container-fuse.sh` ([`FUSE.md`](FUSE.md)).
 
 Every committed evidence JSON is validated by `sh scripts/validate-evidence.sh`
 (`examples/validate_evidence.rs`, dependency-free, wired into
-`scripts/container-reproduce.sh`); it currently reports **46** files `OK`, and a
+`scripts/container-reproduce.sh`); it currently reports **53** files `OK`, and a
 malformed file fails the reproduction non-zero rather than publishing silently.
 The R4 verifier fix (`src/verify.rs::check_regional` re-derives the regional
 successor cursor and uses a checked `start + len`) is exercised by
@@ -419,7 +419,7 @@ both fixed).
 | **N5** | OrFS one authoritative store + pointer views | authoritative payload stored **exactly once**; real on-disk excess **+1.89 % / +0.70 %** over the in-memory engine; genuine `ReadMode::Machine` decode **382×** the dispatch | `orfs.json`, [`ORFS.md`](ORFS.md), P38 |
 | **N6** | physical-budget-aware joint planner | held-out p99 **10.07 µs** vs greedy **13.58 µs** (budget `N`); **9.84** vs **13.19 µs** (`1.5·N`); `all_certified`, cap-rechecked, additive `grow_into` | `optimizer.json`, [`OPTIMIZER.md`](OPTIMIZER.md), P39 |
 | **N7** | end-to-end real-data verdict | `beats_raw_store = true` on all three corpora (0.74×/0.98×/0.78× raw; hot 4 KiB 120–130 ns vs raw 160–170 ns; non-evicting); `holds_vs_pinned = false` (behind pinned LZ4/Zstd, and behind raw/LZ4 cold + sequential) | `e2e.json`, [`E2E.md`](E2E.md) |
-| **N8** | resource policy + fuzzing | every whole-object allocation driven by a declared/core-derived length bounded at **1 GiB** (`AllocationTooLarge`); **17** libFuzzer targets (three added in N8, two in O3, two in the P-round) | [`SECURITY.md`](SECURITY.md), `src/resource.rs`, P40 |
+| **N8** | resource policy + fuzzing | every whole-object allocation driven by a declared/core-derived length bounded at **1 GiB** (`AllocationTooLarge`); **19** libFuzzer targets (three added in N8, two in O3, two in the P-round, two in R2) | [`SECURITY.md`](SECURITY.md), `src/resource.rs`, P40 |
 
 **Honest reading.** The N-round adds real capabilities and bounded resource use —
 identity-bound plans, bounded windows, two directly-addressable machines, a
@@ -470,8 +470,11 @@ performance, reproducibility, security), plus the N-round docs
 [`MACHINES.md`](MACHINES.md) (the machine catalogue),
 [`BUDGET-GUIDE.md`](BUDGET-GUIDE.md) (the budget chooser),
 [`LIMITATIONS.md`](LIMITATIONS.md) (the consolidated non-claims),
-[`GATES.md`](GATES.md) (the machine-checked gates) and
-[`TESTING.md`](TESTING.md) (the trust infrastructure).
+[`GATES.md`](GATES.md) (the machine-checked gates),
+[`TESTING.md`](TESTING.md) (the trust infrastructure),
+[`ROCKSDB.md`](ROCKSDB.md) (the RocksDB-style skewed KV court),
+[`OPERATIONS.md`](OPERATIONS.md) (the production runbook) and
+[`MACHINE_CONTRACT.md`](MACHINE_CONTRACT.md) (the machine-10 contributor contract).
 
 ### Limitations closure — rounds O1–O3
 
@@ -486,7 +489,7 @@ the optimiser tight-budget base defect (**J**) and the `cursor + N` overflow
 |---|---|---|---|
 | **O1** | the **decoder court** — word16 (machine 7), independent lanes (machine 8), an AVX2 rANS kernel | all **REJECTED**: machine 7 ≈**6 %** over machine 2 but ≈**37 %** under `K = 8`; machine 8 **+30 %**; kernel **+25–27 %**. Best stays **machine 4 `K = 8`** (cold 4 KiB p50 **8,997 ns**, 45-byte restart), **3.2× smaller** than LZ4 but ≈4.3× slower cold; every variant byte-exact, machines 1–6 wire-hash pinned | `decoders.json`, [`DECODERS.md`](DECODERS.md), P41, P42 |
 | **O2** | uniform-footprint gate + OrFS compaction | uniform plan `committed_bytes == raw_bytes == 4,194,304`, no p99 regression (130.9 == 130.9 ns), sequential raw-like (**69.6 GB/s**); OrFS on-disk excess **+1.89 %/+0.70 % → +1.54 %/+0.58 %** (payload stored once) | `optimizer.json`, `orfs.json`, [`OPTIMIZER.md`](OPTIMIZER.md), [`ORFS.md`](ORFS.md), P43, P44 |
-| **O3** | review fixes + cursor hardening | Finding **I** (cursor overflow, machines 7/8 + SIMD kernel) and Finding **J** (gate aborted when only the base fit) fixed; **14** unchecked `cursor + N` sites hardened to `saturating_add` across machines 1–4; **17** fuzz targets, **766/0** release, **46** JSON, verify green at **780** | `tests/adversarial_o.rs`, [`reviews/security.md`](reviews/security.md) Revision 8 |
+| **O3** | review fixes + cursor hardening | Finding **I** (cursor overflow, machines 7/8 + SIMD kernel) and Finding **J** (gate aborted when only the base fit) fixed; **14** unchecked `cursor + N` sites hardened to `saturating_add` across machines 1–4; **19** fuzz targets, **792/0** release, **53** JSON, verify green at **806** | `tests/adversarial_o.rs`, [`reviews/security.md`](reviews/security.md) Revision 8 |
 
 **Honest reading.** The decoder court is **complete with all variants rejected**
 (a word16 renorm, independent per-lane streams and a SIMD gather kernel all lose to
@@ -514,7 +517,7 @@ and its properties are **P45–P50** in [`PROOFS.md`](PROOFS.md).
 | **P5** | machine 9 (`OrANS-DICT`) shared trained dictionary | **83.5 B/rec** vs machine 2 **590.0** (raw 100.0); decode 721 vs 1,403 ns; break-even **2 records**; unregistered/tampered id typed `Err` | `dictionary.json`, [`DICTIONARY.md`](DICTIONARY.md), P49 |
 | **P6** | standard corpora + counters + concurrency + worst-case bound | **`E_V` 0.988–0.998** (≤ raw) on Silesia/enwik8/Calgary/text/ELF; **39.14 instr/byte** (8.1 cycles) for 1-byte reads; **1.4e-3 locks/read** for 64 readers; **1,200,000** bound samples, **0** violations | `corpora.json`/`counters.json`/`concurrency.json`/`bound.json`, [`CORPORA.md`](CORPORA.md), P50 |
 | **P7** | machine catalogue + `choose_plan` budget chooser + one limitations list | machines 1–9 specified exactly; `choose_plan` selects machine × segment × restart × path × tiles under a byte budget; every honest non-claim in one place | [`MACHINES.md`](MACHINES.md), [`BUDGET-GUIDE.md`](BUDGET-GUIDE.md), [`LIMITATIONS.md`](LIMITATIONS.md) |
-| **P8** | fuzz + cross-arch determinism + machine-checked gates | **17** libFuzzer targets PASS; x86_64 == arm64 (`identical: true`); gates **G1–G5 all PASS**; machine-6 trait `decode` fixed from `O(n²)` to **linear** (**415 s → 0.5 ms** at `n = 2²⁰`) | [`TESTING.md`](TESTING.md), [`GATES.md`](GATES.md), `aarch64-determinism.json`, P48 |
+| **P8** | fuzz + cross-arch determinism + machine-checked gates | **19** libFuzzer targets PASS; x86_64 == arm64 (`identical: true`); gates **G1–G5 all PASS**; machine-6 trait `decode` fixed from `O(n²)` to **linear** (**415 s → 0.5 ms** at `n = 2²⁰`) | [`TESTING.md`](TESTING.md), [`GATES.md`](GATES.md), `aarch64-determinism.json`, P48 |
 
 **Honest reading.** The P-round adds **no new speed ceiling**. It makes the format
 safe to evolve (typed version refusal, byte-identical cores), bounds streaming memory,
@@ -525,3 +528,30 @@ evidence plus fuzz, cross-architecture determinism and the G1–G5 gates. The en
 verdict of the N/O rounds is unchanged: on real data EKBLOOM wins against raw (space +
 hot latency, non-evicting) and **loses** to the pinned-hot LZ4/Zstd codecs and on the
 cold/sequential axes ([`CORPORA.md`](CORPORA.md), [`E2E.md`](E2E.md)).
+
+### Rounds Q1–Q4 and R1–R2
+
+The Q/R rounds harden the trust surface and add the production-facing dictionary API;
+no stored byte changes. The surface is reviewed in **Revision 10**
+([`reviews/adversarial.md`](reviews/adversarial.md),
+[`reviews/security.md`](reviews/security.md); verdict **NO LIBRARY DEFECT FOUND — one
+test-hardening fix, one honesty observation**), and the properties are **P51–P56** in
+[`PROOFS.md`](PROOFS.md).
+
+| Round | What it folds in | Measured result | Artifact / doc |
+|---|---|---|---|
+| **Q1** | frozen v0.3.0/v0.4.0 reverse-compat fixtures | **12** genuine old-version `.ekb` files read back byte-exact; header, sampled `byte_at`, `physical_bytes()`, `verify`/`verify_deep` reproduced; a **whole-file BLAKE3** is asserted before `open`; tamper refused | [`MIGRATION.md`](MIGRATION.md) §6, `tests/fixtures/`, `tests/compat_fixtures.rs`, P51 |
+| **Q2** | scalar-fallback + aarch64 CI matrix | `{x86_64-simd, x86_64-scalar, aarch64}` all **PASS**, **identical `physical_bytes` 15,478 B**; arm64 p99.9 **68,628 ns** / p99.99 **84,507 ns** (QEMU overhead); equality + G1–G5 + bounded Silesia court + arm64 Miri subset | `ci-matrix.json` (+ `ci-*.json`), [`TESTING.md`](TESTING.md) §4, P52 |
+| **Q3** | RocksDB-style skewed KV court | machine 9 record-granular: **81.8 B/get** vs `zstd-dict` **578.0** (**7.1× less I/O**), p99.9 **1,192 ns** (**4.1× tighter**), at **~5.2×** the footprint (0.903× vs 0.173× N); loses on 4 KiB blocks | `rocksdb-skew.json`, [`ROCKSDB.md`](ROCKSDB.md) |
+| **Q4** | Loom model of RCU publication | `tests/loom_rcu.rs` drives the real `ObjectCache`/`OpenObject`/`OrFs`/`append_generation`: **3 scenarios / 407 interleavings** (274/33/100), **no torn read**, no deadlock | `tests/loom_rcu.rs`, [`HANDLES.md`](HANDLES.md), [`reviews/concurrency.md`](reviews/concurrency.md), P54 |
+| **R1** | one-line dictionary API + operator/security/machine docs | `Dictionary::train`/`create_with_dict` build+use a shared model in one line; machine-9 evidence unchanged (**83.5 vs 590.0 B/rec**); `SECURITY` v2, `OPERATIONS`, `MACHINE_CONTRACT` added | [`DICTIONARY.md`](DICTIONARY.md), [`SECURITY.md`](SECURITY.md), [`OPERATIONS.md`](OPERATIONS.md), [`MACHINE_CONTRACT.md`](MACHINE_CONTRACT.md), P53 |
+| **R2** | fault-atomic publication + committed corpus + cross-FS | **5,933** fault points **100 %** pass, **0** torn, previous generation intact, recovery clean; **19** fuzz targets; same `.ekb`/container **byte-identical** across **overlayfs / tmpfs / ext2-ext3** (xfs/btrfs blocked) | `faults.json`, `crossfs.json`, [`OPERATIONS.md`](OPERATIONS.md) §6–§7, [`TESTING.md`](TESTING.md) §8–§9, P55/P56 |
+
+**Honest reading.** The Q/R rounds add **no** new machine, no wire change and no new
+speed ceiling; they pin reverse-compatibility with genuine old files, make the scalar
+fallback and aarch64 an explicit matrix, answer the key/value-engine question directly
+(a real small-value-read win at a **~5.2×** footprint premium), extend Loom to the RCU
+publication path, add the one-line dictionary API, and prove publication atomicity and
+filesystem independence. Remaining honest boundaries: **xfs/btrfs untested**,
+**no anti-rollback**, the bare-machine dictionary id unbound, cold-vs-LZ4 unchanged and
+the uniform manifested footprint still **1.07× raw** ([`LIMITATIONS.md`](LIMITATIONS.md)).

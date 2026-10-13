@@ -21,7 +21,7 @@ Captured by `scripts/capture-environment.sh` into
 - **toolchain** `rustc 1.99.0 (b940084d7 2026-09-28)`, `cargo 1.99.0`,
   host `x86_64-unknown-linux-gnu`;
 - **host** AMD Ryzen 7 9800X3D, `nproc 16`, kernel `7.2.9-2-cachyos`;
-- **source** `Cargo.lock` sha256 `f1cbc54f…`, git HEAD `2ac1e62…`;
+- **source** `Cargo.lock` sha256 `46b7645c…`, git HEAD `1c1592b…`;
 - **nightly harness image** `rustlang/rust:nightly-bookworm-slim@sha256:2fe113dd…`.
 
 Detected CPU features for the sweep (`evidence/bench/cpu.json`): `sse2`, `avx2`,
@@ -332,7 +332,7 @@ handling, and transparent fallback — not throughput for small single-file writ
 
 ---
 
-## Research phases (v0.4–v0.5 additions)
+## Research phases (v0.4–v0.6 additions)
 
 Seven later artifacts measure the round-3 modules. Each is read from its committed
 `evidence/bench/*.json` and detailed in its own doc; the numbers below are the
@@ -370,7 +370,7 @@ replacement (P17). Their proved/observed properties are P11–P40 in
 [`PROOFS.md`](PROOFS.md); the L1–L4, M1–M5 and N1–N8 closures are the last blocks of
 that set (P24–P40).
 
-### Rounds R1–R4 (`evidence/bench/rans.json`, `blocks.json`, `frontier.json`)
+### Rounds R1–R4 (pre-Q) (`evidence/bench/rans.json`, `blocks.json`, `frontier.json`)
 
 The final round closes four gaps; every number below is read from the named
 artifact.
@@ -380,11 +380,12 @@ artifact.
   machine adapter and stores the **complete successor cursor** for a
   cursor-divergent machine; `tiles::parse_tile_set_prefix` is the single guard
   shared by the in-memory and file-backed readers. `sh scripts/validate-evidence.sh`
-  validates every `evidence/**/*.json` and reports **46** files `OK` (up from 24;
+  validates every `evidence/**/*.json` and reports **53** files `OK` (up from 24;
   `batch.json` added in L4, `window`/`orfs`/`optimizer`/`e2e` added in the N-round,
-  `decoders.json` added in the O-round, and `stream`/`corruption`/`dictionary`/
+  `decoders.json` added in the O-round, `stream`/`corruption`/`dictionary`/
   `corpora`/`counters`/`concurrency`/`bound`/`aarch64-determinism` plus the gates
-  `G1`–`G5` added in the P-round).
+  `G1`–`G5` added in the P-round, and `rocksdb-skew`/`faults`/`crossfs` plus the
+  `ci-matrix`/`ci-*` per-job files added in the Q/R rounds).
 - **R2 — machine-2 prepared context, encode-first budgets, bounded cold
   reconstruction, cache single-flight.** A validated `RansContext` reused for the
   whole decode is **165×** the per-symbol rebuild on skewed data
@@ -541,7 +542,7 @@ and the surface is reviewed in **Revision 7** (`tests/adversarial_r7.rs`, 11 tes
 | N5 OrFS single store | payload stored **exactly once**; real on-disk **+1.54 % (`skewed`) / +0.58 % (`mixed`)** over the in-memory engine (O-round compaction, from +1.89 %/+0.70 %); genuine `ReadMode::Machine` **382×** the dispatch | [`ORFS.md`](ORFS.md) | `orfs.json` |
 | N6 joint optimiser | held-out p99 **10.07 µs vs greedy 13.58 µs** (budget `N`); **9.84 vs 13.19 µs** (`1.5·N`); deterministic; only `all_certified` plans | [`OPTIMIZER.md`](OPTIMIZER.md) | `optimizer.json` |
 | N7 E2E real data | `beats_raw_store = true` on `text`/`elf`/`mixed` (0.74×/0.98×/0.78× raw; hot 4 KiB 120–130 ns vs raw 160–170 ns; non-evicting); `holds_vs_pinned = false` | [`E2E.md`](E2E.md) | `e2e.json` |
-| N8 resource policy | whole-object allocations bounded at **1 GiB** default (`AllocationTooLarge`); **17** fuzz targets (three added in N8, two in O3, two in the P-round); bounded read paths unaffected | [`SECURITY.md`](SECURITY.md) §Resource policy | `src/resource.rs` |
+| N8 resource policy | whole-object allocations bounded at **1 GiB** default (`AllocationTooLarge`); **19** fuzz targets (three added in N8, two in O3, two in the P-round, two in R2); bounded read paths unaffected | [`SECURITY.md`](SECURITY.md) §Resource policy | `src/resource.rs` |
 
 **Honest reading.** The N-round adds bounded resource use and real capabilities
 (identity-bound plans, bounded windows, machines 5/6, a single-store OrFS, a
@@ -593,9 +594,9 @@ on-disk excess over the in-memory engine from **+1.89 % / +0.70 %** to **+1.54 %
   7/8 and the SIMD kernel — a read path for machine 7) and **Finding J** (above),
   **both fixed** (`saturating_add` per site; base built before the guard). The same
   hardening was applied to **14 unchecked `cursor + N` sites across machines 1–4**, so
-  no read path panics on a crafted cursor. `container-fuzz.sh` runs **seventeen**
-  targets; `container-reproduce.sh` passes **766/0** with **46** evidence JSON OK and
-  the verify gate green at **780 passed**.
+  no read path panics on a crafted cursor. `container-fuzz.sh` runs **nineteen**
+  targets; `container-reproduce.sh` passes **792/0** with **53** evidence JSON OK and
+  the verify gate green at **806 passed**.
 
 **Honest reading.** The decoder court is **complete and closed**: no variant (
 word16, independent lanes, SIMD kernel) beat machine 4 `K = 8`, which is the best
@@ -624,7 +625,7 @@ fuzz-coverage gap fixed, two doc defects reported**).
 | **P5** dictionary | machine 9: **83.5 B/rec** vs machine 2 **590.0** (raw 100.0, zstd-dict 65.9); decode 721 vs 1,403 ns; break-even **2 records** | [`DICTIONARY.md`](DICTIONARY.md) | `dictionary.json` |
 | **P6** corpora | **`E_V` 0.988–0.998** (≤ raw) on Silesia/enwik8/Calgary/text/ELF; `byte_at` 1.1–3.3 µs vs zstd 8.6–16.1; **39.14 instr/byte** (8.1 cycles); **1.4e-3 locks/read** for 64 readers; **1,200,000** bound samples, **0** violations | [`CORPORA.md`](CORPORA.md) | `corpora.json`, `counters.json`, `concurrency.json`, `bound.json` |
 | **P7** machines & guide | machines 1–9 specified exactly; `choose_plan` + the budget guide pick machine × segment × restart × path × tiles under a byte budget; one consolidated non-claim list | [`MACHINES.md`](MACHINES.md), [`BUDGET-GUIDE.md`](BUDGET-GUIDE.md), [`LIMITATIONS.md`](LIMITATIONS.md) | `tests/budget_chooser.rs` |
-| **P8** trust infra | **17/17** fuzz targets PASS; **x86_64 == arm64** (`identical: true`, equal sha256); gates **G1–G5 all PASS**; machine-6 trait `decode` fixed from `O(n²)` to **linear** (**415 s → 0.5 ms** at `n = 2²⁰`) | [`TESTING.md`](TESTING.md), [`GATES.md`](GATES.md) | `aarch64-determinism.json`, `gates/G1.json`–`G5.json` |
+| **P8** trust infra | **19/19** fuzz targets PASS; **x86_64 == arm64** (`identical: true`, equal sha256); gates **G1–G5 all PASS**; machine-6 trait `decode` fixed from `O(n²)` to **linear** (**415 s → 0.5 ms** at `n = 2²⁰`) | [`TESTING.md`](TESTING.md), [`GATES.md`](GATES.md) | `aarch64-determinism.json`, `gates/G1.json`–`G5.json` |
 
 **Honest reading.** The P-round adds **no new speed ceiling**. It makes the format safe
 to evolve, bounds streaming memory, proves 100 % + localized corruption detection,
@@ -634,16 +635,110 @@ rounds is unchanged: on real data EKBLOOM wins against raw (space + hot latency,
 non-evicting) and **loses** to the pinned-hot LZ4/Zstd codecs and on the cold/sequential
 axes ([`CORPORA.md`](CORPORA.md), [`E2E.md`](E2E.md)).
 
+### Rounds Q1–Q4 — frozen fixtures, scalar/aarch64 CI, RocksDB skew, Loom RCU
+
+The Q-round hardens the trust surface. Every number below is read from its committed
+artifact; the properties are P51–P54 in [`PROOFS.md`](PROOFS.md) and the surface is
+reviewed in **Revision 10**.
+
+- **Q1 — frozen reverse-compatibility fixtures.** Twelve `.ekb` fixtures written by the
+  **genuine v0.3.0 and v0.4.0** releases (six each, byte-identical between the two
+  writers) are checked in under [`../tests/fixtures/`](../tests/fixtures) and asserted
+  by `tests/compat_fixtures.rs`: the current reader reproduces the header, sampled
+  `byte_at` bytes, `physical_bytes()` and content hash byte-for-byte, `verify`/
+  `verify_deep` pass, and a **whole-file BLAKE3** (`file_blake3`) is asserted before
+  `open`. A tampered core byte and a tampered footer byte are refused
+  ([`MIGRATION.md`](MIGRATION.md) §6).
+- **Q2 — scalar fallback + aarch64 CI matrix.** `ci-matrix.json` (`scripts/run-matrix.sh`):
+
+  | job | status | footprint | p50 | p99.9 | p99.99 |
+  |---|---|---:|---:|---:|---:|
+  | `x86_64-simd` | PASS | 15,478 B | 1,583 ns | 6,292 ns | 14,237 ns |
+  | `x86_64-scalar` (`EKB_NO_SIMD=1`) | PASS | 15,478 B | 1,593 ns | 5,209 ns | 34,434 ns |
+  | `aarch64` (QEMU) | PASS | 15,478 B | 14,507 ns | 68,628 ns | 84,507 ns |
+
+  The footprint is **identical to the byte** across all three jobs, the structural
+  proof that forcing the scalar path and cross-compiling to aarch64 change no result;
+  the arm64 latency is QEMU overhead ([`TESTING.md`](TESTING.md) §4).
+- **Q3 — RocksDB-style skewed KV court** (`rocksdb-skew.json`): 100-byte values, 80/20
+  key skew, `get` + 4 KiB `read_random`.
+
+  | contender | footprint (`F/N`) | `B/get` | get p50 | get p99.9 |
+  |---|---:|---:|---:|---:|
+  | `raw` | 1.000 | 100.0 | 20 ns | 280 ns |
+  | `lz4-block` | 0.282 | 1,170.6 | 761 ns | 2,635 ns |
+  | `zstd-seek` | 0.163 | 664.1 | 2,665 ns | 6,883 ns |
+  | `zstd-dict` | 0.173 | 578.0 | 1,413 ns | 4,839 ns |
+  | **`ekbloom-dict`** (machine 9) | 0.903 | **81.8** | **441 ns** | **1,192 ns** |
+  | **`ekbloom-opt`** | 0.924 | 304.0 | 160 ns | 2,795 ns |
+
+  **Honest verdict.** Machine 9 is a genuine **record-granular** store: **81.8 B/get**
+  vs `zstd-dict`'s **578.0** (**7.1× less I/O**), a **3.2× lower p50** and a **4.1×
+  tighter p99.9** — but that trade costs footprint (**0.903× N** vs **0.173× N**, ~**5.2×
+  larger**) and it **loses** on 4 KiB block reads (`ekbloom-dict` 13.1 µs / 3,426.5 B
+  vs `zstd-dict` 1.9 µs / 565.7 B). [`ROCKSDB.md`](ROCKSDB.md).
+- **Q4 — Loom model of RCU publication.** `tests/loom_rcu.rs` drives the **real**
+  `ObjectCache`/`OpenObject`/`OrFs`/`append_generation` code over **3 scenarios / 407
+  interleavings** (cache-open-vs-publish **274**, single-flight cold misses **33**,
+  index-publish-vs-lock-free-read **100**): every reader observes one whole committed
+  generation (1 or 2), never a torn read, and all threads join. Publication *ordering*
+  remains a filesystem property (crash-recovery tests), not a Loom property
+  ([`HANDLES.md`](HANDLES.md), [`reviews/concurrency.md`](reviews/concurrency.md)).
+
+**Honest reading.** Q1–Q4 add **no** new speed ceiling and no new machine; they
+strengthen the *trust* surface (genuine frozen fixtures, an explicit scalar/aarch64
+matrix, a direct KV-engine answer, RCU model checking) without changing any stored byte.
+The KV court is a genuine small-value-read win with an honest **~5.2× footprint
+premium** and a clear loss on block reads ([`ROCKSDB.md`](ROCKSDB.md)).
+
+### Rounds R1–R2 — dictionary one-line API, fault atomicity, cross-FS determinism
+
+The R-round (distinct from the earlier pre-Q **R1–R4** blocks/engine rounds) adds the
+production dictionary entry points and proves publication atomicity. Properties are
+P53/P55/P56 in [`PROOFS.md`](PROOFS.md); reviewed in **Revision 10**.
+
+- **R1 — one-line dictionary API + operator docs.** `Dictionary::train` /
+  `create_with_dict` build and use a shared trained order-0 model in one line; the
+  machine-9 evidence is unchanged (**83.5 B/rec** vs machine 2's **590.0**, break-even
+  **2 records**, decode **721 vs 1,403 ns**; `dictionary.json`). `SECURITY.md` is
+  revised to **v2** (exact per-section coverage, inert-padding proof, key management,
+  the honest non-coverage), and `OPERATIONS.md` (metrics, recovery runbook, `choose_plan`)
+  and `MACHINE_CONTRACT.md` (the machine-10 contributor contract) are added
+  ([`DICTIONARY.md`](DICTIONARY.md), [`OPERATIONS.md`](OPERATIONS.md),
+  [`MACHINE_CONTRACT.md`](MACHINE_CONTRACT.md)).
+- **R2 — fault-atomic publication + committed fuzz corpus + cross-FS determinism.**
+  `faults.json`: **5,933** injected fault points, **5,933 passed (100 %)** — 5,151
+  stream offsets (2,832 in the `finish` directory/footer phase, **0** torn containers
+  readable), 778 append truncations (previous generation intact 778/778; 774 torn
+  tails recovered clean) and 4 publish fsync/rename boundaries (destination absent or
+  the previous valid version). The `evidence/fuzz/` curated corpus stays committed
+  across **19** targets. `crossfs.json`: the same `.ekb` and stream container are
+  **byte-identical** across **overlayfs / tmpfs / ext2-ext3** (`physical_bytes =
+  65,666`, `identical = true`), with a loopback **xfs/btrfs** attempt **blocked** (no
+  `mkfs`) and the blocker recorded verbatim; x86_64-vs-aarch64 determinism is separate
+  (Q2) ([`OPERATIONS.md`](OPERATIONS.md) §6–§7, [`TESTING.md`](TESTING.md) §8–§9).
+
+**Honest reading.** The R-round adds **no new speed ceiling**. It gives the dictionary
+machine a one-line API and operator/security/machine-contract docs, proves publication
+is atomic under injected I/O faults and filesystem-independent, and keeps the fuzz
+corpus committed. The cross-FS result covers three filesystems; **xfs/btrfs remain
+untested** (blocked in this environment), and the dictionary id stays unbound in the
+bare machine API (integrity ≠ authenticity) — both recorded honestly
+([`LIMITATIONS.md`](LIMITATIONS.md)).
+
 ---
 
 ## Concurrency and `unsafe` (Loom)
 
-`sh scripts/container-loom.sh` exhaustively model-checks the crate's one genuine
-shared-mutable structure (`OrFs`'s index mutex): **330** schedules at
-preemptions = 2 and **1,416** at preemptions = 3, all pass. Publication ordering
-is a filesystem property covered by `tests/crash_recovery.rs`, not Loom. The
-crate's `unsafe` is confined to **three** sanctioned modules (`src/simd.rs`,
-`src/async_io.rs`, `src/mapped.rs`), each independently reviewed SAFE. See
+`sh scripts/container-loom.sh` exhaustively model-checks the crate's genuine
+shared-mutable structures: the `OrFs` index mutex (`tests/loom.rs`: **330** schedules
+at preemptions = 2 and **1,416** at preemptions = 3) and, since the Q-round, the
+**RCU publication path** (`tests/loom_rcu.rs`: **3 scenarios / 407 interleavings** —
+cache-open-vs-publish 274, single-flight cold misses 33, index-publish-vs-lock-free-read
+100), all pass with **no torn read**. Publication *ordering* is a filesystem property
+covered by `tests/crash_recovery.rs`, not Loom. The crate's `unsafe` is confined to
+**three** sanctioned modules (`src/simd.rs`, `src/async_io.rs`, `src/mapped.rs`), each
+independently reviewed SAFE. See
 [`docs/reviews/concurrency.md`](reviews/concurrency.md) and
 [`docs/reviews/security.md`](reviews/security.md).
 
@@ -834,9 +929,18 @@ sh scripts/run-batch.sh              # batch.json (batched reconstruction + GPU 
 sh scripts/run-window.sh             # window.json (bounded encoded-window reads, machines 2/4)
 sh scripts/run-orfs.sh               # orfs.json (OrFS single authoritative store)
 sh scripts/run-optimizer.sh          # optimizer.json (joint budget-aware planner)
-sh scripts/run-e2e.sh                # e2e.json (end-to-end real-data proof)
-sh scripts/validate-evidence.sh      # validate every evidence/**/*.json (46 files)
-sh scripts/container-loom.sh         # Loom model checking
-sh scripts/container-bench.sh        # Divan microbenchmarks (benches/ekbloom.rs)
-sh scripts/capture-environment.sh    # refresh evidence/environment.txt
+sh scripts/run-e2e.sh               # e2e.json (end-to-end real-data proof)
+sh scripts/run-stream.sh            # stream.json (streaming container)
+sh scripts/run-corruption.sh        # corruption.json (corruption court)
+sh scripts/run-dictionary.sh        # dictionary.json (machine 9 OrANS-DICT; R1)
+sh scripts/run-corpora.sh           # corpora.json + concurrency.json (standard corpora; downloads inside the container)
+sh scripts/run-rocksdb-skew.sh      # rocksdb-skew.json (RocksDB-style skewed KV court; Q3)
+sh scripts/run-counters.sh          # counters.json (hardware counters, CAP_PERFMON)
+sh scripts/run-bound.sh             # bound.json (worst-case step bound, 1,000,000 samples)
+sh scripts/run-faults.sh            # faults.json (transactional-publication fault injection; R2)
+sh scripts/run-crossfs.sh           # crossfs.json (cross-filesystem determinism; R2)
+sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (53 files)
+sh scripts/container-loom.sh        # Loom model checking (tests/loom.rs + tests/loom_rcu.rs)
+sh scripts/container-bench.sh       # Divan microbenchmarks (benches/ekbloom.rs)
+sh scripts/capture-environment.sh   # refresh evidence/environment.txt
 ```

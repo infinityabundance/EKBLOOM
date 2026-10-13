@@ -36,7 +36,7 @@ byte-identical to before.
 
 ## 2. Read/write compatibility matrix
 
-This build is **release 0.5.0 on wire format line 0.3**.
+This build is **release 0.6.0 on wire format line 0.3**.
 
 | artifact | versions this build **READS** | this build **WRITES** |
 |---|---|---|
@@ -129,12 +129,19 @@ writers emit `2`.
 |---|---|---|---|
 | 0.3 | `0.3` | (field absent; reads as `0`) | machines 1–8 (machine 9 arrives in 0.5); checkpoints v2, blocks v1, tiles, segments v1 |
 | 0.5 | `0.3` | `1` written, `{0,1}` read | adds machine 9 (`OrANS-DICT`, the shared-dictionary record machine) and explicit `core_version` (formerly-reserved header bytes), plus typed `UnsupportedCoreVersion` / `UnsupportedManifestVersion` errors; machine cores byte-identical; machine semantics unchanged |
+| 0.6 | `0.3` | `1` written, `{0,1}` read | **no wire change**: a docs/evidence release adding the frozen v0.3.0/v0.4.0 reverse-compat fixtures (§6), the `{x86_64-simd, x86_64-scalar, aarch64}` CI matrix, the RocksDB-style skew court, Loom-checked RCU publication, the one-line dictionary API (`Dictionary::train`/`create_with_dict`), transactional-publication fault injection and cross-filesystem determinism; the `.ekb` wire line stays `0.3` and machine cores remain byte-identical |
 
 The `0.5` change is **backward-compatible on read**: a 0.5 reader opens every 0.3/0.4
 file (`core_version` reads as legacy `0`), and the only byte difference a 0.5 writer
 introduces is the two-byte `core_version` field in the genesis header (plus the
 reserved bytes it no longer needs). The `0.4` release was a documentation/packaging
 release on the same wire line `0.3` (machines 1–8).
+
+The `0.6` release is a **documentation/evidence + API** release on the **same wire
+line `0.3`**: it changes **no stored byte** (the machine cores stay byte-identical and
+a 0.6 writer emits exactly what 0.5 emitted). It pins reverse-compatibility with the
+12 frozen v0.3.0/v0.4.0 fixtures below and adds the Q/R evidence; the frozen-fixture
+rule (§6.4) is unchanged.
 
 ---
 
@@ -159,6 +166,11 @@ expectations the current build must reproduce:
 | `v0.3_empty_root_m1.ekb` | 0.3.0 | empty | 1 | root | 0 | 0 | 0 |
 | `v0.3_one_root_m1.ekb` | 0.3.0 | 1 byte (`0x5A`) | 1 | root | 0 | 1 | 1 |
 | `v0.4_*` (same six) | 0.4.0 | identical sources | identical | identical | 0 | identical | identical |
+
+`tests/fixtures/expected.json` additionally records a **whole-file BLAKE3**
+(`file_blake3`) per fixture, asserted **before** `open` by
+[`tests/compat_fixtures.rs`](../tests/compat_fixtures.rs), so any altered byte (even an
+otherwise-uninterpreted inert byte) fails the compatibility claim.
 
 The 0.3.0 and 0.4.0 artifacts are byte-identical, which is the frozen evidence
 that 0.4.0 was a documentation/packaging release on wire line `0.3`: their

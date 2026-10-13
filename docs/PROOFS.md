@@ -1648,7 +1648,156 @@ cold→hot→cold 256 KiB request (actual 126,960 ≤ claimed 131,070, above the
 
 ---
 
-## Limitations — resolved (L1–L4, M1–M5, N1–N8, O1–O3 and P1–P8) and remaining (honest)
+## P51. Frozen old-version fixtures read back byte-exact — **PROVED** (reader checks) **EMPIRICALLY OBSERVED** (12 genuine v0.3.0/v0.4.0 files)
+
+**Claim.** Every `.ekb` written by the v0.3.0 and v0.4.0 releases is opened by the
+current reader and reproduced **byte-for-byte** — header fields, sampled `byte_at`
+bytes and their BLAKE3, `physical_bytes()`, `logical_len` and `machine_id` — and passes
+`verify`/`verify_deep`; opening never rewrites the artifact, and a tamper is refused.
+This is the *reverse* direction of P45 (current reader, old writer) and is what makes
+the compatibility matrix load-bearing rather than prose.
+
+**Proof.** v0.4.0 was a documentation/packaging release on the same wire line `0.3`,
+and the `core_version` field (P45) was carved from formerly-reserved header bytes, so
+the old writers' `encode` output and the current reader's expectations coincide. The
+fixtures were produced by checking the old releases out into git worktrees and running
+the emitter **against that release's own library** (`scripts/regen-fixtures.sh`), not by
+relabelling current output. `tests/compat_fixtures.rs` asserts the recorded values and a
+**whole-file BLAKE3** (`file_blake3` in `tests/fixtures/expected.json`) **before**
+`open`, so any altered byte — even an otherwise-uninterpreted inert byte — fails, and it
+forbids adding/dropping a fixture. ∎
+
+**Corroboration.** **12** fixtures (6 × v0.3.0, 6 × v0.4.0; the two writer sets are
+byte-identical, the frozen evidence that 0.4.0 changed no byte). `tests/compat_fixtures.rs`
+(3 tests green), [`docs/MIGRATION.md`](MIGRATION.md) §6.
+
+**Tested:** `tests/compat_fixtures.rs`, `tests/fixtures/expected.json`, `scripts/regen-fixtures.sh`.
+
+---
+
+## P52. Forcing the scalar fallback and cross-compiling to aarch64 change no result — **PROVED** (byte-identical fallbacks) **EMPIRICALLY OBSERVED** (identical footprint across the matrix)
+
+**Claim.** `EKB_NO_SIMD=1` (or `EKB_FORCE_SCALAR=1`) makes every SIMD dispatcher take
+its byte-identical scalar fallback, and the whole crate built for `linux/arm64` (which
+has no AVX2) produces the **same** `physical_bytes()` and decoded bytes as native
+`x86_64`. No result depends on the SIMD path being taken.
+
+**Proof.** `src/simd.rs` gates every kernel behind an `*_available()` probe that returns
+`false` under `force_scalar()`, and each kernel's scalar fallback is byte-equal to the
+native result (`tests/simd.rs::forced_scalar_is_byte_identical_to_scalar_reference_for_every_kernel`).
+Every machine step is integer arithmetic (P48), so a scalar-only compile is the same
+pure function of `(source, machine)`. ∎
+
+**Corroboration.** `evidence/bench/ci-matrix.json` (`scripts/run-matrix.sh`): the jobs
+`x86_64-simd`, `x86_64-scalar` and `aarch64` all **PASS** the SIMD-vs-scalar equality
+suite, gates **G1–G5** and the bounded Silesia court, with **identical `physical_bytes`
+of 15,478 B** in all three; the arm64 `byte_at` tail (p99.9 **68,628 ns**, p99.99
+**84,507 ns**) is QEMU emulation overhead. `evidence/bench/aarch64-determinism.json`:
+`identical: true`, equal output sha256 over 70 lines.
+
+**Tested:** `tests/simd.rs`, `tests/gates.rs`, `tests/ci_bench.rs`, `tests/arch_determinism.rs`, `evidence/bench/ci-matrix.json`, `evidence/bench/aarch64-determinism.json`.
+
+---
+
+## P53. A shared dictionary is trained and used in one line, and a record decodes only against its intended dictionary — **PROVED** (id recompute + registry) **EMPIRICALLY OBSERVED** (typed rejects, exact round-trips)
+
+**Claim.** `Dictionary::train(&records)` fits an order-0 model and
+`create_with_dict(&source, &dict, profile)` encodes a record against it in a single
+call; the resulting record decodes only against the dictionary whose content id it
+names, and a wrong/absent/tampered/relabelled id, a bad embedded table, an out-of-range
+state or a length mismatch is a typed `Err`. This is the one-line, production-facing
+form of P49.
+
+**Proof.** The id `blake3("ekbloom.dictionary-id.v1" ++ version ++ freq[256])[0..16]`
+is recomputed on load (P49); an embedded dictionary is checked against the framing
+`dict_id` and a referenced one is resolved from the registry (an unregistered id is a
+typed error); `DictContext::from_core` bounds the declared length with
+`resource::checked_default` before decoding. `snapshot_needs_lanes`/`lane_cursors`
+consult the machine trait, so no site hardcodes a machine id (P49, [`MACHINE_CONTRACT.md`](MACHINE_CONTRACT.md)). ∎
+
+**Corroboration.** `tests/dictionary.rs` (shapes, `train`→`create_with_dict`,
+embedded/referenced round-trips, every typed reject), `tests/adversarial_p.rs`,
+`fuzz_dictionary`. Machine-9 evidence unchanged: **83.5 B/rec** vs machine 2
+**590.0**, break-even **2 records**, decode **721 vs 1,403 ns** (`dictionary.json`).
+
+**Tested:** `src/dictionary.rs`, `src/machine_dict.rs`, `tests/dictionary.rs`, `tests/adversarial_p.rs`, `fuzz/fuzz_targets/fuzz_dictionary.rs`, [`docs/DICTIONARY.md`](DICTIONARY.md).
+
+---
+
+## P54. RCU publication exposes only whole committed generations — **PROVED** (immutable `Arc` swap under the map mutex) **EMPIRICALLY OBSERVED** (3 scenarios / 407 Loom schedules)
+
+**Claim.** A new generation is built as a **new** immutable `OpenObject` and its `Arc` is
+swapped into the cache under the map mutex; a reader holding an `Arc<OpenObject>` keeps
+its whole snapshot, and a fresh `ObjectCache::open` observes either the old or the new
+consistent generation — **never a torn read**. The build is single-flight (one build per
+concurrent cold miss) and the `OrFs` index mutex never blocks a lock-free read of an
+already-open object.
+
+**Proof.** `OpenObject` is immutable after publication; the swap is a single `Arc`
+replacement under the lock, so any reader's `Arc` is an entire committed generation. The
+`OpenObject` holds an open `File` fd, so a concurrent `rename`/append cannot retarget an
+existing snapshot. Loom explores the real types (the production `Mutex` compiles against
+loom's under `--cfg loom`). ∎
+
+**Corroboration.** `tests/loom_rcu.rs`: **3 scenarios / 407 interleavings** — cache-open
+vs new-generation publication **274**, concurrent cold misses single-flight **33**,
+index-publish vs lock-free read **100** — no torn read, no deadlock; `tests/handles.rs`,
+`tests/loom.rs`. Publication *ordering* (append + validated footer, temp + `rename`) is
+a filesystem property and is out of Loom's scope ([`OPERATIONS.md`](OPERATIONS.md) §2).
+
+**Tested:** `tests/loom_rcu.rs`, `tests/loom.rs`, `tests/handles.rs`, `tests/crash_recovery.rs`, [`docs/HANDLES.md`](HANDLES.md), [`docs/reviews/concurrency.md`](reviews/concurrency.md).
+
+---
+
+## P55. `.ekb`/stream publication is fault-atomic — **PROVED** (private temp + validated footer + atomic rename) **EMPIRICALLY OBSERVED** (5,933 fault points, 100 %)
+
+**Claim.** Under an injected write fault (`WriteZero`, `ENOSPC`, `EIO`) at **any** byte
+offset of a stream build (header, payloads, directory, footer) or any append truncation
+or publish fsync/rename boundary, (a) no partially written generation is ever readable,
+(b) the previous committed generation remains intact and reads byte-identical, and (c)
+`recover`/`truncate_to_valid` restore a clean state.
+
+**Proof.** A generation is only visible once its validated footer is present
+(`scan_generations`); `write_body*`/`append_generation*` write a private `*.tmp` and
+touch the destination only by an atomic `rename`, so a failure at any byte leaves the
+destination absent or the old valid version. `StreamBuilder` is generic over
+`std::io::Write`, so the failing writer is injected over **every** byte offset. ∎
+
+**Corroboration.** `evidence/bench/faults.json`: **5,933 fault points, 5,933 passed
+(100 %)** — 5,151 stream offsets (2,832 in the `finish` directory/footer phase, **0**
+torn containers readable), 778 append truncations (previous generation intact 778/778;
+774 torn tails recovered clean), 4 publish boundaries (destination absent or the previous
+valid version). Raw-faults: `tests/faults.rs` ([`OPERATIONS.md`](OPERATIONS.md) §6).
+
+**Tested:** `tests/faults.rs`, `src/writer.rs`, `src/recovery.rs`, `src/stream.rs`, `evidence/bench/faults.json`.
+
+---
+
+## P56. Positional reads and accounting are independent of the backing filesystem — **PROVED** (no FS-specific code path) **EMPIRICALLY OBSERVED** (3 filesystems byte-identical)
+
+**Claim.** The same `.ekb` (root + sparse gen-2) and the same stream container written
+on, and reopened from, any supported filesystem give **identical** file BLAKE3,
+`physical_bytes()`, sampled `byte_at` values and container bytes. No read or accounting
+result depends on the filesystem.
+
+**Proof.** The codec reads bytes through ordinary `pread`/`mmap` with no
+filesystem-conditional logic; `physical_bytes()` is a structural property of the
+serialized body (P30), not of block allocation. With the honest caveat that only
+filesystems present in the environment are exercised. ∎
+
+**Corroboration.** `evidence/bench/crossfs.json`: **3** filesystems — container
+**overlayfs** (`/tmp`), container **tmpfs** (`/dev/shm`) and the **ext4** bind mount
+(`/work/target`; `stat -f` reports the ext family as `ext2/ext3`) — all with
+`physical_bytes = 65,666`, `.ekb` BLAKE3 `5480d5bf…15adb477`, container BLAKE3
+`e9ea4ea5…c7cdbeb6`, `identical = true`. A loopback **xfs/btrfs** attempt is **blocked**
+(no `mkfs`; mounting needs `CAP_SYS_ADMIN`) and recorded verbatim. x86_64-vs-aarch64 is
+separate (P52).
+
+**Tested:** `tests/crossfs.rs`, `scripts/crossfs-inner.sh`, `evidence/bench/crossfs.json`, [`docs/TESTING.md`](TESTING.md) §9.
+
+---
+
+## Limitations — resolved (L1–L4, M1–M5, N1–N8, O1–O3, P1–P8 and Q1–Q4/R1–R2) and remaining (honest)
 
 **Resolved in rounds L1–L4** (P24–P28): the base representation never expands past
 raw (machine 3 + the `auto` policy, P24); the 1-byte fully-resident read is within
@@ -1701,6 +1850,18 @@ B/rec**) (P49); and **cross-architecture determinism** (x86_64 == arm64) and the
 machine-checked gates **G1–G5** hold, including the **1,200,000-sample worst-case
 bound with 0 violations** (P48, P50). The machine-6 trait `decode` was fixed from
 `O(n²)` to linear (**415 s → 0.5 ms** at `n = 2²⁰`, P48).
+
+**Resolved in the Q/R rounds** (P51–P56): reverse-compatibility is pinned by **12
+genuine v0.3.0/v0.4.0 fixtures** with a whole-file BLAKE3 (P51); forcing the scalar
+fallback and cross-compiling to **aarch64** change no byte — the CI matrix reports an
+identical `physical_bytes` of **15,478 B** across `{x86_64-simd, x86_64-scalar, aarch64}`
+(P52); the shared dictionary is built and used **in one line** and a record decodes only
+against its intended id (P53); the **RCU publication path** is Loom-checked over **3
+scenarios / 407 interleavings** with **no torn read** (P54); `.ekb`/stream publication is
+**fault-atomic** over **5,933** injected fault points at **100 %** (P55); and positional
+reads/accounting are **byte-identical** across **overlayfs / tmpfs / ext2-ext3** (P56).
+The Q/R review's honesty observation was fixed: `fastpath::cpu_features()` now reports
+the **effective** (scalar-aware) capability, with `hardware_features()` for the raw facts.
 
 **Remaining (honest):**
 
@@ -1866,3 +2027,16 @@ bound with 0 violations** (P48, P50). The machine-6 trait `decode` was fixed fro
     Miri filter; they are pinned instead by `tests/simd.rs`/`tests/unsafe_review.rs`/
     `tests/mmap.rs`, the SAFE review and `tests/dictionary.rs` (P4; `docs/SAFETY.md`,
     `docs/ALLOC.md`).
+25. **Loopback xfs/btrfs cross-filesystem determinism is untested.** P56 covers three
+    filesystems (**overlayfs**, **tmpfs**, **ext2-ext3**); a loopback xfs/btrfs attempt
+    is **blocked** in this environment (`mkfs.xfs`/`mkfs.btrfs` are not installed and
+    mounting a loop device needs `CAP_SYS_ADMIN` — `EKB_CROSSFS_PRIVILEGED=1`). The
+    blocker is recorded verbatim in `crossfs.json`. x86_64-vs-aarch64 determinism is
+    covered separately (Q2, P52).
+26. **There is no anti-rollback, and cold/sequential still lose.** The keyed-MAC `AUTH`
+    covers bytes, not freshness: a genuinely authenticated **older** file/generation is
+    accepted (P27; `docs/SECURITY.md` §6). The bare-machine dictionary id remains unbound
+    (limitation 23), cold random-access still loses to block-indexed LZ4 (**≈4.3×**,
+    best machine 4 `K = 8` vs bare LZ4) and the uniform manifested footprint stays
+    **1.07× raw** — all unchanged by the Q/R rounds (limitations 5/12/14). Pointer:
+    [`SECURITY.md`](SECURITY.md) §6, [`ROCKSDB.md`](ROCKSDB.md), limitations 5/12/14/23.

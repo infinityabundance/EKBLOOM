@@ -1091,7 +1091,7 @@ override is fuzzed through the public trait. (fuzz-only edit; campaign re-run gr
   ## Revision 10 — Q/R rounds: compat fixtures (Q1), scalar/aarch64 CI (Q2), Loom RCU (Q4), dictionary (R1), faults + cross-FS (R2) (verdict **NO LIBRARY DEFECT FOUND; one test-hardening fix, one honesty observation**)
 
   All tooling ran in the pinned container with every `docker run` memory-capped at
-  4 GiB. Results: `container-verify.sh` **805 passed / 0 failed**, 0 clippy
+  4 GiB. Results: `container-verify.sh` **806 passed / 0 failed**, 0 clippy
   warnings, fmt + safety clean; `container-reproduce.sh` clean `--locked
   --release` build + **53** evidence JSON OK; `container-loom.sh` **6 models** green
   (OrFs index 20/206/12; RCU 274/33/100 interleavings); `run-faults.sh`
@@ -1099,7 +1099,8 @@ override is fuzzed through the public trait. (fuzz-only edit; campaign re-run gr
   `run-matrix.sh` `{x86_64-simd, x86_64-scalar, aarch64}` **PASS** with identical
   footprint **15,478 B** in all three (aarch64 Miri-subset 66 passed);
   `container-fuzz.sh` **19/19** targets; `run-crossfs.sh` **3** filesystems
-  byte-identical.
+  byte-identical. *(Verify was 805 at review time; the follow-up `cpu_features`
+  fix adds one test, giving 806/792 now.)*
 
   ### Finding L (**Low**, test hardening, FIXED) — the fixtures were asserted only by fields + sampled bytes
 
@@ -1121,18 +1122,20 @@ override is fuzzed through the public trait. (fuzz-only edit; campaign re-run gr
   * **R2 faults** — every stream byte offset (incl. 2,832 in `finish`), every append truncation, and the publish fsync/rename boundaries leave no torn generation readable and the previous generation byte-exact. **(held)**
   * **R2 cross-FS** — the FS set is discovered by `stat -f` (**overlayfs**, **tmpfs**, **ext2/ext3**); loopback **xfs/btrfs are honestly blocked** (no `mkfs`, needs `CAP_SYS_ADMIN`). All three are byte-identical. **(held)**
 
-  ### Observation (reported, not changed) — `force_scalar()` is not reflected in `cpu_features()`
+  ### Observation (reported; FIXED in the follow-up commit) — `force_scalar()` is not reflected in `cpu_features()`
 
-  `fastpath::cpu_features()` calls `is_x86_feature_detected!` directly, so under
-  `EKB_NO_SIMD=1` an artifact recording `cpu.avx2` (`baseline.rs`/`sweep.rs`) would
-  report native AVX2 while every decode path is scalar. No committed scalar-arm
-  artifact records `cpu` (`run-scalar.sh` emits none) and it never changes a byte,
-  so this is a documentation/honesty gap, not a correctness defect; folding
-  `force_scalar` into it would misreport the hardware.
+  `fastpath::cpu_features()` originally called `is_x86_feature_detected!` directly, so
+  under `EKB_NO_SIMD=1` an artifact recording `cpu.avx2` (`baseline.rs`/`sweep.rs`) would
+  report native AVX2 while every decode path is scalar. No committed scalar-arm artifact
+  records `cpu` (`run-scalar.sh` emits none) and it never changes a byte, so this was a
+  documentation/honesty gap, not a correctness defect. **Fixed:** `cpu_features()` now
+  reports the **effective** (scalar-aware) capability — clearing `sse2`/`avx2`/`avx512f`
+  and setting `forced_scalar` under forced scalar — while `hardware_features()` carries the
+  raw `is_x86_feature_detected!` facts (`cpu_features_reports_no_simd_under_forced_scalar`).
 
   ### Residual risk (Revision 10)
 
   * The harness injects **truncation-style** crash images; an `fsync` that fails *after a full write* (correct length, possibly partial durability) is unmodellable and is covered instead by the corruption court and `crash_recovery.rs`. A completed-but-unflushed append can leave a wholly valid new generation while the writer returned an error — never torn.
   * `file_blake3` is a manifest value, not embedded in the `.ekb`: a regeneration that also edits `expected.json` still passes, which is a deliberate manifest edit carrying the same trust as the fixtures.
-  * The `cpu_features()` observation above.
+  * The `cpu_features()` observation above (now **fixed** in the follow-up commit).
  

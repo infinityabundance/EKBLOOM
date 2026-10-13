@@ -1,4 +1,4 @@
-# Adversarial review — EKBLOOM 0.5
+# Adversarial review — EKBLOOM 0.6
 
 Independent "try to break correctness" pass over the frozen contract
 (`docs/DESIGN.md`, `docs/PROOFS.md`) and the machine, reader, fast paths,
@@ -787,9 +787,10 @@ now called for machines 1–9. (fuzz-only edit.)
   Independent attacks over the Q/R surface, executable in the committed suites
   (`tests/compat_fixtures.rs`, `tests/simd.rs`, `tests/loom_rcu.rs`,
   `tests/dictionary.rs`, `tests/faults.rs`, `tests/crossfs.rs`) and re-run in the
-  pinned 4 GiB container: verify **805/0**, reproduce clean `--locked` + 53
+  pinned 4 GiB container: verify **806/0**, reproduce clean `--locked` + 53
   evidence JSON, loom 6 models, faults **5,933/5,933**, matrix `{simd,scalar,arm64}`
   PASS (footprint 15,478 B identical), fuzz **19/19**, cross-FS 3 filesystems.
+  *(Verify was 805 at review time; the follow-up `cpu_features` fix adds one test.)*
 
   ### Finding L (**Low**, test coverage, FIXED) — fixtures not pinned by a whole-file digest
 
@@ -816,6 +817,9 @@ now called for machines 1–9. (fuzz-only edit.)
   failure is unmodellable (covered by the corruption court / `crash_recovery.rs`).
   * `file_blake3` lives in the manifest, not inside the `.ekb`; regenerating and
   editing the manifest together still passes (a deliberate, trusted edit).
-  * `fastpath::cpu_features()` ignores `force_scalar()`, so a `cpu`-recording
-  artifact produced under `EKB_NO_SIMD=1` would misreport AVX2 (no committed
-  scalar artifact does; it never changes a byte).
+  * `fastpath::cpu_features()` originally ignored `force_scalar()`, so a `cpu`-recording
+  artifact produced under `EKB_NO_SIMD=1` would misreport AVX2 (no committed scalar
+  artifact does; it never changes a byte). **(Addressed in the follow-up commit:**
+  `cpu_features()` now reports the **effective** (scalar-aware) capability — clearing
+  the SIMD fields and setting `forced_scalar` under forced scalar — with
+  `hardware_features()` kept for the raw facts (`cpu_features_reports_no_simd_under_forced_scalar`).)**

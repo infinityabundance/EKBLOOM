@@ -140,9 +140,41 @@ spent is only worth it where the evidence shows a real win — those boundaries 
     and `tests/dictionary.rs`. Pointer: [`SAFETY.md`](SAFETY.md), [`ALLOC.md`](ALLOC.md),
     P4, limitation 24.
 
+## Q/R-round observations (v0.6)
+
+24. **Loopback xfs/btrfs cross-filesystem determinism is untested.** The cross-FS check
+    (P56) covers three filesystems — container **overlayfs**, container **tmpfs** and the
+    **ext4** bind mount (`stat -f` reports the ext family as `ext2/ext3`) — all
+    byte-identical. A loopback **xfs/btrfs** attempt is **blocked** in this environment
+    (`mkfs.xfs`/`mkfs.btrfs` are not installed and mounting a loop device needs
+    `CAP_SYS_ADMIN`); the blocker is recorded verbatim in `crossfs.json`. x86_64-vs-aarch64
+    determinism is covered separately by the Q2 CI matrix. Pointer:
+    `evidence/bench/crossfs.json`, [`TESTING.md`](TESTING.md) §9, P52/P56, limitation 19.
+25. **The bare-machine dictionary id is not cryptographically bound, and there is no
+    anti-rollback.** A *referenced* machine-9 core relabelled to a different **registered**
+    id is caught only by a manifested body's `core_hash` linkage, not by the bare machine
+    API; and the keyed-MAC `AUTH` covers bytes, not freshness, so a genuinely authenticated
+    **older** file is accepted. Only `AUTH` (fail-closed `--require-auth`) is an
+    authenticity boundary, and it has no anti-replay. Pointer: [`DICTIONARY.md`](DICTIONARY.md),
+    [`SECURITY.md`](SECURITY.md) §6, P49/P53, limitations 13/22.
+26. **`cpu_features()` was reporting a mis-report under forced scalar — fixed.** The Q/R
+    review observed (`docs/reviews/security.md` Revision 10) that `fastpath::cpu_features()`
+    ignored the forced-scalar override, so a scalar-arm artifact could record native AVX2.
+    This was **fixed** in a follow-up commit: `cpu_features()` now reports the **effective**
+    (scalar-aware) capability — the SIMD fields cleared and `forced_scalar` set under
+    `EKB_NO_SIMD=1` — while `hardware_features()` carries the raw facts; no committed
+    artifact records `cpu` under forced scalar, and it never changes a byte.
+27. **The KV win is small-value-read only, and cold/sequential still lose.** On skewed
+    100-byte KV machine 9 wins I/O amplification and tail (**81.8 B/get**, p99.9
+    **1,192 ns**) but at **~5.2×** the footprint of `zstd-dict` and a loss on 4 KiB block
+    reads. The Q/R rounds add **no** new speed ceiling; cold random-access still loses to
+    LZ4 (**≈4.3×**) and the uniform manifested footprint stays **1.07× raw**. Pointer:
+    [`ROCKSDB.md`](ROCKSDB.md), `rocksdb-skew.json`, limitations 5/12/14.
+
 ## See also
 
-[`PROOFS.md`](PROOFS.md) §Limitations (the origin of items 1–23 above),
-[`ACCEPTANCE.md`](ACCEPTANCE.md) (rounds L1–L4, M1–M5, N1–N8, O1–O3, P1–P8),
-[`MACHINES.md`](MACHINES.md) (per-machine wins/loses) and
+[`PROOFS.md`](PROOFS.md) §Limitations (the origin of items 1–27 above),
+[`ACCEPTANCE.md`](ACCEPTANCE.md) (rounds L1–L4, M1–M5, N1–N8, O1–O3, P1–P8, Q1–Q4, R1–R2),
+[`MACHINES.md`](MACHINES.md) (per-machine wins/loses),
+[`ROCKSDB.md`](ROCKSDB.md) (the skewed-KV court) and
 [`BUDGET-GUIDE.md`](BUDGET-GUIDE.md) §4 (when **not** to spend bytes).

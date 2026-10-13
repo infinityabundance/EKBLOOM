@@ -1,4 +1,4 @@
-# EKBLOOM 0.5 — Frozen Engineering Contract
+# EKBLOOM 0.6 — Frozen Engineering Contract
 
 This document is the authoritative internal contract. Every module must conform to it.
 It freezes machine semantics, state log semantics, bloom definitions, the data model,
@@ -266,10 +266,10 @@ ekbloom bench    <file.ekb> --workload <seq|random-1b|rand-4k|range-64k|mixed>
 
 ---
 
-## 9. Addenda (v0.4–v0.5 research)
+## 9. Addenda (v0.4–v0.6 research)
 
 This section is **additive**. It records the modules and interfaces added by the
-0.4–0.5 research rounds. It does **not** change the frozen machine contract in §1, the
+0.4–0.6 research rounds. It does **not** change the frozen machine contract in §1, the
 state-log/history semantics in §2, the bloom definitions in §3, the data model in
 §4 (except that new additive structures may be appended to a body), or the wire
 layout in §5 (except for one new section kind). Where an addendum and the frozen
@@ -351,3 +351,25 @@ docs. The round's proved/observed properties are **P45–P50** in
 [`PROOFS.md`](PROOFS.md); it is reviewed in Revision 9
 ([`docs/reviews/adversarial.md`](reviews/adversarial.md),
 [`docs/reviews/security.md`](reviews/security.md)).
+
+### 9.6 Q/R-round (v0.6) additions
+
+The v0.6 round changes **no stored byte** and no interface semantics: the `.ekb` wire
+line stays `0.3`, machine cores stay byte-identical, and a 0.6 writer emits exactly
+what 0.5 emitted ([`MIGRATION.md`](MIGRATION.md)). It adds **frozen compatibility
+fixtures**, a **one-line dictionary API**, and evidence/CI/Loom/fault/cross-FS trust
+infrastructure:
+
+| Module / interface | Role | Doc |
+|---|---|---|
+| `Dictionary::train` / `create_with_dict` | one-line train-and-use entry points for machine 9 | [`DICTIONARY.md`](DICTIONARY.md) |
+| `tests/fixtures/` + `tests/compat_fixtures.rs` | 12 frozen v0.3.0/v0.4.0 `.ekb` fixtures pinned by a whole-file BLAKE3 | [`MIGRATION.md`](MIGRATION.md) §6 |
+| `tests/loom_rcu.rs` | Loom model of the RCU handle/`OrFs` publication path | [`HANDLES.md`](HANDLES.md), [`reviews/concurrency.md`](reviews/concurrency.md) |
+| `tests/faults.rs` / `tests/crossfs.rs` | fault-atomic publication + cross-filesystem determinism | [`OPERATIONS.md`](OPERATIONS.md) §6–§7 |
+| `scripts/run-matrix.sh` / `scripts/run-scalar.sh` | the `{x86_64-simd, x86_64-scalar, aarch64}` CI matrix | [`TESTING.md`](TESTING.md) §4 |
+| [`OPERATIONS.md`](OPERATIONS.md), [`MACHINE_CONTRACT.md`](MACHINE_CONTRACT.md) | the production runbook and the machine-10 contributor contract | [`OPERATIONS.md`](OPERATIONS.md), [`MACHINE_CONTRACT.md`](MACHINE_CONTRACT.md) |
+
+The round's proved/observed properties are **P51–P56** in [`PROOFS.md`](PROOFS.md);
+it is reviewed in Revision 10 ([`docs/reviews/adversarial.md`](reviews/adversarial.md),
+[`docs/reviews/security.md`](reviews/security.md)) and detailed in
+[`RESULTS.md`](RESULTS.md) and [`ROCKSDB.md`](ROCKSDB.md).

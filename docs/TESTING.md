@@ -37,13 +37,14 @@ Measured on the pinned image (`rust:1.99.0`, `ekbloom-rust:1.99.0`):
 
 | run | tests passed | failed |
 |---|---:|---:|
-| `cargo test --all-features` (debug) | **805** | 0 |
-| `cargo test --release --locked` (reproduce) | **791** | 0 |
+| `cargo test --all-features` (debug) | **806** | 0 |
+| `cargo test --release --locked` (reproduce) | **792** | 0 |
 
 (The release run has fewer tests because it does not enable the optional
 `fuse`/`io-uring` features.) New in this work: `tests/faults.rs` (transactional
 publication under I/O faults), `tests/crossfs.rs` (cross-filesystem determinism),
-and §8/§9 below.
+and §8/§9 below (the counts include the `cpu_features` scalar-reporting test added
+with the Q/R-fold follow-up; the review-time counts were 805/791).
 
 ---
 
@@ -219,15 +220,18 @@ percentiles are run-to-run noisy):
 
 | job | status | footprint (`physical_bytes`, `E_V`) | `byte_at` p50 | p99.9 | p99.99 |
 |---|---|---:|---:|---:|---:|
-| `x86_64-simd` | PASS | 15,478 B, `E_V` 0.756 | 1.58 µs | 3.26 µs | 5.17 µs |
-| `x86_64-scalar` | PASS | 15,478 B, `E_V` 0.756 | 1.58 µs | 3.80 µs | 10.0 µs |
-| `aarch64` | PASS | 15,478 B, `E_V` 0.756 | 14.5 µs | 19.5 µs | 34.6 µs |
+| `x86_64-simd` | PASS | 15,478 B, `E_V` 0.756 | 1,583 ns | 6,292 ns | 14,237 ns |
+| `x86_64-scalar` | PASS | 15,478 B, `E_V` 0.756 | 1,593 ns | 5,209 ns | 34,434 ns |
+| `aarch64` | PASS | 15,478 B, `E_V` 0.756 | 14,507 ns | 68,628 ns | 84,507 ns |
 
 The footprint is **identical to the byte** across all three jobs (over the same
 20,480 bytes of real Silesia/Calgary seed data) — the structural proof that forcing
 the scalar path and cross-compiling to aarch64 do not change a result. The arm64
-`byte_at` p50 is ~9× the x86_64 number, which is QEMU emulation overhead, not the
-code (the `physical_bytes`/hash equality above is the correctness claim).
+`byte_at` p50 is ~**9×** the x86_64 number (and its QEMU tail correspondingly wider),
+which is QEMU emulation overhead, not the code (the `physical_bytes`/hash equality
+above is the correctness claim). The committed per-job artifacts are
+`ci-x86_64-simd.json` / `ci-x86_64-scalar.json` / `ci-aarch64.json` (rolled up in
+`ci-matrix.json`).
 
 **QEMU requirement / best effort.** The `aarch64` job needs `qemu-aarch64` via
 `binfmt_misc`; if it is absent the job is recorded **`SKIPPED`** (not FAIL) and the
