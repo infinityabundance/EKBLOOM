@@ -61,32 +61,67 @@ const PATH_PREFIX_LEN: usize = 2 + 8 + 8;
 
 /// CPU features relevant to choosing a fast path.
 ///
-/// Detection uses the safe `std::is_x86_feature_detected!` macro on x86/x86_64;
-/// on other architectures every field is `false`.
+/// [`cpu_features`] reports the **effective** capability — what the code will
+/// actually run — while [`hardware_features`] records the raw
+/// `std::is_x86_feature_detected!` facts. When the scalar reference path is
+/// forced (see [`crate::simd::force_scalar`]; `EKB_NO_SIMD=1` or
+/// `EKB_FORCE_SCALAR=1`), the three SIMD fields are `false` and
+/// [`CpuFeatures::forced_scalar`] is `true`, so evidence that records
+/// `cpu_features()` is honest about the scalar path. Detection uses the safe
+/// `std::is_x86_feature_detected!` macro on x86/x86_64; on other architectures
+/// every hardware field is `false`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CpuFeatures {
-    /// Streaming SIMD Extensions 2.
+    /// Streaming SIMD Extensions 2 (effective: `false` when scalar is forced).
     pub sse2: bool,
-    /// Advanced Vector Extensions 2.
+    /// Advanced Vector Extensions 2 (effective: `false` when scalar is forced).
     pub avx2: bool,
-    /// AVX-512 Foundation.
+    /// AVX-512 Foundation (effective: `false` when scalar is forced).
     pub avx512f: bool,
+    /// Whether the scalar reference path is forced, making every SIMD field
+    /// above `false` regardless of the host CPU.
+    pub forced_scalar: bool,
 }
 
-/// Detect the CPU features of the current process.
+/// Detect the raw hardware CPU features of the current process.
+///
+/// This reports the bare `std::is_x86_feature_detected!` facts and ignores any
+/// scalar-forcing override, so [`CpuFeatures::forced_scalar`] is always `false`
+/// here. Prefer [`cpu_features`] when the value is recorded as evidence, since
+/// that reflects what will actually run.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub fn cpu_features() -> CpuFeatures {
+pub fn hardware_features() -> CpuFeatures {
     CpuFeatures {
         sse2: std::is_x86_feature_detected!("sse2"),
         avx2: std::is_x86_feature_detected!("avx2"),
         avx512f: std::is_x86_feature_detected!("avx512f"),
+        forced_scalar: false,
     }
 }
 
-/// Detect the CPU features of the current process.
+/// Detect the raw hardware CPU features of the current process.
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-pub fn cpu_features() -> CpuFeatures {
+pub fn hardware_features() -> CpuFeatures {
     CpuFeatures::default()
+}
+
+/// Detect the **effective** CPU features of the current process.
+///
+/// Unlike [`hardware_features`], this reflects what the code will actually run:
+/// when the scalar reference path is forced ([`crate::simd::force_scalar`];
+/// `EKB_NO_SIMD=1` / `EKB_FORCE_SCALAR=1`), the SIMD fields are cleared and
+/// [`CpuFeatures::forced_scalar`] is `true` even on capable hardware. This is
+/// the value recorded in evidence artifacts.
+pub fn cpu_features() -> CpuFeatures {
+    let forced = crate::simd::force_scalar();
+    let mut f = hardware_features();
+    if forced {
+        f.sse2 = false;
+        f.avx2 = false;
+        f.avx512f = false;
+    }
+    f.forced_scalar = forced;
+    f
 }
 
 /// Construct an [`EkbloomError::OutOfBounds`] for a rejected fast-path request.
@@ -643,7 +678,40 @@ mod tests {
     fn cpu_features_is_callable() {
         let f = cpu_features();
         // The values are machine-dependent; the call must simply be safe and total.
-        let _ = (f.sse2, f.avx2, f.avx512f);
+        let _ = (f.sse2, f.avx2, f.avx512f, f.forced_scalar);
+    }
+
+    #[test]
+    fn cpu_features_reports_no_simd_under_forced_scalar() {
+        // Keep the process-wide forced window as short as possible so it barely
+        // overlaps other tests that read the same override.
+        let prev = crate::simd::force_scalar();
+        crate::simd::set_force_scalar(true);
+        let effective = cpu_features();
+        let hw = hardware_features();
+        crate::simd::set_force_scalar(prev);
+
+        // The effective view must be honest: forcing the scalar path means no
+        // SIMD will actually run, whatever the host hardware supports.
+        assert!(effective.forced_scalar);
+        assert!(
+            !effective.sse2,
+            "sse2 must be unavailable under forced scalar"
+        );
+        assert!(
+            !effective.avx2,
+            "avx2 must be unavailable under forced scalar"
+        );
+        assert!(
+            !effective.avx512f,
+            "avx512f must be unavailable under forced scalar"
+        );
+
+        // The raw hardware facts stay independently available and are never
+        // masked by the override.
+        assert!(!hw.forced_scalar);
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        assert_eq!(hw.avx2, std::is_x86_feature_detected!("avx2"));
     }
 
     #[test]
