@@ -1440,6 +1440,7 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 - `evidence/bench/counters.json` — hardware counters: 39.14 instructions/byte, 8.1 cycles for a 1-byte read (P6).
 - `evidence/bench/concurrency.json` — 64 readers vs a publishing writer: 1.4e-3 locks/read, non-spiking tails (P6).
 - `evidence/bench/bound.json` — the worst-case step bound: 1,200,000 samples, **0** violations (P6).
+- `evidence/bench/rocksdb-skew.json` — the **RocksDB-style skewed KV court**: 100-byte values, 80/20 key skew, `get` + 4 KiB `read_random` — footprint, bytes fetched per read (I/O amplification), hot/cold and p50/p99.9, vs raw / block LZ4 / seekable Zstd / Zstd-with-dictionary, plus EKBLOOM's best plan and machine 9.
 - `evidence/counterexamples/` — rejected state-keyed blooms.
 - `evidence/model-search/` — finite-model sufficiency sweep.
 - `evidence/gates/G1.json` … `G5.json` — acceptance gates G1–G5 ([`docs/GATES.md`](docs/GATES.md)).
@@ -1491,6 +1492,7 @@ Documentation map:
 | [`docs/ALLOC.md`](docs/ALLOC.md) | The allocation/panic audit (P4): allocation-free hot path, policy-ceilinged whole-object allocations, the Miri subset. |
 | [`docs/DICTIONARY.md`](docs/DICTIONARY.md) | Machine 9 (`OrANS-DICT`): the shared trained order-0 dictionary for many small records (P5). |
 | [`docs/CORPORA.md`](docs/CORPORA.md) | The standard-corpora court, hardware counters, 64-reader concurrency p99, and the worst-case step bound (P6). |
+| [`docs/ROCKSDB.md`](docs/ROCKSDB.md) | The RocksDB-style skewed KV court: 100-byte values, 80/20 key skew, `get` + 4 KiB `read_random` — footprint, bytes fetched per read (I/O amplification), hot/cold and p50/p99.9 vs raw/LZ4/Zstd/Zstd-dict, and EKBLOOM's best plan + machine 9. |
 | [`docs/MACHINES.md`](docs/MACHINES.md) | The machine catalogue (ids 1–9): exact transition/encoding math, complete resumable state, decode algorithm, size table and wins/loses per machine, plus a relationship map. |
 | [`docs/BUDGET-GUIDE.md`](docs/BUDGET-GUIDE.md) | The budget chooser guide (`choose_plan`): budget × workload decision table, how to pick machine / segment / restart `K` / block `B` / path `D` / tiles, and worked examples. |
 | [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) | The consolidated honest non-claims, each with a one-line pointer to its evidence. |

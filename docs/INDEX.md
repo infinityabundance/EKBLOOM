@@ -49,6 +49,7 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`ALLOC.md`](ALLOC.md) | The **allocation/panic audit** (P4): allocation-free hot path, policy-ceilinged whole-object allocations, and the Miri subset. |
 | [`DICTIONARY.md`](DICTIONARY.md) | **Machine 9** (`OrANS-DICT`): the shared trained order-0 dictionary for many small records (83.5 B/rec vs 590.0; P5). |
 | [`CORPORA.md`](CORPORA.md) | **Standard-corpora court**: EKBLOOM vs LZ4/zstd/pinned-hot/raw on Silesia/enwik8/Calgary/text/ELF at an equal budget, plus hardware counters, 64-reader concurrency p99, and the machine-checked worst-case step bound (1,000,000 samples, zero violations). |
+| [`ROCKSDB.md`](ROCKSDB.md) | **RocksDB-style skewed KV court**: 100-byte values read with an 80/20 key skew (`get` + 4 KiB `read_random`), comparing EKBLOOM (best plan and machine 9 `OrANS-DICT`) vs raw / block LZ4 / seekable Zstd / Zstd-with-dictionary at an equal budget — footprint, bytes fetched per read (I/O amplification), hot/cold and p50/p99.9 latency. |
 | [`MACHINES.md`](MACHINES.md) | **The machine catalogue (ids 1–9)**: name, `machine_id`, `core_version`, exact transition/encoding math, complete resumable state, decode algorithm, size table and wins/loses, plus a relationship map — one section per machine. |
 | [`BUDGET-GUIDE.md`](BUDGET-GUIDE.md) | **The budget chooser guide**: how to pick machine / segment size / restart `K` / block `B` / path `D` / tiles, with a budget × workload decision table, the measured tradeoffs, and worked examples — backed by `choose_plan`. |
 | [`LIMITATIONS.md`](LIMITATIONS.md) | **The consolidated honest non-claims** (compression, latency, integrity/`AUTH`, backends, scope), each with a one-line pointer to its evidence. |
@@ -107,6 +108,7 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`bench/corruption.json`](../evidence/bench/corruption.json) | The **corruption court** (P3): 1024 single-bit flips per structure, **100 %** detected, localized ≤4096 B, typed `Corrupt { section, offset }`. |
 | [`bench/dictionary.json`](../evidence/bench/dictionary.json) | Machine 9 `OrANS-DICT` (P5) vs per-record machine 2: **83.5 vs 590.0 B/rec**, break-even **2 records**. |
 | [`bench/corpora.json`](../evidence/bench/corpora.json) | **Standard-corpora court**: per corpus (Silesia/enwik8/Calgary/text/ELF) at an equal budget — `physical_bytes/N`, `byte_at` and 4 KiB p50/p99, and the real `FileBody` encoded-window counters, vs LZ4/zstd-19/zstd-3/raw/pinned-hot. |
+| [`bench/rocksdb-skew.json`](../evidence/bench/rocksdb-skew.json) | **RocksDB-style skewed KV court**: 100-byte values, 80/20 key skew, `get` + 4 KiB `read_random` — footprint, bytes fetched per read (I/O amplification), hot/cold and p50/p99.9, vs raw / block LZ4 / seekable Zstd / Zstd-with-dictionary, and EKBLOOM's best plan + machine 9. |
 | [`bench/counters.json`](../evidence/bench/counters.json) | **Hardware counters** (`CAP_PERFMON`) for 1-byte and 4 KiB reads: instructions/byte, cycles/read, cache-miss rate, L1 misses/read. |
 | [`bench/concurrency.json`](../evidence/bench/concurrency.json) | **Concurrency p99**: 64 readers vs a publishing writer — p50/p99/p99.9 for byte_at and 4 KiB reads, quiet vs busy, and the shared-lock-per-read ratio. |
 | [`bench/bound.json`](../evidence/bench/bound.json) | **Worst-case bound verification**: 1,000,000 random positions (plus rANS and multi-path passes), `measured_steps ≤ worst_case_steps_for`, **zero** violations. |
@@ -149,9 +151,10 @@ sh scripts/run-stream.sh            # stream.json (streaming container)
 sh scripts/run-corruption.sh        # corruption.json (corruption court)
 sh scripts/run-dictionary.sh        # dictionary.json (machine 9 OrANS-DICT)
 sh scripts/run-corpora.sh           # corpora.json + concurrency.json (standard corpora; downloads inside the container)
+sh scripts/run-rocksdb-skew.sh      # rocksdb-skew.json (RocksDB-style skewed KV court)
 sh scripts/run-counters.sh          # counters.json (hardware counters, CAP_PERFMON)
 sh scripts/run-bound.sh             # bound.json (worst-case step bound, 1,000,000 samples)
-sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (46 files)
+sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (51 files)
 sh scripts/container-fuzz.sh        # all 17 libFuzzer targets (fuzz_machine/open/bloom/history_store/packed/tiles/blocks/batch/rans_i/region/pack/seg/resource/rans_w/rans_il/roundtrip/stream)
 sh scripts/run-gates.sh             # acceptance gates G1-G5 (docs/GATES.md)
 sh scripts/run-scale.sh             # nightly 2^30 scale build (opt-in: EKB_RUN_SCALE=1)

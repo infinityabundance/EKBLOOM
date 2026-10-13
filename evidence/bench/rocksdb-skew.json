@@ -1,0 +1,79 @@
+{
+  "generated_by": "examples/rocksdb_skew.rs (sh scripts/run-rocksdb-skew.sh)",
+  "method": "RocksDB-style skewed KV court: 100-byte values, 80/20 key skew (Zipf-ish, fixed seed), get + block-aligned read_random 4 KiB, at budget = raw size N; bytes_fetched are real (FileBody window counters for EKBLOOM, a counting pread wrapper for the codecs); every read asserted byte-exact",
+  "records": 40000,
+  "value_bytes": 100,
+  "raw_bytes": 4000000,
+  "hot_records": 8000,
+  "hot_read_pct": 80,
+  "hot_read_fraction_measured": 0.7985,
+  "gets": 16384,
+  "reads_4k": 2048,
+  "seed": 6717980921468813313,
+  "budget_bytes": 4000000,
+  "zstd_dict_bytes": 112640,
+  "ekbloom_plan": "machine 4 / region 4096 B / restart K1024 / tile 2^12 / hot 325 region(s) / 3696368 committed B / p99 130.9 ns",
+  "contenders": [
+    {
+      "name": "raw",
+      "class": "baseline",
+      "footprint_bytes": 4000000,
+      "footprint_ratio": 1.0000,
+      "dict_shared_bytes": 0,
+      "note": "positional byte array",
+      "get": {"bytes_fetched_mean": 100.0, "bytes_fetched_max": 100, "syscalls_mean": 0.00, "p50_ns": 20, "p99_ns": 160, "p999_ns": 280, "mean_ns": 30.0, "mib_per_s": 3184.1, "hot": {"p50_ns":20,"p99_ns":120,"bytes_mean":100.0}, "cold": {"p50_ns":30,"p99_ns":231,"bytes_mean":100.0}},
+      "read4k": {"bytes_fetched_mean": 4096.0, "bytes_fetched_max": 4096, "syscalls_mean": 0.00, "p50_ns": 50, "p99_ns": 280, "p999_ns": 341, "mean_ns": 76.6, "mib_per_s": 50970.7, "hot": null, "cold": null}
+    },
+    {
+      "name": "lz4-block",
+      "class": "baseline",
+      "footprint_bytes": 1126400,
+      "footprint_ratio": 0.2816,
+      "dict_shared_bytes": 0,
+      "note": "4 KiB blocks, lz4-block index",
+      "get": {"bytes_fetched_mean": 1170.6, "bytes_fetched_max": 2416, "syscalls_mean": 1.02, "p50_ns": 761, "p99_ns": 1934, "p999_ns": 2635, "mean_ns": 930.9, "mib_per_s": 102.4, "hot": {"p50_ns":741,"p99_ns":1533,"bytes_mean":1171.9}, "cold": {"p50_ns":1242,"p99_ns":2525,"bytes_mean":1165.2}},
+      "read4k": {"bytes_fetched_mean": 1138.2, "bytes_fetched_max": 1238, "syscalls_mean": 1.00, "p50_ns": 871, "p99_ns": 1402, "p999_ns": 1613, "mean_ns": 967.7, "mib_per_s": 4036.5, "hot": null, "cold": null}
+    },
+    {
+      "name": "zstd-seek",
+      "class": "baseline",
+      "footprint_bytes": 651264,
+      "footprint_ratio": 0.1628,
+      "dict_shared_bytes": 0,
+      "note": "4 KiB blocks, zstd-seek index",
+      "get": {"bytes_fetched_mean": 664.1, "bytes_fetched_max": 1373, "syscalls_mean": 1.02, "p50_ns": 2665, "p99_ns": 6061, "p999_ns": 6883, "mean_ns": 2962.8, "mib_per_s": 32.2, "hot": {"p50_ns":2605,"p99_ns":5350,"bytes_mean":663.5}, "cold": {"p50_ns":3376,"p99_ns":6763,"bytes_mean":666.5}},
+      "read4k": {"bytes_fetched_mean": 649.7, "bytes_fetched_max": 696, "syscalls_mean": 1.00, "p50_ns": 3055, "p99_ns": 3556, "p999_ns": 4709, "mean_ns": 3011.0, "mib_per_s": 1297.3, "hot": null, "cold": null}
+    },
+    {
+      "name": "zstd-dict",
+      "class": "baseline",
+      "footprint_bytes": 690176,
+      "footprint_ratio": 0.1725,
+      "dict_shared_bytes": 112640,
+      "note": "4 KiB blocks, zstd-dict index",
+      "get": {"bytes_fetched_mean": 578.0, "bytes_fetched_max": 1226, "syscalls_mean": 1.02, "p50_ns": 1413, "p99_ns": 3827, "p999_ns": 4839, "mean_ns": 1749.4, "mib_per_s": 54.5, "hot": {"p50_ns":1313,"p99_ns":2966,"bytes_mean":574.6}, "cold": {"p50_ns":2364,"p99_ns":4728,"bytes_mean":591.4}},
+      "read4k": {"bytes_fetched_mean": 565.7, "bytes_fetched_max": 628, "syscalls_mean": 1.00, "p50_ns": 1903, "p99_ns": 2585, "p999_ns": 2905, "mean_ns": 1864.3, "mib_per_s": 2095.3, "hot": null, "cold": null}
+    },
+    {
+      "name": "ekbloom-dict",
+      "class": "ekbloom",
+      "footprint_bytes": 3613212,
+      "footprint_ratio": 0.9033,
+      "dict_shared_bytes": 540,
+      "note": "OrANS-DICT machine 9, 540 B dictionary",
+      "get": {"bytes_fetched_mean": 81.8, "bytes_fetched_max": 88, "syscalls_mean": 1.00, "p50_ns": 441, "p99_ns": 731, "p999_ns": 1192, "mean_ns": 477.4, "mib_per_s": 199.8, "hot": {"p50_ns":421,"p99_ns":682,"bytes_mean":81.7}, "cold": {"p50_ns":561,"p99_ns":801,"bytes_mean":82.3}},
+      "read4k": {"bytes_fetched_mean": 3426.5, "bytes_fetched_max": 3493, "syscalls_mean": 1.00, "p50_ns": 13125, "p99_ns": 14367, "p999_ns": 16841, "mean_ns": 12717.8, "mib_per_s": 307.1, "hot": null, "cold": null}
+    },
+    {
+      "name": "ekbloom-opt",
+      "class": "ekbloom",
+      "footprint_bytes": 3696368,
+      "footprint_ratio": 0.9241,
+      "dict_shared_bytes": 0,
+      "note": "machine 4 / region 4096 B / restart K1024 / tile 2^12 / hot 325 region(s) / 3696368 committed B / p99 130.9 ns",
+      "get": {"bytes_fetched_mean": 304.0, "bytes_fetched_max": 2304, "syscalls_mean": 1.18, "p50_ns": 160, "p99_ns": 2484, "p999_ns": 2795, "mean_ns": 430.4, "mib_per_s": 221.6, "hot": {"p50_ns":151,"p99_ns":381,"bytes_mean":100.0}, "cold": {"p50_ns":1493,"p99_ns":2695,"bytes_mean":1112.7}},
+      "read4k": {"bytes_fetched_mean": 4747.8, "bytes_fetched_max": 8256, "syscalls_mean": 1.16, "p50_ns": 290, "p99_ns": 9438, "p999_ns": 10519, "mean_ns": 1674.8, "mib_per_s": 2332.4, "hot": null, "cold": null}
+    }
+  ],
+  "verdict": "On skewed 100-byte KV reads the block-indexed codecs pay a whole 4 KiB block per value: raw fetches 100 B/get, lz4 1171 B/get and zstd-dict 578 B/get, against 82 B/get for EKBLOOM machine 9 (7.1x less I/O than zstd-dict) and 304 B/get for EKBLOOM's best plan (hot tiles). zstd-dict is the smallest store (0.173x raw) and the fastest small-record decoder (1413 ns vs 441 ns get p50); EKBLOOM machine 9 is 0.903x raw, costs 82 B/get (about the value) and has the tightest get tail (1192 ns p99.9 vs 4839 ns). EKBLOOM-opt's hot tiles serve hot gets at 151 ns p50 / 100 B/get and cold gets at 1493 ns p50 / 1113 B/get. Net: on skewed small-value KV, EKBLOOM machine 9 buys a real I/O-amplification and tail tradeoff against the block codecs, but zstd-dict stays smaller and decodes faster - stated plainly."
+}
