@@ -7,11 +7,12 @@
 //! (embedded and referenced); and the machines 1-8 non-regression.
 
 use ekbloom::{
-    create_dictionary, create_machine, frame_dictionary_embedded, frame_dictionary_reference,
-    lookup_dictionary, machine_by_id, read, reader, register_dictionary, train_dictionary,
-    write_body, Dictionary, EkbloomError, ManifestationProfile, OrMachine, ReadRequest, DICT,
-    DICT_BYTES, MACHINE_DICT, MACHINE_NL2, MACHINE_PACK, MACHINE_RANS0, MACHINE_RANS0I,
-    MACHINE_RANS0IL, MACHINE_RANS0W, MACHINE_SEG, MACHINE_STORE,
+    create_dictionary, create_machine, create_with_dict, frame_dictionary_embedded,
+    frame_dictionary_reference, lookup_dictionary, machine_by_id, read, reader,
+    register_dictionary, train_dictionary, write_body, Dictionary, EkbloomError,
+    ManifestationProfile, OrMachine, ReadRequest, DICT, DICT_BYTES, MACHINE_DICT, MACHINE_NL2,
+    MACHINE_PACK, MACHINE_RANS0, MACHINE_RANS0I, MACHINE_RANS0IL, MACHINE_RANS0W, MACHINE_SEG,
+    MACHINE_STORE,
 };
 use std::path::PathBuf;
 
@@ -74,6 +75,46 @@ fn shapes() -> Vec<(&'static str, Vec<u8>)> {
         ("text", text_like(7, 137)),
         ("all_bytes", (0u8..=255).collect()),
     ]
+}
+
+#[test]
+fn ergonomic_train_and_encode_record() {
+    // The one-line ergonomic path: train once, then encode records.
+    let corpus: Vec<Vec<u8>> = (0..64).map(|i| text_like(i, 100)).collect();
+    let refs: Vec<&[u8]> = corpus.iter().map(|r| r.as_slice()).collect();
+    let dict = Dictionary::train(&refs).expect("train");
+    // The alias is exactly the existing trainer.
+    assert_eq!(dict, train_dictionary(&refs).expect("alias"));
+
+    let record = text_like(101, 100);
+
+    // `create_with_dict` is the referenced body in one line (it registers the dict).
+    let body = create_with_dict(&dict, &record).expect("create_with_dict");
+    assert_eq!(body.machine_id, MACHINE_DICT);
+    assert_eq!(body.logical_len, record.len() as u64);
+
+    // `encode_record` returns a complete machine-9 referenced core.
+    let framed = dict.encode_record(&record).expect("encode_record");
+    assert_eq!(
+        DICT.decode(&framed, record.len() as u64).expect("decode"),
+        record
+    );
+
+    // The full path end to end through a `.ekb` file.
+    let dir = temp_dir("ergonomic");
+    let path = dir.join("record.ekb");
+    write_body(&path, &body).expect("write");
+    let opened = reader::open(&path).expect("open");
+    let got = read(
+        &opened,
+        ReadRequest {
+            offset: 0,
+            length: opened.logical_len,
+        },
+    )
+    .expect("read");
+    assert_eq!(got, record);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

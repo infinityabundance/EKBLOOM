@@ -483,6 +483,57 @@ pub fn create_dictionary(
     build_body(core, source.len() as u64, MACHINE_DICT, profile)
 }
 
+/// Build a fresh machine-9 (`OrANS-DICT`) body for one `record` that **references**
+/// a shared trained `dict`, under [`ManifestationProfile::Root`] — the one-line
+/// "use" half of the ergonomic dictionary path.
+///
+/// Equivalent to `create_dictionary(record, ManifestationProfile::Root, dict)`: the
+/// dictionary is registered so the reader can resolve the core's id, and the record
+/// is a compact header-less core. For a single **self-contained** `.ekb` (decodable
+/// by any reader, with no registry), use [`create_embedded_with_dict`].
+///
+/// ```
+/// # fn main() -> ekbloom::Result<()> {
+/// let corpus: [&[u8]; 2] = [b"user=alice", b"user=bob"];
+/// let dict = ekbloom::Dictionary::train(&corpus)?;
+/// let body = ekbloom::create_with_dict(&dict, b"user=carol")?;
+/// assert_eq!(body.machine_id, ekbloom::MACHINE_DICT);
+/// # Ok(())
+/// # }
+/// ```
+pub fn create_with_dict(dict: &Dictionary, record: &[u8]) -> Result<EkbloomBody> {
+    create_dictionary(record, ManifestationProfile::Root, dict)
+}
+
+/// Build a machine-9 (`OrANS-DICT`) body whose core **embeds** `dict`, so a single
+/// `.ekb` is self-contained and decodable by any reader without registering the
+/// dictionary.
+///
+/// This is the file-shaped counterpart of [`create_with_dict`]: [`create_machine`]
+/// with `MACHINE_DICT` trains a dictionary from the record itself, whereas this uses
+/// the *supplied* dictionary. The embedded table is validated against the framing id
+/// by [`Dictionary::from_bytes`] on read, so a tampered table is refused.
+///
+/// ```
+/// use ekbloom::ManifestationProfile;
+/// # fn main() -> ekbloom::Result<()> {
+/// let corpus: [&[u8]; 2] = [b"user=alice", b"user=bob"];
+/// let dict = ekbloom::Dictionary::train(&corpus)?;
+/// let body = ekbloom::create_embedded_with_dict(b"user=carol", ManifestationProfile::Root, &dict)?;
+/// assert_eq!(body.machine_id, ekbloom::MACHINE_DICT);
+/// # Ok(())
+/// # }
+/// ```
+pub fn create_embedded_with_dict(
+    source: &[u8],
+    profile: ManifestationProfile,
+    dict: &Dictionary,
+) -> Result<EkbloomBody> {
+    let record = dict.encode(source)?;
+    let core = crate::machine_dict::frame_embedded(dict, &record);
+    build_body(core, source.len() as u64, MACHINE_DICT, profile)
+}
+
 /// Assemble a body from an already-encoded `core` and apply `profile`.
 ///
 /// `logical_len` is the number of symbols `core` reveals (the manifesting

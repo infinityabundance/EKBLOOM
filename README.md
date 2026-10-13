@@ -1460,7 +1460,9 @@ Documentation map:
 | [`docs/BASELINES.md`](docs/BASELINES.md) | Conventional baseline comparison (`RawVec`/`RawFile`/…). |
 | [`docs/COMPETITIVE.md`](docs/COMPETITIVE.md) | Region-scoped manifestation vs an ordinary LRU cache and raw. |
 | [`docs/ASYNC.md`](docs/ASYNC.md) | The `io_uring` asynchronous publication backend. |
-| [`docs/SECURITY.md`](docs/SECURITY.md) | Opt-in keyed-MAC authenticated mode (`AUTH`). |
+| [`docs/SECURITY.md`](docs/SECURITY.md) | The opt-in keyed-MAC `AUTH` mode (v2): threat-model table, **exact per-section coverage** (which checksum/digest covers each structure, ≤4096 B granularity), the inert-padding proof, where the key `K` lives and how to rotate it, and the honest non-coverage (rollback/anti-replay). |
+| [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Running EKBLOOM in production: the metrics to export (`physical_bytes`, `E_V`, `worst_case_steps_for`, the `ResourcePolicy` breach counter, read p50/p99, `bytes_fetched`), the recovery runbook (`recover`/`truncate_to_valid`/`scan_generations`), expected numbers, `choose_plan`, and the operational limits. |
+| [`docs/MACHINE_CONTRACT.md`](docs/MACHINE_CONTRACT.md) | The contract an external contributor must satisfy to **add machine 10**: required `OrMachine` API + window bound, obligations (byte-exact roundtrip, bounded `check_core`, `estimate >= actual`, a corruption-court entry, a G1/G3 entry, cross-arch determinism, exact accounting), the review bar, and the accept/reject rule. |
 | [`docs/FUSE.md`](docs/FUSE.md) | Read-only FUSE projection of the OrFs namespace. |
 | [`docs/LAYOUT.md`](docs/LAYOUT.md) | Layout & SIMD experiments (§9/§23). |
 | [`docs/ADAPTIVE.md`](docs/ADAPTIVE.md) | Adaptive shells (O7), parallel readers (O8), memory tiers (O9). |

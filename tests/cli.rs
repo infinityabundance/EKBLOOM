@@ -239,6 +239,74 @@ fn bench_reports_in_memory_and_file_backed() {
 }
 
 #[test]
+fn dict_train_and_create_with_dict_roundtrip() {
+    let dir = temp_dir("dict");
+    // A corpus of small, text-like records (one newline-separated line each).
+    let mut corpus = Vec::new();
+    for i in 0..64u32 {
+        corpus.extend_from_slice(format!("id={i}|user=alice|region=us-east-1\n").as_bytes());
+    }
+    let corpus_path = dir.join("corpus.txt");
+    fs::write(&corpus_path, &corpus).unwrap();
+    let dict_path = dir.join("shared.dict");
+
+    // Train the shared dictionary.
+    let out = run(&[
+        "dict",
+        "train",
+        corpus_path.to_str().unwrap(),
+        "-o",
+        dict_path.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "dict train failed: {}", stderr(&out));
+    assert!(dict_path.exists(), "dict train produced no file");
+    assert!(
+        stdout(&out).contains("dictionary_bytes: 540"),
+        "dict output: {}",
+        stdout(&out)
+    );
+
+    // Create a self-contained machine-9 object with `--dict` (embedded).
+    let record = b"id=999|user=alice|region=us-east-1";
+    let input = dir.join("record.bin");
+    fs::write(&input, record).unwrap();
+    let ekb = dir.join("record.ekb");
+    let out = run(&[
+        "create",
+        input.to_str().unwrap(),
+        "-o",
+        ekb.to_str().unwrap(),
+        "--dict",
+        dict_path.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "create --dict failed: {}",
+        stderr(&out)
+    );
+    assert!(
+        stdout(&out).contains("machine: 9"),
+        "create output: {}",
+        stdout(&out)
+    );
+
+    // The embedded dictionary makes the file decodable with no registry.
+    let length = record.len().to_string();
+    let out = run(&[
+        "read",
+        ekb.to_str().unwrap(),
+        "--offset",
+        "0",
+        "--length",
+        length.as_str(),
+    ]);
+    assert!(out.status.success(), "read failed: {}", stderr(&out));
+    assert_eq!(out.stdout, record, "dict roundtrip mismatch");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn missing_file_is_rejected() {
     let dir = temp_dir("missing");
     let missing = dir.join("nope.ekb");

@@ -181,3 +181,46 @@ sh scripts/container-verify.sh          # fmt + clippy(-D warnings) + full suite
 sh scripts/container-test.sh --release --test dictionary -- --nocapture
 sh scripts/run-dictionary.sh            # writes evidence/bench/dictionary.json
 ```
+
+---
+
+## 7. One-line ergonomic API
+
+`Dictionary::train` is a thin alias for [`train_dictionary`](../src/dictionary.rs), and
+`create_with_dict` / `Dictionary::encode_record` are the one-line "use" half — mirroring
+`zstd::dict::from_samples`:
+
+```rust
+// Train a shared dictionary from a corpus (one line), then create records with it.
+let corpus: [&[u8]; 2] = [b"user=alice|region=us-east-1", b"user=bob|region=eu-west-1"];
+let dict = ekbloom::Dictionary::train(&corpus)?;               // or train_dictionary(&corpus)
+let body = ekbloom::create_with_dict(&dict, b"user=carol")?;   // machine-9 body (referenced)
+
+// Per-record core, directly:
+let framed: Vec<u8> = dict.encode_record(b"user=carol")?;      // machine-9 referenced core
+```
+
+* **`Dictionary::train(&[&[u8]]) -> Result<Dictionary>`** — alias of `train_dictionary`
+  (same largest-remainder scaling, same content id).
+* **`create_with_dict(&Dictionary, record) -> Result<EkbloomBody>`** — a machine-9 body
+  under `ManifestationProfile::Root` that **references** the shared dictionary (it
+  registers the dictionary so the reader can resolve the id); exactly
+  `create_dictionary(record, ManifestationProfile::Root, dict)`.
+* **`Dictionary::encode_record(&self, record) -> Result<Vec<u8>>`** — a complete
+  machine-9 **referenced** core (`[dict_id: 16][dict_len = 0]` ++ the header-less record
+  core), decodable via `DICT.decode` (registered as `MACHINE_DICT`). Unlike
+  [`Dictionary::encode`](../src/dictionary.rs) (the bare header-less core), this is the
+  full machine-9 framing.
+* **`create_embedded_with_dict(source, profile, dict) -> Result<EkbloomBody>`** — the
+  **self-contained file** form: it uses the *supplied* dictionary but **embeds** it, so a
+  single `.ekb` is decodable by any reader with no registry. (`create_machine(source,
+  profile, MACHINE_DICT)` trains a fresh dictionary from the record itself instead.)
+
+The **referenced** path is the in-process amortised small-record path (the process-wide
+registry must hold the dictionary); the **embedded** path is the file-shaped one that
+outlives the process. The CLI wires this up: `ekbloom dict train <corpus> -o <dict.bin>`
+then `ekbloom create <record> --dict <dict.bin> -o <out.ekb>` (self-contained, machine 9).
+
+Tests: `tests/dictionary.rs::ergonomic_train_and_encode_record` (train → referenced body
+→ `.ekb` read, byte-exact) and `tests/cli.rs::dict_train_and_create_with_dict_roundtrip`
+(`dict train` + `create --dict` end to end).

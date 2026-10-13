@@ -16,7 +16,7 @@ use ekbloom::bloom_region::certify_regional;
 use ekbloom::manifest;
 use ekbloom::metrics::{now_ns, percentiles};
 use ekbloom::{
-    read_random_1b, read_ranges, read_sequential, Counterexample, EkbloomError,
+    read_random_1b, read_ranges, read_sequential, Counterexample, Dictionary, EkbloomError,
     ManifestationBudget, ManifestationProfile, ManifestationReport, ReadRequest,
     RepresentationPolicy, StreamBuilder, StreamOptions, StreamReader, STREAM_DEFAULT_BLOCK_BYTES,
 };
@@ -27,7 +27,7 @@ const USAGE: &str = "\
 ekbloom — concealed-expansion codec CLI
 
 usage:
-  ekbloom create   <input> -o <out.ekb> [--profile <p>] [--machine auto|1|2|3] [--depth D] [--interval K] [--region-bytes R] [--max-physical-bytes B] [--key-hex H | --key-file F]
+  ekbloom create   <input> -o <out.ekb> [--profile <p>] [--machine auto|1|2|3] [--depth D] [--interval K] [--region-bytes R] [--max-physical-bytes B] [--dict <dict.bin>] [--key-hex H | --key-file F]
   ekbloom manifest <file.ekb> --profile <p> [--depth D] [--interval K] [--region-bytes R] [--max-physical-bytes B] [--key-hex H | --key-file F]
   ekbloom grow     <file.ekb> --profile <p> [--depth D] [--interval K] [--region-bytes R] [--max-physical-bytes B] [--key-hex H | --key-file F]
   ekbloom read     <file.ekb> --offset O --length L [-o <out.bin>] [--key-hex H | --key-file F] [--require-auth]
@@ -38,6 +38,7 @@ usage:
   ekbloom bench    <file.ekb> --workload <seq|random-1b|random-4k|range-64k|mixed|hot-set> [--iterations N]
   ekbloom stream   <in> -o <out.ekb> [--block-bytes B] [--machine auto|packed|segmented|word16|independent]
   ekbloom stream   <file.ekb> --info | --offset O --length L [-o <out.bin>]
+  ekbloom dict     train <corpus> -o <dict.bin>
 
 profiles:
   root, sparse, dense, full, bloom4, bloom8, bloom16, bloom32, regional, path, max-speed
@@ -61,6 +62,9 @@ keys:
   not carry a valid AUTH section: strict authenticity, never a silent downgrade.
 
 notes:
+  --dict <dict.bin> on create trains nothing: it embeds the supplied shared
+  dictionary (machine 9, OrANS-DICT) so the output is self-contained; `dict train`
+  builds one from a corpus whose records are its newline-separated lines.
   --max-physical-bytes B is a hard ceiling on total manifested physical bytes;
   create/manifest/grow reject (nonzero exit) when the chosen profile's build would
   exceed it, leaving the object/file unchanged.
@@ -329,6 +333,7 @@ fn dispatch(argv: &[String]) -> Result<i32, CliError> {
         "recover" => cmd_recover(&parsed),
         "bench" => cmd_bench(&parsed),
         "stream" => cmd_stream(&parsed),
+        "dict" => cmd_dict(&parsed),
         other => Err(CliError::usage(format!(
             "unknown command '{other}' (try --help)"
         ))),
@@ -396,6 +401,29 @@ fn cmd_create(parsed: &Parsed) -> Result<i32, CliError> {
     let max_physical_bytes = parsed.parse_u64("max-physical-bytes")?;
 
     let source = fs::read(input)?;
+    // `--dict <file>` embeds a pre-trained shared dictionary (machine 9,
+    // `OrANS-DICT`): the record is entropy-coded against the supplied model and the
+    // table travels with the core, so the `.ekb` is self-contained and decodable by
+    // any reader with no registry. `--machine` is ignored on this path.
+    if let Some(dict_path) = parsed.option("dict") {
+        let dict = Dictionary::from_bytes(&fs::read(dict_path)?)?;
+        let dict_bytes = dict.physical_bytes();
+        let body = manifest::create_embedded_with_dict(&source, profile, &dict)?;
+        match &key {
+            Some(key) => writer::write_body_authenticated(Path::new(out), &body, key)?,
+            None => writer::write_body(Path::new(out), &body)?,
+        }
+        println!("created {out}");
+        println!("profile: {}", profile.label());
+        println!("machine: {}", body.machine_id);
+        println!("dictionary: embedded ({dict_bytes} bytes)");
+        if key.is_some() {
+            println!("auth: keyed-blake3");
+        }
+        println!("visible_bytes: {}", body.visible_bytes());
+        println!("physical_bytes: {}", body.physical_bytes());
+        return Ok(0);
+    }
     // `--machine auto` (the default) selects the machine from the source: machine 2
     // when order-0 rANS shrinks it, else machine 3 (verbatim), so the base
     // representation never exceeds raw. An explicit id overrides the policy.
@@ -430,6 +458,47 @@ fn cmd_create(parsed: &Parsed) -> Result<i32, CliError> {
     println!("visible_bytes: {}", body.visible_bytes());
     println!("physical_bytes: {}", body.physical_bytes());
     Ok(0)
+}
+
+/// `ekbloom dict train <corpus> -o <dict.bin>`: train a shared machine-9
+/// (`OrANS-DICT`) dictionary from a corpus whose records are newline-separated
+/// lines, and write the 540-byte serialized dictionary.
+fn cmd_dict(parsed: &Parsed) -> Result<i32, CliError> {
+    match parsed.positional(0, "dict subcommand (train)")? {
+        "train" => {
+            let input = parsed.positional(1, "corpus")?;
+            let out = parsed
+                .option("o")
+                .ok_or_else(|| CliError::usage("dict train requires -o <dict.bin>"))?;
+            let data = fs::read(input)?;
+            let mut records: Vec<&[u8]> = data
+                .split(|&b| b == b'\n')
+                .filter(|r| !r.is_empty())
+                .collect();
+            if records.is_empty() {
+                records.push(data.as_slice());
+            }
+            let dict = Dictionary::train(&records)?;
+            fs::write(out, dict.to_bytes())?;
+            println!("trained {out}");
+            println!("records: {}", records.len());
+            println!("dictionary_bytes: {}", dict.physical_bytes());
+            println!("dictionary_id: {}", hex16(&dict.id()));
+            Ok(0)
+        }
+        other => Err(CliError::usage(format!(
+            "unknown dict subcommand '{other}' (expected train)"
+        ))),
+    }
+}
+
+/// Lowercase hex of a 16-byte dictionary id.
+fn hex16(id: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(32);
+    for b in id.iter() {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 fn cmd_manifest(parsed: &Parsed, grow: bool) -> Result<i32, CliError> {

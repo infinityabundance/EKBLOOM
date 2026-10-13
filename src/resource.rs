@@ -52,6 +52,23 @@ impl Default for ResourcePolicy {
 /// Process-wide default ceiling, consulted by [`checked_default`].
 static DEFAULT_LIMIT: AtomicU64 = AtomicU64::new(DEFAULT_MAX_SINGLE_ALLOCATION);
 
+/// Count of allocation requests [`checked_capacity`] has refused since process
+/// start (an operational metric: a nonzero rate means untrusted declarations are
+/// hitting the ceiling).
+static BREACHES: AtomicU64 = AtomicU64::new(0);
+
+/// The number of allocation requests [`checked_capacity`] has refused.
+#[inline]
+pub fn breaches() -> u64 {
+    BREACHES.load(Ordering::Relaxed)
+}
+
+/// Reset the breach counter, returning the previous value.
+#[inline]
+pub fn reset_breaches() -> u64 {
+    BREACHES.swap(0, Ordering::Relaxed)
+}
+
 /// The current process-wide default ceiling, in bytes.
 #[inline]
 pub fn max_single_allocation() -> u64 {
@@ -78,6 +95,7 @@ pub fn default_policy() -> ResourcePolicy {
 #[inline]
 pub fn checked_capacity(requested: u64, policy: ResourcePolicy) -> Result<()> {
     if requested > policy.max_single_allocation {
+        BREACHES.fetch_add(1, Ordering::Relaxed);
         return Err(EkbloomError::AllocationTooLarge {
             requested,
             limit: policy.max_single_allocation,
@@ -132,6 +150,18 @@ mod tests {
             }
             other => panic!("expected AllocationTooLarge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn breach_counter_is_monotone_and_resettable() {
+        // The counter is process-wide, so other (parallel) tests may also increment
+        // it: assert monotone growth, never an exact count.
+        let before = breaches();
+        assert!(checked_capacity(1, ResourcePolicy::new(0)).is_err());
+        assert!(checked_capacity(1, ResourcePolicy::new(0)).is_err());
+        assert!(breaches() >= before + 2, "refusals must be counted");
+        let seen = reset_breaches();
+        assert!(seen >= before + 2, "reset must report the refusals");
     }
 
     #[test]

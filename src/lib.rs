@@ -166,11 +166,12 @@ pub use machine_store::{Store, STORE};
 pub use manifest::{
     create, create_auto, create_auto_independent, create_auto_packed, create_auto_segmented,
     create_auto_with_policy, create_auto_within_budget, create_auto_word16, create_dictionary,
-    create_machine, create_machine_within_budget, create_within_budget, estimate_physical_bytes,
-    estimate_physical_bytes_for_core, grow, inspect, manifest, manifest_within_budget,
-    select_machine, select_machine_independent, select_machine_packed, select_machine_policy,
-    select_machine_segmented, select_machine_word16, select_profile_within_budget, ComponentReport,
-    EkbloomBody, ManifestationReport, RepresentationPolicy,
+    create_embedded_with_dict, create_machine, create_machine_within_budget, create_with_dict,
+    create_within_budget, estimate_physical_bytes, estimate_physical_bytes_for_core, grow, inspect,
+    manifest, manifest_within_budget, select_machine, select_machine_independent,
+    select_machine_packed, select_machine_policy, select_machine_segmented, select_machine_word16,
+    select_profile_within_budget, ComponentReport, EkbloomBody, ManifestationReport,
+    RepresentationPolicy,
 };
 pub use mapped::{thp_anonymous_probe, HugePageReport, MapMode, MappedSurface};
 pub use metrics::{now_ns, percentiles, Percentiles};
@@ -204,8 +205,9 @@ pub use region_adapt::{
     RegionReader, COLD_CHECKPOINT_INTERVAL, REGION_ADAPT_DEPTH,
 };
 pub use resource::{
-    checked_capacity, default_policy, max_single_allocation, set_max_single_allocation,
-    ResourcePolicy, ResourcePolicyGuard, DEFAULT_MAX_SINGLE_ALLOCATION,
+    breaches as resource_breaches, checked_capacity, default_policy, max_single_allocation,
+    reset_breaches as reset_resource_breaches, set_max_single_allocation, ResourcePolicy,
+    ResourcePolicyGuard, DEFAULT_MAX_SINGLE_ALLOCATION,
 };
 pub use simd::{
     avx2_available, avx512_available, gather_bytes, gather_bytes_avx512, gather_bytes_prefetch,

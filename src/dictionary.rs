@@ -144,6 +144,26 @@ fn cumulate(freq: &[u16; SYMBOLS]) -> [u32; SYMBOLS] {
 }
 
 impl Dictionary {
+    /// Train a shared order-0 dictionary from a corpus of records (one line).
+    ///
+    /// A thin alias for [`train_dictionary`], mirroring `zstd::dict::from_samples`:
+    /// train once over a corpus, then encode every record against the shared model.
+    /// The companion "use" half is [`create_with_dict`](crate::create_with_dict) or
+    /// [`Dictionary::encode_record`].
+    ///
+    /// ```
+    /// # fn main() -> ekbloom::Result<()> {
+    /// let corpus: [&[u8]; 2] = [b"user=alice|region=us-east-1", b"user=bob|region=eu-west-1"];
+    /// let dict = ekbloom::Dictionary::train(&corpus)?;
+    /// let body = ekbloom::create_with_dict(&dict, b"user=carol|region=us-east-1")?;
+    /// assert_eq!(body.machine_id, ekbloom::MACHINE_DICT);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn train(records: &[&[u8]]) -> Result<Dictionary> {
+        train_dictionary(records)
+    }
+
     /// The content identity (`blake3("ekbloom.dictionary-id.v1" ++ version ++ freq)[0..16]`).
     #[inline]
     pub fn id(&self) -> [u8; 16] {
@@ -262,6 +282,23 @@ impl Dictionary {
         core.extend_from_slice(&x.to_le_bytes());
         core.extend(emitted.iter().rev());
         Ok(core)
+    }
+
+    /// Encode `record` as a complete machine-9 (`OrANS-DICT`) core that
+    /// **references** this dictionary, registering it so a reader can resolve the
+    /// id — the one-line "use" half of the ergonomic path
+    /// (`Dictionary::train(&corpus)?.encode_record(record)?`).
+    ///
+    /// Unlike [`Dictionary::encode`] (which returns the bare header-less record
+    /// core), the returned bytes are a full machine-9 core:
+    /// `[dict_id: 16][dict_len = 0]` ++ the header-less record core. Decode it with
+    /// [`crate::machine_dict::DictMachine`] (registered as
+    /// [`MACHINE_DICT`](crate::MACHINE_DICT)) or drop it into a body via
+    /// [`create_with_dict`](crate::create_with_dict).
+    pub fn encode_record(&self, record: &[u8]) -> Result<Vec<u8>> {
+        register(self)?;
+        let core = self.encode(record)?;
+        Ok(crate::machine_dict::frame_reference(self, &core))
     }
 
     /// Decode a core produced by [`Dictionary::encode`] against this dictionary.
