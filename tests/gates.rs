@@ -29,7 +29,6 @@ use ekbloom::bloom_context::build_context_shell;
 use ekbloom::checkpoint::{CheckpointSet, CKPT_FIXED_LEN};
 use ekbloom::format;
 use ekbloom::machine::{machine_by_id, state_log, OrMachine, NL2};
-use ekbloom::machine_seg::{SegContext, SEG};
 use ekbloom::packed::{PackedHistory, PackedRestarts};
 use ekbloom::prefix::{block_summary, prefix_scan, reconstruct_blocks, Affine, LinMap};
 use ekbloom::tiles::{DirectoryKind, TileSet};
@@ -116,41 +115,17 @@ fn g1_invertibility_all_machines() {
                 .encode(&src)
                 .unwrap_or_else(|e| panic!("machine {id} len {len}: encode failed: {e:?}"));
             let n = len as u64;
-            if id == ekbloom::MACHINE_SEG {
-                // `Seg` does not override the reference `OrMachine::decode`; that
-                // default re-parses the core per symbol (O(n^2), ~415 s at n=2^20 —
-                // reported as a library perf issue). The segment-wise
-                // `SegContext::decode_into` is the linear path the read API uses;
-                // verify invertibility through it at every length, and also through
-                // the trait `decode` for the bounded lengths.
-                let ctx = SegContext::from_core(&core).expect("seg ctx");
-                let mut omega = SEG.init(&core).expect("seg init");
-                let mut out = Vec::new();
-                ctx.decode_into(&core, &mut omega, n, &mut out)
-                    .unwrap_or_else(|e| panic!("machine 6 len {len}: decode_into: {e:?}"));
-                assert_eq!(out, src, "machine 6 len {len}: decode_into mismatch");
-                if len <= 4097 {
-                    let via_trait = machine
-                        .decode(&core, n)
-                        .unwrap_or_else(|e| panic!("machine 6 len {len}: decode: {e:?}"));
-                    assert_eq!(via_trait, src, "machine 6 len {len}: trait decode mismatch");
-                }
-            } else {
-                let out = machine
-                    .decode(&core, n)
-                    .unwrap_or_else(|e| panic!("machine {id} len {len}: decode failed: {e:?}"));
-                assert_eq!(out, src, "machine {id} len {len}: roundtrip mismatch");
-            }
+            let out = machine
+                .decode(&core, n)
+                .unwrap_or_else(|e| panic!("machine {id} len {len}: decode failed: {e:?}"));
+            assert_eq!(out, src, "machine {id} len {len}: roundtrip mismatch");
             cases += 1;
         }
     }
     record(
         "G1",
         "invertibility",
-        &format!(
-            "machines=1..9 cases={cases} max_len={} seg_large_path=SegContext::decode_into",
-            1usize << 20
-        ),
+        &format!("machines=1..9 cases={cases} max_len={}", 1usize << 20),
     );
 }
 

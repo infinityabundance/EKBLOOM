@@ -55,7 +55,10 @@
 //! Just like machine 5, the per-segment decoding contexts are parsed once by
 //! [`SegContext::from_core`] and reused by the bulk/prepared paths; the
 //! [`Seg`] machine's own `reveal`/`peek` re-parse the container per call, matching
-//! machine 5's shape.
+//! machine 5's shape. The whole-object trait paths [`Seg::decode`] and
+//! [`Seg::state_log`] do **not** re-parse per symbol: they parse once and dispatch
+//! segment-wise through [`SegContext::decode_into`], so both are `O(N)` rather than
+//! the `O(N^2)` a per-symbol re-parse would cost.
 
 use crate::error::{EkbloomError, Result};
 use crate::machine::{OrMachine, MACHINE_PACK, MACHINE_SEG, MACHINE_STORE};
@@ -1063,6 +1066,54 @@ impl OrMachine for Seg {
     /// Encode `source` as a fixed-segment container (see [`Seg::encode_segmented`]).
     fn encode(&self, source: &[u8]) -> Result<Vec<u8>> {
         self.encode_segmented(source)
+    }
+
+    /// Decode `logical_len` symbols from `core` in **linear** time.
+    ///
+    /// The default trait `decode` reveals one symbol at a time, and each `Seg`
+    /// `reveal` re-parses the whole container (including a full directory+payload
+    /// BLAKE3 hash) — `O(N)` work per symbol, `O(N^2)` overall. Machine 6 is
+    /// position-addressable, so parse the container once here and dispatch
+    /// segment-wise through [`SegContext::decode_into`]: one lookup per *segment
+    /// crossed* plus a bulk fill/copy/unpack, never a per-symbol re-parse.
+    fn decode(&self, core: &[u8], logical_len: u64) -> Result<Vec<u8>> {
+        let ctx = SegContext::from_core(core)?;
+        if ctx.logical_len != logical_len {
+            return Err(bad(format!(
+                "segmented core declares {} symbols, expected {logical_len}",
+                ctx.logical_len
+            )));
+        }
+        let mut omega = Snapshot::new(0, 0);
+        let mut out = Vec::new();
+        ctx.decode_into(core, &mut omega, logical_len, &mut out)?;
+        Ok(out)
+    }
+
+    /// The full state log `[x_0, ..., x_n]` for `core` and `logical_len`, in
+    /// **linear** time.
+    ///
+    /// The default re-parses the container per symbol (`O(N^2)`). Machine 6's
+    /// state at position `i` is the symbol `s_{i-1}` with genesis `x_0 = 0`, so
+    /// decode the object once and project it rather than stepping `reveal`.
+    fn state_log(&self, core: &[u8], logical_len: u64) -> Result<Vec<u32>> {
+        let ctx = SegContext::from_core(core)?;
+        if ctx.logical_len != logical_len {
+            return Err(bad(format!(
+                "segmented core declares {} symbols, expected {logical_len}",
+                ctx.logical_len
+            )));
+        }
+        // `(logical_len + 1)` `u32` states: bound the allocation before reserving,
+        // exactly as the reference `state_log` does.
+        crate::resource::checked_default(logical_len.saturating_mul(4).saturating_add(4))?;
+        let mut omega = Snapshot::new(0, 0);
+        let mut symbols = Vec::new();
+        ctx.decode_into(core, &mut omega, logical_len, &mut symbols)?;
+        let mut log = Vec::with_capacity(symbols.len() + 1);
+        log.push(0u32);
+        log.extend(symbols.iter().map(|&b| u32::from(b)));
+        Ok(log)
     }
 
     /// Validate that `core` is a complete segmented container declaring exactly
