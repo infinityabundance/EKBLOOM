@@ -75,10 +75,21 @@ docker run --rm \
         fi
 
         cd /work/fuzz
+
+        # Seed the corpus from the committed small real samples (Silesia/Calgary
+        # 4 KiB prefixes; see fuzz/seeds/README.md) so the campaign starts from
+        # valid, structured inputs. The corpus directory is gitignored.
+        if [ -d /work/fuzz/seeds ]; then
+            for TARGET in fuzz_roundtrip fuzz_stream; do
+                mkdir -p "corpus/$TARGET"
+                cp /work/fuzz/seeds/*.bin "corpus/$TARGET/" 2>/dev/null || true
+            done
+        fi
+
         failed=0
         # Every target declared in fuzz/Cargo.toml. Keep this list in sync with
         # that manifest so the campaign covers the whole fuzz surface.
-        for TARGET in fuzz_machine fuzz_open fuzz_bloom fuzz_history_store fuzz_packed fuzz_tiles fuzz_blocks fuzz_batch fuzz_rans_i fuzz_region fuzz_pack fuzz_seg fuzz_resource fuzz_rans_w fuzz_rans_il; do
+        for TARGET in fuzz_machine fuzz_open fuzz_bloom fuzz_history_store fuzz_packed fuzz_tiles fuzz_blocks fuzz_batch fuzz_rans_i fuzz_region fuzz_pack fuzz_seg fuzz_resource fuzz_rans_w fuzz_rans_il fuzz_roundtrip fuzz_stream; do
             start=$(date +%s)
             echo "ekbloom-fuzz: running $TARGET"
             if cargo fuzz run "$TARGET" -- -runs="$EKB_FUZZ_RUNS" -max_total_time="$EKB_FUZZ_SECS"; then

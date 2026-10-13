@@ -1,0 +1,6 @@
+{
+  "gate": "G5",
+  "name": "physical-accounting",
+  "status": "PASS",
+  "evidence": "structures=46 exact_equality=18 fixed_header_relation=28"
+}

@@ -1,0 +1,220 @@
+%A Abdou, I.E.
+%A Wong, K.Y.
+%D 1982
+%T Analysis of linear interpolation schemes for bi-level image applications
+%J IBM J Research and Development
+%V 26
+%P 667-680
+
+%A Abell, R.
+%D 1981
+%T Implementation of a Telidon system using Unix file structures
+%B The Telidon book
+%E D.Godfrey and E.Chang
+%I Press Porcepic
+%C Toronto, ON
+%P 203-209
+
+%A Abut, H.
+%A Gray, R.M.
+%A Rebolledo, V.
+%D 1982
+%T Vector quantization of speech and speech-like waveforms
+%J IEEE Trans Acoustics, Speech and Signal Processing
+%V Acoustics, Speech, and Signal Processing -30
+%N 3
+%P 423-435 
+%O June
+%K *
+
+%A Achugbue, J.O.
+%D 1981
+%T On the line breaking problem in text formatting
+%J SIGOA Newsletter (Proc ACM Symposium on Text manipulation, Portland, Oregon)
+%V 2
+%N 1/2
+%P 117-121
+%O Spring/Summer
+
+%A Adams, D.N.
+%D 1979
+%T The hitchhiker's guide to the galaxy
+%I Pan
+%C London, England
+
+%A Adams, J.B.
+%D 1976
+%T A probability model of medical reasoning and the MYCIN model
+%J Mathematical Biosciences
+%V 32
+%P 177-186
+
+%A Aho, A.V.
+%A Corasick, M.J.
+%D 1975
+%T Efficient string matching: an aid to bibliographic search
+%J Comm ACM
+%V 18
+%N 6
+%P 333-340
+%O June
+
+%A Aikins, J.S.
+%D 1983
+%T Prototypical knowledge for expert systems
+%J Artificial Intelligence
+%V 20
+%N 2
+%P 163-210
+%O February
+%K *
+
+%A Akers, G.
+%A Lennig, M.
+%D 1984
+%T Intonation in text-to-speech synthesis: evaluation of algorithms
+%R Report
+%I Bell-Northern Research
+%C Verdun, QUE 
+%K *
+
+%A Allebach, J.P.
+%A Liu, B.
+%D 1976
+%T Analysis of halftone dot profile and aliasing in the discrete binary representation of images
+%J Optical Society of America
+%V 67
+%N 9
+%K *
+
+%A Allen, B.P.
+%A Wright, J.M.
+%D 1983
+%T Integrating logic programs and schemata
+%J Proc 8th International Joint Conference on Artificial Intelligence
+%P 340-342
+
+%A Allen, E.M.
+%D 1983
+%T YAPS: yet another production system
+%R Report TR-1146
+%I Maryland Artificial Intelligence Group, Computer Science Department, University of Maryland
+%C Maryland, MD
+%O December
+%K *
+
+%A Allen, J.F.
+%A Perrault, C.R.
+%D 1980
+%T Analyzing intention in utterances
+%J Artificial Intelligence
+%V 15
+%P 143-178
+%K *
+
+%A Allen, J.F.
+%D 1984
+%T Towards a general theory of action and time
+%J Artificial Intelligence
+%V 23
+%P 123-154
+%K *
+
+%A Almes, G.T.
+%A Black, A.P.
+%A Lazowska, E.L.
+%A Noe, J.D.
+%D 1985
+%T The Eden system: a technical review
+%J IEEE Trans Software Engineering
+%V SE-11
+%N 1
+%P 43-59
+%O January
+%K *
+
+%A Alvey, P.
+%D 1983
+%T The problems of designing a medical expert system
+%J Proc Expert Systems 83
+%I Churchill College
+%C Cambridge, England
+%P 30-42
+%O December
+%K *
+
+%A Anderberg, M.R.
+%D 1973
+%T Cluster analysis for applications
+%I Academic Press
+%C New York, NY
+
+%A Anderson, D.P.
+%A Hedin, R.C.
+%D 1982
+%T Voice input/output module
+%J Voice Data Entry Systems Application Conference '82
+%C San Mateo, CA
+%O September 21
+%K *
+
+%A Anderson, J.R.
+%T Knowledge compilation: the general learning mechanism
+%K *
+
+%A Anderson, J.R.
+%A Reiser, B.J.
+%D 1985
+%T The LISP tutor
+%J Byte
+%V 10
+%N 4
+%P 159-175
+%O April
+
+%A Andreae, J.H.
+%D 1984
+%T Numbers in the head
+%R Man-Machine Studies Progress Report UC-DSE/24
+%P 5-28
+%I Department of Electrical Engineering, University of Canterbury
+%C New Zealand
+
+%A Andreae, P.M.
+%D 1984
+%T Constraint limited generalization: acquiring procedures from examples
+%J Proc American Association on Artificial Intelligence
+%C Austin, TX
+%O August
+%K *
+
+%A Andreae, P.M.
+%D 1984
+%T Justified generalization: acquiring procedures from examples
+%R PhD Thesis
+%I Department of Electrical Engineering and Computer Science, MIT
+
+%A Andreae, P.M.
+%D 1986
+%T Justified generalization
+%J Proc International Conference on Future Advances in Computing
+%C Christchurch, New Zealand
+%O February 17-21
+%K *
+
+%A Andreka, H.
+%A Nemeti, I.
+%A Sain, I.
+%D 1982
+%T A complete logic for reasoning about programs via nonstandard model theory I
+%J Theoretical Computer Science
+%V 17
+%P 193-212
+%K *
+
+%A Andreka, H.
+%A Nemeti, I.
+%A Sain, I.
+%D 1982
+%T A complete logic for reasoning about programs via nonstandard model theory II
+%J Theoretical Computer Sc

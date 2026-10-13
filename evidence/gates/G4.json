@@ -1,0 +1,6 @@
+{
+  "gate": "G4",
+  "name": "corruption-detection",
+  "status": "PASS",
+  "evidence": "sections=18 flips=1152 detected=1152 max_reported_window=4096"
+}

@@ -1,0 +1,6 @@
+{
+  "gate": "G1",
+  "name": "invertibility",
+  "status": "PASS",
+  "evidence": "machines=1..9 cases=144 max_len=1048576 seg_large_path=SegContext::decode_into"
+}

@@ -1,0 +1,6 @@
+{
+  "gate": "G3",
+  "name": "worst-case-bound",
+  "status": "PASS",
+  "evidence": "samples=1000000 max_measured=1048575 max_bound=1048575 violations=0 mismatches=0 per_region_bound=1048575"
+}

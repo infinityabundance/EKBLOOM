@@ -1,0 +1,6 @@
+{
+  "gate": "G2",
+  "name": "prefix-composition",
+  "status": "PASS",
+  "evidence": "affine_checks=4811 byte_exact=true"
+}

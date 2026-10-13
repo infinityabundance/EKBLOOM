@@ -1036,7 +1036,10 @@ sh scripts/run-window.sh            # evidence/bench/window.json (bounded encode
 sh scripts/run-orfs.sh              # evidence/bench/orfs.json (OrFS single-store real disk bytes)
 sh scripts/run-optimizer.sh         # evidence/bench/optimizer.json (joint budget-aware planner)
 sh scripts/run-e2e.sh               # evidence/bench/e2e.json (end-to-end on real data; uses FUSE when /dev/fuse exists)
-sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (33 files)
+sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (46 files)
+sh scripts/run-gates.sh             # acceptance gates G1-G5 (docs/GATES.md)
+sh scripts/run-scale.sh             # nightly 2^30 scale build (opt-in: EKB_RUN_SCALE=1)
+sh scripts/container-aarch64.sh     # cross-arch determinism: x86_64 == arm64 (QEMU)
 sh scripts/container-loom.sh        # Loom model checking (tests/loom.rs)
 sh scripts/container-reproduce.sh   # clean build + tests from scratch
 sh scripts/capture-environment.sh   # write evidence/environment.txt
@@ -1046,9 +1049,10 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 (libFuzzer — runs **every** target declared in `fuzz/Cargo.toml`:
 `fuzz_machine`, `fuzz_open`, `fuzz_bloom`, `fuzz_history_store`, `fuzz_packed`,
 `fuzz_tiles`, `fuzz_blocks`, `fuzz_batch`, `fuzz_rans_i`, `fuzz_region`,
-`fuzz_pack`, `fuzz_seg`, `fuzz_resource`, `fuzz_rans_w`, `fuzz_rans_il`), `scripts/container-miri.sh` (UB),
+`fuzz_pack`, `fuzz_seg`, `fuzz_resource`, `fuzz_rans_w`, `fuzz_rans_il`,
+`fuzz_roundtrip`, `fuzz_stream`), `scripts/container-miri.sh` (UB),
 `scripts/container-sanitize.sh` (AddressSanitizer), and `scripts/container-fuse.sh`
-(read-only FUSE mount).
+(read-only FUSE mount). See [`docs/TESTING.md`](docs/TESTING.md).
 
 ### Verified tooling
 
@@ -1275,6 +1279,8 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 - `evidence/bench/decoders.json` — the decoder court (O1): machines 7/8 and the AVX2 rANS kernel vs machine 4 `K = 8` at equal stored bytes; all rejected.
 - `evidence/counterexamples/` — rejected state-keyed blooms.
 - `evidence/model-search/` — finite-model sufficiency sweep.
+- `evidence/gates/G1.json` … `G5.json` — acceptance gates G1–G5 ([`docs/GATES.md`](docs/GATES.md)).
+- `evidence/bench/aarch64-determinism.json` — x86_64 == arm64 determinism (QEMU).
 
 Documentation map:
 
@@ -1316,6 +1322,8 @@ Documentation map:
 | [`docs/MACHINES.md`](docs/MACHINES.md) | The machine catalogue (ids 1–9): exact transition/encoding math, complete resumable state, decode algorithm, size table and wins/loses per machine, plus a relationship map. |
 | [`docs/BUDGET-GUIDE.md`](docs/BUDGET-GUIDE.md) | The budget chooser guide (`choose_plan`): budget × workload decision table, how to pick machine / segment / restart `K` / block `B` / path `D` / tiles, and worked examples. |
 | [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) | The consolidated honest non-claims, each with a one-line pointer to its evidence. |
+| [`docs/GATES.md`](docs/GATES.md) | The machine-checked acceptance gates **G1–G5** (invertibility, prefix composition, worst-case bound, corruption detection, physical accounting) and their runner. |
+| [`docs/TESTING.md`](docs/TESTING.md) | The trust-building test infrastructure: fuzz roundtrips, cross-architecture determinism, the nightly scale job, and the gates. |
 | [`docs/reviews/adversarial.md`](docs/reviews/adversarial.md) | Adversarial correctness review (through **Revision 8**, O1–O2: two defects, both fixed). |
 | [`docs/reviews/concurrency.md`](docs/reviews/concurrency.md) | Concurrency audit + Loom model checking. |
 | [`docs/reviews/mathematics.md`](docs/reviews/mathematics.md) | Independent re-derivation of the proofs. |

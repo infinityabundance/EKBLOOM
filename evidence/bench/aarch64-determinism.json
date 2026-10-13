@@ -1,0 +1,12 @@
+{
+  "generated_by": "scripts/container-aarch64.sh",
+  "platforms": ["linux/amd64", "linux/arm64"],
+  "arm64_emulation": "qemu-aarch64 (binfmt_misc)",
+  "corpus": "fuzz/seeds/*.bin (Silesia/Calgary 4 KiB) + generated",
+  "amd64_lines": 70,
+  "arm64_lines": 70,
+  "amd64_output_sha256": "0fc33046d0bd97ceb7e22c688d1750052d3f51a4771644969e1d4b5780fcb49c",
+  "arm64_output_sha256": "0fc33046d0bd97ceb7e22c688d1750052d3f51a4771644969e1d4b5780fcb49c",
+  "identical": true,
+  "verdict": "identical physical_bytes() and content hashes across x86_64 and arm64"
+}
