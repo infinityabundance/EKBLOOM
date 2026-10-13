@@ -20,9 +20,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use ekbloom::{
-    create_machine, select_machine, AccessTrace, CourtConfig, DirectoryKind, Dist, EkbloomBody,
-    Engine, ManifestationBudget, ManifestationProfile, OptimizedPlan, PlanReceipt, ReadRequest,
-    TileSet, Workload, WorkloadKind,
+    create_machine, evaluate, select_machine, AccessTrace, CostModel, CourtConfig, DirectoryKind,
+    Dist, EkbloomBody, Engine, ManifestationBudget, ManifestationProfile, OptimizedPlan,
+    PlanReceipt, ReadRequest, TileSet, Workload, WorkloadKind, OPTIMIZER_READ_BYTES,
 };
 
 /// Corpus size (4 MiB, well inside the 8 GiB container cap).
@@ -33,6 +33,9 @@ const TRACE_REGION: u64 = 16 * 1024;
 const READ: u64 = 4096;
 /// Total timed reads per measurement (sample sizes are proportional to counts).
 const MAX_READS: usize = 3000;
+/// Sequential-read chunk size (bytes) and passes for the sequential measurement.
+const SEQ_CHUNK: u64 = 64 * 1024;
+const SEQ_REPS: u32 = 3;
 /// Count on the single hot region.
 const HOT_COUNT: u64 = 3000;
 /// Count on each spread region.
@@ -166,6 +169,7 @@ struct Outcome {
     region_bytes: u64,
     committed_bytes: u64,
     dist: Dist,
+    seq_gbps: f64,
     certified: bool,
     note: String,
 }
@@ -240,6 +244,45 @@ fn finite(x: f64) -> f64 {
     }
 }
 
+/// Sequential (whole-object) throughput in GB/s: run `read_all` (which reads the
+/// whole object once and returns the bytes consumed) `SEQ_REPS` times and return
+/// `total_bytes * reps / elapsed_ns` (`1 byte/ns == 1 GB/s`). A warm pass absorbs
+/// setup cost, and the byte count is black-boxed so the copy/decode is not
+/// dead-code-eliminated.
+fn seq_gbps(total_bytes: u64, mut read_all: impl FnMut() -> u64) -> f64 {
+    std::hint::black_box(read_all());
+    let t0 = Instant::now();
+    let mut sink = 0u64;
+    for _ in 0..SEQ_REPS {
+        sink = sink.wrapping_add(read_all());
+    }
+    let elapsed = t0.elapsed().as_nanos().max(1) as f64;
+    std::hint::black_box(sink);
+    (total_bytes as f64 * SEQ_REPS as f64) / elapsed
+}
+
+/// Sequential GB/s of `engine` over `body` (64 KiB chunks).
+fn engine_seq_gbps(body: &EkbloomBody, engine: &Engine, n: u64) -> f64 {
+    seq_gbps(n, || {
+        let mut s = 0u64;
+        let mut off = 0u64;
+        while off < n {
+            let len = SEQ_CHUNK.min(n - off);
+            if let Ok(bytes) = engine.read(
+                body,
+                ReadRequest {
+                    offset: off,
+                    length: len,
+                },
+            ) {
+                s += std::hint::black_box(bytes).len() as u64;
+            }
+            off += len;
+        }
+        s
+    })
+}
+
 fn write_outcome(s: &mut String, name: &str, o: &Outcome) {
     s.push_str(&format!("      \"{name}\": {{\n"));
     let _ = writeln!(s, "        \"machine\": {},", o.machine);
@@ -248,9 +291,52 @@ fn write_outcome(s: &mut String, name: &str, o: &Outcome) {
     let _ = writeln!(s, "        \"p50_ns\": {:.1},", finite(o.dist.p50));
     let _ = writeln!(s, "        \"p99_ns\": {:.1},", finite(o.dist.p99));
     let _ = writeln!(s, "        \"p999_ns\": {:.1},", finite(o.dist.p999));
+    let _ = writeln!(s, "        \"seq_gbps\": {:.3},", finite(o.seq_gbps));
     let _ = writeln!(s, "        \"certified\": {},", o.certified);
     let _ = writeln!(s, "        \"note\": \"{}\"", o.note);
     s.push_str("      },\n");
+}
+
+struct UniformEvidence {
+    source_len: u64,
+    raw_bytes: u64,
+    chosen_machine: u32,
+    committed_bytes: u64,
+    committed_le_raw: bool,
+    expected_p99_ns: f64,
+    no_structure_p99_ns: f64,
+    latency_not_worse: bool,
+    seq_gbps: f64,
+    hot_regions: usize,
+    summary: String,
+}
+
+fn write_uniform(s: &mut String, e: &UniformEvidence) {
+    s.push_str("  \"uniform_evidence\": {\n");
+    let _ = writeln!(s, "    \"source_len\": {},", e.source_len);
+    let _ = writeln!(s, "    \"raw_bytes\": {},", e.raw_bytes);
+    let _ = writeln!(s, "    \"chosen_machine\": {},", e.chosen_machine);
+    let _ = writeln!(s, "    \"committed_bytes\": {},", e.committed_bytes);
+    let _ = writeln!(s, "    \"committed_le_raw\": {},", e.committed_le_raw);
+    let _ = writeln!(s, "    \"hot_regions\": {},", e.hot_regions);
+    let _ = writeln!(
+        s,
+        "    \"expected_p99_ns\": {:.1},",
+        finite(e.expected_p99_ns)
+    );
+    let _ = writeln!(
+        s,
+        "    \"no_structure_p99_ns\": {:.1},",
+        finite(e.no_structure_p99_ns)
+    );
+    let _ = writeln!(
+        s,
+        "    \"latency_not_worse_than_no_structure\": {},",
+        e.latency_not_worse
+    );
+    let _ = writeln!(s, "    \"seq_gbps\": {:.3},", finite(e.seq_gbps));
+    let _ = writeln!(s, "    \"summary\": \"{}\"", e.summary);
+    s.push_str("  },\n");
 }
 
 fn write_json(
@@ -259,6 +345,7 @@ fn write_json(
     held_out: &AccessTrace,
     evaluation: &AccessTrace,
     results: &[BudgetResult],
+    uniform: &UniformEvidence,
 ) -> ekbloom::Result<()> {
     let mut s = String::new();
     s.push_str("{\n");
@@ -273,6 +360,10 @@ fn write_json(
         hex32(blake3::hash(source).as_bytes())
     );
     let _ = writeln!(s, "  \"read_bytes\": {READ},");
+    let raw_seq = seq_gbps(source.len() as u64, || {
+        std::hint::black_box(source.to_vec()).len() as u64
+    });
+    let _ = writeln!(s, "  \"raw_seq_gbps\": {:.3},", finite(raw_seq));
     let _ = writeln!(
         s,
         "  \"held_out_trace_fingerprint\": \"{}\",",
@@ -284,6 +375,7 @@ fn write_json(
         hex32(&ekbloom::trace_fingerprint(evaluation))
     );
     let _ = writeln!(s, "  \"max_reads\": {MAX_READS},");
+    write_uniform(&mut s, uniform);
     s.push_str("  \"budgets\": [\n");
     for (i, r) in results.iter().enumerate() {
         s.push_str("    {\n");
@@ -353,8 +445,13 @@ fn main() -> ekbloom::Result<()> {
             region_bytes: plan.region_bytes(),
             committed_bytes: joint_body.physical_bytes(),
             dist: joint_dist,
+            seq_gbps: engine_seq_gbps(&joint_body, &joint_engine, n),
             certified: joint_engine.plan_ref().all_certified(),
-            note: plan.summary(),
+            note: format!(
+                "{} | expected seq {:.2} GB/s",
+                plan.summary(),
+                plan.sequential_gbps()
+            ),
         };
 
         // ---- greedy ----------------------------------------------------------
@@ -365,6 +462,7 @@ fn main() -> ekbloom::Result<()> {
             region_bytes: g_engine.plan_ref().region_bytes(),
             committed_bytes: g_body.physical_bytes(),
             dist: g_dist,
+            seq_gbps: engine_seq_gbps(&g_body, &g_engine, n),
             certified: g_engine.plan_ref().all_certified(),
             note: "machine select + greedy hot tiles (K=64, 4 KiB regions)".to_string(),
         };
@@ -377,6 +475,7 @@ fn main() -> ekbloom::Result<()> {
             region_bytes: m_engine.plan_ref().region_bytes(),
             committed_bytes: m_body.physical_bytes(),
             dist: m_dist,
+            seq_gbps: engine_seq_gbps(&m_body, &m_engine, n),
             certified: m_engine.plan_ref().all_certified(),
             note: "machine select only (K=64, no tiles)".to_string(),
         };
@@ -386,16 +485,19 @@ fn main() -> ekbloom::Result<()> {
             && joint.committed_bytes <= limit;
 
         println!(
-            "  budget {:>9} B: joint p99 {:>8.0} ns @ {:>9} B (m{}, R{}) | greedy p99 {:>8.0} ns @ {:>9} B | machine-only p99 {:>8.0} ns @ {:>9} B -> improves={}",
+            "  budget {:>9} B: joint p99 {:>8.0} ns @ {:>9} B (m{}, R{}) seq {:.2} GB/s | greedy p99 {:>8.0} ns @ {:>9} B seq {:.2} | machine-only p99 {:>8.0} ns @ {:>9} B seq {:.2} -> improves={}",
             limit,
             joint.dist.p99,
             joint.committed_bytes,
             joint.machine,
             joint.region_bytes,
+            joint.seq_gbps,
             greedy_out.dist.p99,
             greedy_out.committed_bytes,
+            greedy_out.seq_gbps,
             machine_out.dist.p99,
             machine_out.committed_bytes,
+            machine_out.seq_gbps,
             improves
         );
         println!("      joint plan: {}", plan.summary());
@@ -413,12 +515,74 @@ fn main() -> ekbloom::Result<()> {
     let any = results.iter().any(|r| r.improves);
     println!("joint planner improved the held-out p99 frontier at equal budget: {any}");
 
+    // ---- GAP 1 evidence: a uniform (incompressible) corpus. --------------------
+    // The optimiser must not spend bytes on structures that buy no speed: the
+    // chosen plan is the machine-3 base representation, committed bytes <= raw, and
+    // its held-out p99 is not worse than the no-structure plan's.
+    let mut un = lcg(0x0E71_0000_0000_0FEE);
+    let uniform_src: Vec<u8> = (0..N).map(|_| un()).collect();
+    let un_len = uniform_src.len() as u64;
+    let un_trace = workload_trace(un_len, 5);
+    let un_limit = un_len + un_len / 8;
+    let un_budget = ManifestationBudget {
+        maximum_physical_bytes: un_limit,
+    };
+    let (un_plan, _) = OptimizedPlan::optimize(&uniform_src, &un_trace, &un_budget, &cfg())?;
+    let un_body = un_plan.build(&uniform_src)?;
+    let un_engine = un_plan.engine(&un_body)?;
+
+    // The no-structure base plan (auto machine, `Root`) for the latency comparison.
+    let bare = create_machine(
+        &uniform_src,
+        ManifestationProfile::Root,
+        un_plan.machine_id(),
+    )?;
+    let bare_workload = Workload {
+        kind: WorkloadKind::RangeMixed,
+        hot_prefix: None,
+        sample: vec![(0, READ)],
+    };
+    let bare_engine = Engine::plan(&bare, &un_budget, &bare_workload)?;
+    let no_structure_p99 = evaluate(
+        &bare_engine,
+        &un_trace,
+        &CostModel::measured_default(),
+        OPTIMIZER_READ_BYTES,
+    )
+    .p99;
+    let uni = UniformEvidence {
+        source_len: un_len,
+        raw_bytes: un_len,
+        chosen_machine: un_plan.machine_id(),
+        committed_bytes: un_body.physical_bytes(),
+        committed_le_raw: un_body.physical_bytes() <= un_len,
+        expected_p99_ns: un_plan.expected_p99(),
+        no_structure_p99_ns: no_structure_p99,
+        latency_not_worse: un_plan.expected_p99() <= no_structure_p99 + 1e-9,
+        seq_gbps: engine_seq_gbps(&un_body, &un_engine, un_len),
+        hot_regions: un_plan.hot_regions().len(),
+        summary: un_plan.summary(),
+    };
+    println!(
+        "  uniform corpus: machine {} committed {} B <= raw {} B ({}), p99 {:.0} ns vs no-structure {:.0} ns, seq {:.2} GB/s",
+        uni.chosen_machine,
+        uni.committed_bytes,
+        uni.raw_bytes,
+        uni.committed_le_raw,
+        uni.expected_p99_ns,
+        uni.no_structure_p99_ns,
+        uni.seq_gbps,
+    );
+    assert!(uni.committed_le_raw, "uniform plan must not exceed raw");
+    assert!(uni.latency_not_worse, "uniform plan latency regressed");
+
     write_json(
         Path::new("evidence/bench/optimizer.json"),
         &source,
         &held_out,
         &evaluation,
         &results,
+        &uni,
     )?;
     println!("wrote evidence/bench/optimizer.json");
     Ok(())

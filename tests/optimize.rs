@@ -13,9 +13,11 @@
 //! * the plan is **additive** — [`OptimizedPlan::grow_into`] never removes an
 //!   earlier generation's structures.
 
+use ekbloom::adapt::{Workload, WorkloadKind};
+use ekbloom::machine::MACHINE_STORE;
 use ekbloom::{
-    create_machine, evaluate, trace_fingerprint, AccessTrace, CourtConfig, EkbloomBody,
-    ManifestationBudget, ManifestationProfile, OptimizedPlan, ReadRequest,
+    create_machine, evaluate, trace_fingerprint, AccessTrace, CourtConfig, EkbloomBody, Engine,
+    ManifestationBudget, ManifestationProfile, OptimizedPlan, ReadRequest, OPTIMIZER_READ_BYTES,
 };
 
 /// A heterogeneous corpus: a low-entropy skewed half followed by a uniform half.
@@ -31,6 +33,28 @@ fn heterogeneous(seed: u64, len: usize) -> Vec<u8> {
         out.push(if i < half { byte & 0x07 } else { byte });
     }
     out
+}
+
+/// A uniform (incompressible) corpus: the order-0 encoder cannot shrink it, so the
+/// `auto` policy picks the verbatim machine 3.
+fn uniform(seed: u64, len: usize) -> Vec<u8> {
+    let mut s = seed;
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        out.push((s >> 33) as u8);
+    }
+    out
+}
+
+fn workload4k() -> Workload {
+    Workload {
+        kind: WorkloadKind::RangeMixed,
+        hot_prefix: None,
+        sample: vec![(0, 4096)],
+    }
 }
 
 /// A skewed held-out/evaluation trace: a uniform spread of small regions plus one
@@ -243,6 +267,112 @@ fn hot_dominated_trace_selects_hot_tiles() {
         length: 4096,
     };
     assert_eq!(engine.read(&body, req).unwrap(), &src[..4096]);
+}
+
+/// GAP 1: on incompressible/uniform data the joint optimiser must not spend bytes
+/// on structures that buy no speed. The chosen plan is the base representation
+/// (machine 3, no structures), so `committed_bytes <= raw`, its latency is not worse
+/// than the no-structure plan, and it is still certified and byte-exact.
+#[test]
+fn optimiser_chooses_a_leq_raw_footprint_plan_on_uniform_data() {
+    let src = uniform(0x0E71_0000_0000_00A0, SRC_LEN);
+    let n = src.len() as u64;
+    let trace = hot_trace(n, 7);
+    let b = budget(n + n / 8);
+
+    let (plan, receipts) = OptimizedPlan::optimize(&src, &trace, &b, &cfg()).unwrap();
+    assert_eq!(
+        plan.machine_id(),
+        MACHINE_STORE,
+        "uniform data must use the verbatim machine 3"
+    );
+    assert!(
+        plan.committed_bytes() <= n,
+        "committed {} must be <= raw {n}",
+        plan.committed_bytes()
+    );
+    assert!(plan.tile_shift().is_none(), "no tiles on uniform data");
+    assert!(
+        plan.hot_regions().is_empty(),
+        "no hot regions on uniform data"
+    );
+
+    // Still a real, certified, byte-exact plan.
+    let body = plan.build(&src).unwrap();
+    assert_eq!(body.physical_bytes(), plan.committed_bytes());
+    assert!(ekbloom::verify_deep(&body).unwrap().ok);
+    let engine = plan.engine(&body).unwrap();
+    assert!(engine.plan_ref().all_certified());
+    for &(start, len) in &[(0u64, 1u64), (1, 4095), (n / 2, 777), (n - 1, 1), (0, n)] {
+        let req = ReadRequest {
+            offset: start,
+            length: len,
+        };
+        assert_eq!(
+            engine.read(&body, req).unwrap(),
+            &src[start as usize..(start + len) as usize]
+        );
+    }
+
+    // Latency is not worse than the no-structure base plan (it IS that plan).
+    let bare = ekbloom::manifest::create_auto(&src, ManifestationProfile::Root).unwrap();
+    let bare_engine = Engine::plan(&bare, &b, &workload4k()).unwrap();
+    let bare_p99 = evaluate(
+        &bare_engine,
+        &trace,
+        &ekbloom::CostModel::measured_default(),
+        OPTIMIZER_READ_BYTES,
+    )
+    .p99;
+    assert!(
+        plan.expected_p99() <= bare_p99 + 1e-9,
+        "chosen p99 {} must not exceed the no-structure plan's {bare_p99}",
+        plan.expected_p99()
+    );
+
+    // The gate recorded the base representation as the footprint floor.
+    assert!(
+        receipts
+            .iter()
+            .any(|r| r.reason.contains("footprint floor")),
+        "the base-representation receipt must be present"
+    );
+}
+
+/// GAP 2: sequential throughput is first-class. Incompressible data reaches a
+/// raw-like bulk rate (the verbatim core), while compressible data reports the
+/// honest decode-bound number.
+#[test]
+fn sequential_config_selection_is_honest() {
+    let src = uniform(0x0E71_0000_0000_00B0, SRC_LEN);
+    let n = src.len() as u64;
+    let (u_plan, _) =
+        OptimizedPlan::optimize(&src, &hot_trace(n, 3), &budget(n + n / 8), &cfg()).unwrap();
+    assert_eq!(u_plan.machine_id(), MACHINE_STORE);
+    assert!(
+        u_plan.sequential_gbps() > 5.0,
+        "verbatim sequential must be raw-like, got {} GB/s",
+        u_plan.sequential_gbps()
+    );
+
+    let skewed = heterogeneous(0x0E71_0000_0000_00B1, SRC_LEN);
+    let m = skewed.len() as u64;
+    let (s_plan, _) =
+        OptimizedPlan::optimize(&skewed, &hot_trace(m, 3), &budget(m + m / 8), &cfg()).unwrap();
+    assert!(
+        s_plan.committed_bytes() < m,
+        "compressible data must compress: {} vs raw {m}",
+        s_plan.committed_bytes()
+    );
+    assert!(
+        s_plan.machine_id() != MACHINE_STORE,
+        "compressible data must not choose the verbatim machine"
+    );
+    assert!(
+        s_plan.sequential_gbps() < 1.0,
+        "compressible sequential is decode-bound, got {} GB/s",
+        s_plan.sequential_gbps()
+    );
 }
 
 #[test]

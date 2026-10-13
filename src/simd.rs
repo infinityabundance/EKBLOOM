@@ -377,6 +377,288 @@ unsafe fn gather_bytes_avx512_impl(hot: &[u8], offsets: &[u64], out: &mut Vec<u8
 // per-step map `s = S(h) ^ l ^ r` is reused exactly as written, with `S` in its
 // `GF(2)`-linear form `h ^ (h<<1) ^ (h<<3)` so it lowers to shifts and XORs.
 
+// ---------------------------------------------------------------------------
+// Interleaved rANS decode kernel (machine 4 / machine 8 competitor).
+// ---------------------------------------------------------------------------
+//
+// The rANS per-symbol step is `nx = (x >> 12) * f + slot - c`, `sym = e >> 24`
+// with `slot = x & 4095` and `e = table[slot]` the fused table entry. Eight
+// independent lanes can be advanced with one 8-wide gather of the fused table
+// plus one vector multiply/add; renormalisation (rare on skewed data) stays
+// scalar because it is data-dependent and per-lane. This is the measured
+// "vectorised table-lookup/renorm kernel": the caller drives the renorm loop, the
+// kernel does the table lookup and the parallel state update.
+
+/// Lanes advanced per [`rans_step8_scalar`]/[`rans_step8_avx2`] call.
+pub const RANS_LANES8: usize = 8;
+
+/// Scalar reference for one fused-table step on eight independent lanes:
+/// returns each lane's pre-renorm successor state and its revealed symbol.
+#[inline]
+pub fn rans_step8_scalar(
+    states: &[u32; RANS_LANES8],
+    table: &[u32],
+) -> ([u32; RANS_LANES8], [u8; RANS_LANES8]) {
+    let mut nx = [0u32; RANS_LANES8];
+    let mut sym = [0u8; RANS_LANES8];
+    for t in 0..RANS_LANES8 {
+        let x = states[t];
+        let slot = x & 0xFFF;
+        let e = table[slot as usize];
+        nx[t] = (x >> 12) * (e & 0x0FFF) + slot - ((e >> 12) & 0x0FFF);
+        sym[t] = (e >> 24) as u8;
+    }
+    (nx, sym)
+}
+
+/// AVX2 fused-table step for eight independent lanes when available; otherwise
+/// byte-for-byte the scalar reference.
+///
+/// Errors only when `table` has fewer than 4096 slots (the fused table is exactly
+/// `M = 4096` entries for the order-0 model).
+#[inline]
+pub fn rans_step8_avx2(
+    states: &[u32; RANS_LANES8],
+    table: &[u32],
+) -> Result<([u32; RANS_LANES8], [u8; RANS_LANES8])> {
+    if table.len() < 4096 {
+        return Err(EkbloomError::InvalidArgument {
+            what: format!(
+                "rans_step8_avx2 expects a 4096-slot fused table, got {}",
+                table.len()
+            ),
+        });
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2_available() {
+            // SAFETY: guarded by the runtime `avx2_available()` check just above;
+            // `rans_step8_avx2_impl` is compiled with `#[target_feature(enable =
+            // "avx2")]`, which is its own precondition. `table.len() >= 4096` was
+            // checked, and every gathered index is `x & 4095 < 4096`.
+            return Ok(unsafe { rans_step8_avx2_impl(states, table) });
+        }
+    }
+    Ok(rans_step8_scalar(states, table))
+}
+
+/// AVX2 implementation of [`rans_step8_avx2`].
+///
+/// # Safety
+///
+/// The caller must ensure AVX2 is available at runtime (checked in
+/// [`rans_step8_avx2`]) and that `table.len() >= 4096`. Every gathered 32-bit
+/// index is `state & 4095`, hence in-bounds, and all loads/stores are unaligned or
+/// register-only.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn rans_step8_avx2_impl(
+    states: &[u32; RANS_LANES8],
+    table: &[u32],
+) -> ([u32; RANS_LANES8], [u8; RANS_LANES8]) {
+    use std::arch::x86_64::*;
+
+    let mask = _mm256_set1_epi32(0xFFF);
+    let base = table.as_ptr() as *const i32;
+
+    // SAFETY: `states` is an 8-element array; a 32-byte unaligned load is in bounds.
+    let xv = _mm256_loadu_si256(states.as_ptr() as *const __m256i);
+    let slots = _mm256_and_si256(xv, mask);
+    // SAFETY: every slot lane is `< 4096` and `table.len() >= 4096` (precondition),
+    // so each of the eight 4-byte gathers reads within `table`; the shift/mask and
+    // multiply operate register-only.
+    let gathered = _mm256_i32gather_epi32::<4>(base, slots);
+    let f = _mm256_and_si256(gathered, mask);
+    let c = _mm256_and_si256(_mm256_srli_epi32::<12>(gathered), mask);
+    let symv = _mm256_srli_epi32::<24>(gathered);
+    let calc = _mm256_add_epi32(
+        _mm256_mullo_epi32(_mm256_srli_epi32::<12>(xv), f),
+        _mm256_sub_epi32(slots, c),
+    );
+
+    let mut nx = [0u32; RANS_LANES8];
+    _mm256_storeu_si256(nx.as_mut_ptr() as *mut __m256i, calc);
+
+    // Compact the eight 32-bit symbols to eight bytes (low byte of each lane).
+    let p16 = _mm256_packus_epi32(symv, symv);
+    let p8 = _mm256_packus_epi16(p16, p16);
+    let compact = _mm_unpacklo_epi32(
+        _mm256_castsi256_si128(p8),
+        _mm256_extracti128_si256::<1>(p8),
+    );
+    let mut sym = [0u8; 16];
+    // SAFETY: `sym` is a 16-byte array; a 16-byte unaligned store is in bounds.
+    _mm_storeu_si128(sym.as_mut_ptr() as *mut __m128i, compact);
+    let mut out = [0u8; RANS_LANES8];
+    out.copy_from_slice(&sym[..RANS_LANES8]);
+    (nx, out)
+}
+
+/// Decode `out.len()` symbols for eight lanes that own **independent** payload
+/// ranges, driving the AVX2 table kernel when available and the scalar reference
+/// otherwise.
+///
+/// `out.len()` must be a multiple of [`RANS_LANES8`]. Per-lane renormalisation (the
+/// rare, data-dependent part) reads from each lane's own cursor bounded by
+/// `ends[t]`; the table lookup and state arithmetic use
+/// [`rans_step8_avx2`]/[`rans_step8_scalar`]. Byte-for-byte identical on both
+/// paths, and a clean [`EkbloomError::CoreTooShort`] on a short payload.
+pub fn rans_decode8_independent(
+    table: &[u32],
+    core: &[u8],
+    states: &mut [u32; RANS_LANES8],
+    cursors: &mut [u64; RANS_LANES8],
+    ends: &[u64; RANS_LANES8],
+    out: &mut [u8],
+) -> Result<()> {
+    if !out.len().is_multiple_of(RANS_LANES8) {
+        return Err(EkbloomError::InvalidArgument {
+            what: "independent kernel decode needs a multiple-of-8 output".to_string(),
+        });
+    }
+    if table.len() < 4096 {
+        return Err(EkbloomError::InvalidArgument {
+            what: format!("kernel expects a 4096-slot table, got {}", table.len()),
+        });
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2_available() {
+            // SAFETY: guarded by the runtime `avx2_available()` check; the callee is
+            // `#[target_feature(enable = "avx2")]` and `table.len() >= 4096`.
+            unsafe {
+                rans_decode8_independent_avx2(table, core, states, cursors, ends, out)?;
+            }
+            return Ok(());
+        }
+    }
+    rans_decode8_independent_scalar(table, core, states, cursors, ends, out)
+}
+
+/// Scalar reference for [`rans_decode8_independent`].
+pub fn rans_decode8_independent_scalar(
+    table: &[u32],
+    core: &[u8],
+    states: &mut [u32; RANS_LANES8],
+    cursors: &mut [u64; RANS_LANES8],
+    ends: &[u64; RANS_LANES8],
+    out: &mut [u8],
+) -> Result<()> {
+    for group in out.chunks_mut(RANS_LANES8) {
+        let (nx, sym) = rans_step8_scalar(states, table);
+        for t in 0..RANS_LANES8 {
+            let mut v = nx[t];
+            let mut p = cursors[t];
+            while v < crate::machine_rans::RANS_L {
+                if p >= ends[t] {
+                    return Err(EkbloomError::CoreTooShort {
+                        needed: p.saturating_add(1),
+                        available: core.len() as u64,
+                    });
+                }
+                let b = *core.get(p as usize).ok_or(EkbloomError::CoreTooShort {
+                    needed: p.saturating_add(1),
+                    available: core.len() as u64,
+                })?;
+                v = (v << 8) | u32::from(b);
+                p += 1;
+            }
+            cursors[t] = p;
+            states[t] = v;
+        }
+        group.copy_from_slice(&sym);
+    }
+    Ok(())
+}
+
+/// AVX2 implementation of [`rans_decode8_independent`].
+///
+/// # Safety
+///
+/// The caller must ensure AVX2 is available at runtime and `table.len() >= 4096`.
+/// Every gathered index is `state & 4095 < 4096`; renormalisation re-checks the
+/// per-lane bound before every byte read.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn rans_decode8_independent_avx2(
+    table: &[u32],
+    core: &[u8],
+    states: &mut [u32; RANS_LANES8],
+    cursors: &mut [u64; RANS_LANES8],
+    ends: &[u64; RANS_LANES8],
+    out: &mut [u8],
+) -> Result<()> {
+    for group in out.chunks_mut(RANS_LANES8) {
+        // SAFETY: AVX2 availability and the 4096-slot table are the caller's
+        // preconditions; the array is a fixed 8-element array.
+        let (nx, sym) = rans_step8_avx2_impl(states, table);
+        for t in 0..RANS_LANES8 {
+            let mut v = nx[t];
+            let mut p = cursors[t];
+            while v < crate::machine_rans::RANS_L {
+                if p >= ends[t] {
+                    return Err(EkbloomError::CoreTooShort {
+                        needed: p.saturating_add(1),
+                        available: core.len() as u64,
+                    });
+                }
+                let b = *core.get(p as usize).ok_or(EkbloomError::CoreTooShort {
+                    needed: p.saturating_add(1),
+                    available: core.len() as u64,
+                })?;
+                v = (v << 8) | u32::from(b);
+                p += 1;
+            }
+            cursors[t] = p;
+            states[t] = v;
+        }
+        group.copy_from_slice(&sym);
+    }
+    Ok(())
+}
+
+/// Decode `out.len()` symbols for eight lanes sharing **one** cursor (machine 4's
+/// structure): the table kernel is vectorised, but renormalisation reads from the
+/// single cursor in lane order, so the shared-cursor serialisation remains.
+/// `out.len()` must be a multiple of [`RANS_LANES8`].
+pub fn rans_decode8_shared(
+    table: &[u32],
+    core: &[u8],
+    cursor: &mut u64,
+    states: &mut [u32; RANS_LANES8],
+    out: &mut [u8],
+) -> Result<()> {
+    if !out.len().is_multiple_of(RANS_LANES8) {
+        return Err(EkbloomError::InvalidArgument {
+            what: "shared kernel decode needs a multiple-of-8 output".to_string(),
+        });
+    }
+    if table.len() < 4096 {
+        return Err(EkbloomError::InvalidArgument {
+            what: format!("kernel expects a 4096-slot table, got {}", table.len()),
+        });
+    }
+    for group in out.chunks_mut(RANS_LANES8) {
+        let (nx, sym) = rans_step8_scalar(states, table);
+        let mut p = *cursor;
+        for t in 0..RANS_LANES8 {
+            let mut v = nx[t];
+            while v < crate::machine_rans::RANS_L {
+                let b = *core.get(p as usize).ok_or(EkbloomError::CoreTooShort {
+                    needed: p.saturating_add(1),
+                    available: core.len() as u64,
+                })?;
+                v = (v << 8) | u32::from(b);
+                p += 1;
+            }
+            states[t] = v;
+        }
+        *cursor = p;
+        group.copy_from_slice(&sym);
+    }
+    Ok(())
+}
+
 /// Number of 16-bit NL2 restart windows reconstructed per AVX2 register.
 pub const NL2_WINDOW_LANES: usize = 16;
 
@@ -642,6 +924,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn rans_step8_kernel_matches_scalar_for_adversarial_inputs() {
+        // Build a plausible fused table: 4096 slots, packed f|c<<12|sym<<24.
+        let mut table = vec![0u32; 4096];
+        let mut cum = 0u32;
+        for s in 0..256u32 {
+            let f = 16u32; // 256 * 16 == 4096
+            let packed = f | (cum << 12) | (s << 24);
+            let start = cum as usize;
+            for slot in &mut table[start..start + f as usize] {
+                *slot = packed;
+            }
+            cum += f;
+        }
+        // Adversarial lane states including the range extremes and repeats.
+        let cases: [[u32; RANS_LANES8]; 4] = [
+            [1 << 23; RANS_LANES8],
+            [u32::MAX; RANS_LANES8],
+            [
+                0,
+                1,
+                2,
+                4095,
+                1 << 23,
+                (1 << 23) + 1,
+                0xFFFF_FFFF,
+                0x1234_5678,
+            ],
+            [0xDEAD_BEEF, 0, 4096, 4095, 8191, 1, 2, 3],
+        ];
+        for states in cases {
+            let (want_nx, want_sym) = rans_step8_scalar(&states, &table);
+            let (got_nx, got_sym) = rans_step8_avx2(&states, &table).unwrap();
+            assert_eq!(got_nx, want_nx, "next states");
+            assert_eq!(got_sym, want_sym, "symbols");
+        }
+        // A short table is a clean error, never a panic.
+        assert!(rans_step8_avx2(&[0; RANS_LANES8], &table[..16]).is_err());
     }
 
     #[test]

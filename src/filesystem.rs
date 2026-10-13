@@ -18,7 +18,6 @@
 //! <root>/<logical_path>                      pointer/registration artifact
 //! <root>/.ekbloom/index                      concealed registry
 //! <root>/.ekbloom/<logical-id-hex>/manifests  the ONE authoritative `.ekb` store
-//! <root>/.ekbloom/<logical-id-hex>/core       small pointer view (no payload)
 //! <root>/.ekbloom/<logical-id-hex>/history    small pointer view (if present)
 //! <root>/.ekbloom/<logical-id-hex>/checkpoints
 //! <root>/.ekbloom/<logical-id-hex>/bloom4     non-regional transition blooms
@@ -30,7 +29,10 @@
 //! tiny **pointer/metadata view** ([`ViewRecord`]) that names the byte range of
 //! one section inside that single store — it never repeats the payload. This is
 //! what makes [`OrFs::inspect_physical`] the real on-disk footprint rather than a
-//! doubled one.
+//! doubled one. There is deliberately **no `core` view**: the visible core's range
+//! is fixed by the genesis header and its content is pinned by the manifest
+//! `core_hash`, so a `core` view would be redundant metadata (and one more
+//! allocated inode).
 //!
 //! Each object's concealed directory is keyed by its **logical identity** — a
 //! digest of the normalized logical path — not by its content. Two independently
@@ -78,12 +80,15 @@ const AUTHORITATIVE_FILE: &str = "manifests";
 
 /// Marker that prefixes a pointer/metadata view file.
 const VIEW_MAGIC: &[u8; 8] = b"EKBFSVW1";
-/// View format version.
-const VIEW_VERSION: u8 = 1;
+/// View format version (2: compact 12-byte header + 32-byte record, no per-record
+/// generation).
+const VIEW_VERSION: u8 = 2;
 
 // View kinds (the second header byte). One view file per concealed structure
-// class that previously duplicated a payload.
-const VIEW_KIND_CORE: u8 = 0;
+// class that previously duplicated a payload. The `core` range is deliberately NOT
+// given a view: it is fully determined by the genesis header (offset
+// `CORE_OFFSET`, length `core_len`) and the manifest's `core_hash`, so a `core`
+// view would be redundant metadata and a whole 4 KiB allocated inode.
 const VIEW_KIND_HISTORY: u8 = 1;
 const VIEW_KIND_CHECKPOINTS: u8 = 2;
 const VIEW_KIND_BLOOM4: u8 = 3;
@@ -92,8 +97,6 @@ const VIEW_KIND_REGIONAL: u8 = 4;
 /// One pointer record: which byte range of the authoritative store a view names.
 #[derive(Clone, Copy, Debug)]
 struct ViewRecord {
-    /// Generation the section belongs to.
-    generation: u64,
     /// Absolute offset of the payload within the authoritative `.ekb`.
     payload_offset: u64,
     /// Payload length in bytes.
@@ -249,7 +252,7 @@ impl OrFs {
         let authoritative = obj_dir.join(AUTHORITATIVE_FILE);
         writer::write_body(&authoritative, body)?;
         // Pointer/metadata views of that one store (never duplicated payload).
-        write_views(&authoritative, body)?;
+        write_views(&authoritative)?;
 
         write_file(
             &pointer,
@@ -587,17 +590,9 @@ fn pointer_artifact(logical_id: &[u8; 16]) -> String {
 /// store — it never repeats the payload. The view files are tiny (a 16-byte
 /// header plus 40 bytes per referenced section), so the authoritative bytes are
 /// stored exactly once on disk.
-fn write_views(authoritative: &Path, body: &EkbloomBody) -> Result<()> {
+fn write_views(authoritative: &Path) -> Result<()> {
     let bytes = std::fs::read(authoritative)?;
     let scan = format::scan(&bytes)?;
-    let generation = scan.commits.last().map(|c| c.generation).unwrap_or(0);
-
-    let core = [ViewRecord {
-        generation,
-        payload_offset: format::CORE_OFFSET,
-        payload_len: scan.header.core_len,
-        digest: first16(&body.core_hash),
-    }];
 
     let mut history: Vec<ViewRecord> = Vec::new();
     let mut checkpoints: Vec<ViewRecord> = Vec::new();
@@ -606,7 +601,6 @@ fn write_views(authoritative: &Path, body: &EkbloomBody) -> Result<()> {
     if let Some(commit) = scan.commits.last() {
         for section in &commit.sections {
             let record = ViewRecord {
-                generation: section.generation,
                 payload_offset: section.payload_offset,
                 payload_len: section.payload_len,
                 digest: section_digest(&bytes, section.payload_offset, section.payload_len),
@@ -623,7 +617,10 @@ fn write_views(authoritative: &Path, body: &EkbloomBody) -> Result<()> {
         }
     }
 
-    write_view(&authoritative.with_file_name("core"), VIEW_KIND_CORE, &core)?;
+    // Note: no `core` view is written. The visible core's range is fixed by the
+    // genesis header (`CORE_OFFSET`, `core_len`) and its content is pinned by the
+    // manifest `core_hash`, so a `core` view file would name a range the reader can
+    // already derive — redundant metadata that costs a whole allocated inode.
     write_view_if_any(authoritative, "history", VIEW_KIND_HISTORY, &history)?;
     write_view_if_any(
         authoritative,
@@ -652,16 +649,17 @@ fn write_view_if_any(
 
 /// Encode and write one pointer/metadata view file.
 ///
-/// Layout: `magic[8]`, `version u8`, `kind u8`, `reserved u16`, `count u32`, then
-/// `count` records of `generation u64`, `payload_offset u64`, `payload_len u64`,
-/// `digest [u8; 16]`.
+/// Layout: `magic[8]`, `version u8`, `kind u8`, `count u16`, then `count` records
+/// of `payload_offset u64`, `payload_len u64`, `digest [u8; 16]`. The 12-byte
+/// header plus a 32-byte record is **44 bytes** for one record (was 16 + 40 = 56),
+/// and the redundant per-record generation was dropped — the commit generation is
+/// already carried by the store's footer and manifest.
 fn write_view(path: &Path, kind: u8, records: &[ViewRecord]) -> Result<()> {
     let mut w = Writer::new();
     w.raw(VIEW_MAGIC);
-    w.raw(&[VIEW_VERSION, kind, 0, 0]);
-    w.u32(records.len() as u32);
+    w.raw(&[VIEW_VERSION, kind]);
+    w.u16(records.len().min(u16::MAX as usize) as u16);
     for record in records {
-        w.u64(record.generation);
         w.u64(record.payload_offset);
         w.u64(record.payload_len);
         w.raw(&record.digest);

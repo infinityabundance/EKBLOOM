@@ -193,6 +193,13 @@ impl CheckpointSet {
         if !Self::supported_interval(interval) {
             return Err(EkbloomError::BadInterval { interval });
         }
+        if machine.snapshot_needs_lane_cursors() {
+            return Err(EkbloomError::BadSection {
+                reason: "checkpoint set cannot store an independent-lane machine's per-lane \
+                         cursors"
+                    .to_string(),
+            });
+        }
         machine.check_core(core, logical_len)?;
         let ctx = crate::machine::prepare(machine, core)?;
 

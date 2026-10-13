@@ -28,6 +28,7 @@ constraint    ── CommittedBytes(plan) <= B
 pub struct Latency { pub p50: f64, pub p99: f64, pub p999: f64, pub mean: f64, pub requests: u64 }
 
 pub enum RestartGeometry {
+    None,                           // base representation only (verbatim core)
     Checkpoint { interval: u32 },   // bounded replay K - 1
     Block { block_bytes: u32 },     // bounded replay B - 1
 }
@@ -51,6 +52,9 @@ impl OptimizedPlan {
     pub fn build(&self, source: &[u8]) -> Result<EkbloomBody>;
     pub fn grow_into(&self, body: &mut EkbloomBody) -> Result<()>;   // additive
     pub fn engine(&self, body: &EkbloomBody) -> Result<Engine>;
+    /// Sequential throughput of the chosen plan, first-class in the selection.
+    pub fn expected_sequential_ns_per_byte(&self) -> f64;
+    pub fn sequential_gbps(&self) -> f64;
     // machine_id / region_bytes / restart / tile_shift / hot_regions /
     // expected_p99 / held_out_fingerprint / receipts / summary
 }
@@ -86,14 +90,30 @@ pub fn trace_fingerprint(trace: &AccessTrace) -> [u8; 32];
    distribution** is reduced to p99/p99.9 ([`Latency::weighted`], nearest-rank).
    Percentiles are taken over the *complete* plan's request distribution —
    independent component percentiles are never summed.
-4. **Choose** the lowest expected p99, ties broken by fewer committed bytes, then
-   a deterministic seed-keyed label hash.
+4. **Choose** the lowest expected p99, ties broken by the **higher sequential**
+   bulk throughput (the sequential axis is first-class), then fewer committed
+   bytes, then a deterministic seed-keyed label hash.
 
 The evaluation is a **deterministic certified cost-model evaluation** of the whole
 plan: it uses the plan's own per-region paths and worst-case positioning steps
 with the frozen [`CostModel`] constants, so the optimiser is *deterministic for a
 fixed seed/trace*. The example additionally measures real wall-clock p99 for the
 joint plan and the baselines at equal budget, validating the model's ranking.
+
+### Footprint gate (the governing objective)
+
+Adding manifested structures is only worth their bytes if they **measurably**
+improve the held-out p99. `optimize` therefore evaluates the **base
+representation** — the `auto` machine's core with no manifested structure
+([`RestartGeometry::None`]) — as the footprint floor. Because the `auto` core is
+never larger than raw, the base plan commits `core_len <= raw_bytes`. Any
+candidate that commits **more** than the base is admissible only when its held-out
+p99 beats the base's by more than `FOOTPRINT_GAIN_EPSILON` (1 %); otherwise it is
+dropped. On uniform/incompressible data the base is the verbatim machine 3, whose
+core is itself a certified `O(1)` bounded path (`StructureRef::Core`), so the
+chosen plan is **machine 3, no structures**, `CommittedBytes(plan) <= raw_bytes`.
+On compressible data the `auto` machine is machine 2, whose bare core has no
+bounded path, so no base plan is admitted and the gate is inert.
 
 ## 3. Transactionality & non-withdrawal
 
@@ -125,9 +145,21 @@ The optimiser decides from one held-out trace and is scored on a **different**
 evaluation trace with real wall-clock latency. Two budgets: `N` and `1.5·N`.
 
 The `budgets[].joint` / `.greedy` / `.machine_only` records carry the achieved
-held-out p50/p99/p99.9, committed bytes and chip (`joint_improves_frontier`). The
-honest comparison is: joint vs greedy (machine by core size + greedy hot tiles
-`K=64`, 4 KiB regions) vs machine selection alone, all under the same budget cap.
+held-out p50/p99/p99.9, committed bytes, sequential GB/s and chip
+(`joint_improves_frontier`). The honest comparison is: joint vs greedy (machine by
+core size + greedy hot tiles `K=64`, 4 KiB regions) vs machine selection alone, all
+under the same budget cap.
+
+**Uniform footprint (GAP 1).** `optimizer.json` `uniform_evidence` runs the same
+optimiser on a 4 MiB **uniform (incompressible)** corpus. The chosen plan is
+machine 3 with **no structures**: `committed_bytes == raw_bytes` (≤ raw), held-out
+p99 does not exceed the no-structure plan's, and the sequential rate is raw-like
+(`seq_gbps` in the high tens), against the decode-bound rate of the compressing
+plans on the heterogeneous corpus (`~0.3–0.6 GB/s`).
+
+**Sequential (GAP 2).** The optimiser reports each plan's `seq_gbps`; on uniform
+data it selects the verbatim machine 3, so its sequential rate tracks raw, while
+on compressible data it honestly reports the decode-bound number.
 
 ## 6. Reproduce
 

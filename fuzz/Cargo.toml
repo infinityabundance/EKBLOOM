@@ -105,3 +105,17 @@ path = "fuzz_targets/fuzz_resource.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_rans_w"
+path = "fuzz_targets/fuzz_rans_w.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_rans_il"
+path = "fuzz_targets/fuzz_rans_il.rs"
+test = false
+doc = false
+bench = false

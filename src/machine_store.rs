@@ -52,7 +52,7 @@ impl OrMachine for Store {
     fn reveal(&self, core: &[u8], omega: &mut Snapshot) -> Result<u8> {
         let p = omega.cursor;
         let s = *core.get(p as usize).ok_or(EkbloomError::CoreTooShort {
-            needed: p + 1,
+            needed: p.saturating_add(1),
             available: core.len() as u64,
         })?;
         omega.state = u32::from(s);
@@ -66,7 +66,7 @@ impl OrMachine for Store {
         core.get(p as usize)
             .copied()
             .ok_or(EkbloomError::CoreTooShort {
-                needed: p + 1,
+                needed: p.saturating_add(1),
                 available: core.len() as u64,
             })
     }

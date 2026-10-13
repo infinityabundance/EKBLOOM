@@ -180,6 +180,11 @@ impl BlockIndex {
         }
         let machine =
             machine_by_id(machine_id).ok_or(EkbloomError::UnknownMachine { id: machine_id })?;
+        if machine.snapshot_needs_lane_cursors() {
+            return Err(bad(
+                "block index cannot store an independent-lane machine's per-lane cursors",
+            ));
+        }
         machine.check_core(core, logical_len)?;
         let entries = crate::machine::block_restarts_with(machine, core, logical_len, block_bytes)?;
         let mut index = BlockIndex {
@@ -719,7 +724,7 @@ fn decode_nl2_into(
     let mut pos = core_pos;
     for _ in 0..skip {
         let r = *core.get(pos).ok_or(EkbloomError::CoreTooShort {
-            needed: pos as u64 + 1,
+            needed: (pos as u64).saturating_add(1),
             available: core.len() as u64,
         })?;
         let h = (x >> 8) as u8;
@@ -730,7 +735,7 @@ fn decode_nl2_into(
     }
     for byte in out.iter_mut() {
         let r = *core.get(pos).ok_or(EkbloomError::CoreTooShort {
-            needed: pos as u64 + 1,
+            needed: (pos as u64).saturating_add(1),
             available: core.len() as u64,
         })?;
         let h = (x >> 8) as u8;

@@ -247,7 +247,7 @@ impl RansIContext {
                         Some(&b) => b,
                         None => {
                             return Err(EkbloomError::CoreTooShort {
-                                needed: p + 1,
+                                needed: p.saturating_add(1),
                                 available: core.len() as u64,
                             })
                         }
@@ -322,7 +322,7 @@ impl RansIContext {
                         Some(&b) => b,
                         None => {
                             return Err(EkbloomError::CoreTooShort {
-                                needed: p + 1,
+                                needed: p.saturating_add(1),
                                 available: core.len() as u64,
                             })
                         }
@@ -393,7 +393,7 @@ fn step_at(table: &[u32], x: u32, core: &[u8], p: &mut u64) -> Result<(u8, u32)>
             Some(&b) => b,
             None => {
                 return Err(EkbloomError::CoreTooShort {
-                    needed: *p + 1,
+                    needed: p.saturating_add(1),
                     available: core.len() as u64,
                 })
             }
@@ -550,7 +550,7 @@ pub fn decode_measured(core: &[u8], k: usize, out: &mut [u8]) -> Result<()> {
             let mut v = *v_slot;
             while v < RANS_L {
                 let b = *core.get(p as usize).ok_or(EkbloomError::CoreTooShort {
-                    needed: p + 1,
+                    needed: p.saturating_add(1),
                     available: core.len() as u64,
                 })?;
                 v = (v << 8) | u32::from(b);
@@ -572,7 +572,7 @@ pub fn decode_measured(core: &[u8], k: usize, out: &mut [u8]) -> Result<()> {
         let mut v = (x >> SCALE_BITS) * (e & 0x0FFF) + slot - ((e >> SCALE_BITS) & 0x0FFF);
         while v < RANS_L {
             let b = *core.get(p as usize).ok_or(EkbloomError::CoreTooShort {
-                needed: p + 1,
+                needed: p.saturating_add(1),
                 available: core.len() as u64,
             })?;
             v = (v << 8) | u32::from(b);

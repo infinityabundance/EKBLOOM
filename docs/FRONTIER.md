@@ -20,10 +20,10 @@ the pinned-hot codec (**1,384,698 B** Zstd / **2,938,008 B** LZ4), and that acce
 survives a full scan. It does **not** win the *absolute* hot-latency contest — raw
 `memcpy` wins (**50/90 ns** p50/p99) and pinned-hot Zstd is next (**80/150 ns**) —
 and it does **not** win cold latency against LZ4 (EKBLOOM's fastest *compressing*
-engine config — machine 4 — is **12.0 µs** cold p99 vs **2.0 µs** for a plain LZ4
-4 KiB decode). On `mixed` it is smaller than raw (**0.79×**) but **not** smaller
-than pinned-hot Zstd (**3.30 MB** vs **2.92 MB**); on `uniform` its manifested body
-is larger than raw. See §3 and §6.
+engine config — machine 4 — is **17.7 µs** cold p99 on `skewed` vs **2.5 µs** for a
+plain LZ4 4 KiB decode). On `mixed` it is smaller than raw (**0.79×**) but **not**
+smaller than pinned-hot Zstd (**3.30 MB** vs **2.92 MB**); on `uniform` its
+manifested body is larger than raw. See §3 and §6.
 
 Everything is measured by `examples/frontier.rs` inside the pinned, memory-capped
 container. No number is estimated.
@@ -148,58 +148,59 @@ once per object/generation rather than once per byte.
 ## 3. Frontier (`evidence/bench/frontier.json`)
 
 Latencies in nanoseconds; `ret` = retained bytes; `build` = construction time;
-`hit` = cached/pinned lookup hit rate. Latest measured run. **Bold** marks the
-`auto` engine row and its smallest-footprint win. Two EKBLOOM engine rows appear per
-corpus and are **not** conflated: `ekbloom-engine` is the `auto` representation
-(machine 2 on `skewed`/`mixed`, machine 3 on `uniform`) and `ekbloom-engine-m4` is
-the explicit **machine-4** configuration (`OrANS-RANS0I`) — both built identically
-(256 KiB hot tiles + a 1024-byte block index) under the same budget.
+`seq GB/s` = whole-object 64 KiB-chunk sequential throughput; `hit` = cached/pinned
+lookup hit rate. Latest measured run. **Bold** marks the `auto` engine row and its
+smallest-footprint win. Two EKBLOOM engine rows appear per corpus and are **not**
+conflated: `ekbloom-engine` is the `auto` representation (machine 2 on
+`skewed`/`mixed`, machine 3 on `uniform`) and `ekbloom-engine-m4` is the explicit
+**machine-4** configuration (`OrANS-RANS0I`) — both built identically (256 KiB hot
+tiles + a 1024-byte block index) under the same budget.
 
 ### `skewed` (core 829,911 B, V/N 0.198, budget 4,718,592 B)
 
-| contender | ret | build | hot p50 | hot p99 | cold p50 | cold p99 | thrash p50 | thrash p99 | hit |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| raw-vec | 4,194,304 | 0 | 80 | 572 | 251 | 441 | 60 | 380 | – |
-| lz4-block | 2,675,864 | 5.6 ms | 3,497 | 4,238 | 4,168 | 5,871 | 3,497 | 4,238 | – |
-| lz4-block+cache | 4,718,592 | 5.6 ms | 160 | 220 | 4,278 | 6,142 | 371 | 5,009 | 0.72 |
-| lz4-block+pinned | 2,938,008 | 5.7 ms | 121 | 211 | 4,068 | 5,610 | 121 | 581 | 0.52 |
-| zstd-chunk | 1,122,554 | 12.7 ms | 11,602 | 28,773 | 12,253 | 28,723 | 11,602 | 28,773 | – |
-| zstd-chunk+cache | 4,718,592 | 12.7 ms | 90 | 150 | 471 | 30,537 | 160 | 13,135 | 0.91 |
-| zstd-chunk+pinned | 1,384,698 | 12.9 ms | 80 | 180 | 12,233 | 32,020 | 80 | 331 | 0.46 |
-| **ekbloom-engine** (machine 2, `auto`) | **1,141,643** | 103 ms | 130 | 401 | 15,349 | 17,342 | 120 | 431 | – |
-| ekbloom-engine-m4 (machine 4) | 1,276,859 | 119 ms | 120 | 410 | 10,590 | **12,023** | 130 | 441 | – |
+| contender | ret | build | hot p50 | hot p99 | cold p50 | cold p99 | thrash p50 | thrash p99 | seq GB/s | hit |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| raw-vec | 4,194,304 | 0 | 51 | 331 | 191 | 361 | 60 | 161 | **55.47** | – |
+| lz4-block | 2,675,864 | 5.6 ms | 3,296 | 4,338 | 4,018 | 4,859 | 3,296 | 4,338 | 2.03 | – |
+| lz4-block+cache | 4,718,592 | 5.6 ms | 160 | 250 | 4,157 | 5,330 | 381 | 4,889 | – | 0.72 |
+| lz4-block+pinned | 2,938,008 | 5.7 ms | 121 | 221 | 4,007 | 5,249 | 120 | 201 | – | 0.52 |
+| zstd-chunk | 1,122,554 | 12.9 ms | 11,441 | 25,898 | 12,023 | 24,586 | 11,441 | 25,898 | 1.36 | – |
+| zstd-chunk+cache | 4,718,592 | 12.9 ms | 90 | 160 | 411 | 30,206 | 160 | 12,424 | – | 0.91 |
+| zstd-chunk+pinned | 1,384,698 | 13.1 ms | 80 | 150 | 11,972 | 38,262 | 80 | 280 | – | 0.46 |
+| **ekbloom-engine** (machine 2, `auto`) | **1,141,643** | 109 ms | 120 | 391 | 15,299 | 30,256 | 120 | 391 | 0.32 | – |
+| ekbloom-engine-m4 (machine 4) | 1,276,859 | 127 ms | 120 | 421 | 9,849 | **17,683** | 120 | 231 | 0.49 | – |
 
 **smaller-than-raw = true · smaller-than-pinned = true · hot-p99-best = false · cold-p99-best = false · thrash-hot-p99-best = false**
 
 ### `mixed` (core 2,986,989 B, V/N 0.712, budget 4,718,592 B)
 
-| contender | ret | build | hot p50 | hot p99 | cold p50 | cold p99 | thrash p50 | thrash p99 | hit |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| raw-vec | 4,194,304 | 0 | 50 | 220 | 261 | 511 | 60 | 411 | – |
-| lz4-block | 3,447,151 | 3.1 ms | 3,577 | 4,879 | 851 | 5,551 | 3,577 | 4,879 | – |
-| lz4-block+cache | 4,718,592 | 3.1 ms | 160 | 210 | 1,763 | 7,163 | 301 | 4,718 | 0.70 |
-| lz4-block+pinned | 3,709,295 | 3.2 ms | 130 | 231 | 781 | 4,378 | 120 | 250 | 0.52 |
-| zstd-chunk | 2,660,548 | 8.0 ms | 11,562 | 23,504 | 1,984 | 24,496 | 11,562 | 23,504 | – |
-| zstd-chunk+cache | 4,718,592 | 8.0 ms | 90 | 141 | 1,523 | 25,397 | 130 | 12,263 | 0.86 |
-| zstd-chunk+pinned | 2,922,692 | 8.2 ms | 80 | 141 | 1,703 | 24,035 | 80 | 160 | 0.46 |
-| ekbloom-engine (machine 2, `auto`) | 3,298,721 | 99 ms | 120 | 411 | 14,798 | 17,462 | 120 | 341 | – |
-| ekbloom-engine-m4 (machine 4) | 3,433,937 | 109 ms | 120 | 441 | 10,450 | **12,764** | 120 | 231 | – |
+| contender | ret | build | hot p50 | hot p99 | cold p50 | cold p99 | thrash p50 | thrash p99 | seq GB/s | hit |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| raw-vec | 4,194,304 | 0 | 60 | 81 | 71 | 280 | 60 | 150 | **65.54** | – |
+| lz4-block | 3,447,151 | 3.1 ms | 3,306 | 4,609 | 491 | 4,479 | 3,306 | 4,609 | 4.09 | – |
+| lz4-block+cache | 4,718,592 | 3.1 ms | 151 | 201 | 952 | 4,979 | 301 | 5,180 | – | 0.70 |
+| lz4-block+pinned | 3,709,295 | 3.2 ms | 120 | 221 | 260 | 5,400 | 110 | 190 | – | 0.52 |
+| zstd-chunk | 2,660,548 | 7.8 ms | 11,521 | 23,974 | 1,994 | 24,406 | 11,521 | 23,974 | 2.47 | – |
+| zstd-chunk+cache | 4,718,592 | 7.8 ms | 90 | 160 | 1,342 | 24,686 | 131 | 12,242 | – | 0.86 |
+| zstd-chunk+pinned | 2,922,692 | 8.0 ms | 80 | 140 | 1,713 | 24,926 | 80 | 160 | – | 0.46 |
+| ekbloom-engine (machine 2, `auto`) | 3,298,721 | 105 ms | 130 | 421 | 14,678 | 17,673 | 120 | 360 | 0.33 | – |
+| ekbloom-engine-m4 (machine 4) | 3,433,937 | 119 ms | 120 | 351 | 10,079 | **13,275** | 130 | 351 | 0.48 | – |
 
 **smaller-than-raw = true · smaller-than-pinned = false (pinned Zstd 2.92 MB < engine 3.30 MB) · hot/cold/thrash-p99-best = false**
 
 ### `uniform` (core 4,194,304 B = raw, V/N 1.000, budget 4,718,592 B)
 
-| contender | ret | build | hot p50 | hot p99 | cold p50 | cold p99 | thrash p50 | thrash p99 | hit |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| raw-vec | 4,194,304 | 0 | 50 | 220 | 180 | 511 | 51 | 361 | – |
-| lz4-block | 4,216,832 | 0.8 ms | 201 | 551 | 501 | 832 | 201 | 551 | – |
-| lz4-block+cache | 4,718,592 | 0.8 ms | 150 | 201 | 1,012 | 2,104 | 201 | 871 | 0.67 |
-| lz4-block+pinned | 4,478,976 | 0.8 ms | 120 | 200 | 251 | 621 | 110 | 180 | 0.52 |
-| zstd-chunk | 4,197,632 | 3.9 ms | 762 | 1,563 | 1,182 | 2,585 | 762 | 1,563 | – |
-| zstd-chunk+cache | 4,718,592 | 3.9 ms | 90 | 150 | 1,142 | 6,973 | 100 | 1,102 | 0.80 |
-| zstd-chunk+pinned | 4,459,776 | 3.9 ms | 80 | 130 | 901 | 1,813 | 80 | 131 | 0.46 |
-| ekbloom-engine (machine 3, `auto`) | 4,506,036 | 39 ms | 120 | 391 | 491 | **752** | 120 | 220 | – |
-| ekbloom-engine-m4 (machine 4) | 4,641,769 | 73 ms | 120 | 370 | 6,572 | 7,655 | 120 | 211 | – |
+| contender | ret | build | hot p50 | hot p99 | cold p50 | cold p99 | thrash p50 | thrash p99 | seq GB/s | hit |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| raw-vec | 4,194,304 | 0 | 60 | 90 | 71 | 251 | 60 | 90 | **63.86** | – |
+| lz4-block | 4,216,832 | 0.6 ms | 210 | 451 | 261 | 641 | 210 | 451 | 45.96 | – |
+| lz4-block+cache | 4,718,592 | 0.6 ms | 150 | 200 | 651 | 922 | 201 | 672 | – | 0.67 |
+| lz4-block+pinned | 4,478,976 | 0.6 ms | 120 | 201 | 241 | 301 | 110 | 170 | – | 0.52 |
+| zstd-chunk | 4,197,632 | 3.5 ms | 752 | 1,523 | 1,032 | 2,164 | 752 | 1,523 | 19.61 | – |
+| zstd-chunk+cache | 4,718,592 | 3.5 ms | 90 | 140 | 1,092 | 5,941 | 100 | 1,092 | – | 0.80 |
+| zstd-chunk+pinned | 4,459,776 | 3.5 ms | 80 | 140 | 872 | 1,794 | 80 | 130 | – | 0.46 |
+| ekbloom-engine (machine 3, `auto`) | 4,506,036 | 45 ms | 120 | 431 | 521 | **842** | 120 | 200 | **33.00** | – |
+| ekbloom-engine-m4 (machine 4) | 4,641,769 | 79 ms | 120 | 331 | 6,633 | 9,307 | 120 | 281 | 0.72 | – |
 
 **smaller-than-raw = false (base == raw, manifested body > raw) · smaller-than-pinned = false · hot/cold/thrash-p99-best = false**
 
@@ -293,10 +294,11 @@ LZ4 ≈0.50–0.69 ns/byte — is the stable residual.)
 - **Block size is not the lever.** A 4 KiB read decodes 4096 symbols regardless, so
   256 B / 1 KiB / 4 KiB blocks move machine-4 r4k by <3% (9.3–10.0 µs); smaller
   blocks only shrink the bounded skip while costing a larger restart directory.
-- The **engine** cold p99 is **17.3 µs `skewed`**, **17.5 µs `mixed`** on the
-  `auto` (machine-2) plan, and **12.0 µs `skewed`**, **12.8 µs `mixed`** on the
+- The **engine** cold p99 measured **30.3 µs `skewed`**, **17.7 µs `mixed`** on the
+  `auto` (machine-2) plan, and **17.7 µs `skewed`**, **13.3 µs `mixed`** on the
   machine-4 engine configuration (the `ekbloom-engine-m4` rows in §3); machine 4's
-  interleaved block decode flows through the unified engine.
+  interleaved block decode flows through the unified engine. (Cold p50/p99 move
+  by tens of percent run to run; §3 and §4 state the stable decode-rate residual.)
 
 **Why it still cannot close at equal bytes.** LZ4's cold advantage is a *decoder*
 property, not a footprint property. Interleaving (the format-level change §4's
@@ -353,19 +355,20 @@ packing does not help and the machine falls back to the identity rendering
   `uniform` the manifested body (**4,506,036 B**) is larger than both pinned rows.
 - **Warm hot reads: the engine is mid-pack, not the winner.** The engine's hot p50
   is **120–130 ns**, level with pinned LZ4 (**120–130 ns**) but above pinned Zstd
-  (**80 ns**) and far above raw (**50–80 ns**). Its p99 (**341–441 ns**) is worse than
-  every pinned/cached row (**140–231 ns**) and every raw row (**180–572 ns**). Raw
+  (**80 ns**) and far above raw (**50–80 ns**). Its p99 (**391–431 ns**) is worse than
+  every pinned/cached row (**140–231 ns**) and every raw row (**90–572 ns**). Raw
   wins the absolute hot-latency contest outright.
-- **Cold tail.** The `auto` engine's bounded cold p99 is **17.3 µs (`skewed`)** and
-  **17.5 µs (`mixed`)** — it plans machine 2 for its in-file manifests. The
-  **machine-4 engine configuration** (`ekbloom-engine-m4`, hot tiles + a 1024-byte
-  block index, the *same* budget) cuts that to **12.0 µs (`skewed`)** and
-  **12.8 µs (`mixed`)** — **≈1.44× / ≈1.37× faster** — at a **≈12% larger** retained
-  footprint (the wide `45 B`/entry machine-4 restart records). Both beat pinned-hot
-  Zstd (24.0–32.0 µs) but **lose to pinned/plain LZ4 4 KiB** (2.0 µs) and to raw
-  (1.0–2.1 µs); §4 shows interleaving narrows the *bounded block* cold gap from
+- **Cold tail.** The `auto` engine's bounded cold p99 measured **30.3 µs
+  (`skewed`)** and **17.7 µs (`mixed`)** — it plans machine 2 for its in-file
+  manifests. The **machine-4 engine configuration** (`ekbloom-engine-m4`, hot tiles
+  + a 1024-byte block index, the *same* budget) measured **17.7 µs (`skewed`)** and
+  **13.3 µs (`mixed`)** — i.e. **≈1.33× faster** on `mixed` (comparable on `skewed`
+  in this run; cold p50/p99 are noisy) — at a **≈12% larger** retained footprint
+  (the wide `45 B`/entry machine-4 restart records). Both beat pinned-hot Zstd
+  (24.0–38.3 µs) but **lose to pinned/plain LZ4 4 KiB** (2.5–4.9 µs) and to raw
+  (0.25–0.36 µs); §4 shows interleaving narrows the *bounded block* cold gap from
   ≈5–7× to ≈4.7–4.9×. On `uniform`, machine 3 (identity) makes cold replay a direct
-  index: cold p99 **0.75 µs**.
+  index: cold p99 **0.84 µs**.
 - **Non-eviction (thrash): not unique to EKBLOOM.** The pinned-hot codec is
   *permanently* resident, so after a full sequential scan it does not degrade either
   (**zstd-chunk+pinned** thrash hot p99 **131–290 ns**; **lz4-block+pinned**
@@ -374,6 +377,16 @@ packing does not help and the machine falls back to the identity rendering
   **zstd-chunk+cache 1.2–13.1 µs**), but it is **not** best-of-all — the pinned rows
   are lower. Non-eviction alone is therefore **not** an EKBLOOM win; the win is
   holding it at a **smaller footprint** than the pinned codec (`skewed` only).
+- **Sequential throughput (first-class).** `frontier.json` rows now carry
+  `seq_gbps`, a whole-object 64 KiB-chunk read rate. On `uniform`, EKBLOOM's
+  machine-3 engine reaches **33.0 GB/s** — raw-like (raw `63.9 GB/s`), because the
+  verbatim core is a direct slice copy (indexed LZ4 **46.0**, Zstd **19.6**). On
+  the compressible `skewed`/`mixed` corpora the chosen plan is decode-bound:
+  machine 2 **0.32–0.33 GB/s**, machine 4 **0.48–0.49 GB/s**, behind raw
+  (**55.5–65.5 GB/s**) and indexed LZ4 (**2.0–4.1 GB/s**) / Zstd (**1.4–2.5 GB/s**).
+  The honest statement is unchanged: EKBLOOM's sequential axis is raw-like only
+  where the representation is verbatim (incompressible data); the compressing
+  machines are decode-bound.
 - **Construction.** The engine's build is **39–119 ms** versus **0.6–13.5 ms** for
   the codecs — it runs an encode, a full decode to build tiles and an O(N) restart
   pass, then plans. Honest: EKBLOOM trades build time for a bound and a footprint.
@@ -386,13 +399,14 @@ packing does not help and the machine falls back to the identity rendering
 
 | requirement | verdict |
 |---|---|
-| exact random 4 KiB **hot** reads, competitive p50/p99 | **holds** — 120–130 ns p50; p99 (341–441 ns) above every raw/pinned/cached row, far below any no-cache decode |
+| exact random 4 KiB **hot** reads, competitive p50/p99 | **holds** — 120–130 ns p50; p99 (391–431 ns) above every raw/pinned/cached row, far below any no-cache decode |
 | base representation never exceeds raw (`auto`) | **holds** — `uniform` base == `N` (machine 3); `skewed`/`mixed` base `V < N` |
 | materially smaller retained footprint than raw | **holds on `skewed` (0.27×) and `mixed` (0.79×)**; fails on `uniform`'s manifested body (1.07×) — only the base is ≤ raw |
 | smaller retained footprint than the strongest **non-evicting** codec (pinned-hot) | **holds on `skewed` (1.14 MB < 1.38 MB Zstd / 2.94 MB LZ4)**; **fails on `mixed` (3.30 MB > 2.92 MB) and `uniform`** |
 | reproducible advantage over indexed codecs on ≥1 workload | **holds narrowly** — the footprint win over pinned-hot on `skewed`; **non-eviction is matched by the pinned codec**, and the engine wins **no** latency axis |
 | absolute lowest hot latency | **fails** — raw wins (50/90 ns); pinned-hot Zstd next (80/150 ns) |
-| cold (uncached) 4 KiB / 64 KiB reads vs block-indexed LZ4 | **narrows, does *not* close** — the machine-4 engine config is 12.0 µs p99 vs LZ4 2.0 µs (≈6×) on 4 KiB; the bare machine-4 block path is 10.0 µs (≈4.9×) vs 2.0 µs, at ~2.4 ns/byte vs LZ4 ~0.6 ns/byte (§4) |
+| cold (uncached) 4 KiB / 64 KiB reads vs block-indexed LZ4 | **narrows, does *not* close** — the machine-4 engine config is 17.7 µs p99 vs LZ4 2.5 µs on 4 KiB; the bare machine-4 block path is 10.0 µs (≈4.9×) vs 2.0 µs, at ~2.4 ns/byte vs LZ4 ~0.6 ns/byte (§4) |
+| sequential throughput (first-class) | **raw-like only on incompressible data** — machine 3 **33.0 GB/s** vs raw **63.9**; the compressing machines are decode-bound (**0.32–0.49 GB/s** vs LZ4 **2.0–4.1** / Zstd **1.4–2.5**) |
 | 1-byte allocation-free lookup within 15% of raw `Vec` | **holds via the borrowed `ResidentView`** — 0.94–1.05×, dispatch hoisted once per object; the per-call `byte_at` remains 4.7–5.9× (§2.2) |
 
 **The milestone holds on the footprint axis only, with several honest losses.**

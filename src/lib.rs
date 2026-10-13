@@ -50,6 +50,8 @@ pub mod machine;
 pub mod machine_pack;
 pub mod machine_rans;
 pub mod machine_rans_i;
+pub mod machine_rans_il;
+pub mod machine_rans_w;
 pub mod machine_seg;
 pub mod machine_store;
 pub mod manifest;
@@ -128,12 +130,21 @@ pub use kernels::{
 };
 pub use machine::{
     machine_by_id, prepare, state_log_with, OrMachine, Prepared, MACHINE_NL2, MACHINE_PACK,
-    MACHINE_RANS0, MACHINE_RANS0I, MACHINE_SEG, MACHINE_STORE, NL2,
+    MACHINE_RANS0, MACHINE_RANS0I, MACHINE_RANS0IL, MACHINE_RANS0W, MACHINE_SEG, MACHINE_STORE,
+    NL2,
 };
 pub use machine_pack::{Pack, PackContext, PACK};
 pub use machine_rans::{encoded_window_bound, Rans0, RANS0, RENORM_MAX_PER_STEP, WINDOW_MARGIN};
 pub use machine_rans_i::{
     encode_with_k, Rans0I, RansIContext, DEFAULT_K as RANS_I_DEFAULT_K, RANS0I,
+};
+pub use machine_rans_il::{
+    decode_il, encode_il, il_block_restarts, IlContext, IlState, Rans0IL, DEFAULT_IL_K,
+    IL_STATE_LEN, IL_WINDOW_MARGIN, MAX_IL_LANES, RANS0IL,
+};
+pub use machine_rans_w::{
+    encode as encode_word16, encoded_window_bound_w, Rans0W, RansWContext, RANS0W,
+    RANS_W_MODEL_HEADER_BYTES, RENORM_MAX_BYTES_PER_STEP_W, WINDOW_MARGIN_W,
 };
 pub use machine_seg::{
     Seg, SegContext, SegEntry, SEG, SEG_DEFAULT_SEGMENT_BYTES, SEG_ENTRY_BYTES, SEG_HEADER_BYTES,
@@ -141,12 +152,13 @@ pub use machine_seg::{
 };
 pub use machine_store::{Store, STORE};
 pub use manifest::{
-    create, create_auto, create_auto_packed, create_auto_segmented, create_auto_with_policy,
-    create_auto_within_budget, create_machine, create_machine_within_budget, create_within_budget,
-    estimate_physical_bytes, estimate_physical_bytes_for_core, grow, inspect, manifest,
-    manifest_within_budget, select_machine, select_machine_packed, select_machine_policy,
-    select_machine_segmented, select_profile_within_budget, ComponentReport, EkbloomBody,
-    ManifestationReport, RepresentationPolicy,
+    create, create_auto, create_auto_independent, create_auto_packed, create_auto_segmented,
+    create_auto_with_policy, create_auto_within_budget, create_auto_word16, create_machine,
+    create_machine_within_budget, create_within_budget, estimate_physical_bytes,
+    estimate_physical_bytes_for_core, grow, inspect, manifest, manifest_within_budget,
+    select_machine, select_machine_independent, select_machine_packed, select_machine_policy,
+    select_machine_segmented, select_machine_word16, select_profile_within_budget, ComponentReport,
+    EkbloomBody, ManifestationReport, RepresentationPolicy,
 };
 pub use mapped::{thp_anonymous_probe, HugePageReport, MapMode, MappedSurface};
 pub use metrics::{now_ns, percentiles, Percentiles};
@@ -185,8 +197,9 @@ pub use resource::{
 };
 pub use simd::{
     avx2_available, avx512_available, gather_bytes, gather_bytes_avx512, gather_bytes_prefetch,
-    gather_bytes_scalar, nl2_step, nl2_windows16_avx2, nl2_windows_avx2_available, sse_available,
-    NL2_WINDOW_LANES,
+    gather_bytes_scalar, nl2_step, nl2_windows16_avx2, nl2_windows_avx2_available,
+    rans_decode8_independent, rans_decode8_independent_scalar, rans_decode8_shared,
+    rans_step8_avx2, rans_step8_scalar, sse_available, NL2_WINDOW_LANES, RANS_LANES8,
 };
 pub use state::Snapshot;
 pub use sweep::{

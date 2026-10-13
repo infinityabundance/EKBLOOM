@@ -293,9 +293,12 @@ fn machine_one_is_unaffected() {
     // Machine 4 (interleaved rANS) and machine 5 (packed) are registered.
     assert_eq!(machine_by_id(4).unwrap().machine_id(), 4);
     assert_eq!(machine_by_id(5).unwrap().machine_id(), 5);
-    // Machine 6 (segmented container) is registered; higher ids are not.
+    // Machines 6 (segmented), 7 (word16) and 8 (independent lanes) are
+    // registered; higher ids are not.
     assert_eq!(machine_by_id(6).unwrap().machine_id(), 6);
-    assert!(machine_by_id(7).is_none());
+    assert_eq!(machine_by_id(7).unwrap().machine_id(), 7);
+    assert_eq!(machine_by_id(8).unwrap().machine_id(), 8);
+    assert!(machine_by_id(9).is_none());
     assert_eq!(MACHINE_NL2, 1);
     assert_eq!(MACHINE_RANS0, 2);
     assert_eq!(MACHINE_STORE, 3);

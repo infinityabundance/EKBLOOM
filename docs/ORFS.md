@@ -14,7 +14,6 @@ For one logical object `data/obj.bin` keyed by its logical identity:
 <root>/data/obj.bin                          pointer/registration artifact (small)
 <root>/.ekbloom/index                         concealed registry (small)
 <root>/.ekbloom/<logical-id-hex>/manifests    the ONE authoritative `.ekb` store
-<root>/.ekbloom/<logical-id-hex>/core         pointer view  (16 B header + 40 B)
 <root>/.ekbloom/<logical-id-hex>/history      pointer view  (if present)
 <root>/.ekbloom/<logical-id-hex>/checkpoints  pointer view  (if present)
 <root>/.ekbloom/<logical-id-hex>/bloom4       pointer view  (non-regional blooms)
@@ -26,10 +25,14 @@ the checkpoints, the blooms, the serialized tiles/blocks, and the manifest — t
 **only** place the authoritative payload bytes exist.
 
 Every other concealed name is a tiny `EKBFSVW1` **pointer/metadata view**: an
-8-byte magic, a version/kind byte, a record count, and then, per referenced
-section, the section's generation, its absolute `payload_offset` and
-`payload_len` inside the store, and the first 16 bytes of its BLAKE3 digest. A
-view is 56 bytes for one record; it never contains a payload byte.
+8-byte magic, a version/kind byte, a `u16` record count, and then, per referenced
+section, its absolute `payload_offset` and `payload_len` inside the store, and
+the first 16 bytes of its BLAKE3 digest. A view record is 32 bytes and the header
+is 12, so a view is **44 bytes for one record**; it never contains a payload byte.
+There is deliberately **no `core` view**: the visible core's range is fixed by the
+genesis header (`CORE_OFFSET`, `core_len`) and its content is pinned by the
+manifest `core_hash`, so a `core` view would name a range the reader can already
+derive — redundant metadata that costs a whole allocated inode.
 
 The earlier revision wrote the core, history, checkpoints and blooms **twice** —
 once as standalone sidecar files and again inside `manifests` — so the on-disk
@@ -73,22 +76,29 @@ in-memory engine number is `EkbloomBody::physical_bytes()` for the **same** body
 
 | corpus | in-memory engine (B) | OrFS disk (B) | excess | single `.ekb` (B, allocated) | raw (B) | pinned LZ4 (B) | pinned Zstd (B) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| skewed | 1,141,643 | 1,163,264 | +21,621 (**+1.89%**) | 1,142,784 | 4,194,304 | 2,940,928 | 1,388,544 |
-| mixed  | 3,298,721 | 3,321,856 | +23,135 (**+0.70%**) | 3,301,376 | 4,194,304 | 3,710,976 | 2,928,640 |
+| skewed | 1,141,643 | 1,159,168 | +17,525 (**+1.54%**) | 1,142,784 | 4,194,304 | 2,940,928 | 1,388,544 |
+| mixed  | 3,298,721 | 3,317,760 | +19,039 (**+0.58%**) | 3,301,376 | 4,194,304 | 3,710,976 | 2,928,640 |
 
 Read honestly:
 
-- **The OrFS disk number exceeds the in-memory engine number** — by 21,621 B
-  (+1.89%) for `skewed` and 23,135 B (+0.70%) for `mixed`. That excess is the
+- **The OrFS disk number exceeds the in-memory engine number** — by 17,525 B
+  (+1.54%) for `skewed` and 19,039 B (+0.58%) for `mixed`. That excess is the
   `.ekb` container framing (80-byte header, 8-byte alignment padding, 40-byte
   section headers, the manifest record, the 64-byte footer) plus the pointer
   views, the registry and the directory metadata. It is **bounded framing, not a
-  duplicated payload**.
+  duplicated payload**. The earlier revision wrote a redundant always-present
+  `core` view; dropping it (and compacting the view record to 32 bytes) removed a
+  whole 4 KiB allocated inode, taking the overhead from **+1.89 % / +0.70 %** to
+  **+1.54 % / +0.58 %**. The residual is now dominated by filesystem block
+  granularity — the registry, the two concealed directories and the logical
+  pointer artifact each occupy one allocated 4 KiB block — not by container
+  framing (~1.1 KB per object).
 - The OrFS object is only slightly larger than **one** standalone `.ekb`
-  (1,163,264 vs 1,142,784 B for `skewed`; 3,321,856 vs 3,301,376 B for `mixed`):
-  the difference is the pointer views + registry + logical pointer + directory
-  blocks. In the earlier (duplicating) revision it was roughly **2×** the store.
-- The in-memory engine number is far below a raw file (≈3.7× / 1.27× smaller)
+  (1,159,168 vs 1,142,784 B for `skewed`; 3,317,760 vs 3,301,376 B for `mixed`):
+  the difference is the registry + logical pointer + directory blocks (four
+  allocated 4 KiB blocks). In the earlier (duplicating) revision it was roughly
+  **2×** the store.
+- The in-memory engine number is far below a raw file (≈3.6× / 1.27× smaller)
   and below the equal-budget pinned-hot LZ4 store for `skewed` (1.16 MB vs
   2.94 MB) and `mixed` (3.32 MB vs 3.71 MB); pinned Zstandard is smaller than
   the engine footprint on these corpora (0.98×–1.39 MB/2.93 MB), which is stated

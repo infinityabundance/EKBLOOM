@@ -574,6 +574,13 @@ pub fn manifest_hot_regions(
     let machine = machine_by_id(body.machine_id).ok_or(EkbloomError::UnknownMachine {
         id: body.machine_id,
     })?;
+    if machine.snapshot_needs_lane_cursors() {
+        return Err(EkbloomError::BadSection {
+            reason: "regional tables cannot store an independent-lane machine's per-lane \
+                     cursors"
+                .to_string(),
+        });
+    }
     // The capability predicate decides the record form; no machine id is
     // hardcoded here.
     let store_wide = machine.snapshot_needs_lanes();

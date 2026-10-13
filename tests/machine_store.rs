@@ -213,16 +213,24 @@ fn machine_three_manifest_verify_and_file_roundtrip() {
             );
         }
         // The engine accepts any profile that carries a bounded path. For machine 3
-        // the state-only history is not an `AffineSummary` (that is machine-1 only),
-        // so `Root` and `Full` offer no bounded path and are rejected.
-        if matches!(
-            profile,
-            ManifestationProfile::Root | ManifestationProfile::Full
-        ) {
+        // a structureless `Root` body is coverable by the verbatim core itself
+        // (`StructureRef::Core`, an `O(1)` slice with zero steps); a state-only
+        // `Full` history is NOT an `AffineSummary` (that is machine-1 only) and
+        // offers no bounded path, so it is rejected.
+        if matches!(profile, ManifestationProfile::Full) {
             assert!(Engine::plan(&body, &generous(), &workload4k()).is_err());
         } else {
             let engine = Engine::plan(&body, &generous(), &workload4k()).unwrap();
             assert!(engine.plan_ref().all_certified());
+            if matches!(profile, ManifestationProfile::Root) {
+                assert_eq!(engine.worst_case_steps(), 0);
+                assert!(engine
+                    .plan_ref()
+                    .regions()
+                    .iter()
+                    .all(|r| r.path == EnginePath::DirectStorage
+                        && matches!(r.structure, ekbloom::StructureRef::Core)));
+            }
         }
     }
 }

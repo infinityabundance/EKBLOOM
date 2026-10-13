@@ -923,4 +923,97 @@ green at **663 passed**.
 * A public `OrMachine::reveal`/`peek` with a *crafted* `Snapshot.cursor == u64::MAX`
   still overflows `p + 1` in the single-state machines (`NL2`, `STORE`); not reached
   by any read path and pre-existing (not N-introduced). Noted, not fixed.
+
+## Revision 8 — O1–O2: machines 7/8, the SIMD kernel, the footprint gate, OrFS framing (verdict **TWO DEFECTS, BOTH FIXED**)
+
+Independent, executable attacks pinned by `tests/adversarial_o.rs` (9 tests, green)
+plus the two new fuzz targets `fuzz_rans_w`/`fuzz_rans_il`. Machines 1–6 stay
+wire-hash-pinned; every crafted container is a clean typed `Err`.
+
+### Finding I (**Medium**, FIXED) — unchecked `cursor + 1` overflow in machines 7/8 and the SIMD kernel
+
+`CoreTooShort { needed: … }` was built with a non-saturating `cursor + 1` (and `+ 2`
+in machine 7's `read_word`) on an **attacker-controlled cursor**: machine 7
+`read_word` (`machine_rans_w.rs`), machine 8 `IlContext::step`/`decode_into_slice`
+(`machine_rans_il.rs`), and `rans_decode8_independent_scalar`/`_avx2`/
+`rans_decode8_shared` (`simd.rs`). A cursor of `u64::MAX` panicked with `attempt to
+add with overflow` in any overflow-checked build.
+
+**Reachable from a read path for machine 7.** Machine 7 is cursor-divergent but
+`Prepared::is_windowed()` is `false` for it, so it is **not** on the cursor-bounded
+windowed path; `read_via_checkpoint` loads the checkpoint entry's cursor verbatim
+(`Snapshot::unpack`) with no `validate_restart` and no `cursor <= core_len` bound
+(only machine 1's implicit cursor is enforced in `from_bytes_with`). A crafted
+`.ekb` whose machine-7 checkpoint carries `cursor = u64::MAX` (CRC recomputed —
+integrity, not authenticity) therefore reaches `read_word(u64::MAX)`. Machine 8 and
+the kernel are reached through the public `reveal`/`peek`/kernel API with a crafted
+`Snapshot`/`IlState`/cursor array (the same boundary noted for `NL2`/`STORE` in R7,
+but **new code** here).
+
+**Fix (one-line `saturating_add` per site, mirroring Finding H):** `machine_rans_w.rs`
+(`p + 1`, `p + 2`), `machine_rans_il.rs` (three sites), `simd.rs` (five sites).
+Failing-then-passing: `machine7_bogus_checkpoint_cursor_is_a_typed_error`,
+`machine7_reveal_with_max_cursor_is_a_typed_error`,
+`machine8_reveal_with_max_lane_cursor_is_a_typed_error`,
+`simd_kernel_max_cursor_is_a_typed_error` (all panicked before the fix).
+
+### Finding J (**Medium**, FIXED) — the footprint gate aborted when only the base representation fit
+
+On uniform/incompressible data the documented contract is *machine 3, no
+structures, `CommittedBytes(plan) <= raw`* (the footprint floor). But `optimize`
+built the cold geometries (`Checkpoint`/`Block` only — no `None`) **first** and
+returned `AllocationTooLarge { requested: raw, limit: raw }` when none fit the
+budget, *before* Phase 1b computed the structureless base representation. So a
+budget of exactly `raw` (or `raw` plus less than the smallest structure overhead)
+on uniform data — the one case the gate exists for — **errored instead of returning
+the ≤-raw base plan**. Minimal repro: uniform 64 KiB, `budget = raw` →
+`AllocationTooLarge { requested: 65536, limit: 65536 }`.
+
+**Fix (`src/optimize.rs`):** compute the base representation (Phase 1b) **before**
+the cold-geometry guard, and gate the two emptiness checks on the base reference:
+`if bases.is_empty() && base_reference.is_none()` and
+`if evaluated.is_empty() && base_reference.is_none()`. The base candidate is then
+seeded into the evaluated set by the existing Phase 3a gate and chosen.
+Failing-then-passing: `optimizer_uniform_tight_budget_stays_leq_raw` (failed before:
+`AllocationTooLarge`). Behavior for budgets where a cold geometry fits is unchanged.
+
+### Attacks that held (Revision 8)
+
+* **Machines 7/8 exactness** — all categories × lane counts 1–8 round-trip; byte-
+exact vs `reader::read` over full/partial/boundary ranges before and after
+serialize + reopen; complete-state machine-7 checkpoints/blocks and machine-8
+`il_block_restarts` resume exactly at every block boundary; crafted/truncated
+headers (short fixed header, `K∉[1,8]`, overrunning/short lane payload) are clean
+`Err`; machines 1–6 registry + FNV wire hashes unchanged.
+* **SIMD kernel** — the unwired decoder kernel equals the scalar reference for
+adversarial cursors/boundaries and is now total; it is exported but called by no
+other `src` module (unwired, not on any default path); `unsafe` remains confined to
+the three sanctioned modules (`simd`, `async_io`, `mapped`).
+* **OrFS** — `inspect_physical` still equals an independent `du`-style walk, the
+authoritative payload is stored exactly once (sidecars < 512 B), and the compacted
+views/framing round-trip, recover and reject corruption (existing tests, green).
+Views are **write-only** (no reader consumes them), so there is no forged-view
+surface to accept.
+* **Optimiser** — with the fix, budget (committed ≤ `B`), certification
+(`all_certified` only) and the footprint invariant (uniform plan ≤ raw) hold at both
+tight and loose budgets; a compressible/constant corpus does not expand past raw.
+
+### Fuzz + evidence (Revision 8)
+
+`sh scripts/container-fuzz.sh`: **fifteen** targets PASS (`fuzz_rans_w`,
+`fuzz_rans_il` added and wired into `fuzz/Cargo.toml` + the campaign).
+`sh scripts/container-reproduce.sh`: clean `--locked --release` build, **684
+passed / 0 failed**, **33** evidence JSON files OK. Verify gate (`fmt --check`,
+`clippy -D warnings`, `cargo test --all-features`) green at **698 passed**.
+
+### Residual risk (Revision 8)
+
+* **Both defects fixed** (I, J); no unfixed read-path defect found.
+* The pre-existing **`NL2`/`STORE` `reveal`/`peek` `cursor + 1`** overflow (R7) is
+  the same class as Finding I but was left unchanged (public-API-only, not on a read
+  path). Recommend the same `saturating_add` for consistency.
+* Release builds (`overflow-checks` off) already turn the Finding-I overflow into a
+  clean `Err`; the DoS was limited to overflow-checked builds. A restart cursor that
+  is in range but state-inconsistent is still not re-derived at read time (integrity,
+  not authenticity) — unchanged.
  

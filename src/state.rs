@@ -31,6 +31,10 @@ pub struct Snapshot {
     /// Index of the lane that reveals the next symbol (interleaved machines);
     /// zero for single-state machines.
     pub lane: u8,
+    /// Per-lane encoded cursors for the independent-lane machine (`machine_id = 8`,
+    /// `OrANS-RANS0IL`), whose lanes own separate payload ranges. All zero for every
+    /// other machine; the single-state machines and machine 4 read `cursor` only.
+    pub cursors: [u64; MAX_LANES],
 }
 
 impl Snapshot {
@@ -42,6 +46,7 @@ impl Snapshot {
             cursor,
             lanes: [0; MAX_LANES],
             lane: 0,
+            cursors: [0; MAX_LANES],
         }
     }
 
@@ -53,6 +58,26 @@ impl Snapshot {
             cursor,
             lanes,
             lane,
+            cursors: [0; MAX_LANES],
+        }
+    }
+
+    /// Construct an independent-lane snapshot from the complete lane state: the
+    /// active lane's state and cursor, the whole per-lane state array and the
+    /// whole per-lane cursor array.
+    #[inline]
+    pub const fn with_lanes_cursors(
+        cursor: u64,
+        lanes: [u32; MAX_LANES],
+        lane: u8,
+        cursors: [u64; MAX_LANES],
+    ) -> Self {
+        Self {
+            state: lanes[lane as usize],
+            cursor,
+            lanes,
+            lane,
+            cursors,
         }
     }
 
@@ -96,11 +121,57 @@ impl Snapshot {
             cursor,
             lanes,
             lane,
+            cursors: [0u64; MAX_LANES],
         })
     }
 
     /// Packed wire size of a resume point: `u32` state ++ `u64` cursor, no padding.
     pub const PACKED_LEN: usize = 12;
+
+    /// Packed wire size of a complete **independent-lane** resume point:
+    /// `u32` state ++ `u64` cursor ++ `u8` lane ++ `MAX_LANES * u32` lane states
+    /// ++ `MAX_LANES * u64` per-lane cursors (machine 8).
+    pub const WIDE_IL_LEN: usize = 4 + 8 + 1 + 4 * MAX_LANES + 8 * MAX_LANES;
+
+    /// Pack into the fixed independent-lane wide resume form (machine 8): the same
+    /// prefix as [`Self::pack_wide`] followed by the per-lane cursors. It is a
+    /// **distinct** form so no machine-4 wire record changes.
+    pub fn pack_wide_il(&self) -> [u8; Self::WIDE_IL_LEN] {
+        let mut out = [0u8; Self::WIDE_IL_LEN];
+        let base = Self::WIDE_LEN;
+        out[..base].copy_from_slice(&self.pack_wide());
+        for (i, &c) in self.cursors.iter().enumerate() {
+            let o = base + i * 8;
+            out[o..o + 8].copy_from_slice(&c.to_le_bytes());
+        }
+        out
+    }
+
+    /// Unpack from the fixed independent-lane wide resume form.
+    pub fn unpack_wide_il(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < Self::WIDE_IL_LEN {
+            return Err(EkbloomError::Truncated {
+                needed: Self::WIDE_IL_LEN as u64,
+                available: bytes.len() as u64,
+            });
+        }
+        let mut s = Self::unpack_wide(&bytes[..Self::WIDE_LEN])?;
+        let base = Self::WIDE_LEN;
+        for (i, slot) in s.cursors.iter_mut().enumerate() {
+            let o = base + i * 8;
+            *slot = u64::from_le_bytes([
+                bytes[o],
+                bytes[o + 1],
+                bytes[o + 2],
+                bytes[o + 3],
+                bytes[o + 4],
+                bytes[o + 5],
+                bytes[o + 6],
+                bytes[o + 7],
+            ]);
+        }
+        Ok(s)
+    }
 
     /// Pack into the fixed 12-byte little-endian resume form.
     pub fn pack(&self) -> [u8; Self::PACKED_LEN] {
@@ -127,6 +198,7 @@ impl Snapshot {
             cursor,
             lanes: [0; MAX_LANES],
             lane: 0,
+            cursors: [0; MAX_LANES],
         })
     }
 

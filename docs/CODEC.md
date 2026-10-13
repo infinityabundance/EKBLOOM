@@ -1,4 +1,4 @@
-# EKBLOOM — `OrANS-RANS0` (machine 2), `OrANS-Store` (machine 3), `OrANS-RANS0I` (machine 4), `OrANS-PACK` (machine 5) and `OrANS-SEG` (machine 6)
+# EKBLOOM — `OrANS-RANS0` (machine 2), `OrANS-Store` (machine 3), `OrANS-RANS0I` (machine 4), `OrANS-PACK` (machine 5), `OrANS-SEG` (machine 6), `OrANS-RANS0W` (machine 7) and `OrANS-RANS0IL` (machine 8)
 
 The visible-representation machines. Where the authoritative machine `OrANS-NL2`
 (`machine_id = 1`) is expansion-only (`V = N`), machine 2 **compresses** skewed
@@ -12,8 +12,15 @@ the decode rate escapes machine 2's inherently serial state chain — and machin
 each logical segment to its own directly-addressable representation (packed / raw /
 constant), so a mixed source is packed where it is skewed and raw where it is
 uniform while every position stays an `O(1)` exact reveal; see
-[`docs/SEGMENTS.md`](SEGMENTS.md). Machine 1 is unchanged in every respect (its
-semantics, wire behaviour and tests are bit-identical).
+[`docs/SEGMENTS.md`](SEGMENTS.md). Machine 7 (`OrANS-RANS0W`) is machine 2 with
+**16-bit word** renormalisation (at most one renorm read per step instead of two);
+machine 8 (`OrANS-RANS0IL`) is machine 4 with **independent-lane streams** — each
+lane owns its own payload range and cursor, so no shared-cursor ordering remains.
+Both are **decode-throughput variants**: same model, same `V`, a different decode
+kernel. They are measured, and their keep/reject verdicts recorded, in
+[`docs/DECODERS.md`](DECODERS.md). Machine 1 is unchanged in every respect (its
+semantics, wire behaviour and tests are bit-identical), and machines 2–6 are
+bit-identical to before.
 
 Machine 2's contract is the first half of this document; machine 3, machine 4,
 machine 5, machine 6 and the `auto` representation policy that chooses between
@@ -413,6 +420,61 @@ explicit boundaries. Genesis `Omega_0 = (0, 0)`; the cursor **equals** the logic
 position (`Snapshot::new(state, i)` is exact and resumable), so `skip` is `O(1)`.
 The full write-up is [`docs/SEGMENTS.md`](SEGMENTS.md).
 
+## Machine 7 — `OrANS-RANS0W` (`machine_id = 7`): 16-bit word renormalisation
+
+Machine 2 renormalises in 8-bit **bytes**, so from a valid state its renorm loop
+can run **twice** per decoded symbol (`docs/WINDOW.md` §1). Machine 7 keeps the
+exact same order-0 model, the same fused `slot -> (freq, cum, symbol)` table and
+the same `V`, but shifts the decoder state in **16-bit words**: one step
+renormalises in **at most one iteration**. It is a decode-throughput variant, not
+a compression win.
+
+```text
+core = [freq: 256 * u16 LE = 512 B][initial_state: u32 LE][renorm words: u16 LE ...]
+```
+
+The word-renorm lower bound is `RANS_W_L = 1 << 15` (not `1 << 23`), so a genuine
+encoder keeps every state in `[RANS_W_L, RANS_W_L << 16)`, which still fits a
+`u32`. The per-symbol bound follows the standard argument: the pre-renorm
+successor is `x' = floor(x / 2^12) * f + r >= RANS_W_L >> 12 = 2^3`, so **one**
+16-bit read gives `x' << 16 >= 2^19 > RANS_W_L`. The encoded-window **byte** bound
+is therefore the same `2 * (steps + symbols) + margin` as machine 2, with half the
+renorm iterations (`encoded_window_bound_w`, `RENORM_MAX_BYTES_PER_STEP_W = 2`).
+The complete resumable state is the ordinary `(state, cursor)` pair, so blocks and
+checkpoints use the compact 12-byte form. The implementation is
+`src/machine_rans_w.rs`; the decode-rate comparison is [`docs/DECODERS.md`](DECODERS.md).
+
+## Machine 8 — `OrANS-RANS0IL` (`machine_id = 8`): independent-lane streams
+
+Machine 4 keeps `K` independent rANS *states* but shares **one** renormalisation
+cursor: lane `t`'s reads depend on how many bytes lanes `0..t` already consumed.
+Machine 8 removes that ordering — each lane owns its own encoded **payload range**
+and its own **cursor**, so lane `t`'s decode is fully independent of every other
+lane (the property that would let a parallel reconstructor rebuild lanes
+concurrently).
+
+```text
+core = [freq: 256 * u16 LE = 512 B][K: u32 LE]
+       [lane_len[0..K]: K * u32 LE][states[0..K]: K * u32 LE]
+       [lane 0 payload][lane 1 payload]...[lane K-1 payload]
+```
+
+Symbol `i` is coded in lane `i % K`; `lane_len[t]` gives lane `t`'s payload
+length and its payload begins at `header_bytes + sum(lane_len[0..t])`. Each lane's
+bytes are stored reversed, so the decoder reads its payload forward. Genesis
+`Omega_0 = (states, cursors = payload starts, lane 0)`. The complete resumable
+state — **lane states + per-lane cursors + lane index** — is carried by the
+`Snapshot` (`cursors`), and is exposed directly as `IlState` (with `pack`/
+`unpack` and `il_block_restarts`). The per-symbol bound is machine 2's (at most two
+8-bit reads per step).
+
+Because the generic manifested wide records (blocks, checkpoints, regional
+tables) carry machine 4's shared-cursor form and **not** per-lane cursors, the
+`OrMachine::snapshot_needs_lane_cursors` capability makes those builders return a
+clean `Err` for machine 8 rather than silently drop its cursors; its block/restart
+exactness is exercised through `IlState`/`il_block_restarts`. The implementation is
+`src/machine_rans_il.rs`.
+
 ## The `auto` representation policy
 
 `create --machine auto` (the CLI default) and `manifest::create_auto` try machine 2
@@ -420,12 +482,13 @@ first; if the encoded core is **not** smaller than the source (`core_len >=
 source_len`) they use machine 3, so **EKBLOOM never stores more than raw for the
 base representation** (`V <= N` for every source). The chosen machine is recorded
 in the body (and therefore the `.ekb` header and `MANIFEST`) exactly as an explicit
-id. Explicit `--machine 1|2|3|4|5|6` overrides the policy. Machine 4 and machine 5 are
-deliberately **not** selected by `Auto` (machine 4's core is machine 2's plus a
-`4 + 4K` header; machine 5 trades size for `O(1)` access). Machine 5 and machine 6
-are reachable through `RepresentationPolicy::Packed` / `Segmented` and
-`create_auto_packed` / `create_auto_segmented` (see their sections), never by the
-default `Auto`.
+id. Explicit `--machine 1|2|3|4|5|6|7|8` overrides the policy. Machine 4, machine 7
+and machine 8 are deliberately **not** selected by `Auto` (machine 4's core is
+machine 2's plus a `4 + 4K` header; machines 7 and 8 are decode variants with the
+same or slightly larger core); machine 5 trades size for `O(1)` access. Machine 5
+and machine 6 are reachable through `RepresentationPolicy::Packed` / `Segmented`
+and `create_auto_packed` / `create_auto_segmented` (see their sections), never by
+the default `Auto`.
 
 `create_auto` reuses the encoded core the decision already produced, so the winning
 encode runs **once** instead of twice; `create_auto_within_budget` does the same.
@@ -455,5 +518,5 @@ sh scripts/container-test.sh --test machine_rans -- --nocapture
 sh scripts/container-test.sh --test machine_pack -- --nocapture
 sh scripts/container-test.sh --test machine_seg -- --nocapture
 sh scripts/run-rans.sh                  # writes evidence/bench/rans.json
-sh scripts/run-frontier.sh              # writes evidence/bench/frontier.json (incl. `packed`, `segmented`)
+sh scripts/run-frontier.sh              # writes evidence/bench/frontier.json and evidence/bench/decoders.json
 ```

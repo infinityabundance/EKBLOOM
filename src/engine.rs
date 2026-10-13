@@ -55,7 +55,7 @@ use std::sync::Arc;
 use crate::adapt::{Workload, WorkloadKind};
 use crate::bloom::{BloomKind, Certification};
 use crate::error::{EkbloomError, Result};
-use crate::machine::{machine_by_id, MACHINE_NL2, MACHINE_RANS0, MACHINE_RANS0I};
+use crate::machine::{machine_by_id, MACHINE_NL2, MACHINE_RANS0, MACHINE_RANS0I, MACHINE_STORE};
 use crate::machine_rans::RansContext;
 use crate::machine_rans_i::RansIContext;
 use crate::manifest::EkbloomBody;
@@ -134,6 +134,13 @@ pub enum StructureRef {
     BlockIndex(usize),
     /// The complete state history.
     History,
+    /// The authoritative core itself, used only for the verbatim machine 3
+    /// (`OrANS-Store`): because `encode(source) = source` and the cursor equals the
+    /// logical position, a position is an `O(1)` slice of `core` with **no manifested
+    /// structure and no replay**. It is offered only for a **structureless**
+    /// machine-3 body, so a body that manifests a cold-restart structure keeps using
+    /// it exactly as before.
+    Core,
 }
 
 impl StructureRef {
@@ -145,6 +152,7 @@ impl StructureRef {
             StructureRef::BlockIndex(_) => 2,
             StructureRef::Checkpoint(_) => 3,
             StructureRef::History => 4,
+            StructureRef::Core => 5,
         }
     }
 
@@ -156,6 +164,7 @@ impl StructureRef {
             StructureRef::Checkpoint(_) => "checkpoint",
             StructureRef::BlockIndex(_) => "block-index",
             StructureRef::History => "history",
+            StructureRef::Core => "core",
         }
     }
 }
@@ -208,6 +217,8 @@ enum HotIndex {
     TileSet(usize),
     /// Every region is served by the same certified path bloom.
     PathBloom(usize),
+    /// Every region is served by the verbatim machine-3 core (a slice of `core`).
+    Core,
 }
 
 /// The immutable identity of the core a plan/engine was built against: the object
@@ -486,7 +497,10 @@ impl AccessPlan {
             Path::PackedRestart => matches!(r.structure, StructureRef::Checkpoint(_)),
             Path::BlockRestart => matches!(r.structure, StructureRef::BlockIndex(_)),
             Path::AffineSummary => matches!(r.structure, StructureRef::History),
-            Path::DirectStorage => matches!(r.structure, StructureRef::PathBloom(_)),
+            // The verbatim core is itself a directly-addressable certified surface.
+            Path::DirectStorage => {
+                matches!(r.structure, StructureRef::PathBloom(_) | StructureRef::Core)
+            }
         })
     }
 }
@@ -828,6 +842,20 @@ impl Engine {
                             }
                         }
                     }
+                    (Path::DirectStorage, StructureRef::Core) => {
+                        let a = usize::try_from(req.offset)
+                            .map_err(|_| oob(req.offset, req.length, body.logical_len))?;
+                        let b = a
+                            .checked_add(usize::try_from(req.length).map_err(|_| {
+                                EkbloomError::Overflow {
+                                    what: "read length",
+                                }
+                            })?)
+                            .ok_or(EkbloomError::Overflow { what: "read range" })?;
+                        if let Some(slice) = body.core.get(a..b) {
+                            return Ok(slice.to_vec());
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -974,6 +1002,11 @@ impl Engine {
                     .ok_or_else(|| bad("engine planned path bloom is not usable"))?;
                 crate::fastpath::byte_at_hot(hot, offset)
             }
+            HotIndex::Core => body
+                .core
+                .get(usize::try_from(offset).map_err(|_| oob(offset, 1, body.logical_len))?)
+                .copied()
+                .ok_or_else(|| oob(offset, 1, body.logical_len)),
             HotIndex::None => {
                 let mut buf = [0u8; 1];
                 self.read_into(body, ReadRequest { offset, length: 1 }, &mut buf)?;
@@ -1007,6 +1040,10 @@ impl Engine {
                 let shell = body.blooms.get(pi)?;
                 Some((crate::fastpath::path_hot_of(shell, body.logical_len)?, 0))
             }
+            HotIndex::Core => Some((
+                &body.core[..body.logical_len.min(body.core.len() as u64) as usize],
+                0,
+            )),
             HotIndex::None => None,
         }
     }
@@ -1063,6 +1100,12 @@ impl Engine {
                                     return Ok(());
                                 }
                             }
+                        }
+                    }
+                    (Path::DirectStorage, StructureRef::Core) => {
+                        if let Some(slice) = slice_checked(&body.core, req.offset, req.length) {
+                            out.copy_from_slice(slice);
+                            return Ok(());
                         }
                     }
                     _ => {}
@@ -1258,6 +1301,7 @@ fn hot_index(regions: &[RegionPath]) -> HotIndex {
     let kind = match (first.path, first.structure) {
         (Path::HotTile, StructureRef::TileSet(ti)) => HotIndex::TileSet(ti),
         (Path::DirectStorage, StructureRef::PathBloom(pi)) => HotIndex::PathBloom(pi),
+        (Path::DirectStorage, StructureRef::Core) => HotIndex::Core,
         _ => return HotIndex::None,
     };
     let uniform = regions
@@ -1359,7 +1403,29 @@ fn enumerate(body: &EkbloomBody) -> Vec<Candidate> {
         }
     }
 
+    // Core: the verbatim machine-3 core, offered only for a structureless body. A
+    // position is then an `O(1)` slice with no manifested structure, so the base
+    // representation is coverable by a certified bounded path (zero steps).
+    if body.machine_id == MACHINE_STORE && is_structureless(body) {
+        out.push(Candidate {
+            structure: StructureRef::Core,
+            path: Path::DirectStorage,
+            steps: 0,
+            bytes: 0,
+        });
+    }
+
     out
+}
+
+/// Whether `body` manifests no structure at all (only its visible core).
+fn is_structureless(body: &EkbloomBody) -> bool {
+    body.history.is_none()
+        && body.checkpoints.is_empty()
+        && body.blooms.is_empty()
+        && body.certificates.is_empty()
+        && body.tiles.is_empty()
+        && body.blocks.is_empty()
 }
 
 /// Whether the structure fully covers `[start, end)`.
@@ -1370,6 +1436,8 @@ fn covers(body: &EkbloomBody, structure: StructureRef, start: u64, end: u64) -> 
     match structure {
         StructureRef::PathBloom(_) => true,
         StructureRef::History => true,
+        // The verbatim core covers every logical position.
+        StructureRef::Core => true,
         StructureRef::Checkpoint(i) => body
             .checkpoints
             .get(i)
@@ -1475,6 +1543,21 @@ fn dispatch_into(
                 })?)
                 .ok_or(EkbloomError::Overflow { what: "read range" })?;
             let slice = hot
+                .get(a..b)
+                .ok_or_else(|| oob(offset, length, body.logical_len))?;
+            out.extend_from_slice(slice);
+            Ok(length)
+        }
+        (Path::DirectStorage, StructureRef::Core) => {
+            // Machine 3: `core[cursor] == symbol`, so the read is a verbatim slice.
+            let a = usize::try_from(offset).map_err(|_| oob(offset, length, body.logical_len))?;
+            let b = a
+                .checked_add(usize::try_from(length).map_err(|_| EkbloomError::Overflow {
+                    what: "read length",
+                })?)
+                .ok_or(EkbloomError::Overflow { what: "read range" })?;
+            let slice = body
+                .core
                 .get(a..b)
                 .ok_or_else(|| oob(offset, length, body.logical_len))?;
             out.extend_from_slice(slice);

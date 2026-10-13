@@ -26,6 +26,10 @@ use ekbloom::{
     Snapshot, TileSet, MACHINE_PACK, MACHINE_RANS0, MACHINE_RANS0I, MACHINE_SEG, MACHINE_STORE,
     PACK, RANS0, RANS0I, SEG_HEADER_BYTES, SEG_KIND_CONSTANT,
 };
+use ekbloom::{
+    encode_il, encode_word16, encoded_window_bound, encoded_window_bound_w, il_block_restarts,
+    rans_decode8_independent, rans_decode8_shared, IlContext, MACHINE_RANS0IL, MACHINE_RANS0W,
+};
 use std::path::Path;
 
 /// Logical size of each corpus (4 MiB — comfortably inside the 8 GiB cap).
@@ -49,6 +53,10 @@ const LZ4_BLOCK: usize = 4096;
 /// Zstandard chunk size (bytes) — a seekable chunk coarse enough to be realistic,
 /// fine enough that a scan evicts the hot chunks (so the tail is measurable).
 const ZSTD_CHUNK: usize = 16 * 1024;
+/// Sequential-read chunk size (bytes) for the four-quadrant sequential measurement.
+const SEQ_CHUNK: u64 = 64 * 1024;
+/// Sequential passes per contender (each reads the whole object once).
+const SEQ_REPS: u32 = 3;
 /// Working sets for the allocation-free `byte_at` vs `raw[i]` residency probe.
 const RES_1M: usize = 1 << 20;
 const RES_256M: usize = 256 << 20;
@@ -132,6 +140,23 @@ fn best_p50(reps: usize, offsets: &[u64], read: impl FnMut(u64) -> Vec<u8> + Cop
         best = best.min(time_reads(offsets, read).p50);
     }
     best
+}
+
+/// Sequential (whole-object) throughput in GB/s: run `read_all` (which reads the
+/// whole object once and returns the bytes consumed) `SEQ_REPS` times and return
+/// `total_bytes * reps / elapsed_ns` (numerically `1 byte/ns == 1 GB/s`). A warm
+/// pass absorbs one-time setup/decoder-cache cost, and the byte count is
+/// black-boxed so the copy/decode cannot be dead-code-eliminated.
+fn seq_gbps(total_bytes: u64, mut read_all: impl FnMut() -> u64) -> f64 {
+    std::hint::black_box(read_all());
+    let t = now_ns();
+    let mut sink = 0u64;
+    for _ in 0..SEQ_REPS {
+        sink = sink.wrapping_add(read_all());
+    }
+    let elapsed = now_ns().saturating_sub(t).max(1);
+    std::hint::black_box(sink);
+    (total_bytes as f64 * SEQ_REPS as f64) / elapsed as f64
 }
 
 /// A deterministic shuffle of one offset per 64-byte cache line across the whole
@@ -1211,6 +1236,557 @@ fn measure_decode(source: &[u8]) -> ekbloom::Result<Vec<DecodeRate>> {
 }
 
 // ---------------------------------------------------------------------------
+// DECODER COURT — machine 7 (word16 renorm), machine 8 (independent lanes) and a
+// SIMD kernel, measured same-host at equal stored bytes against the current best
+// (machine 4 K=8), plus the indexed LZ4/Zstd competitors.
+// ---------------------------------------------------------------------------
+
+/// One decoder-court row: bulk throughput, cold latency, restart geometry and
+/// construction cost for one (variant, family) pair.
+struct DecoderRow {
+    variant: String,
+    family: String,
+    machine: u32,
+    k: usize,
+    core_bytes: u64,
+    ns_per_byte: f64,
+    gb_per_s: f64,
+    bulk_exact: bool,
+    cold4k_p50: f64,
+    cold4k_p99: f64,
+    cold64k_p50: f64,
+    cold64k_p99: f64,
+    restart_bytes: u64,
+    construction_ns: u64,
+    window_bound_bytes: u64,
+    note: String,
+}
+
+/// One indexed-codec competitor row (cold latency only).
+struct DecoderCompetitor {
+    name: String,
+    class: String,
+    stored_bytes: u64,
+    cold4k_p50: f64,
+    cold4k_p99: f64,
+    cold64k_p50: f64,
+    cold64k_p99: f64,
+    note: String,
+}
+
+/// The decoder court for one corpus.
+struct DecoderCourt {
+    name: String,
+    source_len: u64,
+    rows: Vec<DecoderRow>,
+    competitors: Vec<DecoderCompetitor>,
+}
+
+/// Best-of-3 bulk decode ns and byte-exactness for a registered machine's
+/// prepared decoder from genesis.
+fn bulk_decode_ns(machine_id: u32, core: &[u8], source: &[u8]) -> ekbloom::Result<(f64, bool)> {
+    let n = source.len() as u64;
+    let machine = machine_by_id(machine_id).expect("registered machine");
+    let mut best = u64::MAX;
+    let mut exact = true;
+    for _ in 0..3 {
+        let ctx = prepare(machine, core)?;
+        let mut omega = machine.init(core)?;
+        let mut out: Vec<u8> = Vec::with_capacity(source.len());
+        let t = now_ns();
+        ctx.decode_into(core, &mut omega, n, &mut out)?;
+        best = best.min(now_ns().saturating_sub(t));
+        exact &= out == source;
+    }
+    Ok((best as f64, exact))
+}
+
+/// Best-of-3 encode ns for `source`.
+fn encode_ns(source: &[u8], mut encode: impl FnMut(&[u8]) -> Vec<u8>) -> u64 {
+    let mut best = u64::MAX;
+    for _ in 0..3 {
+        let t = now_ns();
+        let c = encode(source);
+        best = best.min(now_ns().saturating_sub(t));
+        std::hint::black_box(&c);
+    }
+    best
+}
+
+/// Cold 4 KiB and 64 KiB percentiles through a `(offset, len) -> bytes` reader.
+fn cold_pair(
+    offs4: &[u64],
+    offs64: &[u64],
+    mut read: impl FnMut(u64, u64) -> Vec<u8>,
+) -> (Percentiles, Percentiles) {
+    let r4 = time_reads(offs4, |off| read(off, COLD4K));
+    let r64 = time_reads(offs64, |off| read(off, COLD64K));
+    (r4, r64)
+}
+
+// Machine-4 K=8 kernel decode: shared cursor, vectorised table work.
+fn bulk_kernel_m4(core: &[u8], source: &[u8]) -> ekbloom::Result<(f64, bool)> {
+    let n = source.len();
+    let k = 8usize;
+    assert!(
+        n.is_multiple_of(8),
+        "kernel corpus must be a multiple of 8 symbols"
+    );
+    let table = RansContext::from_core(core)?;
+    let table = table.table();
+    let mut states = [0u32; 8];
+    for (t, slot) in states.iter_mut().enumerate() {
+        let o = 516 + 4 * t;
+        *slot = u32::from_le_bytes([core[o], core[o + 1], core[o + 2], core[o + 3]]);
+    }
+    let start = (516 + 4 * k) as u64;
+    let mut best = u64::MAX;
+    let mut exact = true;
+    for _ in 0..3 {
+        let mut st = states;
+        let mut cur = start;
+        let mut out = vec![0u8; n];
+        let t0 = now_ns();
+        rans_decode8_shared(table, core, &mut cur, &mut st, &mut out)?;
+        best = best.min(now_ns().saturating_sub(t0));
+        exact &= out == source;
+    }
+    Ok((best as f64, exact))
+}
+
+// Machine-8 K=8 kernel decode: independent per-lane cursors, vectorised table work.
+fn bulk_kernel_m8(core: &[u8], source: &[u8]) -> ekbloom::Result<(f64, bool)> {
+    let n = source.len();
+    assert!(
+        n.is_multiple_of(8),
+        "kernel corpus must be a multiple of 8 symbols"
+    );
+    let ctx = IlContext::from_core(core)?;
+    let table = ctx.table();
+    let genesis = ctx.genesis(core);
+    let mut ends = [0u64; 8];
+    for (t, slot) in ends.iter_mut().enumerate() {
+        *slot = ctx.lane_range(t).1;
+    }
+    let mut best = u64::MAX;
+    let mut exact = true;
+    for _ in 0..3 {
+        let mut st = genesis.lanes;
+        let mut cur = genesis.cursors;
+        let mut out = vec![0u8; n];
+        let t0 = now_ns();
+        rans_decode8_independent(table, core, &mut st, &mut cur, &ends, &mut out)?;
+        best = best.min(now_ns().saturating_sub(t0));
+        exact &= out == source;
+    }
+    Ok((best as f64, exact))
+}
+
+/// Measure the decoder court for one corpus.
+fn measure_decoder_court(name: &str, source: &[u8]) -> ekbloom::Result<DecoderCourt> {
+    let n = source.len() as u64;
+    let offs4 = cold_offsets(n, COLD4K, 0xD3C0_DE01);
+    let offs64 = cold_offsets(n, COLD64K, 0xD3C0_DE64);
+    let mut rows: Vec<DecoderRow> = Vec::new();
+
+    // Stored variants: (label, machine, K, core, restart bytes, window bound).
+    let core2 = RANS0.encode(source)?;
+    let core4_4 = encode_with_k(source, 4)?;
+    let core4_8 = encode_with_k(source, 8)?;
+    let core7 = encode_word16(source);
+    let core8_4 = encode_il(source, 4)?;
+    let core8_8 = encode_il(source, 8)?;
+
+    let wide8 = ekbloom::IL_STATE_LEN as u64;
+    let bound = encoded_window_bound(READ, READ);
+    let bound_w = encoded_window_bound_w(READ, READ);
+    let bound_il = ekbloom::IL_WINDOW_MARGIN + 2 * (READ + READ);
+
+    // ---- machine 2 (baseline single-state, byte renorm).
+    {
+        let idx = BlockIndex::build_machine(&core2, n, 256, MACHINE_RANS0)?;
+        assert_eq!(
+            idx.read_range(&core2, offs4[0], COLD4K)?,
+            &source[offs4[0] as usize..(offs4[0] + COLD4K) as usize]
+        );
+        let (r4, r64) = cold_pair(&offs4, &offs64, |o, l| {
+            idx.read_range(&core2, o, l).unwrap()
+        });
+        let (ns, exact) = bulk_decode_ns(MACHINE_RANS0, &core2, source)?;
+        rows.push(DecoderRow {
+            variant: "m2".to_string(),
+            family: "scalar".to_string(),
+            machine: MACHINE_RANS0,
+            k: 1,
+            core_bytes: core2.len() as u64,
+            ns_per_byte: ns / n as f64,
+            gb_per_s: if ns > 0.0 { n as f64 / ns } else { 0.0 },
+            bulk_exact: exact,
+            cold4k_p50: r4.p50,
+            cold4k_p99: r4.p99,
+            cold64k_p50: r64.p50,
+            cold64k_p99: r64.p99,
+            restart_bytes: idx.entry_bytes(),
+            construction_ns: encode_ns(source, |s| RANS0.encode(s).unwrap()),
+            window_bound_bytes: bound,
+            note: "single 32-bit state, 8-bit byte renorm (<=2 reads/step)".to_string(),
+        });
+    }
+
+    // ---- machine 4 K in {4, 8} (shared-cursor interleaved).
+    for (label, core, k) in [("m4-k4", &core4_4, 4usize), ("m4-k8", &core4_8, 8usize)] {
+        let idx = BlockIndex::build_machine(core, n, 256, MACHINE_RANS0I)?;
+        assert_eq!(
+            idx.read_range(core, offs4[0], COLD4K)?,
+            &source[offs4[0] as usize..(offs4[0] + COLD4K) as usize]
+        );
+        let (r4, r64) = cold_pair(&offs4, &offs64, |o, l| idx.read_range(core, o, l).unwrap());
+        let (ns, exact) = bulk_decode_ns(MACHINE_RANS0I, core, source)?;
+        rows.push(DecoderRow {
+            variant: label.to_string(),
+            family: "scalar".to_string(),
+            machine: MACHINE_RANS0I,
+            k,
+            core_bytes: core.len() as u64,
+            ns_per_byte: ns / n as f64,
+            gb_per_s: if ns > 0.0 { n as f64 / ns } else { 0.0 },
+            bulk_exact: exact,
+            cold4k_p50: r4.p50,
+            cold4k_p99: r4.p99,
+            cold64k_p50: r64.p50,
+            cold64k_p99: r64.p99,
+            restart_bytes: idx.entry_bytes(),
+            construction_ns: encode_ns(source, |s| encode_with_k(s, k).unwrap()),
+            window_bound_bytes: bound,
+            note: format!("interleaved K={k}, shared cursor"),
+        });
+    }
+
+    // ---- machine 7 (word16 renorm).
+    {
+        let idx = BlockIndex::build_machine(&core7, n, 256, MACHINE_RANS0W)?;
+        assert_eq!(
+            idx.read_range(&core7, offs4[0], COLD4K)?,
+            &source[offs4[0] as usize..(offs4[0] + COLD4K) as usize]
+        );
+        let (r4, r64) = cold_pair(&offs4, &offs64, |o, l| {
+            idx.read_range(&core7, o, l).unwrap()
+        });
+        let (ns, exact) = bulk_decode_ns(MACHINE_RANS0W, &core7, source)?;
+        rows.push(DecoderRow {
+            variant: "m7".to_string(),
+            family: "scalar".to_string(),
+            machine: MACHINE_RANS0W,
+            k: 1,
+            core_bytes: core7.len() as u64,
+            ns_per_byte: ns / n as f64,
+            gb_per_s: if ns > 0.0 { n as f64 / ns } else { 0.0 },
+            bulk_exact: exact,
+            cold4k_p50: r4.p50,
+            cold4k_p99: r4.p99,
+            cold64k_p50: r64.p50,
+            cold64k_p99: r64.p99,
+            restart_bytes: idx.entry_bytes(),
+            construction_ns: encode_ns(source, encode_word16),
+            window_bound_bytes: bound_w,
+            note: "single 32-bit state, 16-bit word renorm (<=1 read/step)".to_string(),
+        });
+    }
+
+    // ---- machine 8 K in {4, 8} (independent-lane streams).
+    for (label, core, k) in [("m8-k4", &core8_4, 4usize), ("m8-k8", &core8_8, 8usize)] {
+        let ctx = IlContext::from_core(core)?;
+        let restarts = il_block_restarts(core, n, 256)?;
+        let cb = core.clone();
+        let read = |o: u64, l: u64| -> Vec<u8> {
+            let b = 256u64;
+            let i = (o / b) as usize;
+            let start = i as u64 * b;
+            let mut s = restarts[i];
+            ctx.skip(&cb, &mut s, o - start).unwrap();
+            let mut out = vec![0u8; l as usize];
+            ctx.decode_into_slice(&cb, &mut s, &mut out).unwrap();
+            out
+        };
+        assert_eq!(
+            read(offs4[0], COLD4K),
+            &source[offs4[0] as usize..(offs4[0] + COLD4K) as usize]
+        );
+        let (r4, r64) = cold_pair(&offs4, &offs64, read);
+        let (ns, exact) = bulk_decode_ns(MACHINE_RANS0IL, core, source)?;
+        rows.push(DecoderRow {
+            variant: label.to_string(),
+            family: "scalar".to_string(),
+            machine: MACHINE_RANS0IL,
+            k,
+            core_bytes: core.len() as u64,
+            ns_per_byte: ns / n as f64,
+            gb_per_s: if ns > 0.0 { n as f64 / ns } else { 0.0 },
+            bulk_exact: exact,
+            cold4k_p50: r4.p50,
+            cold4k_p99: r4.p99,
+            cold64k_p50: r64.p50,
+            cold64k_p99: r64.p99,
+            restart_bytes: wide8,
+            construction_ns: encode_ns(source, |s| encode_il(s, k).unwrap()),
+            window_bound_bytes: bound_il,
+            note: format!("independent lanes K={k}, per-lane cursor + payload"),
+        });
+    }
+
+    // ---- SIMD kernel rows (K=8, where applicable). Compare against the matching
+    // scalar row without touching the stored geometry.
+    {
+        let (kns, kexact) = bulk_kernel_m4(&core4_8, source)?;
+        let scalar = rows.iter().find(|r| r.variant == "m4-k8").unwrap();
+        rows.push(DecoderRow {
+            variant: "m4-k8".to_string(),
+            family: "kernel".to_string(),
+            machine: MACHINE_RANS0I,
+            k: 8,
+            core_bytes: core4_8.len() as u64,
+            ns_per_byte: kns / n as f64,
+            gb_per_s: if kns > 0.0 { n as f64 / kns } else { 0.0 },
+            bulk_exact: kexact,
+            cold4k_p50: scalar.cold4k_p50,
+            cold4k_p99: scalar.cold4k_p99,
+            cold64k_p50: scalar.cold64k_p50,
+            cold64k_p99: scalar.cold64k_p99,
+            restart_bytes: scalar.restart_bytes,
+            construction_ns: scalar.construction_ns,
+            window_bound_bytes: scalar.window_bound_bytes,
+            note: "AVX2 gather table kernel + scalar per-lane renorm (shared cursor)".to_string(),
+        });
+        let (kns8, kexact8) = bulk_kernel_m8(&core8_8, source)?;
+        let scalar8 = rows
+            .iter()
+            .find(|r| r.variant == "m8-k8" && r.family == "scalar")
+            .unwrap();
+        rows.push(DecoderRow {
+            variant: "m8-k8".to_string(),
+            family: "kernel".to_string(),
+            machine: MACHINE_RANS0IL,
+            k: 8,
+            core_bytes: core8_8.len() as u64,
+            ns_per_byte: kns8 / n as f64,
+            gb_per_s: if kns8 > 0.0 { n as f64 / kns8 } else { 0.0 },
+            bulk_exact: kexact8,
+            cold4k_p50: scalar8.cold4k_p50,
+            cold4k_p99: scalar8.cold4k_p99,
+            cold64k_p50: scalar8.cold64k_p50,
+            cold64k_p99: scalar8.cold64k_p99,
+            restart_bytes: scalar8.restart_bytes,
+            construction_ns: scalar8.construction_ns,
+            window_bound_bytes: scalar8.window_bound_bytes,
+            note: "AVX2 gather table kernel + independent scalar renorm".to_string(),
+        });
+    }
+
+    // ---- Indexed LZ4 / Zstd competitors on the same cold offsets.
+    let mut competitors: Vec<DecoderCompetitor> = Vec::new();
+    {
+        let block = 4096usize;
+        let blocks: Vec<Vec<u8>> = source.chunks(block).map(lz4_flex::compress).collect();
+        let stored: u64 =
+            blocks.iter().map(|b| b.len() as u64).sum::<u64>() + blocks.len() as u64 * 4;
+        let (r4, r64) = cold_pair(&offs4, &offs64, |o, l| {
+            lz4_read_blocked(&blocks, block, source.len(), o, l)
+        });
+        competitors.push(DecoderCompetitor {
+            name: "lz4-block-4096".to_string(),
+            class: "lz4".to_string(),
+            stored_bytes: stored,
+            cold4k_p50: r4.p50,
+            cold4k_p99: r4.p99,
+            cold64k_p50: r64.p50,
+            cold64k_p99: r64.p99,
+            note: "block-indexed LZ4, one decompress per 4 KiB block".to_string(),
+        });
+    }
+    {
+        let frames: Vec<Vec<u8>> = source
+            .chunks(ZSTD_CHUNK)
+            .map(|c| zstd::stream::encode_all(c, 3).expect("zstd encode"))
+            .collect();
+        let stored: u64 = frames.iter().map(|f| f.len() as u64).sum();
+        let (r4, r64) = cold_pair(&offs4, &offs64, |o, l| {
+            zstd_read_at(&frames, ZSTD_CHUNK, o, l)
+        });
+        competitors.push(DecoderCompetitor {
+            name: format!("zstd-chunk-{ZSTD_CHUNK}"),
+            class: "zstd".to_string(),
+            stored_bytes: stored,
+            cold4k_p50: r4.p50,
+            cold4k_p99: r4.p99,
+            cold64k_p50: r64.p50,
+            cold64k_p99: r64.p99,
+            note: "chunked Zstandard, one frame decode per chunk".to_string(),
+        });
+    }
+
+    Ok(DecoderCourt {
+        name: name.to_string(),
+        source_len: n,
+        rows,
+        competitors,
+    })
+}
+
+fn print_decoder_court(courts: &[DecoderCourt]) {
+    for c in courts {
+        println!(
+            "\n== DECODER COURT: corpus {} ==  source {} B",
+            c.name, c.source_len
+        );
+        println!(
+            "{:<12} {:<8} {:>8} {:>3} {:>10} {:>10} {:>8} {:>9} {:>9} {:>9} {:>9} {:>6}",
+            "variant",
+            "family",
+            "core_B",
+            "K",
+            "ns/byte",
+            "GB/s",
+            "restart_B",
+            "cold4k50",
+            "cold4k99",
+            "c64k p50",
+            "window",
+            "exact"
+        );
+        for r in &c.rows {
+            println!(
+                "{:<12} {:<8} {:>8} {:>3} {:>10.4} {:>10.3} {:>8} {:>9.0} {:>9.0} {:>9.0} {:>9} {:>6}",
+                r.variant,
+                r.family,
+                r.core_bytes,
+                r.k,
+                r.ns_per_byte,
+                r.gb_per_s,
+                r.restart_bytes,
+                r.cold4k_p50,
+                r.cold4k_p99,
+                r.cold64k_p50,
+                r.window_bound_bytes,
+                r.bulk_exact
+            );
+        }
+        println!("  competitors (cold):");
+        for x in &c.competitors {
+            println!(
+                "    {:<18} {:<6} stored {:>10} 4k50 {:>8.0} 4k99 {:>9.0} 64k50 {:>9.0}",
+                x.name, x.class, x.stored_bytes, x.cold4k_p50, x.cold4k_p99, x.cold64k_p50
+            );
+        }
+    }
+}
+
+fn render_decoders_json(courts: &[DecoderCourt]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(s, "{{");
+    let _ = writeln!(s, "  \"producer\": \"examples/frontier.rs\",");
+    let _ = writeln!(s, "  \"read_bytes\": {READ},");
+    let _ = writeln!(s, "  \"cold_samples\": {COLD_SAMPLES},");
+    let _ = writeln!(s, "  \"corpora\": [");
+    for (ci, c) in courts.iter().enumerate() {
+        s.push_str("    {\n");
+        let _ = writeln!(s, "      \"name\": \"{}\",", json_escape(&c.name));
+        let _ = writeln!(s, "      \"source_len\": {},", c.source_len);
+        s.push_str("      \"variants\": [\n");
+        for (ri, r) in c.rows.iter().enumerate() {
+            s.push_str("        {\n");
+            let _ = writeln!(s, "          \"variant\": \"{}\",", r.variant);
+            let _ = writeln!(s, "          \"family\": \"{}\",", r.family);
+            let _ = writeln!(s, "          \"machine\": {},", r.machine);
+            let _ = writeln!(s, "          \"k\": {},", r.k);
+            let _ = writeln!(s, "          \"core_bytes\": {},", r.core_bytes);
+            let _ = writeln!(
+                s,
+                "          \"ns_per_byte\": {:.4},",
+                finite(r.ns_per_byte)
+            );
+            let _ = writeln!(s, "          \"gb_per_s\": {:.3},", finite(r.gb_per_s));
+            let _ = writeln!(s, "          \"bulk_exact\": {},", r.bulk_exact);
+            let _ = writeln!(
+                s,
+                "          \"cold4k_p50_ns\": {:.1},",
+                finite(r.cold4k_p50)
+            );
+            let _ = writeln!(
+                s,
+                "          \"cold4k_p99_ns\": {:.1},",
+                finite(r.cold4k_p99)
+            );
+            let _ = writeln!(
+                s,
+                "          \"cold64k_p50_ns\": {:.1},",
+                finite(r.cold64k_p50)
+            );
+            let _ = writeln!(
+                s,
+                "          \"cold64k_p99_ns\": {:.1},",
+                finite(r.cold64k_p99)
+            );
+            let _ = writeln!(s, "          \"restart_bytes\": {},", r.restart_bytes);
+            let _ = writeln!(s, "          \"construction_ns\": {},", r.construction_ns);
+            let _ = writeln!(
+                s,
+                "          \"window_bound_bytes\": {},",
+                r.window_bound_bytes
+            );
+            let _ = writeln!(s, "          \"note\": \"{}\"", json_escape(&r.note));
+            let _ = write!(s, "        }}");
+            if ri + 1 < c.rows.len() {
+                s.push(',');
+            }
+            s.push('\n');
+        }
+        s.push_str("      ],\n");
+        s.push_str("      \"competitors\": [\n");
+        for (xi, x) in c.competitors.iter().enumerate() {
+            s.push_str("        {\n");
+            let _ = writeln!(s, "          \"name\": \"{}\",", json_escape(&x.name));
+            let _ = writeln!(s, "          \"class\": \"{}\",", x.class);
+            let _ = writeln!(s, "          \"stored_bytes\": {},", x.stored_bytes);
+            let _ = writeln!(
+                s,
+                "          \"cold4k_p50_ns\": {:.1},",
+                finite(x.cold4k_p50)
+            );
+            let _ = writeln!(
+                s,
+                "          \"cold4k_p99_ns\": {:.1},",
+                finite(x.cold4k_p99)
+            );
+            let _ = writeln!(
+                s,
+                "          \"cold64k_p50_ns\": {:.1},",
+                finite(x.cold64k_p50)
+            );
+            let _ = writeln!(
+                s,
+                "          \"cold64k_p99_ns\": {:.1},",
+                finite(x.cold64k_p99)
+            );
+            let _ = writeln!(s, "          \"note\": \"{}\"", json_escape(&x.note));
+            let _ = write!(s, "        }}");
+            if xi + 1 < c.competitors.len() {
+                s.push(',');
+            }
+            s.push('\n');
+        }
+        s.push_str("      ]\n");
+        let _ = write!(s, "    }}");
+        if ci + 1 < courts.len() {
+            s.push(',');
+        }
+        s.push('\n');
+    }
+    s.push_str("  ]\n}\n");
+    s
+}
+
+// ---------------------------------------------------------------------------
 // MACHINE 5 — `OrANS-PACK`: fixed-width packed direct addressing vs order-0 rANS
 // (machines 2/4), raw storage and indexed/pinned LZ4. A packed position is an
 // `O(1)` shift/mask (cursor == position, no index, no replay); a cursor-divergent
@@ -1694,6 +2270,8 @@ struct Row {
     thrash_hot_p50: f64,
     thrash_hot_p99: f64,
     hit_rate: f64,
+    /// Sequential whole-object throughput (GB/s).
+    seq_gbps: f64,
     note: String,
 }
 
@@ -1714,6 +2292,7 @@ impl Row {
             thrash_hot_p50: 0.0,
             thrash_hot_p99: 0.0,
             hit_rate: 0.0,
+            seq_gbps: 0.0,
             note: String::new(),
         }
     }
@@ -1905,6 +2484,10 @@ fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
         row.cold_p99 = cold.p99;
         row.thrash_hot_p50 = thrash.p50;
         row.thrash_hot_p99 = thrash.p99;
+        row.seq_gbps = seq_gbps(n, || {
+            let copy = raw.clone();
+            std::hint::black_box(copy).len() as u64
+        });
         row.note = "raw storage; a positional slice is a memcpy".to_string();
         rows.push(row);
     }
@@ -1941,6 +2524,15 @@ fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
         row.thrash_hot_p50 = row.hot_p50;
         row.thrash_hot_p99 = row.hot_p99;
         row.note = format!("{LZ4_BLOCK} B block grid, one LZ4 block per read, no cache");
+        row.seq_gbps = seq_gbps(n, || {
+            let mut s = 0u64;
+            for b in &lz4_blocks {
+                if let Ok(d) = lz4_flex::decompress(b, LZ4_BLOCK) {
+                    s += std::hint::black_box(d).len() as u64;
+                }
+            }
+            s
+        });
         rows.push(row);
     }
     {
@@ -2070,6 +2662,15 @@ fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
         row.thrash_hot_p50 = hot.p50;
         row.thrash_hot_p99 = hot.p99;
         row.note = format!("{ZSTD_CHUNK} B seekable chunk, one frame per read, no cache");
+        row.seq_gbps = seq_gbps(n, || {
+            let mut s = 0u64;
+            for f in &zstd_frames {
+                if let Ok(d) = zstd::stream::decode_all(&f[..]) {
+                    s += std::hint::black_box(d).len() as u64;
+                }
+            }
+            s
+        });
         rows.push(row);
     }
     {
@@ -2180,6 +2781,28 @@ fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
         &cold_offsets,
         &scan_offsets,
     )?);
+    {
+        let mut row = rows.pop().expect("engine row");
+        row.seq_gbps = seq_gbps(n, || {
+            let mut s = 0u64;
+            let mut off = 0u64;
+            while off < n {
+                let len = SEQ_CHUNK.min(n - off);
+                if let Ok(bytes) = engine.read(
+                    &body,
+                    ReadRequest {
+                        offset: off,
+                        length: len,
+                    },
+                ) {
+                    s += std::hint::black_box(bytes).len() as u64;
+                }
+                off += len;
+            }
+            s
+        });
+        rows.push(row);
+    }
     rows.push(measure_engine_row(
         "ekbloom-engine-m4",
         "machine 4 (OrANS-RANS0I, interleaved rANS, K=4)",
@@ -2193,6 +2816,28 @@ fn measure_corpus(name: &str, source: &[u8]) -> ekbloom::Result<CorpusReport> {
         &cold_offsets,
         &scan_offsets,
     )?);
+    {
+        let mut row = rows.pop().expect("engine-m4 row");
+        row.seq_gbps = seq_gbps(n, || {
+            let mut s = 0u64;
+            let mut off = 0u64;
+            while off < n {
+                let len = SEQ_CHUNK.min(n - off);
+                if let Ok(bytes) = engine4.read(
+                    &body4,
+                    ReadRequest {
+                        offset: off,
+                        length: len,
+                    },
+                ) {
+                    s += std::hint::black_box(bytes).len() as u64;
+                }
+                off += len;
+            }
+            s
+        });
+        rows.push(row);
+    }
 
     // ---- Verdict flags for this corpus.
     let indexed = |pred: &dyn Fn(&Row) -> f64, class: &str| -> f64 {
@@ -2620,6 +3265,7 @@ fn render_json(
                 finite(r.thrash_hot_p99)
             );
             let _ = writeln!(s, "          \"hit_rate\": {:.4},", finite(r.hit_rate));
+            let _ = writeln!(s, "          \"seq_gbps\": {:.3},", finite(r.seq_gbps));
             let _ = writeln!(s, "          \"note\": \"{}\"", json_escape(&r.note));
             let _ = write!(s, "        }}");
             if ri + 1 < c.rows.len() {
@@ -2651,7 +3297,7 @@ fn print_table(corpora: &[CorpusReport]) {
             c.hot_bytes
         );
         println!(
-            "{:<18} {:<9} {:>11} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
+            "{:<18} {:<9} {:>11} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>7}",
             "contender",
             "class",
             "retained",
@@ -2661,11 +3307,12 @@ fn print_table(corpora: &[CorpusReport]) {
             "cold_p99",
             "thr_p50",
             "thr_p99",
+            "seq_GB/s",
             "hit%"
         );
         for r in &c.rows {
             println!(
-                "{:<18} {:<9} {:>11} {:>9} {:>9.0} {:>9.0} {:>9.0} {:>9.0} {:>9.0} {:>7.2}",
+                "{:<18} {:<9} {:>11} {:>9} {:>9.0} {:>9.0} {:>9.0} {:>9.0} {:>9.0} {:>8.2} {:>7.2}",
                 r.name,
                 r.class,
                 r.retained_bytes,
@@ -2675,6 +3322,7 @@ fn print_table(corpora: &[CorpusReport]) {
                 r.cold_p99,
                 r.thrash_hot_p50,
                 r.thrash_hot_p99,
+                r.seq_gbps,
                 r.hit_rate * 100.0
             );
         }
@@ -2827,12 +3475,18 @@ fn main() -> ekbloom::Result<()> {
         .iter()
         .map(|(name, source)| measure_segmented(name, source))
         .collect::<ekbloom::Result<Vec<_>>>()?;
+    let decoders: Vec<DecoderCourt> = corpus_list
+        .iter()
+        .filter(|(name, _)| *name == "skewed" || *name == "mixed")
+        .map(|(name, source)| measure_decoder_court(name, source))
+        .collect::<ekbloom::Result<Vec<_>>>()?;
 
     print_table(&corpora);
     print_cold_table(&cold);
     print_decode_table(&decode);
     print_packed_table(&packed);
     print_segmented_table(&segmented);
+    print_decoder_court(&decoders);
 
     println!("\n== hot index (fully resident, allocation-parity) ==");
     println!(
@@ -2987,5 +3641,13 @@ fn main() -> ekbloom::Result<()> {
     }
     std::fs::write(out, json)?;
     println!("wrote {}", out.display());
+
+    let decoder_json = render_decoders_json(&decoders);
+    let out_decoders = Path::new("evidence/bench/decoders.json");
+    if let Some(parent) = out_decoders.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out_decoders, decoder_json)?;
+    println!("wrote {}", out_decoders.display());
     Ok(())
 }

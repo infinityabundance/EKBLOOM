@@ -36,7 +36,8 @@ use crate::checkpoint::CheckpointSet;
 use crate::error::{EkbloomError, Result};
 use crate::history::History;
 use crate::machine::{
-    machine_by_id, OrMachine, MACHINE_NL2, MACHINE_PACK, MACHINE_RANS0, MACHINE_SEG, MACHINE_STORE,
+    machine_by_id, OrMachine, MACHINE_NL2, MACHINE_PACK, MACHINE_RANS0, MACHINE_RANS0IL,
+    MACHINE_RANS0W, MACHINE_SEG, MACHINE_STORE,
 };
 use crate::state::Snapshot;
 use crate::tiles::TileSet;
@@ -322,6 +323,12 @@ pub enum RepresentationPolicy {
     Packed,
     /// Machine 6 (`OrANS-SEG`) when its container is smaller than raw, else `Auto`.
     Segmented,
+    /// Machine 7 (`OrANS-RANS0W`, 16-bit word renorm) when its core is smaller
+    /// than raw, else `Auto`. Additive: the default `Auto` is unchanged.
+    Word16,
+    /// Machine 8 (`OrANS-RANS0IL`, independent-lane streams) when its core is
+    /// smaller than raw, else `Auto`. Additive: the default `Auto` is unchanged.
+    IndependentLanes,
 }
 
 /// The machine chosen by `policy` for `source` (the policy-aware [`select_machine`]).
@@ -342,6 +349,20 @@ pub fn select_machine_packed(source: &[u8]) -> Result<u32> {
 /// when its container is smaller than raw, else the `Auto` policy.
 pub fn select_machine_segmented(source: &[u8]) -> Result<u32> {
     select_machine_policy(source, RepresentationPolicy::Segmented)
+}
+
+/// [`select_machine_policy`] for [`RepresentationPolicy::Word16`]: machine 7 when
+/// its core is smaller than raw, else the `Auto` policy. Additive; `Auto` is
+/// unchanged.
+pub fn select_machine_word16(source: &[u8]) -> Result<u32> {
+    select_machine_policy(source, RepresentationPolicy::Word16)
+}
+
+/// [`select_machine_policy`] for [`RepresentationPolicy::IndependentLanes`]: machine
+/// 8 when its core is smaller than raw, else the `Auto` policy. Additive; `Auto` is
+/// unchanged.
+pub fn select_machine_independent(source: &[u8]) -> Result<u32> {
+    select_machine_policy(source, RepresentationPolicy::IndependentLanes)
 }
 
 /// The policy decision together with the encoded core it was made against, so
@@ -368,6 +389,27 @@ fn select_machine_with_core_policy(
             let core = machine.encode(source)?;
             if core.len() < source.len() {
                 Ok((MACHINE_SEG, core))
+            } else {
+                select_machine_with_core(source)
+            }
+        }
+        RepresentationPolicy::Word16 => {
+            let machine = machine_by_id(MACHINE_RANS0W)
+                .ok_or(EkbloomError::UnknownMachine { id: MACHINE_RANS0W })?;
+            let core = machine.encode(source)?;
+            if core.len() < source.len() {
+                Ok((MACHINE_RANS0W, core))
+            } else {
+                select_machine_with_core(source)
+            }
+        }
+        RepresentationPolicy::IndependentLanes => {
+            let machine = machine_by_id(MACHINE_RANS0IL).ok_or(EkbloomError::UnknownMachine {
+                id: MACHINE_RANS0IL,
+            })?;
+            let core = machine.encode(source)?;
+            if core.len() < source.len() {
+                Ok((MACHINE_RANS0IL, core))
             } else {
                 select_machine_with_core(source)
             }
@@ -400,6 +442,23 @@ pub fn create_auto_packed(source: &[u8], profile: ManifestationProfile) -> Resul
 /// `auto` choice.
 pub fn create_auto_segmented(source: &[u8], profile: ManifestationProfile) -> Result<EkbloomBody> {
     create_auto_with_policy(source, profile, RepresentationPolicy::Segmented)
+}
+
+/// [`create_auto`] for [`RepresentationPolicy::Word16`]: prefer machine 7
+/// (`OrANS-RANS0W`) when its core is smaller than raw, else the historical `auto`
+/// choice.
+pub fn create_auto_word16(source: &[u8], profile: ManifestationProfile) -> Result<EkbloomBody> {
+    create_auto_with_policy(source, profile, RepresentationPolicy::Word16)
+}
+
+/// [`create_auto`] for [`RepresentationPolicy::IndependentLanes`]: prefer machine 8
+/// (`OrANS-RANS0IL`) when its core is smaller than raw, else the historical `auto`
+/// choice.
+pub fn create_auto_independent(
+    source: &[u8],
+    profile: ManifestationProfile,
+) -> Result<EkbloomBody> {
+    create_auto_with_policy(source, profile, RepresentationPolicy::IndependentLanes)
 }
 
 /// Assemble a body from an already-encoded `core` and apply `profile`.

@@ -27,6 +27,8 @@ use crate::error::{EkbloomError, Result};
 use crate::machine_pack::{PackContext, PACK};
 use crate::machine_rans::{RansContext, RANS0};
 use crate::machine_rans_i::{RansIContext, RANS0I};
+use crate::machine_rans_il::{IlContext, IlState, RANS0IL};
+use crate::machine_rans_w::{RansWContext, RANS0W};
 use crate::machine_seg::{SegContext, SEG};
 use crate::machine_store::STORE;
 use crate::state::Snapshot;
@@ -48,6 +50,13 @@ pub const MACHINE_PACK: u32 = 5;
 
 /// Machine identifier for `OrANS-SEG` (the versioned segmented container).
 pub const MACHINE_SEG: u32 = 6;
+
+/// Machine identifier for `OrANS-RANS0W` (order-0 rANS with 16-bit renorm words).
+pub const MACHINE_RANS0W: u32 = 7;
+
+/// Machine identifier for `OrANS-RANS0IL` (order-0 rANS with independent-lane
+/// streams).
+pub const MACHINE_RANS0IL: u32 = 8;
 
 const fn build_sbox() -> [u8; 256] {
     let mut s = [0u8; 256];
@@ -99,6 +108,21 @@ pub trait OrMachine: Send + Sync {
     /// store the complete wide [`Snapshot`] rather than the compact
     /// `(state, cursor)` form, so no site needs to hardcode a machine id.
     fn snapshot_needs_lanes(&self) -> bool {
+        false
+    }
+
+    /// Whether a *complete* resumable snapshot of this machine additionally needs
+    /// per-lane **cursors** (`Snapshot::cursors`), i.e. an independent-lane stream
+    /// whose lanes own separate payload ranges.
+    ///
+    /// The single-state machines and the shared-cursor interleaved machine
+    /// (machine 4) return `false`. The independent-lane machine (`machine_id = 8`,
+    /// `OrANS-RANS0IL`) returns `true`. The generic manifested structures
+    /// (blocks, checkpoints, regional tables) store the machine-4 wide form, which
+    /// does **not** carry per-lane cursors, so a site that must store a complete
+    /// successor consults this predicate to reject an independent-lane machine
+    /// rather than silently drop its cursors.
+    fn snapshot_needs_lane_cursors(&self) -> bool {
         false
     }
 
@@ -176,7 +200,7 @@ impl OrMachine for Nl2 {
     fn reveal(&self, core: &[u8], omega: &mut Snapshot) -> Result<u8> {
         let p = omega.cursor;
         let r = *core.get(p as usize).ok_or(EkbloomError::CoreTooShort {
-            needed: p + 1,
+            needed: p.saturating_add(1),
             available: core.len() as u64,
         })?;
         let h = (omega.state >> 8) as u8;
@@ -191,7 +215,7 @@ impl OrMachine for Nl2 {
     fn peek(&self, core: &[u8], omega: &Snapshot) -> Result<u8> {
         let p = omega.cursor;
         let r = *core.get(p as usize).ok_or(EkbloomError::CoreTooShort {
-            needed: p + 1,
+            needed: p.saturating_add(1),
             available: core.len() as u64,
         })?;
         let h = (omega.state >> 8) as u8;
@@ -240,6 +264,10 @@ pub enum Prepared<'a> {
     Rans(Box<RansContext>),
     /// A prepared `OrANS-RANS0I` interleaved decoder context (machine 4).
     RansI(Box<RansIContext>),
+    /// A prepared `OrANS-RANS0W` word-renorm decoder context (machine 7).
+    RansW(Box<RansWContext>),
+    /// A prepared `OrANS-RANS0IL` independent-lane decoder context (machine 8).
+    RansIL(Box<IlContext>),
     /// A prepared `OrANS-PACK` packed decoder context (machine 5).
     Pack(Box<PackContext>),
     /// A prepared `OrANS-SEG` segmented-container decoder context (machine 6).
@@ -254,6 +282,13 @@ impl Prepared<'_> {
             Prepared::Delegated(machine) => machine.reveal(core, omega),
             Prepared::Rans(ctx) => ctx.reveal(core, omega),
             Prepared::RansI(ctx) => ctx.reveal(core, omega),
+            Prepared::RansW(ctx) => ctx.reveal(core, omega),
+            Prepared::RansIL(ctx) => {
+                let mut s = IlState::from_snapshot(omega);
+                let sym = ctx.reveal(core, &mut s)?;
+                *omega = s.snapshot();
+                Ok(sym)
+            }
             Prepared::Pack(ctx) => ctx.reveal(core, omega),
             Prepared::Seg(ctx) => ctx.reveal(core, omega),
         }
@@ -266,6 +301,11 @@ impl Prepared<'_> {
             Prepared::Delegated(machine) => machine.peek(core, omega),
             Prepared::Rans(ctx) => ctx.peek(core, omega),
             Prepared::RansI(ctx) => ctx.peek(core, omega),
+            Prepared::RansW(ctx) => ctx.peek(core, omega),
+            Prepared::RansIL(ctx) => {
+                let mut s = IlState::from_snapshot(omega);
+                ctx.reveal(core, &mut s)
+            }
             Prepared::Pack(ctx) => ctx.peek(core, omega),
             Prepared::Seg(ctx) => ctx.peek(core, omega),
         }
@@ -276,6 +316,13 @@ impl Prepared<'_> {
         match self {
             Prepared::Rans(ctx) => ctx.skip(core, omega, n),
             Prepared::RansI(ctx) => ctx.skip(core, omega, n),
+            Prepared::RansW(ctx) => ctx.skip(core, omega, n),
+            Prepared::RansIL(ctx) => {
+                let mut s = IlState::from_snapshot(omega);
+                ctx.skip(core, &mut s, n)?;
+                *omega = s.snapshot();
+                Ok(())
+            }
             Prepared::Pack(ctx) => ctx.skip(core, omega, n),
             Prepared::Seg(ctx) => ctx.skip(core, omega, n),
             _ => {
@@ -297,6 +344,15 @@ impl Prepared<'_> {
     ) -> Result<()> {
         if let Prepared::RansI(ctx) = self {
             return ctx.decode_into(core, omega, n, out);
+        }
+        if let Prepared::RansW(ctx) = self {
+            return ctx.decode_into(core, omega, n, out);
+        }
+        if let Prepared::RansIL(ctx) = self {
+            let mut s = IlState::from_snapshot(omega);
+            ctx.decode_into(core, &mut s, n, out)?;
+            *omega = s.snapshot();
+            return Ok(());
         }
         if let Prepared::Rans(ctx) = self {
             return ctx.decode_into(core, omega, n, out);
@@ -335,6 +391,8 @@ impl Prepared<'_> {
         match self {
             Prepared::Rans(ctx) => ctx.header_bytes(),
             Prepared::RansI(ctx) => ctx.header_bytes(),
+            Prepared::RansW(ctx) => ctx.header_bytes(),
+            Prepared::RansIL(ctx) => ctx.header_bytes(),
             // `OrANS-PACK` and `OrANS-SEG` are cursor==position: the minimal
             // cursor is 0.
             Prepared::Pack(_) => 0,
@@ -362,6 +420,16 @@ impl Prepared<'_> {
                 }
             }
             Prepared::RansI(ctx) => ctx.validate_snapshot(omega),
+            Prepared::RansW(_) => {
+                if crate::machine_rans_w::valid_state_w(omega.state) {
+                    Ok(())
+                } else {
+                    Err(EkbloomError::BadSection {
+                        reason: format!("word-renorm restart state {} out of range", omega.state),
+                    })
+                }
+            }
+            Prepared::RansIL(ctx) => ctx.validate(&IlState::from_snapshot(omega)),
             Prepared::Delegated(_) => Ok(()),
             Prepared::Pack(_) => Ok(()),
             Prepared::Seg(_) => Ok(()),
@@ -378,6 +446,8 @@ pub fn prepare<'a>(machine: &'a dyn OrMachine, core: &[u8]) -> Result<Prepared<'
     match machine.machine_id() {
         MACHINE_RANS0 => Ok(Prepared::Rans(Box::new(RansContext::from_core(core)?))),
         MACHINE_RANS0I => Ok(Prepared::RansI(Box::new(RansIContext::from_core(core)?))),
+        MACHINE_RANS0W => Ok(Prepared::RansW(Box::new(RansWContext::from_core(core)?))),
+        MACHINE_RANS0IL => Ok(Prepared::RansIL(Box::new(IlContext::from_core(core)?))),
         MACHINE_PACK => Ok(Prepared::Pack(Box::new(PackContext::from_core(core)?))),
         MACHINE_SEG => Ok(Prepared::Seg(Box::new(SegContext::from_core(core)?))),
         _ => Ok(Prepared::Delegated(machine)),
@@ -391,6 +461,8 @@ pub fn machine_by_id(id: u32) -> Option<&'static dyn OrMachine> {
         MACHINE_RANS0 => Some(&RANS0),
         MACHINE_STORE => Some(&STORE),
         MACHINE_RANS0I => Some(&RANS0I),
+        MACHINE_RANS0W => Some(&RANS0W),
+        MACHINE_RANS0IL => Some(&RANS0IL),
         MACHINE_PACK => Some(&PACK),
         MACHINE_SEG => Some(&SEG),
         _ => None,

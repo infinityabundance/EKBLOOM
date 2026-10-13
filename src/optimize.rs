@@ -63,7 +63,7 @@ use crate::error::{EkbloomError, Result};
 use crate::machine::{
     MACHINE_NL2, MACHINE_PACK, MACHINE_RANS0, MACHINE_RANS0I, MACHINE_SEG, MACHINE_STORE,
 };
-use crate::manifest::{create_machine, manifest, EkbloomBody};
+use crate::manifest::{create_machine, manifest, select_machine, EkbloomBody};
 use crate::planner::CostModel;
 use crate::region_adapt::AccessTrace;
 use crate::tiles::{DirectoryKind, TileSet};
@@ -107,6 +107,39 @@ const MAX_EVALUATED: usize = 18;
 /// Hot-region subsets generated per base geometry (as fractions of the greedy
 /// value order): `1/3`, `2/3`, and all.
 const HOT_SUBSET_FRACTIONS: [usize; 3] = [1, 2, 3];
+
+/// The relative held-out p99 improvement a candidate that commits **more than the
+/// base representation** must deliver to be admissible. A structure that only
+/// matches (or barely beats) the base's p99 is not worth its bytes, so the
+/// governing objective prefers the base representation instead — the footprint
+/// gate that keeps uniform/incompressible plans at or below raw.
+const FOOTPRINT_GAIN_EPSILON: f64 = 0.01;
+
+/// Measured sequential (bulk) decode cost, nanoseconds per byte, for the machines
+/// the optimiser may choose (`docs/FRONTIER.md` §4, `docs/CODEC.md`). Machine 3
+/// (`OrANS-Store`) is a verbatim slice copy and so tracks raw `memcpy`; the
+/// compressing machines are decode-bound. These only order the sequential axis;
+/// they neither admit nor reject a plan.
+const SEQ_NS_PER_BYTE_STORE: f64 = 0.02; // verbatim copy / resident surface, ~50 GB/s
+const SEQ_NS_PER_BYTE_NL2: f64 = 1.60; // machine 1 XOR step, ~0.63 GB/s
+const SEQ_NS_PER_BYTE_RANS0: f64 = 3.40; // machine 2 serial chain, ~0.29 GB/s
+const SEQ_NS_PER_BYTE_RANS0I: f64 = 2.10; // machine 4 interleaved (K=8), ~0.47 GB/s
+const SEQ_NS_PER_BYTE_PACK: f64 = 0.86; // machine 5 direct packed, ~1.16 GB/s
+const SEQ_NS_PER_BYTE_SEG: f64 = 0.86; // machine 6 per-segment direct
+
+/// The estimated sequential (whole-object) bulk decode cost of `machine_id`, in
+/// nanoseconds per byte (`1 ns/byte == 1 GB/s`).
+fn sequential_ns_per_byte(machine_id: u32) -> f64 {
+    match machine_id {
+        MACHINE_STORE => SEQ_NS_PER_BYTE_STORE,
+        MACHINE_NL2 => SEQ_NS_PER_BYTE_NL2,
+        MACHINE_RANS0 => SEQ_NS_PER_BYTE_RANS0,
+        MACHINE_RANS0I => SEQ_NS_PER_BYTE_RANS0I,
+        MACHINE_PACK => SEQ_NS_PER_BYTE_PACK,
+        MACHINE_SEG => SEQ_NS_PER_BYTE_SEG,
+        _ => SEQ_NS_PER_BYTE_RANS0,
+    }
+}
 
 /// A latency distribution (nanoseconds) of one complete plan evaluated on a trace.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -175,6 +208,11 @@ impl Latency {
 /// The geometry of the cold-region restart structure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RestartGeometry {
+    /// No restart structure: the base representation alone. Admitting such a plan
+    /// requires a machine whose core is itself a certified bounded surface (the
+    /// verbatim machine 3), so `build` materialises the bare core and
+    /// `committed_bytes` equals the visible core length (`<= raw`).
+    None,
     /// A checkpoint set restarting every `interval` symbols (bounded replay
     /// `interval - 1`).
     Checkpoint {
@@ -192,6 +230,7 @@ impl RestartGeometry {
     /// The per-region positional step bound this geometry implies.
     pub fn max_steps(self) -> u64 {
         match self {
+            RestartGeometry::None => 0,
             RestartGeometry::Checkpoint { interval } => u64::from(interval).saturating_sub(1),
             RestartGeometry::Block { block_bytes } => u64::from(block_bytes).saturating_sub(1),
         }
@@ -200,6 +239,7 @@ impl RestartGeometry {
     /// Stable, human-readable label.
     pub fn label(self) -> String {
         match self {
+            RestartGeometry::None => "none".to_string(),
             RestartGeometry::Checkpoint { interval } => format!("K{interval}"),
             RestartGeometry::Block { block_bytes } => format!("B{block_bytes}"),
         }
@@ -266,6 +306,7 @@ impl PlanCandidate {
     /// Append only the cold-restart structure (core assumed present).
     fn apply_restart(&self, body: &mut EkbloomBody) -> Result<()> {
         match self.restart {
+            RestartGeometry::None => {}
             RestartGeometry::Checkpoint { interval } => {
                 manifest(body, ManifestationProfile::Sparse { interval })?;
             }
@@ -455,7 +496,51 @@ impl OptimizedPlan {
                 }
             }
         }
-        if bases.is_empty() {
+        // ---- Phase 1b: the base representation (auto machine, no structures). --
+        // The `auto` policy's core is never larger than raw. When its machine's core
+        // is itself a certified bounded surface (the verbatim machine 3), the bare
+        // core is a valid plan: the footprint floor the governing objective gates
+        // every other plan against. It is absent for a compressing machine, whose
+        // core alone has no bounded path. It is computed **before** the
+        // cold-geometry guard so a budget that admits only the base representation
+        // (e.g. exactly raw on uniform data) still yields that plan instead of
+        // aborting.
+        let auto_machine = select_machine(source)?;
+        let base_candidate = PlanCandidate {
+            machine_id: auto_machine,
+            region_bytes: REGION_SIZES[0],
+            restart: RestartGeometry::None,
+            tile_shift: TILE_SHIFTS[0],
+            hot_regions: Vec::new(),
+            hot_counts: Vec::new(),
+            budget_bytes: limit,
+        };
+        let mut base_reference: Option<(u64, f64)> = None;
+        if let Ok(body) = base_candidate.build(source) {
+            let committed = body.physical_bytes();
+            if committed <= limit {
+                if let Ok(engine) =
+                    Engine::plan_with(&body, budget, base_candidate.region_bytes, model)
+                {
+                    if engine.plan_ref().all_certified() {
+                        let latency = evaluate(&engine, trace, &model, OPTIMIZER_READ_BYTES);
+                        base_reference = Some((committed, latency.p99));
+                        receipts.push(PlanReceipt {
+                            candidate: base_candidate.label(),
+                            committed_bytes: committed,
+                            expected_latency: latency,
+                            reason: "base representation (auto machine, no structures): the \
+                                     footprint floor"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // No cold geometry fits the budget: abort only if there is also no base
+        // representation to fall back to.
+        if bases.is_empty() && base_reference.is_none() {
             return Err(EkbloomError::AllocationTooLarge {
                 requested: source.len() as u64,
                 limit,
@@ -595,18 +680,57 @@ impl OptimizedPlan {
             let latency = evaluate(&engine, trace, &model, OPTIMIZER_READ_BYTES);
             evaluated.push((cand.clone(), committed, latency));
         }
-        if evaluated.is_empty() {
+        if evaluated.is_empty() && base_reference.is_none() {
             return Err(EkbloomError::AllocationTooLarge {
                 requested: source.len() as u64,
                 limit,
             });
         }
 
-        // ---- Phase 3: choose the lowest expected p99. -------------------------
+        // ---- Phase 3a: the footprint gate. ------------------------------------
+        // Guarantee the base representation is in the decision set, then drop any
+        // plan that commits MORE than the base without a measurable held-out-p99
+        // improvement over it. On uniform/incompressible data this keeps the chosen
+        // plan at or below raw (machine 3, no structures) instead of spending bytes
+        // on tiles/restarts that buy no speed.
+        if let Some((base_committed, base_p99)) = base_reference {
+            if let Ok(body) = base_candidate.build(source) {
+                if let Ok(engine) =
+                    Engine::plan_with(&body, budget, base_candidate.region_bytes, model)
+                {
+                    let latency = evaluate(&engine, trace, &model, OPTIMIZER_READ_BYTES);
+                    if !evaluated
+                        .iter()
+                        .any(|(c, _, _)| c.label() == base_candidate.label())
+                    {
+                        evaluated.push((base_candidate.clone(), base_committed, latency));
+                    }
+                }
+            }
+            let threshold = base_p99 * (1.0 - FOOTPRINT_GAIN_EPSILON);
+            let eligible: Vec<(PlanCandidate, u64, Latency)> = evaluated
+                .iter()
+                .filter(|(_, committed, lat)| *committed <= base_committed || lat.p99 < threshold)
+                .cloned()
+                .collect();
+            if !eligible.is_empty() {
+                evaluated = eligible;
+            }
+        }
+
+        // ---- Phase 3b: choose the lowest expected p99. ------------------------
+        // Ties (identical held-out p99) are broken by the higher sequential bulk
+        // throughput (the sequential dimension is first-class), then by fewer
+        // committed bytes and a deterministic seed-keyed label hash.
         evaluated.sort_by(|a, b| {
             a.2.p99
                 .partial_cmp(&b.2.p99)
                 .unwrap_or(Ordering::Equal)
+                .then_with(|| {
+                    sequential_ns_per_byte(a.0.machine_id)
+                        .partial_cmp(&sequential_ns_per_byte(b.0.machine_id))
+                        .unwrap_or(Ordering::Equal)
+                })
                 .then_with(|| a.1.cmp(&b.1))
                 .then_with(|| {
                     seed_key(&a.0.label(), cfg.seed).cmp(&seed_key(&b.0.label(), cfg.seed))
@@ -692,6 +816,27 @@ impl OptimizedPlan {
     /// The chosen plan's expected p99 latency on the held-out trace.
     pub fn expected_p99(&self) -> f64 {
         self.expected_p99
+    }
+
+    /// The chosen plan's estimated sequential (whole-object) bulk decode cost, in
+    /// nanoseconds per byte (`1 ns/byte == 1 GB/s`).
+    ///
+    /// This is the honest sequential-throughput figure for the **chosen machine**:
+    /// the verbatim machine 3 reads a slice (raw-like), while a compressing machine
+    /// is decode-bound. The sequential axis is first-class in the selection (an
+    /// exact-p99 tie is broken toward the higher bulk throughput).
+    pub fn expected_sequential_ns_per_byte(&self) -> f64 {
+        sequential_ns_per_byte(self.machine_id)
+    }
+
+    /// The chosen plan's estimated sequential throughput in GB/s.
+    pub fn sequential_gbps(&self) -> f64 {
+        let ns = self.expected_sequential_ns_per_byte();
+        if ns > 0.0 {
+            1.0 / ns
+        } else {
+            0.0
+        }
     }
 
     /// The fingerprint of the held-out trace the plan was scored on.

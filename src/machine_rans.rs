@@ -240,10 +240,10 @@ impl RansContext {
     }
 
     /// The fused per-slot decode table (see the field documentation). The
-    /// interleaved machine reuses it so its per-lane step is the same **single**
-    /// dependent load as machine 2's step.
+    /// interleaved machine and the measured decode kernel reuse it so their
+    /// per-lane step is the same **single** dependent load as machine 2's step.
     #[inline]
-    pub(crate) fn table(&self) -> &[u32] {
+    pub fn table(&self) -> &[u32] {
         &self.entries
     }
 
@@ -274,7 +274,7 @@ impl RansContext {
                 Some(&b) => b,
                 None => {
                     return Err(EkbloomError::CoreTooShort {
-                        needed: p + 1,
+                        needed: p.saturating_add(1),
                         available: core.len() as u64,
                     })
                 }
@@ -317,7 +317,7 @@ impl RansContext {
                     Some(&b) => b,
                     None => {
                         return Err(EkbloomError::CoreTooShort {
-                            needed: p + 1,
+                            needed: p.saturating_add(1),
                             available: core.len() as u64,
                         })
                     }
@@ -353,7 +353,7 @@ impl RansContext {
                         Some(&b) => b,
                         None => {
                             return Err(EkbloomError::CoreTooShort {
-                                needed: p + 1,
+                                needed: p.saturating_add(1),
                                 available: core.len() as u64,
                             })
                         }

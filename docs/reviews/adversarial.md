@@ -669,3 +669,63 @@ read time; the file path relies on section CRC + `core_hash` linkage (integrity,
 not authenticity). Unchanged.
 * Pre-existing: a crafted `Snapshot.cursor == u64::MAX` still overflows `p + 1` in
 `NL2`/`STORE` reveal; not reachable from a read path.
+
+## Revision 8 — O1–O2 (verdict **TWO DEFECTS, BOTH FIXED**)
+
+The O-round surface: machines 7 (`OrANS-RANS0W`) and 8 (`OrANS-RANS0IL`), the
+unwired SIMD rANS kernel, the budget-aware optimiser footprint gate, and the OrFS
+compacted views/framing. Executable attacks live in `tests/adversarial_o.rs`
+(9 tests, green); the campaign adds `fuzz_rans_w`/`fuzz_rans_il`.
+
+### Finding I (**Medium**, FIXED) — `cursor + 1` overflow (machines 7/8, SIMD kernel)
+
+`CoreTooShort.needed` was built with a non-saturating `cursor + 1` (`+ 2` in machine
+7's `read_word`) on an attacker-controlled cursor: `machine_rans_w.rs`,
+`machine_rans_il.rs` (three sites), `simd.rs` (five sites). `cursor = u64::MAX`
+panicked in any overflow-checked build. For **machine 7 this is a read path**: it is
+cursor-divergent but not `is_windowed()`, so `read_via_checkpoint` loads the entry
+cursor verbatim and never bounds it (`validate_restart` is skipped; only machine 1
+enforces its implicit cursor) — a crafted machine-7 `.ekb` with checkpoint
+`cursor = u64::MAX` reaches `read_word`. Machine 8/kernel are reachable via the
+public `reveal`/`peek`/kernel API with a crafted state. **Fix:** `saturating_add` at
+each site; pinned by the four `*_is_a_typed_error` tests above (all panicked before).
+
+### Finding J (**Medium**, FIXED) — footprint gate aborted when only the base fit
+
+`optimize` enumerated `Checkpoint`/`Block` cold geometries (never `None`) and
+returned `AllocationTooLarge` when none fit the budget, *before* computing the
+structureless base representation (Phase 1b). On uniform data at `budget == raw`
+(the case the gate is for) it **errored instead of returning the ≤-raw base**.
+Repro: uniform 64 KiB, `budget = raw` → `AllocationTooLarge { 65536, 65536 }`.
+**Fix (`src/optimize.rs`):** build Phase 1b before the guard; gate both emptiness
+checks on `base_reference.is_none()`. Pinned by
+`optimizer_uniform_tight_budget_stays_leq_raw` (failed before).
+
+### Attacks that held (Revision 8)
+
+* **Machines 7/8** — exact round-trip all categories × lanes 1–8, byte-exact vs
+  `reader::read` before/after reopen, complete-state checkpoint/block/`il_…` resume
+  at every boundary, crafted/truncated headers clean `Err`, machines 1–6 wire-hash
+  pinned.
+* **SIMD kernel** — equals the scalar reference for adversarial cursors/boundaries
+  (and is now total); unwired from every default path; `unsafe` confined to
+  `simd`/`async_io`/`mapped`.
+* **Footprint gate** — committed ≤ budget; uniform ≤ raw; constant corpus does not
+  expand; only `all_certified` plans evaluated.
+* **OrFS** — `inspect_physical` equals an independent `du` walk, payload stored once
+  in the compacted container, corruption rejected; views are write-only (no reader),
+  so no forged-view acceptance surface.
+
+### Fuzz + evidence (Revision 8)
+
+`container-fuzz.sh`: **fifteen** targets PASS. `container-reproduce.sh`: clean build,
+**684 passed / 0 failed**, **33** evidence JSON OK. Verify gate green at **698
+passed** (all-features).
+
+### Residual risk (Revision 8)
+
+* Findings I and J fixed; no unfixed read-path defect found.
+* The pre-existing `NL2`/`STORE` `reveal`/`peek` `cursor + 1` overflow (R7) is
+  unchanged (public-API-only); the same `saturating_add` would close it.
+* In-range-but-inconsistent restart cursors are still not re-derived at read time
+  (integrity, not authenticity) — unchanged.
