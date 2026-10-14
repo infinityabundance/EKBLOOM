@@ -239,3 +239,59 @@ reader-parsed structure, with identical `physical_bytes()`, `byte_at` samples an
 machines 1 and 2, through the fresh and append paths, plus a MaxSpeed-style body and
 the frozen legacy fixtures. It changes **no stored byte** and adds **no new wire
 version**.
+
+---
+
+## 8. Release-by-release compatibility
+
+This section is the authoritative, self-contained answer to "will my stored data
+still be readable?" It is a superset of §2 and §5 and is split into the **tag
+cross-product** (§8.1) and the **per-release read/write table** (§8.2). It must be
+updated in the same change as any wire-format change (see §6.4).
+
+### 8.1 `format_major.minor` × `core_version` × `manifest_version`
+
+A `.ekb` file is accepted by this build (**0.6.0**) **iff** all three tags are
+known. The table enumerates every reachable combination and the outcome:
+
+| `format_major.minor` | `core_version` | `manifest_version` | this build reads? | refusal / note |
+|---|---|---|---|---|
+| `0.0` – `0.2` | `0` | `1` | yes | pre-0.3.0 internal format line, legacy cores |
+| `0.3` | `0` (legacy) | `1` | yes | written by 0.3.0 / 0.4.0 (field absent ⇒ `0`) |
+| `0.3` | `1` | `1` | yes | written by 0.5.0 / 0.6.0 |
+| `0.3` | `≥ 2` | `1` | **no** | `UnsupportedCoreVersion { machine_id, core_version }` |
+| any | any | `≥ 2` | **no** | `UnsupportedManifestVersion { version }` |
+| `0.4+` or `major ≠ 0` | any | any | **no** | `UnsupportedVersion { major, minor }` |
+| any (unknown `machine_id`) | any | any | **no** | `UnknownMachine { id }` — checked within a supported `format`, before the `core_version` check |
+
+This build **writes** exactly one combination: `format 0.3` × `core_version 1` ×
+`manifest_version 1`.
+
+The auxiliary containers carry their own version bytes (independent of the
+`format_major/minor` line) and are additive/backward-compatible: checkpoint
+container `EKBCKPT\0` v`2` (plus legacy magic-less), block index `EKBKBLKS` v`1`,
+segment container `ESEG` v`1` — see §1 and §7.
+
+### 8.2 Per-release read/write
+
+| release | `format` writes | `core_version` writes | manifest | machines | this release **reads** |
+|---|---|---|---|---|---|
+| 0.3.0 | `0.3` | *absent* (reserved ⇒ `0`) | `1` | 1–4 | `format 0.0`–`0.3`, machines 1–4, manifest 1 |
+| 0.4.0 | `0.3` | *absent* (reserved ⇒ `0`) | `1` | 1–8 | `format 0.0`–`0.3`, machines 1–8, manifest 1; container bytes identical to 0.3.0 |
+| 0.5.0 | `0.3` | `1` | `1` | 1–9 | `format 0.0`–`0.3`, `core_version {0,1}`, machines 1–9, manifest 1 |
+| 0.6.0 | `0.3` | `1` | `1` | 1–9 | identical to 0.5.0; the writer emits **byte-identical** output to 0.5.0 (**no wire change**) |
+
+Rules a user can apply directly:
+
+- **Backward (new reader, old file).** This build reads every `format 0.0`–`0.3`
+  file, every `core_version {0, 1}`, and `manifest_version 1` — i.e. everything
+  written by 0.3.0–0.6.0. The frozen v0.3.0/v0.4.0 fixtures (§6) pin this.
+- **Forward (old reader, new file).** A release can read any file written on the
+  *same or an earlier* `format` line. Adding a machine or a section kind is
+  additive: an old reader rejects an unknown `machine_id` / section kind with a
+  typed error rather than mis-decoding it (e.g. a 0.3.0 reader rejects machines
+  5–9 with `UnknownMachine`).
+- **Crate semver ≠ wire version.** 0.6.0 changed **no** stored byte; a future
+  `0.7.0` may or may not. Decide from the **⚠ wire format** marker in
+  [`CHANGELOG.md`](../CHANGELOG.md) and the tables above — never from the crate
+  version alone.

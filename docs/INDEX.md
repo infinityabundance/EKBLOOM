@@ -3,7 +3,8 @@
 One-page index of every document and evidence artifact in the repository, with a
 one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contract,
 [`../README.md`](../README.md) for orientation, and
-[`ACCEPTANCE.md`](ACCEPTANCE.md) for the reproduction gates.
+[`ACCEPTANCE.md`](ACCEPTANCE.md) for the reproduction gates. The release history
+is in [`../CHANGELOG.md`](../CHANGELOG.md).
 
 ## Docs (`docs/`)
 
@@ -45,6 +46,7 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`E2E.md`](E2E.md) | The **end-to-end** EKBLOOM/OrFS proof on real text/ELF/mixed data vs raw and pinned-hot LZ4/Zstd at an equal on-disk budget (the honest win/lose verdict). |
 | [`DECODERS.md`](DECODERS.md) | The **decoder court** (O1): machines 7 (`OrANS-RANS0W`, word16) and 8 (`OrANS-RANS0IL`, independent lanes) and an AVX2 rANS kernel measured at equal stored bytes against machine 4 `K = 8` — **all rejected**; best stays machine 4 `K = 8`. |
 | [`MIGRATION.md`](MIGRATION.md) | **Wire-format migration & compatibility** (P1): `format_major.minor`, `core_version`, the read/write compatibility matrix, and the policy that makes stored `.ekb` data safe across releases. |
+| [`../CHANGELOG.md`](../CHANGELOG.md) | **Release history** (Keep a Changelog): the real per-release changes, with wire-format-affecting entries explicitly marked, plus an `[Unreleased]` section. |
 | [`CORE-LAYOUT.md`](CORE-LAYOUT.md) | **Implementable `.ekb`/core byte layout** for machines 1–9 — exact enough to reimplement a decoder from the text alone. |
 | [`STREAMING.md`](STREAMING.md) | The **streaming, downstream-seekable container** (`StreamBuilder`/`StreamReader`) with bounded builder memory (2 GiB at 8.6 MiB peak RSS; P2). |
 | [`CORRUPTION.md`](CORRUPTION.md) | **The corruption model** (P3): what a single-bit flip does per structure — 100 % detection, ≤4096 B granularity, typed `Corrupt { section, offset }`. |

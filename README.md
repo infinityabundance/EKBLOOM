@@ -17,7 +17,59 @@ converts manifested space into access speed.
 This crate is a single Cargo package (`ekbloom`), shipping one library and one
 binary (`ekbloom`), and **`ekbloom` v0.6.0 is published on
 [crates.io](https://crates.io/crates/ekbloom)**. The frozen internal contract is
-`docs/DESIGN.md`; the original specification lives in `research/`.
+`docs/DESIGN.md`; the original specification lives in `research/`. The release
+history is in [`CHANGELOG.md`](CHANGELOG.md); the wire-format compatibility and
+migration policy is in [`docs/MIGRATION.md`](docs/MIGRATION.md).
+
+---
+
+## Versioning, MSRV and the wire format
+
+**MSRV.** The minimum supported Rust version is **1.89**
+(`Cargo.toml` `rust-version = "1.89"`); the crate is expected to build on 1.89.
+CI and all project tooling pin the toolchain at **1.99.0**
+(`rust-toolchain.toml`; the pinned image `ekbloom-rust:1.99.0`, see
+[Build, test, benchmark](#build-test-benchmark--docker-only)). **An MSRV bump is
+treated as (at least) a minor semver change**, so it is never shipped in a patch
+release.
+
+**Crate semver (`0.x`).** `ekbloom` is pre-1.0 and follows the usual `0.y.z`
+convention: for `0.y.z` the **MINOR** version is the compatibility boundary. A
+breaking change to the public Rust API — or any bump of the MSRV — increments
+the MINOR version (`0.6.0` → `0.7.0`); a backward-compatible addition or fix
+increments the PATCH version (`0.6.0` → `0.6.1`).
+
+**The on-disk wire format has its OWN, independent versioning.** A crate semver
+bump does **not** imply a wire-format change, and a wire-format change does
+**not** imply a crate-semver bump — the two are tracked separately. Stored `.ekb`
+data is governed by [`docs/MIGRATION.md`](docs/MIGRATION.md), whose version tags
+are:
+
+- `format_major` / `format_minor` — the `.ekb` genesis-header container version
+  (`u16` at offsets 8 / 10). This build **writes `0.3`** and **reads `0.0`–`0.3`**.
+- `core_version` — the per-machine core-payload layout version (`u16` at
+  offset 68). This build **writes `1`** and **reads `0`** (legacy/implicit)
+  and **`1`**.
+- `manifest_version` — the `MANIFEST` record version (first `u32` of the
+  payload). This build **reads and writes `1`**.
+
+**Deciding whether your stored data stays readable.** A `.ekb` file is readable
+by this build **iff all three hold** (otherwise the reader fails closed with a
+typed error and never partially decodes):
+
+1. `format_major == 0` **and** `format_minor ≤ 3` — else
+   `UnsupportedVersion { major, minor }`;
+2. the file's `machine_id` is known **and** its `core_version ∈ {0, 1}` — else
+   `UnknownMachine { id }` or
+   `UnsupportedCoreVersion { machine_id, core_version }`;
+3. `manifest_version == 1` — else `UnsupportedManifestVersion { version }`.
+
+In practice every release through 0.6.0 writes wire line **`0.3`**, so an `.ekb`
+written by any 0.3.0–0.6.0 release stays readable; the release-by-release
+read/write table and the full `format_major.minor × core_version ×
+manifest_version` matrix are in [`docs/MIGRATION.md`](docs/MIGRATION.md) §8.
+
+---
 
 **Honest headline findings** (all measured; see `docs/RESULTS.md`, `docs/BASELINES.md`,
 `docs/COMPETITIVE.md`, `docs/FRONTIER.md`, and the per-phase docs linked below):
@@ -1590,6 +1642,7 @@ Documentation map:
 
 | Doc | One line |
 |---|---|
+| [`CHANGELOG.md`](CHANGELOG.md) | Release history (Keep a Changelog); wire-format-affecting entries are marked. |
 | [`docs/INDEX.md`](docs/INDEX.md) | One-page index of all docs and evidence. |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Frozen internal engineering contract. |
 | [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | The 10 hard gates mapped to tests and commands. |
