@@ -53,6 +53,13 @@ divan = "0.1"
 lz4_flex = "0.11"
 zstd = "0.13"
 
+# Pure-Rust embedded KV engine for the db-integration court
+# (`examples/kv_integration.rs`, `tests/kv_integration.rs`). `redb` is a
+# log-free copy-on-write B-tree with a single-file backend, no C toolchain, and
+# no `unsafe` in its public API; it is a *dev*-dependency, never part of the
+# shipped `ekbloom` codec.
+redb = "4.4"
+
 # Loom model-checking, enabled only by `RUSTFLAGS="--cfg loom"`. This is a
 # *target-gated normal dependency*, not a dev-dependency: `src/filesystem.rs`
 # itself selects `loom::sync::Mutex` under `#[cfg(loom)]` so the real `OrFs`
