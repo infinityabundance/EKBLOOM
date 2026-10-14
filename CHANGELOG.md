@@ -15,6 +15,17 @@ is written to disk are marked **⚠ wire format** and their rules live in
 
 ### Added
 
+- Nothing yet.
+
+## [0.7.2] - 2026-10-15
+
+**⚠ no wire change.** The `.ekb` line stays `0.3`; machine cores remain
+byte-identical and a 0.7.2 writer emits exactly what 0.7.1 emitted. No public API
+change and no MSRV change — this is a **PATCH** release: `src/` non-test code is
+untouched, and the public API and wire format are unchanged.
+
+### Added
+
 - **Miri coverage for machine 9 (`OrANS-DICT`), and a wider machine-9 unit-test
   surface.** `scripts/container-miri.sh` now selects the `machine_dict::` unit
   tests (frame layout, machine registration, the embedded and referenced/registry
@@ -227,7 +238,8 @@ exist).
 - Correctness court, property tests, fuzzing and Miri/ASan coverage; the measured
   speed-vs-space frontier and conventional-baseline comparison.
 
-[Unreleased]: https://github.com/infinityabundance/EKBLOOM/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/infinityabundance/EKBLOOM/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/infinityabundance/EKBLOOM/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/infinityabundance/EKBLOOM/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/infinityabundance/EKBLOOM/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/infinityabundance/EKBLOOM/compare/v0.5.0...v0.6.0

@@ -15,7 +15,7 @@ preserves exact correctness, accounts for the bytes it actually manifests, and
 converts manifested space into access speed.
 
 This crate is a single Cargo package (`ekbloom`), shipping one library and one
-binary (`ekbloom`), and **`ekbloom` v0.7.1 is published on
+binary (`ekbloom`), and **`ekbloom` v0.7.2 is published on
 [crates.io](https://crates.io/crates/ekbloom)**. The frozen internal contract is
 `docs/DESIGN.md`; the original specification lives in `research/`. The release
 history is in [`CHANGELOG.md`](CHANGELOG.md); the wire-format compatibility and
@@ -64,8 +64,8 @@ typed error and never partially decodes):
    `UnsupportedCoreVersion { machine_id, core_version }`;
 3. `manifest_version == 1` — else `UnsupportedManifestVersion { version }`.
 
-In practice every release through 0.7.1 writes wire line **`0.3`**, so an `.ekb`
-written by any 0.3.0–0.7.1 release stays readable; the release-by-release
+In practice every release through 0.7.2 writes wire line **`0.3`**, so an `.ekb`
+written by any 0.3.0–0.7.2 release stays readable; the release-by-release
 read/write table and the full `format_major.minor × core_version ×
 manifest_version` matrix are in [`docs/MIGRATION.md`](docs/MIGRATION.md) §8.
 
