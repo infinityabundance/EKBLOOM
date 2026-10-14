@@ -54,6 +54,7 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`CORPORA.md`](CORPORA.md) | **Standard-corpora court**: EKBLOOM vs LZ4/zstd/pinned-hot/raw on Silesia/enwik8/Calgary/text/ELF at an equal budget, plus hardware counters, 64-reader concurrency p99, and the machine-checked worst-case step bound (1,000,000 samples, zero violations). |
 | [`ROCKSDB.md`](ROCKSDB.md) | **RocksDB-style skewed KV court**: 100-byte values read with an 80/20 key skew (`get` + 4 KiB `read_random`), comparing EKBLOOM (best plan and machine 9 `OrANS-DICT`) vs raw / block LZ4 / seekable Zstd / Zstd-with-dictionary at an equal budget — footprint, bytes fetched per read (I/O amplification), hot/cold and p50/p99.9 latency. |
 | [`MACHINES.md`](MACHINES.md) | **The machine catalogue (ids 1–9)**: name, `machine_id`, `core_version`, exact transition/encoding math, complete resumable state, decode algorithm, size table and wins/loses, plus a relationship map — one section per machine. |
+| [`REFINEMENT.md`](REFINEMENT.md) | **Machine-spec ↔ implementation refinement**: per machine (ids 1–9) the abstract state/transition/observable, the Rust mapping, the transition invariants (site + discharging test/gate), the complete resumable state, restart correctness and resource bounds — plus the reviewer-run proof-obligation checklist (`scripts/run-refinement.sh`), the wire integrity primitives actually used, and the honest refinement gaps. |
 | [`BUDGET-GUIDE.md`](BUDGET-GUIDE.md) | **The budget chooser guide**: how to pick machine / segment size / restart `K` / block `B` / path `D` / tiles, with a budget × workload decision table, the measured tradeoffs, and worked examples — backed by `choose_plan`. |
 | [`LIMITATIONS.md`](LIMITATIONS.md) | **The consolidated honest non-claims** (compression, latency, integrity/`AUTH`, backends, scope), each with a one-line pointer to its evidence. |
 | [`GATES.md`](GATES.md) | The **machine-checked acceptance gates G1–G5** (invertibility, prefix composition, worst-case bound, corruption detection, physical accounting), their runner (`scripts/run-gates.sh`) and recorded results. |
@@ -168,6 +169,7 @@ sh scripts/run-crossfs.sh           # crossfs.json (cross-filesystem determinism
 sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (53 files)
 sh scripts/container-fuzz.sh        # all 19 libFuzzer targets (fuzz_machine/open/bloom/history_store/packed/tiles/blocks/batch/rans_i/region/pack/seg/resource/rans_w/rans_il/roundtrip/stream/open_auth/dictionary)
 sh scripts/run-gates.sh             # acceptance gates G1-G5 (docs/GATES.md)
+sh scripts/run-refinement.sh        # docs/REFINEMENT.md obligation table (PASS/FAIL)
 sh scripts/run-scale.sh             # nightly 2^30 scale build (opt-in: EKB_RUN_SCALE=1)
 sh scripts/run-scalar.sh scalar     # x86_64 with EKB_NO_SIMD=1: equality + gates + bounded court
 sh scripts/run-matrix.sh            # cross-platform CI matrix {x86_64-simd, x86_64-scalar, aarch64} (ci-matrix.json)
