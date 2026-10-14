@@ -170,11 +170,37 @@ spent is only worth it where the evidence shows a real win — those boundaries 
     reads. The Q/R rounds add **no** new speed ceiling; cold random-access still loses to
     LZ4 (**≈4.3×**) and the uniform manifested footprint stays **1.07× raw**. Pointer:
     [`ROCKSDB.md`](ROCKSDB.md), `rocksdb-skew.json`, limitations 5/12/14.
+[`ROCKSDB.md`](ROCKSDB.md), limitations 5/12/14.
+
+## S-round observations (v0.7)
+
+28. **Inside a real KV engine, machine 9 loses on every DB axis.** Stored as `redb` values
+    and read through a real B-tree, machine 9 is **0.973× raw** with the slowest compressed
+    get (**1,072 ns** p50 / **2,574 ns** p99.9), **1.94×** write amplification and a
+    **97 MiB/s** scan — behind LZ4 and `zstd-dict` on every axis. This is the **opposite** of
+    the standalone block-amplified court ([`ROCKSDB.md`](ROCKSDB.md)): per-value storage
+    removes the block amplification that flattered machine 9, so the small-value read win is
+    **conditional on block-granular alternatives**. Pointer:
+    `evidence/bench/kv-integration.json`, [`DB-INTEGRATION.md`](DB-INTEGRATION.md), P59,
+    limitation 27.
+29. **The central I/O ledger covers the `FileBody` read path only, after open.** It counts
+    physical reads served by a `FileBody` (tiles, encoded windows, the dictionary header,
+    section metadata) and agrees with `/proc/self/io`; the separate surfaces (`HybridReader`,
+    `Baseline`, FUSE, `mmap`, `HistoryStore`) and the input `reader::open` reads are outside
+    `fetched_bytes` by design. Pointer: [`ROCKSDB.md`](ROCKSDB.md) §6,
+    [`HARDENING.md`](HARDENING.md) §7, P57.
+30. **The `AUTH` tag does not detect rollback/replay.** It binds bytes, not freshness: a
+    wholly genuine *older* file — or one truncated at an earlier generation boundary — still
+    authenticates under the same key; supply anti-rollback out of band (a trusted tip
+    pointer, a signed generation log, or an append-only witness). Pointer:
+    [`HARDENING.md`](HARDENING.md) §3, [`SECURITY.md`](SECURITY.md) §6, P27,
+    limitations 13/25/26.
 
 ## See also
 
-[`PROOFS.md`](PROOFS.md) §Limitations (the origin of items 1–27 above),
-[`ACCEPTANCE.md`](ACCEPTANCE.md) (rounds L1–L4, M1–M5, N1–N8, O1–O3, P1–P8, Q1–Q4, R1–R2),
+[`PROOFS.md`](PROOFS.md) §Limitations (the origin of items 1–30 above),
+[`ACCEPTANCE.md`](ACCEPTANCE.md) (rounds L1–L4, M1–M5, N1–N8, O1–O3, P1–P8, Q1–Q4, R1–R2 and
+S1–S8),
 [`MACHINES.md`](MACHINES.md) (per-machine wins/loses),
 [`ROCKSDB.md`](ROCKSDB.md) (the skewed-KV court) and
 [`BUDGET-GUIDE.md`](BUDGET-GUIDE.md) §4 (when **not** to spend bytes).

@@ -36,7 +36,7 @@ byte-identical to before.
 
 ## 2. Read/write compatibility matrix
 
-This build is **release 0.6.0 on wire format line 0.3**.
+This build is **release 0.7.0 on wire format line 0.3**.
 
 | artifact | versions this build **READS** | this build **WRITES** |
 |---|---|---|
@@ -125,23 +125,35 @@ writers emit `2`.
 
 ## 5. Version history
 
-| release | wire format | machine core `core_version` | notes |
-|---|---|---|---|
-| 0.3 | `0.3` | (field absent; reads as `0`) | machines 1–8 (machine 9 arrives in 0.5); checkpoints v2, blocks v1, tiles, segments v1 |
-| 0.5 | `0.3` | `1` written, `{0,1}` read | adds machine 9 (`OrANS-DICT`, the shared-dictionary record machine) and explicit `core_version` (formerly-reserved header bytes), plus typed `UnsupportedCoreVersion` / `UnsupportedManifestVersion` errors; machine cores byte-identical; machine semantics unchanged |
-| 0.6 | `0.3` | `1` written, `{0,1}` read | **no wire change**: a docs/evidence release adding the frozen v0.3.0/v0.4.0 reverse-compat fixtures (§6), the `{x86_64-simd, x86_64-scalar, aarch64}` CI matrix, the RocksDB-style skew court, Loom-checked RCU publication, the one-line dictionary API (`Dictionary::train`/`create_with_dict`), transactional-publication fault injection and cross-filesystem determinism; the `.ekb` wire line stays `0.3` and machine cores remain byte-identical |
+| release | wire format | machine core `core_version` | machines added | notes |
+|---|---|---|---|---|
+| 0.3 | `0.3` | (field absent; reads as `0`) | 1–4 | establishes line `0.3`; machines 1–4 (`OrANS-NL2`/`OrANS-RANS0`/`OrANS-Store`/`OrANS-RANS0I`); checkpoints v2, blocks v1, tiles, segments v1 |
+| 0.4 | `0.3` | (field absent; reads as `0`) | 5–8 | documentation/packaging release on the **same** wire line: adds machines 5–8 (`OrANS-PACK`/`OrANS-SEG`/`OrANS-RANS0W`/`OrANS-RANS0IL`), container bytes identical to 0.3.0; machine 9 does **not** exist yet |
+| 0.5 | `0.3` | `1` written, `{0,1}` read | 9 | adds machine 9 (`OrANS-DICT`, the shared-dictionary record machine) and explicit `core_version` (formerly-reserved header bytes), plus typed `UnsupportedCoreVersion` / `UnsupportedManifestVersion` errors; machine cores byte-identical; machine semantics unchanged |
+| 0.6 | `0.3` | `1` written, `{0,1}` read | — | **no wire change**: a docs/evidence release adding the frozen v0.3.0/v0.4.0 reverse-compat fixtures (§6), the `{x86_64-simd, x86_64-scalar, aarch64}` CI matrix, the RocksDB-style skew court, Loom-checked RCU publication, the one-line dictionary API (`Dictionary::train`/`create_with_dict`), transactional-publication fault injection and cross-filesystem determinism; the `.ekb` wire line stays `0.3` and machine cores remain byte-identical |
+| 0.7 | `0.3` | `1` written, `{0,1}` read | — | **no wire change**: a docs/evidence, hardening and integration release (the S-round, S1–S8) adding the central I/O ledger, `tests/persist_all.rs`, the interleaved multirun court, the hardened untrusted-input boundary, the online controller, the refinement obligations, the explicit MSRV/semver policy and the real `redb` KV-integration verdict; the `.ekb` wire line stays `0.3` and machine cores remain byte-identical |
 
 The `0.5` change is **backward-compatible on read**: a 0.5 reader opens every 0.3/0.4
 file (`core_version` reads as legacy `0`), and the only byte difference a 0.5 writer
 introduces is the two-byte `core_version` field in the genesis header (plus the
-reserved bytes it no longer needs). The `0.4` release was a documentation/packaging
-release on the same wire line `0.3` (machines 1–8).
+reserved bytes it no longer needs). The `0.3` and `0.4` releases were on the same
+wire line `0.3` — `0.3` wrote machines 1–4 and `0.4` added machines 5–8 — so
+the per-release machine ranges are **0.3.0 = 1–4**, **0.4.0 = 1–8** and
+**0.5.0 and later = 1–9** (machine 9 arrives in 0.5).
 
 The `0.6` release is a **documentation/evidence + API** release on the **same wire
 line `0.3`**: it changes **no stored byte** (the machine cores stay byte-identical and
 a 0.6 writer emits exactly what 0.5 emitted). It pins reverse-compatibility with the
 12 frozen v0.3.0/v0.4.0 fixtures below and adds the Q/R evidence; the frozen-fixture
 rule (§6.4) is unchanged.
+
+The `0.7` release is likewise a **documentation/evidence, hardening and API** release
+on the **same wire line `0.3`**: it changes **no stored byte** (machine cores stay
+byte-identical and a 0.7 writer emits exactly what 0.6 emitted). It adds the central
+I/O ledger, the persistence round-trip suite, the interleaved multirun court, the
+hardened untrusted-input boundary, the online controller, the refinement obligations,
+the explicit MSRV/semver policy and the real `redb` KV-integration verdict; the
+frozen-fixture rule (§6.4) is unchanged.
 
 ---
 
@@ -251,14 +263,14 @@ updated in the same change as any wire-format change (see §6.4).
 
 ### 8.1 `format_major.minor` × `core_version` × `manifest_version`
 
-A `.ekb` file is accepted by this build (**0.6.0**) **iff** all three tags are
+A `.ekb` file is accepted by this build (**0.7.0**) **iff** all three tags are
 known. The table enumerates every reachable combination and the outcome:
 
 | `format_major.minor` | `core_version` | `manifest_version` | this build reads? | refusal / note |
 |---|---|---|---|---|
 | `0.0` – `0.2` | `0` | `1` | yes | pre-0.3.0 internal format line, legacy cores |
 | `0.3` | `0` (legacy) | `1` | yes | written by 0.3.0 / 0.4.0 (field absent ⇒ `0`) |
-| `0.3` | `1` | `1` | yes | written by 0.5.0 / 0.6.0 |
+| `0.3` | `1` | `1` | yes | written by 0.5.0 / 0.6.0 / 0.7.0 |
 | `0.3` | `≥ 2` | `1` | **no** | `UnsupportedCoreVersion { machine_id, core_version }` |
 | any | any | `≥ 2` | **no** | `UnsupportedManifestVersion { version }` |
 | `0.4+` or `major ≠ 0` | any | any | **no** | `UnsupportedVersion { major, minor }` |
@@ -280,18 +292,19 @@ segment container `ESEG` v`1` — see §1 and §7.
 | 0.4.0 | `0.3` | *absent* (reserved ⇒ `0`) | `1` | 1–8 | `format 0.0`–`0.3`, machines 1–8, manifest 1; container bytes identical to 0.3.0 |
 | 0.5.0 | `0.3` | `1` | `1` | 1–9 | `format 0.0`–`0.3`, `core_version {0,1}`, machines 1–9, manifest 1 |
 | 0.6.0 | `0.3` | `1` | `1` | 1–9 | identical to 0.5.0; the writer emits **byte-identical** output to 0.5.0 (**no wire change**) |
+| 0.7.0 | `0.3` | `1` | `1` | 1–9 | identical to 0.5.0/0.6.0; the writer emits **byte-identical** output to 0.6.0 (**no wire change**) |
 
 Rules a user can apply directly:
 
 - **Backward (new reader, old file).** This build reads every `format 0.0`–`0.3`
   file, every `core_version {0, 1}`, and `manifest_version 1` — i.e. everything
-  written by 0.3.0–0.6.0. The frozen v0.3.0/v0.4.0 fixtures (§6) pin this.
+  written by 0.3.0–0.7.0. The frozen v0.3.0/v0.4.0 fixtures (§6) pin this.
 - **Forward (old reader, new file).** A release can read any file written on the
   *same or an earlier* `format` line. Adding a machine or a section kind is
   additive: an old reader rejects an unknown `machine_id` / section kind with a
   typed error rather than mis-decoding it (e.g. a 0.3.0 reader rejects machines
   5–9 with `UnknownMachine`).
-- **Crate semver ≠ wire version.** 0.6.0 changed **no** stored byte; a future
-  `0.7.0` may or may not. Decide from the **⚠ wire format** marker in
+- **Crate semver ≠ wire version.** 0.7.0 changed **no** stored byte; a future
+  `0.8.0` may or may not. Decide from the **⚠ wire format** marker in
   [`CHANGELOG.md`](../CHANGELOG.md) and the tables above — never from the crate
   version alone.

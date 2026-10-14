@@ -13,7 +13,7 @@ assumptions** section.
 
 It complements and does not replace [`MACHINES.md`](MACHINES.md) (math),
 [`CODEC.md`](CODEC.md) (semantics), [`CORE-LAYOUT.md`](CORE-LAYOUT.md) (bytes),
-[`PROOFS.md`](PROOFS.md) (P1–P56), [`GATES.md`](GATES.md) (G1–G5) and the
+[`PROOFS.md`](PROOFS.md) (P1–P59), [`GATES.md`](GATES.md) (G1–G5) and the
 [`MACHINE_CONTRACT.md`](MACHINE_CONTRACT.md) (the machine-10 obligations).
 
 **Reproduce (container only).**

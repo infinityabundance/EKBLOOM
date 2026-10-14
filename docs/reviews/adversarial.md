@@ -828,7 +828,7 @@ now called for machines 1–9. (fuzz-only edit.)
 
 Independent adversarial re-run in the pinned container (4 GiB caps): verify
 **847/0**, release **833/0** + **58** evidence JSON, fuzz **24/24**, hardening
-**5 classes / 86 iters max 6.38 MiB, all typed+bounded**, refinement **O1–O16
+**5 classes / 86 iters max 6.29 MiB, all typed+bounded**, refinement **O1–O16
 PASS**. No library defect; nothing to fix.
 
 ### Attacks tried
@@ -846,7 +846,7 @@ PASS**. No library defect; nothing to fix.
   pass as a distribution. **(held)**
 * **S4 adversarial classes** — malformed lengths, alloc exhaustion, dict
   substitution, auth downgrade, mapped truncation: typed errors, bounded RSS
-  (6.38 MiB), no panic, strict mode rejects no-AUTH. **(held)**
+  (6.29 MiB), no panic, strict mode rejects no-AUTH. **(held)**
 * **S5 controller constraint violation** — additive-only, budget/bg-I/O honoured,
   dual hysteresis, deterministic; the pre-filter is conservative and the runtime
   budget is authoritative. Cannot violate a declared constraint. **(held)**

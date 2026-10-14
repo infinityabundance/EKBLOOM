@@ -1797,7 +1797,88 @@ separate (P52).
 
 ---
 
-## Limitations — resolved (L1–L4, M1–M5, N1–N8, O1–O3, P1–P8 and Q1–Q4/R1–R2) and remaining (honest)
+## P57. Central I/O accounting is complete and agrees with the OS — **PROVED** (by construction) **EMPIRICALLY OBSERVED** (`/proc/self/io` agreement)
+
+**Claim.** Every physical read a `FileBody` performs to serve a logical read is counted
+in one `ReadLedger`, so `FileBody::fetched_bytes`/`fetched_reads` are exact totals (not
+reconstructions), and the ledger cannot be silently outpaced.
+
+**Proof.** All `FileBody` read paths route through the counted wrapper in
+`src/ioacct.rs`: tile reads charge `Payload`, bounded encoded windows charge `Encoded`,
+the decoder model (dictionary) header load charges `Dictionary`, and section/metadata
+reads (restart records, path-bloom prefixes, history states) charge `Metadata`. The
+wrapper is a single bounds-checked `pread` site, so there is no uncounted `FileBody`
+branch by construction. ∎
+
+**Corroboration.** `tests/ioacct.rs` (6 tests) pins each class — tile / cold-window /
+dictionary-header / section-metadata — and cross-checks the ledger against an independent
+`/proc/self/io` trace (`syscr`/`rchar` ≥ ledger within slack); a deliberately uncharged raw
+`pread` is shown to leave the ledger at zero, so a bypass would be caught. In the skew
+court the geometric tile re-addition is gone: `ekbloom-opt` moves **304.0 → 311.6 B/get**
+(cold gets now include their restart record) while tile-served hot gets stay **100.0
+B/get** ([`docs/ROCKSDB.md`](ROCKSDB.md) §6).
+
+**Scope (honest).** The ledger covers the `FileBody` read path **after open**; the
+separate surfaces (`HybridReader`, `Baseline`, FUSE, `mmap`, `HistoryStore`) and the
+input `reader::open` reads are outside `fetched_bytes` by design.
+
+**Tested:** `tests/ioacct.rs`, `tests/rocksdb_skew.rs`, [`docs/ROCKSDB.md`](ROCKSDB.md) §6, [`docs/HARDENING.md`](HARDENING.md) §7.
+
+---
+
+## P58. The online controller respects every declared constraint — **PROVED** (by construction) **EMPIRICALLY OBSERVED** (equal-budget court)
+
+**Claim.** `Controller` never violates a declared constraint: it is additive-only
+(non-withdrawal), bounded by the memory budget, the background-I/O token bucket and the
+construction budget, uses dual hysteresis (dwell + band), and is deterministic for a
+fixed configuration and observation sequence.
+
+**Proof.** `observe` only increments per-region counters (no decision, `O(regions)` work,
+never per byte); `step` only ever calls `manifest_hot_tiles`, which **appends** a new
+generation, so earlier cores/checkpoints/blooms/tile sets stay byte-identical
+(non-withdrawal). The total committed body is bounded by `memory_budget` and enforced again
+in `TileSet::manifest_hot_tiles`; a token bucket refilled at `max_bg_io_bytes_per_s` caps
+one epoch's construction bytes; a change needs both `hysteresis` epochs of dwell and a
+`> (1 + hysteresis)×` band. Decisions never consult the wall clock (the control period is
+virtual), so the controller is deterministic. ∎
+
+**Corroboration.** `tests/controller.rs` (8 tests) pins additive/non-withdrawal (earlier
+tile bytes byte-identical, `verify_deep` green), the memory budget
+(`physical_bytes() ≤ memory_budget` every epoch), the background-I/O cap, both hysteresis
+guards, determinism and exact SLO accounting. `controller.json`: at an equal allowance the
+controller beats a **static** plan on warm p99 (**90 vs 18,745 ns**; adaptation recovery
+cold **14,827 → warm 70 ns**, ≈212×), **matches** TinyLFU/LRU on warm p50 (**70 vs
+50–60 ns**) but does **not** beat them, and **loses the cold epoch** (bounded replay
+≈14.8 µs vs LZ4 ≈1.3 µs) ([`docs/CONTROLLER.md`](CONTROLLER.md)).
+
+**Tested:** `tests/controller.rs`, `examples/controller.rs`, `evidence/bench/controller.json`, [`docs/CONTROLLER.md`](CONTROLLER.md).
+
+---
+
+## P59. Real embedded-KV integration: machine 9 is a legitimate record-granular store whose DB-level verdict is a loss — **EMPIRICALLY OBSERVED**
+
+**Claim.** Stored as values inside a real embedded B-tree engine (`redb` 4.4) with a real
+page cache, machine 9 (`OrANS-DICT`) round-trips byte-exactly and is a genuine
+record-granular store, but it does **not** beat LZ4 or zstd-with-dictionary on footprint,
+point-get latency, write amplification or scan throughput. The claim is a measured verdict,
+not a proof.
+
+**Corroboration.** `kv-integration.json`: machine 9 is **0.973×** raw (vs LZ4 **0.819×**,
+`zstd-dict` **0.525×**), the slowest compressed get (**1,072 ns** warm p50 / **2,574 ns**
+p99.9 vs LZ4 170/721, `zstd-dict` 231/441), writes **1.94×** the logical bytes (vs
+`zstd-dict` 0.95×) and scans at **97 MiB/s** (vs LZ4 **1,453**, `zstd-dict` **595**); its
+only edge is the small, self-contained per-value tail. The ordering flips from the
+standalone block-amplified court ([`docs/ROCKSDB.md`](ROCKSDB.md)) because per-value storage
+removes the block amplification that flattered machine 9. `tests/kv_integration.rs` (4
+tests) asserts every codec round-trips byte-exact through `redb`, that the shared dictionary
+is stored once and counted in the footprint, and that write amplification / footprint are
+measured (`> 0`) rather than assumed.
+
+**Tested:** `tests/kv_integration.rs`, `examples/kv_integration.rs`, `tests/common/redb_store.rs`, `evidence/bench/kv-integration.json`, [`docs/DB-INTEGRATION.md`](DB-INTEGRATION.md).
+
+---
+
+## Limitations — resolved (L1–L4, M1–M5, N1–N8, O1–O3, P1–P8, Q1–Q4/R1–R2 and S1–S8) and remaining (honest)
 
 **Resolved in rounds L1–L4** (P24–P28): the base representation never expands past
 raw (machine 3 + the `auto` policy, P24); the 1-byte fully-resident read is within
@@ -1862,6 +1943,21 @@ scenarios / 407 interleavings** with **no torn read** (P54); `.ekb`/stream publi
 reads/accounting are **byte-identical** across **overlayfs / tmpfs / ext2-ext3** (P56).
 The Q/R review's honesty observation was fixed: `fastpath::cpu_features()` now reports
 the **effective** (scalar-aware) capability, with `hardware_features()` for the raw facts.
+
+**Resolved in the S-round** (P57–P59): the reader's I/O accounting is **complete** — one
+`ReadLedger` counts every `FileBody` physical read path (tiles, bounded encoded windows,
+the dictionary header, section metadata) and agrees with `/proc/self/io` (P57); the
+**online controller** respects every declared constraint (additive, budget- and
+background-I/O-bounded, dual-hysteresis, deterministic) and beats a static plan while
+matching — not beating — an equal-budget codec cache (P58); and the **real embedded-KV
+integration** shows machine 9 is a legitimate record-granular store that **loses on every
+DB axis** inside a real B-tree (P59). Companion S-round results without a separate proof:
+the **persistence round-trip** (`tests/persist_all.rs`, every manifested structure
+byte-exact through write → reopen), the **interval-qualified multirun** evidence
+(`multirun.json`; the `byte_at` loss to LZ4 is real, ~1.6×, with **disjoint** CIs), the
+**hardened untrusted boundary** (5 new targets, 24 total; peak RSS **6.29 MiB**) and the
+**refinement obligations** (`scripts/run-refinement.sh`, O1–O16 all PASS). No stored byte
+changed (P45–P50 unchanged).
 
 **Remaining (honest):**
 
@@ -2040,3 +2136,20 @@ the **effective** (scalar-aware) capability, with `hardware_features()` for the 
     best machine 4 `K = 8` vs bare LZ4) and the uniform manifested footprint stays
     **1.07× raw** — all unchanged by the Q/R rounds (limitations 5/12/14). Pointer:
     [`SECURITY.md`](SECURITY.md) §6, [`ROCKSDB.md`](ROCKSDB.md), limitations 5/12/14/23.
+27. **Inside a real KV engine, machine 9 loses on every DB axis.** Stored as `redb`
+   values and read through a real B-tree, machine 9 is **0.973× raw** with the slowest
+   compressed get (**1,072 ns** p50 / **2,574 ns** p99.9), **1.94×** write amplification
+   and a **97 MiB/s** scan — worse than LZ4 and `zstd-dict` on footprint, latency, write
+   amplification and scan. This is the **opposite** of the standalone block-amplified
+   court: per-value storage removes the block amplification that flattered machine 9, so
+   the small-value read win is **conditional on block-granular alternatives** (P59;
+   [`DB-INTEGRATION.md`](DB-INTEGRATION.md), `kv-integration.json`).
+28. **The central I/O ledger covers the `FileBody` read path only, after open.** It counts
+   physical reads served by a `FileBody` (tiles, encoded windows, the dictionary header,
+   section metadata); the separate surfaces (`HybridReader`, `Baseline`, FUSE, `mmap`,
+   `HistoryStore`) and the input `reader::open` reads are outside `fetched_bytes` by
+   design (P57; [`ROCKSDB.md`](ROCKSDB.md) §6, [`HARDENING.md`](HARDENING.md) §7).
+29. **The `AUTH` tag does not detect rollback/replay.** It binds bytes, not freshness: a
+   wholly genuine *older* file — or one truncated at an earlier generation boundary —
+   still authenticates under the same key; supply anti-rollback out of band (P27, P57-adjacent;
+   [`HARDENING.md`](HARDENING.md) §3, [`SECURITY.md`](SECURITY.md) §6).

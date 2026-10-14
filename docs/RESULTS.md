@@ -332,7 +332,7 @@ handling, and transparent fallback — not throughput for small single-file writ
 
 ---
 
-## Research phases (v0.4–v0.6 additions)
+## Research phases (v0.4–v0.7 additions)
 
 Seven later artifacts measure the round-3 modules. Each is read from its committed
 `evidence/bench/*.json` and detailed in its own doc; the numbers below are the
@@ -380,12 +380,14 @@ artifact.
   machine adapter and stores the **complete successor cursor** for a
   cursor-divergent machine; `tiles::parse_tile_set_prefix` is the single guard
   shared by the in-memory and file-backed readers. `sh scripts/validate-evidence.sh`
-  validates every `evidence/**/*.json` and reports **53** files `OK` (up from 24;
-  `batch.json` added in L4, `window`/`orfs`/`optimizer`/`e2e` added in the N-round,
-  `decoders.json` added in the O-round, `stream`/`corruption`/`dictionary`/
-  `corpora`/`counters`/`concurrency`/`bound`/`aarch64-determinism` plus the gates
-  `G1`–`G5` added in the P-round, and `rocksdb-skew`/`faults`/`crossfs` plus the
-  `ci-matrix`/`ci-*` per-job files added in the Q/R rounds).
+  validates every `evidence/**/*.json` and reports **53** files `OK` at the R1
+  round (up from 24; `batch.json` added in L4, `window`/`orfs`/`optimizer`/`e2e` added
+  in the N-round, `decoders.json` added in the O-round,
+  `stream`/`corruption`/`dictionary`/`corpora`/`counters`/`concurrency`/`bound`/
+  `aarch64-determinism` plus the gates `G1`–`G5` added in the P-round, and
+  `rocksdb-skew`/`faults`/`crossfs` plus the `ci-matrix`/`ci-*` per-job files added in
+  the Q/R rounds; the S-round adds `multirun`/`config-manifest`/`hardening`/
+  `controller`/`kv-integration` → **58** now).
 - **R2 — machine-2 prepared context, encode-first budgets, bounded cold
   reconstruction, cache single-flight.** A validated `RansContext` reused for the
   whole decode is **165×** the per-symbol rebuild on skewed data
@@ -594,9 +596,9 @@ on-disk excess over the in-memory engine from **+1.89 % / +0.70 %** to **+1.54 %
   7/8 and the SIMD kernel — a read path for machine 7) and **Finding J** (above),
   **both fixed** (`saturating_add` per site; base built before the guard). The same
   hardening was applied to **14 unchecked `cursor + N` sites across machines 1–4**, so
-  no read path panics on a crafted cursor. `container-fuzz.sh` runs **nineteen**
-  targets; `container-reproduce.sh` passes **792/0** with **53** evidence JSON OK and
-  the verify gate green at **806 passed**.
+  no read path panics on a crafted cursor. At the O-round the campaign ran **nineteen**
+  targets; the current release runs **24**, `container-reproduce.sh` passes **833/0** with
+  **58** evidence JSON OK and the verify gate green at **847 passed** (S-round Revision 11).
 
 **Honest reading.** The decoder court is **complete and closed**: no variant (
 word16, independent lanes, SIMD kernel) beat machine 4 `K = 8`, which is the best
@@ -625,7 +627,7 @@ fuzz-coverage gap fixed, two doc defects reported**).
 | **P5** dictionary | machine 9: **83.5 B/rec** vs machine 2 **590.0** (raw 100.0, zstd-dict 65.9); decode 721 vs 1,403 ns; break-even **2 records** | [`DICTIONARY.md`](DICTIONARY.md) | `dictionary.json` |
 | **P6** corpora | **`E_V` 0.988–0.998** (≤ raw) on Silesia/enwik8/Calgary/text/ELF; `byte_at` 1.1–3.3 µs vs zstd 8.6–16.1; **39.14 instr/byte** (8.1 cycles); **1.4e-3 locks/read** for 64 readers; **1,200,000** bound samples, **0** violations | [`CORPORA.md`](CORPORA.md) | `corpora.json`, `counters.json`, `concurrency.json`, `bound.json` |
 | **P7** machines & guide | machines 1–9 specified exactly; `choose_plan` + the budget guide pick machine × segment × restart × path × tiles under a byte budget; one consolidated non-claim list | [`MACHINES.md`](MACHINES.md), [`BUDGET-GUIDE.md`](BUDGET-GUIDE.md), [`LIMITATIONS.md`](LIMITATIONS.md) | `tests/budget_chooser.rs` |
-| **P8** trust infra | **19/19** fuzz targets PASS; **x86_64 == arm64** (`identical: true`, equal sha256); gates **G1–G5 all PASS**; machine-6 trait `decode` fixed from `O(n²)` to **linear** (**415 s → 0.5 ms** at `n = 2²⁰`) | [`TESTING.md`](TESTING.md), [`GATES.md`](GATES.md) | `aarch64-determinism.json`, `gates/G1.json`–`G5.json` |
+| **P8** trust infra | **19/19** fuzz targets PASS (P-round; **24/24** now); **x86_64 == arm64** (`identical: true`, equal sha256); gates **G1–G5 all PASS**; machine-6 trait `decode` fixed from `O(n²)` to **linear** (**415 s → 0.5 ms** at `n = 2²⁰`) | [`TESTING.md`](TESTING.md), [`GATES.md`](GATES.md) | `aarch64-determinism.json`, `gates/G1.json`–`G5.json` |
 
 **Honest reading.** The P-round adds **no new speed ceiling**. It makes the format safe
 to evolve, bounds streaming memory, proves 100 % + localized corruption detection,
@@ -724,6 +726,83 @@ is atomic under injected I/O faults and filesystem-independent, and keeps the fu
 corpus committed. The cross-FS result covers three filesystems; **xfs/btrfs remain
 untested** (blocked in this environment), and the dictionary id stays unbound in the
 bare machine API (integrity ≠ authenticity) — both recorded honestly
+([`LIMITATIONS.md`](LIMITATIONS.md)).
+
+### Rounds S1–S8 — I/O accounting, persistence, multirun CIs, hardening, controller, refinement, KV integration
+
+The S-round closes the reviewer's priority items. Every number below is read from its
+committed artifact; the properties are P57–P59 in [`PROOFS.md`](PROOFS.md) and the surface
+is reviewed in **Revision 11**.
+
+- **S1 — central I/O accounting.** One `ReadLedger` (`src/ioacct.rs`) counts every
+`FileBody` physical read path (tiles, bounded encoded windows, the dictionary header,
+section metadata); `tests/ioacct.rs` (6 tests) cross-checks `/proc/self/io`. The skew
+court drops its geometric tile re-addition: `ekbloom-opt` **304.0 → 311.6 B/get** (cold
+gets now include their restart record), tile-served hot gets **100.0 B/get** unchanged
+([`ROCKSDB.md`](ROCKSDB.md) §6, P57).
+- **S2 — persistence round-trip.** `tests/persist_all.rs`: the writer emits a section for
+**every** manifested structure on the fresh and append paths, byte-exactly
+([`MIGRATION.md`](MIGRATION.md) §7).
+- **S3 — multirun CIs.** `multirun.json` + `config-manifest.json` (reps 15, bootstrap 95%
+CIs, 1–64-reader concurrency):
+
+| corpus | contender | `byte_at` p50 | 95% CI on p50 | `byte_at` p99 |
+|---|---:|---:|---|---:|
+| text | ekbloom | 1683 | [1653, 1704] | 2534 |
+| text | lz4 | 1062 | [1052, 1072] | 1693 |
+| elf | ekbloom | 1843 | [1814, 1864] | 2715 |
+| elf | lz4 | 1192 | [1172, 1202] | 2174 |
+
+`ekbloom` vs `lz4` p50 CIs are **disjoint** → the **~1.6×** `byte_at` loss is **real**;
+`bytes_fetched` is **4114 B / 2 preads** (deterministic, stddev 0); the cold gap is a
+disjoint **129 ns** loss; `E_V` is a hash (width 0); and concurrency p50/p99 stay flat
+while **p99.9 grows with oversubscription** (0.24 µs at 1 reader → 8.07 µs at 64; the
+container has 8 CPUs) ([`BENCHMARKING.md`](BENCHMARKING.md)).
+- **S4 — hardened untrusted boundary.** Five new fuzz targets (**24** total) and a bounded
+measurement harness: **5** classes / **86** iterations, peak RSS **6,590,464 B (6.29
+MiB)** = 0.006× the 1 GiB policy, `all_typed_errors`/`all_bounded` true, and the honest
+AUTH rollback residual (`rollback_accepted: true`) ([`HARDENING.md`](HARDENING.md)).
+- **S5 — online controller** (`controller.json`), equal allowance, 4 MiB heterogeneous
+corpus, a hot window that hops 6 times (all nanoseconds):
+
+| budget | contender | warm p50 | warm p99 | cold p50 | SLO misses | bytes spent |
+|---|---:|---:|---:|---:|---:|---:|
+| generous | **controller** | **70** | **90** | 14,827 | 1,536 | 395,392 |
+| generous | static | 14,878 | 18,745 | 14,868 | 7,680 | 0 |
+| generous | TinyLFU (LZ4) | 60 | 81 | 60 | 14 | 0 |
+| generous | codec+LRU (LZ4) | 50 | 70 | 50 | 4 | 0 |
+| generous | raw-vec | 20 | 31 | 20 | 0 | 0 |
+
+The controller beats the static plan (**90 vs 18,745 ns** warm p99; recovery cold
+14,827 → warm **70 ns**, ≈**212×**), **matches** TinyLFU/LRU on warm p50 (70 vs 50–60 ns)
+but does **not** beat them, and **loses the cold epoch** (bounded replay ≈14.8 µs vs LZ4
+≈1.3 µs); under the `tight` allowance it saturates additively after ~4 windows
+([`CONTROLLER.md`](CONTROLLER.md), P58).
+- **S6 — refinement obligations.** `scripts/run-refinement.sh` discharges **16 obligations
+(O1–O16)**, all PASS ([`REFINEMENT.md`](REFINEMENT.md)).
+- **S7 — MSRV/semver policy.** MSRV **1.89**; `0.y.z` minor-is-breaking; the wire format is
+versioned independently ([`MIGRATION.md`](MIGRATION.md) §8).
+- **S8 — real `redb` KV integration** (`kv-integration.json`), 40,000×100 B values, 80/20
+skew, a real B-tree with a 2 MiB page cache:
+
+| contender | footprint (`F/N`) | warm p50 | warm p99.9 | wamp | scan MiB/s |
+|---|---:|---:|---:|---:|---:|
+| `raw` | 1.160 | 130 ns | 682 ns | 2.32× | 2,430 |
+| `lz4-block` | 0.819 | 170 ns | 721 ns | 1.63× | 1,453 |
+| `zstd-dict` | **0.525** | **231 ns** | **441 ns** | **0.95×** | 595 |
+| `ekbloom-m9` | 0.973 | 1,072 ns | 2,574 ns | 1.94× | **97** |
+
+Machine 9 is a legitimate record-granular store but **loses on every DB axis**; its only
+edge is the small self-contained per-value tail. The ordering flips from the standalone
+block-amplified court because per-value storage removes the block amplification
+([`DB-INTEGRATION.md`](DB-INTEGRATION.md), P59).
+
+**Honest reading.** The S-round adds **no new speed ceiling** and no wire change. It makes
+the accounting complete (and honestly *raises* the reported cold cost), replaces single-run
+evidence with interval-qualified evidence that confirms the `byte_at` loss to LZ4, bounds
+the untrusted boundary (6.29 MiB peak), shows the controller beats a static plan but not an
+equal-budget codec cache, formalises the refinement obligations, and answers the KV question
+inside a real engine — where machine 9 is *larger and slower* than LZ4
 ([`LIMITATIONS.md`](LIMITATIONS.md)).
 
 ---
@@ -939,7 +1018,7 @@ sh scripts/run-counters.sh          # counters.json (hardware counters, CAP_PERF
 sh scripts/run-bound.sh             # bound.json (worst-case step bound, 1,000,000 samples)
 sh scripts/run-faults.sh            # faults.json (transactional-publication fault injection; R2)
 sh scripts/run-crossfs.sh           # crossfs.json (cross-filesystem determinism; R2)
-sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (53 files)
+sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (58 files)
 sh scripts/container-loom.sh        # Loom model checking (tests/loom.rs + tests/loom_rcu.rs)
 sh scripts/container-bench.sh       # Divan microbenchmarks (benches/ekbloom.rs)
 sh scripts/capture-environment.sh   # refresh evidence/environment.txt

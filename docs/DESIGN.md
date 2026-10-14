@@ -1,4 +1,4 @@
-# EKBLOOM 0.6 — Frozen Engineering Contract
+# EKBLOOM 0.7 — Frozen Engineering Contract
 
 This document is the authoritative internal contract. Every module must conform to it.
 It freezes machine semantics, state log semantics, bloom definitions, the data model,
@@ -266,10 +266,10 @@ ekbloom bench    <file.ekb> --workload <seq|random-1b|rand-4k|range-64k|mixed>
 
 ---
 
-## 9. Addenda (v0.4–v0.6 research)
+## 9. Addenda (v0.4–v0.7 research)
 
 This section is **additive**. It records the modules and interfaces added by the
-0.4–0.6 research rounds. It does **not** change the frozen machine contract in §1, the
+0.4–0.7 research rounds. It does **not** change the frozen machine contract in §1, the
 state-log/history semantics in §2, the bloom definitions in §3, the data model in
 §4 (except that new additive structures may be appended to a body), or the wire
 layout in §5 (except for one new section kind). Where an addendum and the frozen
@@ -373,3 +373,23 @@ The round's proved/observed properties are **P51–P56** in [`PROOFS.md`](PROOFS
 it is reviewed in Revision 10 ([`docs/reviews/adversarial.md`](reviews/adversarial.md),
 [`docs/reviews/security.md`](reviews/security.md)) and detailed in
 [`RESULTS.md`](RESULTS.md) and [`ROCKSDB.md`](ROCKSDB.md).
+
+### 9.7 S-round (v0.7) additions
+
+The v0.7 round changes **no stored byte** and no interface semantics: the `.ekb` wire
+line stays `0.3`, machine cores stay byte-identical, and a 0.7 writer emits exactly what
+0.6 emitted ([`MIGRATION.md`](MIGRATION.md)). It adds a central I/O ledger, an online
+controller, and hardening/evidence/KV-integration trust infrastructure:
+
+| Module / interface | Role | Doc |
+|---|---|---|
+| `src/ioacct.rs` (`ReadLedger`) | one counted ledger for every `FileBody` physical read path (tiles / windows / dictionary / metadata) | [`ROCKSDB.md`](ROCKSDB.md) §6 |
+| `src/controller.rs` (`Controller`, `ControlConfig`, `ControlAction`) | the online, additive workload-adaptation controller | [`CONTROLLER.md`](CONTROLLER.md) |
+| `tests/ioacct.rs`, `tests/persist_all.rs` | ledger completeness + every manifested structure's write → reopen round-trip | [`MIGRATION.md`](MIGRATION.md) §7 |
+| `tests/hardening.rs`, `tests/controller.rs`, `tests/kv_integration.rs` | the untrusted boundary, the controller and the real `redb` integration | [`HARDENING.md`](HARDENING.md), [`CONTROLLER.md`](CONTROLLER.md), [`DB-INTEGRATION.md`](DB-INTEGRATION.md) |
+| `scripts/run-refinement.sh` + [`REFINEMENT.md`](REFINEMENT.md) | the machine-checked refinement obligations (O1–O16) | [`REFINEMENT.md`](REFINEMENT.md) |
+
+The round's proved/observed properties are **P57–P59** in [`PROOFS.md`](PROOFS.md); it is
+reviewed in Revision 11 ([`docs/reviews/adversarial.md`](reviews/adversarial.md),
+[`docs/reviews/security.md`](reviews/security.md)) and detailed in [`RESULTS.md`](RESULTS.md),
+[`BENCHMARKING.md`](BENCHMARKING.md) and [`DB-INTEGRATION.md`](DB-INTEGRATION.md).

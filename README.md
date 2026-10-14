@@ -1,7 +1,7 @@
 # EKBLOOM
 
 EKBLOOM is a **concealed-expansion codec**: a native-Rust implementation of the
-EKBLOOM 0.6 engineering candidate. It presents a logical object through a small
+EKBLOOM 0.7 engineering candidate. It presents a logical object through a small
 visible surface while maintaining a deliberately larger *manifested operational
 body* behind that surface.
 
@@ -15,7 +15,7 @@ preserves exact correctness, accounts for the bytes it actually manifests, and
 converts manifested space into access speed.
 
 This crate is a single Cargo package (`ekbloom`), shipping one library and one
-binary (`ekbloom`), and **`ekbloom` v0.6.0 is published on
+binary (`ekbloom`), and **`ekbloom` v0.7.0 is published on
 [crates.io](https://crates.io/crates/ekbloom)**. The frozen internal contract is
 `docs/DESIGN.md`; the original specification lives in `research/`. The release
 history is in [`CHANGELOG.md`](CHANGELOG.md); the wire-format compatibility and
@@ -64,8 +64,8 @@ typed error and never partially decodes):
    `UnsupportedCoreVersion { machine_id, core_version }`;
 3. `manifest_version == 1` — else `UnsupportedManifestVersion { version }`.
 
-In practice every release through 0.6.0 writes wire line **`0.3`**, so an `.ekb`
-written by any 0.3.0–0.6.0 release stays readable; the release-by-release
+In practice every release through 0.7.0 writes wire line **`0.3`**, so an `.ekb`
+written by any 0.3.0–0.7.0 release stays readable; the release-by-release
 read/write table and the full `format_major.minor × core_version ×
 manifest_version` matrix are in [`docs/MIGRATION.md`](docs/MIGRATION.md) §8.
 
@@ -265,7 +265,7 @@ manifest_version` matrix are in [`docs/MIGRATION.md`](docs/MIGRATION.md) §8.
     machine × segment size × restart `K`/`B` × path `D` × tiles under a byte budget;
     [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) consolidates every honest non-claim
     in one place.
-28. **Trust infrastructure: fuzz, cross-arch determinism and gates (P8).** **19**
+28. **Trust infrastructure: fuzz, cross-arch determinism and gates (P8).** **24**
     libFuzzer targets all PASS; cross-architecture determinism is **identical**
     (x86_64 == arm64, equal output sha256 over 70 lines); and the machine-checked
     gates **G1–G5** are **all PASS** (invertibility, prefix composition, worst-case
@@ -294,6 +294,21 @@ manifest_version` matrix are in [`docs/MIGRATION.md`](docs/MIGRATION.md) §8.
     **100 %**, **0** torn containers or partially-visible generations (P55); and the
     same `.ekb`/container is **byte-identical** across **overlayfs / tmpfs /
     ext2-ext3** (P56), with loopback **xfs/btrfs honestly blocked** (no `mkfs`).
+31. **S-round: complete I/O accounting, interval-qualified evidence, a hardened
+    boundary, an online controller, refinement obligations and a real-KV verdict
+    (S1–S8).** One `ReadLedger` counts every `FileBody` physical read path and
+    agrees with `/proc/self/io` (S1, P57); every manifested structure round-trips
+    write → reopen byte-exactly (S2); repeated, interleaved trials with bootstrap
+    95% CIs confirm the `byte_at` loss to LZ4 is real (~**1.6×**, disjoint CIs) (S3);
+    the untrusted boundary is total and bounded (5 new fuzz targets, **24** total;
+    peak RSS **6.29 MiB**) (S4); the online controller beats a static plan (**90 vs
+    18,745 ns** warm p99) but not an equal-budget codec cache (S5, P58); the
+    refinement obligations are machine-checked (**O1–O16** PASS) (S6); the
+    MSRV/semver/wire policy is explicit (S7); and inside a real `redb` B-tree machine
+    9 **loses on every DB axis** (S8, P59) ([`docs/HARDENING.md`](docs/HARDENING.md),
+    [`docs/CONTROLLER.md`](docs/CONTROLLER.md),
+    [`docs/DB-INTEGRATION.md`](docs/DB-INTEGRATION.md),
+    [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md)).
 
 ---
 
@@ -478,6 +493,9 @@ The crate root (`ekbloom`) exposes:
   (byte budget + target p50), `evaluate`, `trace_fingerprint` — the physical-budget-aware
   held-out decision ([`docs/OPTIMIZER.md`](docs/OPTIMIZER.md),
   [`docs/BUDGET-GUIDE.md`](docs/BUDGET-GUIDE.md));
+- online controller (`controller`): `Controller`, `ControlConfig`, `ControlAction` —
+  observes accesses and additively manifests hot tiles under memory, background-I/O and
+  construction budgets, with dual hysteresis ([`docs/CONTROLLER.md`](docs/CONTROLLER.md));
 - async publication (`asyncpub`): `publish`, `append`, `detect_backend`,
   `Backend` (the `io-uring` feature adds `async_io`);
 - measurement: `sweep::manifestation_sweep`, `sweep::depth_metrics`,
@@ -654,7 +672,7 @@ publication and pays submit/completion round-trips. See
 
 ---
 
-## Research phases (v0.4–v0.6): reconstruction, packing, tiles, handles, kernels, court, planner & mmap
+## Research phases (v0.4–v0.7): reconstruction, packing, tiles, handles, kernels, court, planner & mmap
 
 The 0.4 round is organised around a **three-role separation**: *machine semantics*
 (`src/machine.rs`), the *manifestation engine* (exact certified structures), and an
@@ -795,12 +813,14 @@ affix parser (`tiles::parse_tile_set_prefix`, including the `tile_shift` guard)
 is shared by the in-memory and file-backed readers, so parsing happens in exactly
 one place. `sh scripts/validate-evidence.sh`
 (`examples/validate_evidence.rs`, dependency-free) validates every
-`evidence/**/*.json`: **53** files `OK` (up from 24; `batch.json` added in L4,
+`evidence/**/*.json`: **53** files `OK` at the R1 round (up from 24; `batch.json` added in L4,
 `window.json`/`orfs.json`/`optimizer.json`/`e2e.json` added in the N-round,
 `decoders.json` in the O-round, `stream`/`corruption`/`dictionary`/`corpora`/
 `counters`/`concurrency`/`bound`/`aarch64-determinism` plus the gates `G1`–`G5` in
-the P-round, and `rocksdb-skew.json`/`faults.json`/`crossfs.json` plus the
-`ci-matrix`/`ci-*` per-job files in the Q/R rounds).
+the P-round, `rocksdb-skew.json`/`faults.json`/`crossfs.json` plus the
+`ci-matrix`/`ci-*` per-job files in the Q/R rounds, and
+`multirun`/`config-manifest`/`hardening`/`controller`/`kv-integration` in the
+S-round → **58** now).
 - **R2 — machine-2 prepared decode context, encode-first budgets, bounded cold
 reconstruction, cache single-flight.** A validated `RansContext` (frequencies,
 prefix sums, 4096-entry slot table) is built **once** per bulk decode instead of
@@ -1033,9 +1053,10 @@ by P34–P40 in [`docs/PROOFS.md`](docs/PROOFS.md), and independently reviewed
 - **N8 — resource policy + fuzzing.** `src/resource.rs` bounds every whole-object
   allocation driven by a declared/core-derived length at **1 GiB** by default
   `AllocationTooLarge`). The bounded file-backed paths are unaffected. The campaign
-  now runs **19** libFuzzer targets (`+fuzz_pack`, `fuzz_seg`, `fuzz_resource` in
+  now runs **24** libFuzzer targets (`+fuzz_pack`, `fuzz_seg`, `fuzz_resource` in
   this round; `fuzz_rans_w`/`fuzz_rans_il` in the O-round; `fuzz_roundtrip`/`fuzz_stream`
-  in the P-round; `fuzz_open_auth`/`fuzz_dictionary` in the Q/R rounds)
+  in the P-round; `fuzz_open_auth`/`fuzz_dictionary` in the Q/R rounds; the five
+  hardening targets in the S-round)
   ([`docs/SECURITY.md`](docs/SECURITY.md)).
 
 ### O-round: decoder court, uniform-footprint gate, OrFS compaction, review fixes (O1–O3)
@@ -1077,10 +1098,12 @@ verdict **TWO DEFECTS, BOTH FIXED**, in
   byte-exact across write → scan → reopen and rejects corruption. Revision 8 fixed
   **Finding I** (a non-saturating `cursor + N` overflow on an attacker-controlled
   cursor in machines 7/8 and the SIMD kernel — a read path for machine 7) and
+  a read path for machine 7) and
   **Finding J**; the same hardening was applied to **14** unchecked `cursor + N`
-  sites across machines 1–4, so no read path panics on a crafted cursor. The campaign
-  runs **19** fuzz targets, `container-reproduce.sh` passes **792/0** with **53**
-  evidence JSON `OK`, and the verify gate is green at **806 passed**.
+  sites across machines 1–4, so no read path panics on a crafted cursor. At the
+  O-round the campaign ran **19** fuzz targets; the current release runs **24**,
+  `container-reproduce.sh` passes **833/0** with **58** evidence JSON `OK`, and the
+  verify gate is green at **847 passed** (S-round Revision 11).
 
 ### P-round: versioning, streaming, corruption, safety, dictionaries, corpora, machines & gates (P1–P8)
 
@@ -1145,7 +1168,7 @@ select machine × region/segment size × restart `K`/`B` × path `D` × tiles un
 budget; [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) collects every honest non-claim
 with a pointer to its evidence.
 - **P8 — fuzz, cross-architecture determinism and machine-checked gates.** **19**
-libFuzzer targets all PASS (`+fuzz_roundtrip`, `fuzz_stream` in this round;
+libFuzzer targets all PASS then (**24** now; `+fuzz_roundtrip`, `fuzz_stream` in this round;
 cross-architecture determinism is **identical** (`evidence/bench/aarch64-determinism.json`:
 `identical: true`, equal output sha256 over 70 lines, x86_64 vs arm64/QEMU); and gates
 **G1–G5** are **all PASS** (`gates/G1.json`–`G5.json`). The machine-6 trait `decode` was
@@ -1223,6 +1246,88 @@ P56** in [`docs/PROOFS.md`](docs/PROOFS.md) and **Revision 10**.
   ext2-ext3** (loopback **xfs/btrfs** honestly blocked), with x86_64-vs-aarch64
   covered separately by Q2 ([`docs/TESTING.md`](docs/TESTING.md) §9, `crossfs.json`,
   P56).
+
+### S-round: central I/O accounting, persistence, multirun honesty, hardening, controller, refinement, KV integration (S1–S8)
+
+The S-round closes the reviewer's priority items: it makes the reader's I/O
+accounting **complete** (one ledger), pins the writer→reopen round-trip for
+**every** manifested structure, replaces single-run evidence with **repeated,
+interleaved trials with CIs**, hardens the **untrusted-input boundary**, adds an
+**online controller**, formalises the **refinement** obligations, documents the
+**MSRV/semver policy** and answers the key/value-engine question **inside a real
+B-tree**. Every item is measured by a committed artifact, covered by **P57–P59** in
+[`docs/PROOFS.md`](docs/PROOFS.md), and documented in
+[`docs/HARDENING.md`](docs/HARDENING.md), [`docs/CONTROLLER.md`](docs/CONTROLLER.md),
+[`docs/REFINEMENT.md`](docs/REFINEMENT.md),
+[`docs/DB-INTEGRATION.md`](docs/DB-INTEGRATION.md) and
+[`docs/BENCHMARKING.md`](docs/BENCHMARKING.md); the surface is reviewed in
+**Revision 11** ([`docs/reviews/adversarial.md`](docs/reviews/adversarial.md),
+[`docs/reviews/security.md`](docs/reviews/security.md); verdict **NO LIBRARY DEFECT
+FOUND — all attacks held**).
+
+- **S1 — central I/O accounting** (`ReadLedger`). `src/ioacct.rs` gives one
+  bounds-checked ledger charged by a counted file wrapper; **tile** reads, bounded
+  **encoded windows**, the decoder **dictionary** header load and section **metadata**
+  reads (restarts, path-bloom prefixes, history states) all charge it, so no `FileBody`
+  read path can bypass it. `FileBody::fetched_bytes`/`fetched_reads` are the true
+  totals; `tests/ioacct.rs` (6 tests) pins each class and cross-checks `/proc/self/io`.
+  The skew court drops its geometric tile re-addition — `ekbloom-opt` moves **304.0 →
+  311.6 B/get** (cold gets now include their restart record) while tile-served hot gets
+  stay **100.0 B/get** ([`docs/ROCKSDB.md`](docs/ROCKSDB.md) §6, P57).
+- **S2 — persistence round-trip.** `tests/persist_all.rs` proves the writer emits a
+  section for **every** manifested structure on both the fresh-write and the append
+  path, and each round-trips byte-exactly (identical `physical_bytes()`, `byte_at`
+  samples and `verify`/`verify_deep` before-write vs after-reopen)
+  ([`docs/MIGRATION.md`](docs/MIGRATION.md) §7).
+- **S3 — multirun honesty with CIs.** `multirun.json` + `config-manifest.json` give
+  full distributions and **bootstrap 95% CIs** over repeated, interleaved trials
+  ([`docs/BENCHMARKING.md`](docs/BENCHMARKING.md)): `byte_at` p50 text `ekbloom`
+  **1683 ns [1653, 1704]** vs `lz4` **1062 ns [1052, 1072]** — a **~1.6×**
+  reproducible **loss** with **disjoint** CIs; the cold gap is a disjoint **129 ns**
+  loss; and the concurrency **p99.9 grows with oversubscription** (0.24 µs at 1 reader
+  → 8.07 µs at 64) while p50/p99 stay flat.
+- **S4 — hardened untrusted-input boundary.** **Five** new fuzz targets (declared
+  lengths, alloc exhaustion, dict substitution, auth downgrade, mapped truncation;
+  **24** total) plus bounded resource measurement: **5** classes / **86** iterations,
+  peak RSS **6.29 MiB** (0.006× the 1 GiB ceiling), every error typed and bounded. The
+  honest **AUTH rollback residual** stands: a genuinely authenticated *older*
+  generation is accepted (no anti-replay) ([`docs/HARDENING.md`](docs/HARDENING.md),
+  `hardening.json`, P57-adjacent).
+- **S5 — online workload-adaptation controller.** `src/controller.rs` observes
+  accesses and additively manifests hot 4 KiB tiles once per epoch, under memory,
+  background-I/O and construction budgets, with dual hysteresis and deterministic
+  decisions. At an equal allowance it beats a **static** plan on warm p99 (**90 vs
+  18,745 ns**; adaptation recovery cold **14,827 → warm 70 ns**, ≈212×), **matches**
+  TinyLFU/LRU on warm p50 (**70 vs 50–60 ns**) but does **not** beat them, and **loses
+  the cold epoch** (bounded replay ≈14.8 µs vs LZ4 ≈1.3 µs)
+  ([`docs/CONTROLLER.md`](docs/CONTROLLER.md), `controller.json`, P58).
+- **S6 — refinement obligations.** `docs/REFINEMENT.md` maps each machine (ids 1–9) to
+  its Rust implementation with transition invariants (site + discharging test/gate) and
+  resource bounds; `scripts/run-refinement.sh` checks **16 obligations (O1–O16)**, all
+  **PASS** ([`docs/REFINEMENT.md`](docs/REFINEMENT.md)).
+- **S7 — MSRV/semver/CHANGELOG policy.** The README states the MSRV (**1.89**) and the
+  `0.y.z` rule (a breaking API change or MSRV bump is a MINOR bump), the wire format is
+  versioned **independently**, and [`CHANGELOG.md`](CHANGELOG.md) +
+  [`docs/MIGRATION.md`](docs/MIGRATION.md) §8 carry the authoritative compat matrix.
+- **S8 — real embedded-KV integration.** `examples/kv_integration.rs` +
+  `tests/kv_integration.rs` (4) store codec outputs as **`redb` 4.4** values and decode
+  them through a real B-tree with a real page cache. Machine 9 is a legitimate
+  record-granular store but **loses on every DB axis** in the engine: footprint
+  **0.973×** raw (vs `zstd-dict` **0.525×**, LZ4 **0.819×**), warm p50 **1,072 ns**
+  (vs LZ4 **170**, `zstd-dict` **231**), p99.9 **2,574 ns**, write amplification
+  **1.94×** and range scan **97 MiB/s** (vs LZ4 **1,453**)
+  ([`docs/DB-INTEGRATION.md`](docs/DB-INTEGRATION.md), `kv-integration.json`, P59).
+
+**Honest reading.** The S-round adds **no new speed ceiling** and no wire change: it
+makes the accounting **complete and honest** (and, in doing so, slightly *raises* the
+reported cost of the cold path), replaces single-run evidence with interval-qualified
+evidence that confirms the `byte_at` loss to LZ4 is real, bounds the untrusted input
+(6.29 MiB peak, every error typed), shows the online controller **beats a static plan
+but not an equal-budget codec cache**, formalises the refinement obligations, and
+answers the KV question **inside a real engine** — where machine 9 is *larger and
+slower* than LZ4, the opposite of the standalone block-amplified court. The remaining
+honest boundaries (cold-vs-LZ4, no anti-rollback, the bare-machine dictionary id,
+uniform footprint **1.07× raw**) are unchanged ([`docs/LIMITATIONS.md`](docs/LIMITATIONS.md)).
 
 ---
 
@@ -1317,7 +1422,10 @@ sh scripts/run-counters.sh          # evidence/bench/counters.json (hardware cou
 sh scripts/run-bound.sh             # evidence/bench/bound.json (worst-case step bound)
 sh scripts/run-faults.sh            # evidence/bench/faults.json (fault injection; 100%)
 sh scripts/run-crossfs.sh           # evidence/bench/crossfs.json (cross-filesystem determinism)
-sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (53 files)
+sh scripts/run-hardening.sh         # evidence/bench/hardening.json (hardened untrusted-input boundary; S4)
+sh scripts/run-controller.sh        # evidence/bench/controller.json (online controller; S5)
+sh scripts/run-kv-integration.sh    # evidence/bench/kv-integration.json (real embedded-redb KV integration; S8)
+sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (58 files)
 sh scripts/run-gates.sh             # acceptance gates G1-G5 (docs/GATES.md)
 sh scripts/run-scale.sh             # nightly 2^30 scale build (opt-in: EKB_RUN_SCALE=1)
 sh scripts/run-scalar.sh scalar     # x86_64 with EKB_NO_SIMD=1: equality + gates + bounded court
@@ -1329,11 +1437,14 @@ sh scripts/capture-environment.sh   # write evidence/environment.txt
 ```
 
 Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
-(libFuzzer — runs **every** target declared in `fuzz/Cargo.toml`:
+(libFuzzer — runs **every** target declared in `fuzz/Cargo.toml`, **24** total:
 `fuzz_machine`, `fuzz_open`, `fuzz_bloom`, `fuzz_history_store`, `fuzz_packed`,
 `fuzz_tiles`, `fuzz_blocks`, `fuzz_batch`, `fuzz_rans_i`, `fuzz_region`,
 `fuzz_pack`, `fuzz_seg`, `fuzz_resource`, `fuzz_rans_w`, `fuzz_rans_il`,
-`fuzz_roundtrip`, `fuzz_stream`, `fuzz_open_auth`, `fuzz_dictionary`), `scripts/container-miri.sh` (UB),
+`fuzz_roundtrip`, `fuzz_stream`, `fuzz_open_auth`, `fuzz_dictionary`, and the
+hardening targets `fuzz_declared_lengths`, `fuzz_alloc_exhaustion`,
+`fuzz_dict_substitution`, `fuzz_auth_downgrade`, `fuzz_mapped_truncate`),
+`scripts/container-miri.sh` (UB),
 `scripts/container-sanitize.sh` (AddressSanitizer), and `scripts/container-fuse.sh`
 (read-only FUSE mount). See [`docs/TESTING.md`](docs/TESTING.md).
 
@@ -1357,9 +1468,9 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 
 ---
 
-## Limitations — resolved (L1–L4, M1–M5, N1–N8, O1–O3, P1–P8 and Q1–Q4/R1–R2) and remaining
+## Limitations — resolved (L1–L4, M1–M5, N1–N8, O1–O3, P1–P8, Q1–Q4/R1–R2 and S1–S8) and remaining
 
-### Resolved in rounds L1–L4, M1–M5, N1–N8, O1–O3, P1–P8 and Q1–Q4/R1–R2
+### Resolved in rounds L1–L4, M1–M5, N1–N8, O1–O3, P1–P8, Q1–Q4/R1–R2 and S1–S8
 
 - **The base representation never expands past raw** (L1). Machine 3
   (`OrANS-Store`) is the verbatim identity (`encode = source`, `V = N`), and the
@@ -1452,6 +1563,34 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
   (scalar-aware) capability — clearing the SIMD fields and setting `forced_scalar`
   under `EKB_NO_SIMD=1` — with `hardware_features()` kept for the raw facts, so a
   scalar-arm evidence artifact no longer misreports AVX2.
+- **The reader's I/O accounting is complete** (S1). One `ReadLedger` counts every
+  `FileBody` physical read path — tiles, bounded encoded windows, the dictionary
+  header and section metadata — and `tests/ioacct.rs` cross-checks it against
+  `/proc/self/io`, so `fetched_bytes`/`fetched_reads` are the true totals
+  ([`docs/ROCKSDB.md`](docs/ROCKSDB.md) §6, P57).
+- **Every manifested structure round-trips through write → reopen** (S2).
+  `tests/persist_all.rs` proves the writer emits a section for each on the fresh and
+  append paths, byte-exactly ([`docs/MIGRATION.md`](docs/MIGRATION.md) §7).
+- **The evidence is interval-qualified and honest** (S3). `multirun.json` reports
+  bootstrap 95% CIs over repeated, interleaved trials: the `byte_at` loss to LZ4 is
+  **real** (~1.6×, **disjoint** CIs) and p99.9 grows with oversubscription
+  ([`docs/BENCHMARKING.md`](docs/BENCHMARKING.md)).
+- **The untrusted-input boundary is total and bounded** (S4). Five new fuzz targets
+  (24 total) and a bounded measurement harness show every adversarial input yields a
+  typed `Err` within **6.29 MiB** peak RSS ([`docs/HARDENING.md`](docs/HARDENING.md)).
+- **The online controller respects every declared constraint** (S5). `Controller`
+  is additive-only, honours the memory, background-I/O and construction budgets, uses
+  dual hysteresis and is deterministic, and beats a static plan (**90 vs 18,745 ns**
+  warm p99) ([`docs/CONTROLLER.md`](docs/CONTROLLER.md), P58).
+- **The refinement obligations are machine-checked** (S6).
+  `scripts/run-refinement.sh` discharges **16 obligations (O1–O16)**, all PASS
+  ([`docs/REFINEMENT.md`](docs/REFINEMENT.md)).
+- **The MSRV/semver and wire-format policies are explicit** (S7). The README states
+  the MSRV (**1.89**) and the `0.y.z` minor-is-breaking rule; the wire format is
+  versioned independently ([`docs/MIGRATION.md`](docs/MIGRATION.md) §8).
+- **The dictionary machine is tested inside a real KV engine** (S8).
+  Codec values are stored in `redb` 4.4 and decoded through a real B-tree; the honest
+  DB-level verdict is recorded ([`docs/DB-INTEGRATION.md`](docs/DB-INTEGRATION.md), P59).
 
 ### Remaining (honest)
 
@@ -1584,6 +1723,23 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
   mounting a loop device needs `CAP_SYS_ADMIN`). The blocker is recorded verbatim
   in `crossfs.json`; x86_64-vs-aarch64 determinism is covered separately (Q2)
   ([`docs/TESTING.md`](docs/TESTING.md) §9).
+- **Inside a real KV engine, machine 9 loses on every DB axis** (S8). Stored as
+  `redb` values and read through a real B-tree, machine 9 is **0.973× raw** (vs LZ4
+  **0.819×**, `zstd-dict` **0.525×**) with the slowest compressed get (**1,072 ns**
+  p50, **2,574 ns** p99.9 vs LZ4 170/721 ns), **1.94×** write amplification and a
+  **97 MiB/s** scan — the opposite of the standalone block-amplified court, because
+  per-value storage removes the block amplification that flattered machine 9. Its only
+  edge is the small, self-contained per-value tail ([`docs/DB-INTEGRATION.md`](docs/DB-INTEGRATION.md),
+  `kv-integration.json`).
+- **The central ledger covers the `FileBody` read path only, after open** (S1). It
+  counts physical reads served by a `FileBody`; the separate surfaces (`HybridReader`,
+  `Baseline`, FUSE, `mmap`, `HistoryStore`) and the input `reader::open` reads are
+  outside `fetched_bytes` by design, matching the `ioacct.rs`/`fetched_bytes` docs
+  ([`docs/ROCKSDB.md`](docs/ROCKSDB.md) §6, [`docs/HARDENING.md`](docs/HARDENING.md) §7).
+- **The `AUTH` tag does not detect rollback/replay** (S4). It binds bytes, not
+  freshness: a wholly genuine *older* file — or one truncated at an earlier generation
+  boundary — still authenticates under the same key
+  ([`docs/HARDENING.md`](docs/HARDENING.md) §3, [`docs/SECURITY.md`](docs/SECURITY.md) §6).
 
 ---
 
@@ -1636,6 +1792,9 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 - `evidence/bench/ci-matrix.json` — the cross-platform CI matrix (`scripts/run-matrix.sh`): `{x86_64-simd, x86_64-scalar, aarch64}`, each with PASS/FAIL, footprint and `byte_at` p50/p99/p99.9/p99.99, plus per-job `ci-*.json`.
 - `evidence/bench/faults.json` — transactional-publication fault injection: 5,933 fault points, 100 %, 0 torn (R2).
 - `evidence/bench/crossfs.json` — cross-filesystem determinism: the same `.ekb`/container byte-identical across overlayfs / tmpfs / ext2-ext3 (R2).
+- `evidence/bench/hardening.json` — the hardened untrusted-input boundary (S4): **5** classes / **86** iterations, peak RSS **6.29 MiB**, every error typed and bounded, plus the AUTH rollback residual.
+- `evidence/bench/controller.json` — the online workload-adaptation controller (S5) vs a static plan / TinyLFU / LRU at equal allowances (warm p50 **70 ns** vs static **14,878 ns**; matches the caches; loses the cold epoch).
+- `evidence/bench/kv-integration.json` — the real embedded-`redb` KV integration (S8): machine 9 vs raw / LZ4 / `zstd-dict` footprint, point-get latency, write amplification and scan throughput.
 - `tests/fixtures/` — 12 frozen v0.3.0/v0.4.0 `.ekb` reverse-compat fixtures + `expected.json` (whole-file BLAKE3) (Q1).
 
 Documentation map:
@@ -1646,7 +1805,7 @@ Documentation map:
 | [`docs/INDEX.md`](docs/INDEX.md) | One-page index of all docs and evidence. |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Frozen internal engineering contract. |
 | [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | The 10 hard gates mapped to tests and commands. |
-| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties P1–P56 (machine 1 + machine 2 + the round-3/round-4 modules + the L1–L4 closure + the M1–M5 closure + the N1–N8 closure + the O1–O3 closure + the P1–P8 closure + the Q1–Q4/R1–R2 closure) and honest limitations. |
+| [`docs/PROOFS.md`](docs/PROOFS.md) | Proved properties P1–P59 (machine 1 + machine 2 + the round-3/round-4 modules + the L1–L4 closure + the M1–M5 closure + the N1–N8 closure + the O1–O3 closure + the P1–P8 closure + the Q1–Q4/R1–R2 closure + the S1–S8 closure) and honest limitations. |
 | [`docs/RESULTS.md`](docs/RESULTS.md) | Measured results and the 65,536 research outcome. |
 | [`docs/CODEC.md`](docs/CODEC.md) | Machines 2–8 (`OrANS-RANS0`/`OrANS-Store`/`OrANS-RANS0I`/`OrANS-PACK`/`OrANS-SEG`/`OrANS-RANS0W`/`OrANS-RANS0IL`) codecs + the `auto` policy. |
 | [`docs/BASELINES.md`](docs/BASELINES.md) | Conventional baseline comparison (`RawVec`/`RawFile`/…). |
@@ -1688,15 +1847,18 @@ Documentation map:
 | [`docs/DICTIONARY.md`](docs/DICTIONARY.md) | Machine 9 (`OrANS-DICT`): the shared trained order-0 dictionary for many small records (P5). |
 | [`docs/CORPORA.md`](docs/CORPORA.md) | The standard-corpora court, hardware counters, 64-reader concurrency p99, and the worst-case step bound (P6). |
 | [`docs/ROCKSDB.md`](docs/ROCKSDB.md) | The RocksDB-style skewed KV court: 100-byte values, 80/20 key skew, `get` + 4 KiB `read_random` — footprint, bytes fetched per read (I/O amplification), hot/cold and p50/p99.9 vs raw/LZ4/Zstd/Zstd-dict, and EKBLOOM's best plan + machine 9. |
+| [`docs/HARDENING.md`](docs/HARDENING.md) | The hardened untrusted-input boundary (S4): the threat matrix (input class → typed error → measured peak RSS/CPU), the AUTH downgrade/rollback analysis, mapped-file truncation, the five new fuzz targets, and the residual risks (peak RSS **6.29 MiB**). |
+| [`docs/CONTROLLER.md`](docs/CONTROLLER.md) | The online workload-adaptation controller (`src/controller.rs`, S5): the API, control-theory hygiene (budget/bg-I/O/hysteresis/determinism), and equal-budget comparisons vs a static plan / TinyLFU / LRU. |
+| [`docs/DB-INTEGRATION.md`](docs/DB-INTEGRATION.md) | EKBLOOM inside a real embedded KV engine (`redb`, S8): codec values stored and decoded through a real B-tree, with the honest DB-level verdict (machine 9 loses on every DB axis). |
 | [`docs/MACHINES.md`](docs/MACHINES.md) | The machine catalogue (ids 1–9): exact transition/encoding math, complete resumable state, decode algorithm, size table and wins/loses per machine, plus a relationship map. |
 | [`docs/REFINEMENT.md`](docs/REFINEMENT.md) | Machine-spec ↔ implementation refinement for machines 1–9: abstract state/transition/observable, Rust mapping, transition invariants (site + discharging test/gate), complete resumable state, restart correctness, resource bounds, the reviewer-run obligation checklist (`scripts/run-refinement.sh`), the wire integrity primitives actually used, and the honest refinement gaps. |
 | [`docs/BUDGET-GUIDE.md`](docs/BUDGET-GUIDE.md) | The budget chooser guide (`choose_plan`): budget × workload decision table, how to pick machine / segment / restart `K` / block `B` / path `D` / tiles, and worked examples. |
 | [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) | The consolidated honest non-claims, each with a one-line pointer to its evidence. |
 | [`docs/GATES.md`](docs/GATES.md) | The machine-checked acceptance gates **G1–G5** (invertibility, prefix composition, worst-case bound, corruption detection, physical accounting) and their runner. |
-| [`docs/TESTING.md`](docs/TESTING.md) | The trust-building test infrastructure: fuzz roundtrips (19 targets), cross-architecture determinism, the scalar/aarch64 CI matrix, transactional-publication fault injection, cross-filesystem determinism, the nightly scale job, and the gates. |
-| [`docs/reviews/adversarial.md`](docs/reviews/adversarial.md) | Adversarial correctness review (through **Revision 10**, Q1–Q4/R1–R2: one test-hardening fix, verdict **no library defect found**). |
+| [`docs/TESTING.md`](docs/TESTING.md) | The trust-building test infrastructure: fuzz roundtrips (24 targets), cross-architecture determinism, the scalar/aarch64 CI matrix, transactional-publication fault injection, cross-filesystem determinism, the nightly scale job, and the gates. |
+| [`docs/reviews/adversarial.md`](docs/reviews/adversarial.md) | Adversarial correctness review (through **Revision 11**, S1–S8: verdict **no library defect found; all attacks held**). |
 | [`docs/reviews/concurrency.md`](docs/reviews/concurrency.md) | Concurrency audit + Loom model checking (the `OrFs` index and the RCU publication path). |
 | [`docs/reviews/mathematics.md`](docs/reviews/mathematics.md) | Independent re-derivation of the proofs. |
 | [`docs/reviews/performance.md`](docs/reviews/performance.md) | Locality & SIMD investigation. |
 | [`docs/reviews/reproducibility.md`](docs/reviews/reproducibility.md) | Independent reproducibility review. |
-| [`docs/reviews/security.md`](docs/reviews/security.md) | Wire-form / `unsafe` security review (three `unsafe` modules), through **Revision 10** (Q1–Q4/R1–R2: one test-hardening fix, one honesty observation reported). |
+| [`docs/reviews/security.md`](docs/reviews/security.md) | Wire-form / `unsafe` security review (three `unsafe` modules), through **Revision 11** (S1–S8: verdict **no library defect found; all claims held**). |

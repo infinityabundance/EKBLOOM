@@ -367,7 +367,7 @@ with `sh scripts/container-fuse.sh` ([`FUSE.md`](FUSE.md)).
 
 Every committed evidence JSON is validated by `sh scripts/validate-evidence.sh`
 (`examples/validate_evidence.rs`, dependency-free, wired into
-`scripts/container-reproduce.sh`); it currently reports **53** files `OK`, and a
+`scripts/container-reproduce.sh`); it currently reports **58** files `OK`, and a
 malformed file fails the reproduction non-zero rather than publishing silently.
 The R4 verifier fix (`src/verify.rs::check_regional` re-derives the regional
 successor cursor and uses a checked `start + len`) is exercised by
@@ -419,7 +419,7 @@ both fixed).
 | **N5** | OrFS one authoritative store + pointer views | authoritative payload stored **exactly once**; real on-disk excess **+1.89 % / +0.70 %** over the in-memory engine; genuine `ReadMode::Machine` decode **382×** the dispatch | `orfs.json`, [`ORFS.md`](ORFS.md), P38 |
 | **N6** | physical-budget-aware joint planner | held-out p99 **10.07 µs** vs greedy **13.58 µs** (budget `N`); **9.84** vs **13.19 µs** (`1.5·N`); `all_certified`, cap-rechecked, additive `grow_into` | `optimizer.json`, [`OPTIMIZER.md`](OPTIMIZER.md), P39 |
 | **N7** | end-to-end real-data verdict | `beats_raw_store = true` on all three corpora (0.74×/0.98×/0.78× raw; hot 4 KiB 120–130 ns vs raw 160–170 ns; non-evicting); `holds_vs_pinned = false` (behind pinned LZ4/Zstd, and behind raw/LZ4 cold + sequential) | `e2e.json`, [`E2E.md`](E2E.md) |
-| **N8** | resource policy + fuzzing | every whole-object allocation driven by a declared/core-derived length bounded at **1 GiB** (`AllocationTooLarge`); **19** libFuzzer targets (three added in N8, two in O3, two in the P-round, two in R2) | [`SECURITY.md`](SECURITY.md), `src/resource.rs`, P40 |
+| **N8** | resource policy + fuzzing | every whole-object allocation driven by a declared/core-derived length bounded at **1 GiB** (`AllocationTooLarge`); **19** libFuzzer targets then (three added in N8, two in O3, two in the P-round, two in R2, five in S4 → **24** now) | [`SECURITY.md`](SECURITY.md), `src/resource.rs`, P40 |
 
 **Honest reading.** The N-round adds real capabilities and bounded resource use —
 identity-bound plans, bounded windows, two directly-addressable machines, a
@@ -489,7 +489,7 @@ the optimiser tight-budget base defect (**J**) and the `cursor + N` overflow
 |---|---|---|---|
 | **O1** | the **decoder court** — word16 (machine 7), independent lanes (machine 8), an AVX2 rANS kernel | all **REJECTED**: machine 7 ≈**6 %** over machine 2 but ≈**37 %** under `K = 8`; machine 8 **+30 %**; kernel **+25–27 %**. Best stays **machine 4 `K = 8`** (cold 4 KiB p50 **8,997 ns**, 45-byte restart), **3.2× smaller** than LZ4 but ≈4.3× slower cold; every variant byte-exact, machines 1–6 wire-hash pinned | `decoders.json`, [`DECODERS.md`](DECODERS.md), P41, P42 |
 | **O2** | uniform-footprint gate + OrFS compaction | uniform plan `committed_bytes == raw_bytes == 4,194,304`, no p99 regression (130.9 == 130.9 ns), sequential raw-like (**69.6 GB/s**); OrFS on-disk excess **+1.89 %/+0.70 % → +1.54 %/+0.58 %** (payload stored once) | `optimizer.json`, `orfs.json`, [`OPTIMIZER.md`](OPTIMIZER.md), [`ORFS.md`](ORFS.md), P43, P44 |
-| **O3** | review fixes + cursor hardening | Finding **I** (cursor overflow, machines 7/8 + SIMD kernel) and Finding **J** (gate aborted when only the base fit) fixed; **14** unchecked `cursor + N` sites hardened to `saturating_add` across machines 1–4; **19** fuzz targets, **792/0** release, **53** JSON, verify green at **806** | `tests/adversarial_o.rs`, [`reviews/security.md`](reviews/security.md) Revision 8 |
+| **O3** | review fixes + cursor hardening | Finding **I** (cursor overflow, machines 7/8 + SIMD kernel) and Finding **J** (gate aborted when only the base fit) fixed; **14** unchecked `cursor + N` sites hardened to `saturating_add` across machines 1–4; **19** fuzz targets then (**24** now), **792/0** release then (**833/0** now), **53** JSON then (**58** now), verify green at **806** then (**847** now) | `tests/adversarial_o.rs`, [`reviews/security.md`](reviews/security.md) Revision 8 |
 
 **Honest reading.** The decoder court is **complete with all variants rejected**
 (a word16 renorm, independent per-lane streams and a SIMD gather kernel all lose to
@@ -517,7 +517,7 @@ and its properties are **P45–P50** in [`PROOFS.md`](PROOFS.md).
 | **P5** | machine 9 (`OrANS-DICT`) shared trained dictionary | **83.5 B/rec** vs machine 2 **590.0** (raw 100.0); decode 721 vs 1,403 ns; break-even **2 records**; unregistered/tampered id typed `Err` | `dictionary.json`, [`DICTIONARY.md`](DICTIONARY.md), P49 |
 | **P6** | standard corpora + counters + concurrency + worst-case bound | **`E_V` 0.988–0.998** (≤ raw) on Silesia/enwik8/Calgary/text/ELF; **39.14 instr/byte** (8.1 cycles) for 1-byte reads; **1.4e-3 locks/read** for 64 readers; **1,200,000** bound samples, **0** violations | `corpora.json`/`counters.json`/`concurrency.json`/`bound.json`, [`CORPORA.md`](CORPORA.md), P50 |
 | **P7** | machine catalogue + `choose_plan` budget chooser + one limitations list | machines 1–9 specified exactly; `choose_plan` selects machine × segment × restart × path × tiles under a byte budget; every honest non-claim in one place | [`MACHINES.md`](MACHINES.md), [`BUDGET-GUIDE.md`](BUDGET-GUIDE.md), [`LIMITATIONS.md`](LIMITATIONS.md) |
-| **P8** | fuzz + cross-arch determinism + machine-checked gates | **19** libFuzzer targets PASS; x86_64 == arm64 (`identical: true`); gates **G1–G5 all PASS**; machine-6 trait `decode` fixed from `O(n²)` to **linear** (**415 s → 0.5 ms** at `n = 2²⁰`) | [`TESTING.md`](TESTING.md), [`GATES.md`](GATES.md), `aarch64-determinism.json`, P48 |
+| **P8** | fuzz + cross-arch determinism + machine-checked gates | **19** libFuzzer targets PASS (P-round; **24** now); x86_64 == arm64 (`identical: true`); gates **G1–G5 all PASS**; machine-6 trait `decode` fixed from `O(n²)` to **linear** (**415 s → 0.5 ms** at `n = 2²⁰`) | [`TESTING.md`](TESTING.md), [`GATES.md`](GATES.md), `aarch64-determinism.json`, P48 |
 
 **Honest reading.** The P-round adds **no new speed ceiling**. It makes the format
 safe to evolve (typed version refusal, byte-identical cores), bounds streaming memory,
@@ -555,3 +555,34 @@ publication path, add the one-line dictionary API, and prove publication atomici
 filesystem independence. Remaining honest boundaries: **xfs/btrfs untested**,
 **no anti-rollback**, the bare-machine dictionary id unbound, cold-vs-LZ4 unchanged and
 the uniform manifested footprint still **1.07× raw** ([`LIMITATIONS.md`](LIMITATIONS.md)).
+
+### Rounds S1–S8
+
+The S-round closes the reviewer's priority items: complete I/O accounting, a
+persistence round-trip, interval-qualified evidence, a hardened untrusted boundary, an
+online controller, the refinement obligations, an explicit MSRV/semver policy and a real
+KV-engine verdict. **No stored byte changes.** The surface is reviewed in **Revision 11**
+([`reviews/adversarial.md`](reviews/adversarial.md),
+[`reviews/security.md`](reviews/security.md); verdict **NO LIBRARY DEFECT FOUND — all
+attacks held**), and the properties are **P57–P59** in [`PROOFS.md`](PROOFS.md).
+
+| Round | What it folds in | Measured result | Artifact / doc |
+|---|---|---|---|
+| **S1** | central I/O accounting (`ReadLedger`) | tiles / encoded windows / dictionary header / section metadata all charge one ledger; `/proc/self/io` agreement; `ekbloom-opt` **304.0 → 311.6 B/get**, tile-served hot gets stay **100.0 B/get** | `tests/ioacct.rs`, [`ROCKSDB.md`](ROCKSDB.md) §6, P57 |
+| **S2** | persistence round-trip | writer emits a section for **every** manifested structure on the fresh and append paths; byte-exact round-trip (`physical_bytes`/`byte_at`/`verify` identical) | `tests/persist_all.rs`, [`MIGRATION.md`](MIGRATION.md) §7 |
+| **S3** | multirun evidence with CIs | `byte_at` p50 text `ekbloom` **1683 [1653,1704]** vs `lz4` **1062 [1052,1072]** (**~1.6×**, disjoint); cold gap **129 ns** (disjoint); p99.9 grows with oversubscription (0.24 → 8.07 µs) | `multirun.json`, `config-manifest.json`, [`BENCHMARKING.md`](BENCHMARKING.md) |
+| **S4** | hardened untrusted boundary | **5** new fuzz targets (**24** total); **5** classes / **86** iters, peak RSS **6.29 MiB**, all typed/bounded; AUTH rollback residual | [`HARDENING.md`](HARDENING.md), `hardening.json` |
+| **S5** | online controller | beats static (**90 vs 18,745 ns** warm p99; recovery **14,827 → 70 ns**, ≈212×); matches TinyLFU/LRU (**70 vs 50–60 ns**); loses cold | [`CONTROLLER.md`](CONTROLLER.md), `controller.json`, P58 |
+| **S6** | refinement obligations | **O1–O16** all PASS via `scripts/run-refinement.sh` | [`REFINEMENT.md`](REFINEMENT.md) |
+| **S7** | MSRV/semver/CHANGELOG policy | MSRV **1.89**; `0.y.z` minor-is-breaking; wire format versioned independently | [`MIGRATION.md`](MIGRATION.md) §8, [`../CHANGELOG.md`](../CHANGELOG.md) |
+| **S8** | real `redb` KV integration | machine 9 **0.973×** raw vs `zstd-dict` **0.525×**/LZ4 **0.819×**; warm p50 **1,072** vs **231**/**170** ns; p99.9 **2,574**; wamp **1.94×**; scan **97** vs **1,453**/**595** MiB/s | [`DB-INTEGRATION.md`](DB-INTEGRATION.md), `kv-integration.json`, P59 |
+
+**Honest reading.** The S-round adds **no** new machine, no wire change and no new speed
+ceiling. It makes the accounting complete (raising the reported cold cost honestly),
+replaces single-run evidence with interval-qualified evidence that confirms the `byte_at`
+loss to LZ4, bounds the untrusted boundary, shows the controller beats a static plan but
+**not** an equal-budget codec cache, formalises the refinement obligations, and answers
+the KV question inside a real engine — where machine 9 is **larger and slower** than LZ4.
+Remaining honest boundaries: cold-vs-LZ4 unchanged, no anti-rollback, the bare-machine
+dictionary id unbound, and the uniform manifested footprint still **1.07× raw**
+([`LIMITATIONS.md`](LIMITATIONS.md)).

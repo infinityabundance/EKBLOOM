@@ -37,22 +37,25 @@ Measured on the pinned image (`rust:1.99.0`, `ekbloom-rust:1.99.0`):
 
 | run | tests passed | failed |
 |---|---:|---:|
-| `cargo test --all-features` (debug) | **806** | 0 |
-| `cargo test --release --locked` (reproduce) | **792** | 0 |
+| `cargo test --all-features` (debug) | **847** | 0 |
+| `cargo test --release --locked` (reproduce) | **833** | 0 |
 
 (The release run has fewer tests because it does not enable the optional
-`fuse`/`io-uring` features.) New in this work: `tests/faults.rs` (transactional
-publication under I/O faults), `tests/crossfs.rs` (cross-filesystem determinism),
-and §8/§9 below (the counts include the `cpu_features` scalar-reporting test added
-with the Q/R-fold follow-up; the review-time counts were 805/791).
+`fuse`/`io-uring` features.) The S-round adds `tests/ioacct.rs` (central ledger),
+`tests/persist_all.rs` (structure round-trips), `tests/hardening.rs` (the untrusted
+boundary), `tests/controller.rs` (the online controller) and `tests/kv_integration.rs`
+(the real `redb` integration); counts are the S-round Revision 11 (verify **847**, release
+**833**, **58** evidence JSON). Earlier rounds added `tests/faults.rs` and
+`tests/crossfs.rs` (see §8/§9).
 
 ---
 
 ## 2. Fuzz roundtrips
 
-The campaign now runs **19** libFuzzer targets. The earlier rounds added the
-machine-roundtrip and streaming targets; this work adds the **authenticated-open**
-and **dictionary** targets:
+The campaign now runs **24** libFuzzer targets. Earlier rounds added the
+machine-roundtrip and streaming targets, then the **authenticated-open** and
+**dictionary** targets; the S-round adds five **hardening** targets
+([`HARDENING.md`](HARDENING.md) §5):
 
 | target | property |
 |---|---|
@@ -60,6 +63,11 @@ and **dictionary** targets:
 | `fuzz_stream` ([`fuzz_targets/fuzz_stream.rs`](../fuzz/fuzz_targets/fuzz_stream.rs)) | Arbitrary bytes into the streaming reader are total (never panic, incl. `u64::MAX`); a built `StreamBuilder` container must round-trip exactly (sequential + sampled positional reads). |
 | `fuzz_open_auth` ([`fuzz_targets/fuzz_open_auth.rs`](../fuzz/fuzz_targets/fuzz_open_auth.rs)) | `[key: 32 bytes][image]` into `open_bytes_authenticated` and the strict `open_bytes_require_auth`: total, never panicking, and a missing/mismatching `AUTH` is rejected — never silently accepted. |
 | `fuzz_dictionary` ([`fuzz_targets/fuzz_dictionary.rs`](../fuzz/fuzz_targets/fuzz_dictionary.rs)) | `Dictionary::from_bytes` (bad magic/version, bad frequency sum, zero, id mismatch) is total; a validated record can be registered, looked up and used to decode a forged machine-9 core without an unbounded allocation or panic. |
+| `fuzz_declared_lengths` ([`fuzz_targets/fuzz_declared_lengths.rs`](../fuzz/fuzz_targets/fuzz_declared_lengths.rs)) | The `.ekb` scan plus every raw structure parser from arbitrary bytes (huge/overflowing counts and lengths) returns a typed error — never a panic or an unbounded allocation. |
+| `fuzz_alloc_exhaustion` ([`fuzz_targets/fuzz_alloc_exhaustion.rs`](../fuzz/fuzz_targets/fuzz_alloc_exhaustion.rs)) | Whole-object `decode`/`state_log`/`bulk_unpack`/`unpack_range`/`decode_into` for machines 2/4/5/6/9 under a small `ResourcePolicy`: a declared length past the ceiling is `AllocationTooLarge`. |
+| `fuzz_dict_substitution` ([`fuzz_targets/fuzz_dict_substitution.rs`](../fuzz/fuzz_targets/fuzz_dict_substitution.rs)) | `OrANS-DICT` framing: forged/relabelled/oversized ids and dictionary/record mismatches are typed rejects. |
+| `fuzz_auth_downgrade` ([`fuzz_targets/fuzz_auth_downgrade.rs`](../fuzz/fuzz_targets/fuzz_auth_downgrade.rs)) | `open_bytes_authenticated`/`open_bytes_require_auth`: strict mode rejects any image with no `AUTH`; a genuine image transformed (strip/truncate/flip/splice) never downgrades silently. |
+| `fuzz_mapped_truncate` ([`fuzz_targets/fuzz_mapped_truncate.rs`](../fuzz/fuzz_targets/fuzz_mapped_truncate.rs)) | A backing file truncated under an active `FileBody`, and a live `MappedSurface` reading a retained prefix: a typed error or the correct bytes, never a panic. |
 
 `fuzz_roundtrip` reads the input as `[selector: up to 3 bytes][body]` and derives
 a requested length in `[0, 2^20]`, materialized by cyclically repeating the body.
@@ -102,10 +110,11 @@ EKB_RUN_FUZZ=1 sh scripts/container-fuzz.sh   # NIGHTLY: longer (600 s / 1M runs
 Each target runs `-runs=100000 -max_total_time=60` by default. The **nightly** job
 is opt-in (`EKB_RUN_FUZZ=1`), which raises the per-target budget to
 `-runs=1000000 -max_total_time=600` (still overridable with `EKB_FUZZ_RUNS` /
-`EKB_FUZZ_SECS`). A run of the bounded campaign: **19/19 targets PASS**, no crash,
+`EKB_FUZZ_SECS`). A run of the bounded campaign: **24/24 targets PASS**, no crash,
 emitted by the pinned nightly (`rustlang/rust:nightly-bookworm-slim`), every
 docker run memory-capped. Final libFuzzer coverage (`cov` = edges, `ft` =
-feature counters, `corp` = corpus entries):
+feature counters, `corp` = corpus entries) for the pre-S-round 19 targets (the
+five hardening targets were added later and each PASS the bounded campaign):
 
 | target | `cov` | `ft` | `corp` | target | `cov` | `ft` | `corp` |
 |---|---:|---:|---:|---|---:|---:|---:|
@@ -280,8 +289,11 @@ G5 physical-accounting structures=46 exact_equality=18 fixed_header_relation=28
 
 ```sh
 sh scripts/container-verify.sh    # GREEN: safety + fmt + clippy(-D warnings) + full suite
-sh scripts/container-fuzz.sh      # 19/19 libFuzzer targets PASS
+sh scripts/container-fuzz.sh      # 24/24 libFuzzer targets PASS
 sh scripts/run-fuzz-seeds.sh      # regenerate evidence/fuzz/ (curated corpus)
+sh scripts/run-hardening.sh       # hardened untrusted-input boundary; evidence/bench/hardening.json (S4)
+sh scripts/run-controller.sh      # online controller vs static/TinyLFU/LRU; evidence/bench/controller.json (S5)
+sh scripts/run-kv-integration.sh  # real embedded-redb KV integration; evidence/bench/kv-integration.json (S8)
 sh scripts/run-faults.sh          # transactional-publication fault injection; evidence/bench/faults.json
 sh scripts/run-crossfs.sh         # cross-filesystem determinism; evidence/bench/crossfs.json
 sh scripts/run-gates.sh           # G1–G5 all PASS; writes evidence/gates/*.json

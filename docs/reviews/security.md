@@ -1147,7 +1147,7 @@ Independent re-run in the pinned, memory-capped container (every `docker run`
 `-D warnings` clean); `container-reproduce.sh` clean `--locked --release` build +
 **833 passed / 0 failed** + **58** evidence JSON validated; `container-fuzz.sh`
 **24/24** targets PASS; `run-hardening.sh` **5 classes / 86 iterations,
-`max_peak_rss=6.38 MiB`, `all_typed=true`, `all_bounded=true`**;
+`max_peak_rss=6.29 MiB`, `all_typed=true`, `all_bounded=true`**;
 `run-refinement.sh` **O1–O16 all PASS**. No library defect found; no fix required.
 
 ### S1 I/O accounting — **held; no uncounted read path in `FileBody`**
@@ -1197,7 +1197,7 @@ Five new fuzz targets (declared lengths, alloc exhaustion, dict substitution, au
 downgrade, mapped truncation) all PASS, incl. an in-target assertion that strict
 mode rejects any image with no `AUTH` and that `checked_default(cap+1)` is
 `AllocationTooLarge`. `run-hardening.sh` drives the five classes against the real
-1 GiB policy: peak RSS **6.38 MiB**, every error typed, no OOM/panic; forged
+1 GiB policy: peak RSS **6.29 MiB**, every error typed, no OOM/panic; forged
 machine-5/6 `u64::MAX` cores, oversized `dict_len`, relabelled embedded
 dictionaries and record mismatches are all typed rejects. I could not exceed the
 allocation policy or trigger a panic. **(held)**

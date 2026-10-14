@@ -15,18 +15,48 @@ is written to disk are marked **⚠ wire format** and their rules live in
 
 ### Added
 
-- Central I/O accounting (`ReadLedger`): tile, encoded-window, dictionary and
-  metadata reads are all counted through one ledger (S1).
-- `tests/persist_all.rs`: the writer emits a section for **every** manifested
-  structure on both the fresh-write and the append path, and each structure
-  round-trips byte-exactly (S2).
-- Repeated, interleaved multirun evidence with bootstrap 95% confidence intervals
-  and a full configuration manifest (S3).
-- Hardened untrusted-input boundary: five new fuzz targets plus bounded resource
-  measurement (S4).
-- Online workload-adaptation controller with equal-budget comparisons (S5).
-- Formal refinement document and machine-checked obligation runner
-  (`docs/REFINEMENT.md`, `scripts/run-refinement.sh`) (S6).
+- Nothing yet.
+
+## [0.7.0] - 2026-10-14
+
+**Wire format: no change.** The `.ekb` line stays `0.3`; machine cores remain
+byte-identical and a 0.7.0 writer emits exactly what 0.6.0 emitted. This is the
+**S-round** (S1–S8): a documentation/evidence, hardening and integration release
+reviewed as Revision 11 (verdict **no library defect found; all claims held**). The
+MINOR bump is for the additive public API (the online `Controller`) and the newly
+documented MSRV/semver policy; **no stored byte changes**.
+
+### Added
+
+- **Central I/O accounting (`ReadLedger`)**: every physical `FileBody` read path —
+  tile reads, bounded encoded windows, the decoder model (dictionary) header load,
+  and section/metadata reads (restart records, path-bloom prefixes, history states)
+  — charges one bounds-checked, ledger-counted wrapper, so no path can bypass it.
+  `FileBody::fetched_bytes`/`fetched_reads` are now the true totals;
+  `tests/ioacct.rs` pins each class and cross-checks `/proc/self/io`, and the
+  RocksDB-skew court drops its geometric tile re-addition (S1).
+- **Persistence round-trip suite (`tests/persist_all.rs`)**: the writer emits a
+  section for **every** manifested structure on both the fresh-write and the append
+  path, and each structure round-trips byte-exactly (S2).
+- **Repeated, interleaved multirun evidence with bootstrap 95% confidence
+  intervals** and a full configuration manifest (`docs/BENCHMARKING.md`,
+  `multirun.json`, `config-manifest.json`) (S3).
+- **Hardened untrusted-input boundary** (`docs/HARDENING.md`): **five** new fuzz
+  targets (**24** total) plus bounded resource measurement (`hardening.json`;
+  **5** classes / **86** iterations, peak RSS **6.29 MiB**, every error typed and
+  bounded, AUTH rollback residual documented) (S4).
+- **Online workload-adaptation controller** (`src/controller.rs`,
+  `docs/CONTROLLER.md`) with equal-budget comparisons against a static plan,
+  TinyLFU and an LRU block cache (S5).
+- **Formal refinement document** and machine-checked obligation runner
+  (`docs/REFINEMENT.md`, `scripts/run-refinement.sh`; obligations **O1–O16** all
+  PASS) (S6).
+- **MSRV/semver + wire-format policy** made explicit in the README and
+  `docs/MIGRATION.md` §8 (S7).
+- **Real embedded-KV integration** (`docs/DB-INTEGRATION.md`,
+  `examples/kv_integration.rs`, `tests/kv_integration.rs`): codec outputs stored as
+  `redb` 4.4 values and decoded through a real B-tree, with an honest DB-level
+  verdict (S8).
 
 ### Changed
 
@@ -163,7 +193,8 @@ exist).
 - Correctness court, property tests, fuzzing and Miri/ASan coverage; the measured
   speed-vs-space frontier and conventional-baseline comparison.
 
-[Unreleased]: https://github.com/infinityabundance/EKBLOOM/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/infinityabundance/EKBLOOM/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/infinityabundance/EKBLOOM/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/infinityabundance/EKBLOOM/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/infinityabundance/EKBLOOM/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/infinityabundance/EKBLOOM/compare/v0.3.0...v0.4.0
