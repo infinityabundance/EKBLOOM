@@ -36,7 +36,7 @@ byte-identical to before.
 
 ## 2. Read/write compatibility matrix
 
-This build is **release 0.7.0 on wire format line 0.3**.
+This build is **release 0.7.1 on wire format line 0.3**.
 
 | artifact | versions this build **READS** | this build **WRITES** |
 |---|---|---|
@@ -263,14 +263,14 @@ updated in the same change as any wire-format change (see §6.4).
 
 ### 8.1 `format_major.minor` × `core_version` × `manifest_version`
 
-A `.ekb` file is accepted by this build (**0.7.0**) **iff** all three tags are
+A `.ekb` file is accepted by this build (**0.7.1**) **iff** all three tags are
 known. The table enumerates every reachable combination and the outcome:
 
 | `format_major.minor` | `core_version` | `manifest_version` | this build reads? | refusal / note |
 |---|---|---|---|---|
 | `0.0` – `0.2` | `0` | `1` | yes | pre-0.3.0 internal format line, legacy cores |
 | `0.3` | `0` (legacy) | `1` | yes | written by 0.3.0 / 0.4.0 (field absent ⇒ `0`) |
-| `0.3` | `1` | `1` | yes | written by 0.5.0 / 0.6.0 / 0.7.0 |
+| `0.3` | `1` | `1` | yes | written by 0.5.0 / 0.6.0 / 0.7.0 / 0.7.1 |
 | `0.3` | `≥ 2` | `1` | **no** | `UnsupportedCoreVersion { machine_id, core_version }` |
 | any | any | `≥ 2` | **no** | `UnsupportedManifestVersion { version }` |
 | `0.4+` or `major ≠ 0` | any | any | **no** | `UnsupportedVersion { major, minor }` |
@@ -293,18 +293,19 @@ segment container `ESEG` v`1` — see §1 and §7.
 | 0.5.0 | `0.3` | `1` | `1` | 1–9 | `format 0.0`–`0.3`, `core_version {0,1}`, machines 1–9, manifest 1 |
 | 0.6.0 | `0.3` | `1` | `1` | 1–9 | identical to 0.5.0; the writer emits **byte-identical** output to 0.5.0 (**no wire change**) |
 | 0.7.0 | `0.3` | `1` | `1` | 1–9 | identical to 0.5.0/0.6.0; the writer emits **byte-identical** output to 0.6.0 (**no wire change**) |
+| 0.7.1 | `0.3` | `1` | `1` | 1–9 | identical to 0.5.0–0.7.0; a PATCH release (endurance evidence + docs only) whose writer emits **byte-identical** output to 0.7.0 (**no wire change**) |
 
 Rules a user can apply directly:
 
 - **Backward (new reader, old file).** This build reads every `format 0.0`–`0.3`
   file, every `core_version {0, 1}`, and `manifest_version 1` — i.e. everything
-  written by 0.3.0–0.7.0. The frozen v0.3.0/v0.4.0 fixtures (§6) pin this.
+  written by 0.3.0–0.7.1. The frozen v0.3.0/v0.4.0 fixtures (§6) pin this.
 - **Forward (old reader, new file).** A release can read any file written on the
   *same or an earlier* `format` line. Adding a machine or a section kind is
   additive: an old reader rejects an unknown `machine_id` / section kind with a
   typed error rather than mis-decoding it (e.g. a 0.3.0 reader rejects machines
   5–9 with `UnknownMachine`).
-- **Crate semver ≠ wire version.** 0.7.0 changed **no** stored byte; a future
+- **Crate semver ≠ wire version.** 0.7.1 changed **no** stored byte; a future
   `0.8.0` may or may not. Decide from the **⚠ wire format** marker in
   [`CHANGELOG.md`](../CHANGELOG.md) and the tables above — never from the crate
   version alone.

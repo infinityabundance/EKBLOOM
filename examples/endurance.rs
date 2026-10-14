@@ -146,6 +146,13 @@ const RSS_CAP: usize = 1 << 16;
 const SERIES_HIST_CAP: usize = 4096;
 /// Maximum entries retained in any emitted time series.
 const SERIES_MAX: usize = 64;
+/// Cap on the retained publish physical/on-disk value samples. The publish phase
+/// runs millions of iterations, so these MUST be bounded, not `Vec`s that grow
+/// with the run (an earlier revision's unbounded publish `Vec`s were the entire
+/// apparent "publish leak" in the phase matrix).
+const PUBLISH_CAP: usize = 1 << 14;
+/// Cap on the retained append series / verification offsets (also bounded).
+const APPEND_SERIES_CAP: usize = 1 << 12;
 /// Default wall-clock budget (seconds).
 const DEFAULT_SECONDS: u64 = 120;
 /// Fixed default seed (machine-9 themed).
@@ -280,13 +287,18 @@ impl<T: Copy> Halving<T> {
             return;
         }
         if self.items.len() >= self.cap {
-            let mut kept = Vec::with_capacity(self.cap / 2);
-            for (i, &x) in self.items.iter().enumerate() {
-                if i % 2 == 0 {
-                    kept.push(x);
+            // Compress in place (keep even indices) instead of allocating a new
+            // Vec: the old form freed and reallocated a multi-MB buffer on every
+            // halving, which churned the allocator and could masquerade as RSS
+            // creep in a long run.
+            let mut w = 0usize;
+            for r in 0..self.items.len() {
+                if r % 2 == 0 {
+                    self.items[w] = self.items[r];
+                    w += 1;
                 }
             }
-            self.items = kept;
+            self.items.truncate(w);
             self.stride *= 2;
         }
         self.items.push(v);
@@ -294,6 +306,18 @@ impl<T: Copy> Halving<T> {
 
     fn items(&self) -> &[T] {
         &self.items
+    }
+
+    fn last(&self) -> Option<&T> {
+        self.items.last()
+    }
+
+    /// Drop the retained sample and restart sampling: used when the append phase
+    /// begins a fresh file, so the retained series cannot grow with the run.
+    fn clear(&mut self) {
+        self.items.clear();
+        self.stride = 1;
+        self.count = 0;
     }
 }
 
@@ -434,13 +458,15 @@ struct Run {
     publish_ops: u64,
     append_gens: u64,
     sentinel_mismatches: u64,
-    publish_physical: Vec<u64>,
-    publish_on_disk: Vec<u64>,
-    append_series: Vec<AppendPoint>,
+    publish_physical: Halving<u64>,
+    publish_on_disk: Halving<u64>,
+    append_series: Halving<AppendPoint>,
     append_monotone: bool,
     append_reopen_verified: bool,
     append_max_generation: u64,
-    append_checks: Vec<(u64, u64)>,
+    append_checks: Halving<(u64, u64)>,
+    append_gens_file: u64,
+    append_cycles: u64,
     append_body: Option<EkbloomBody>,
     append_source: Vec<u8>,
     last_physical: u64,
@@ -500,13 +526,15 @@ impl Run {
             publish_ops: 0,
             append_gens: 0,
             sentinel_mismatches: 0,
-            publish_physical: Vec::new(),
-            publish_on_disk: Vec::new(),
-            append_series: Vec::new(),
+            publish_physical: Halving::new(PUBLISH_CAP),
+            publish_on_disk: Halving::new(PUBLISH_CAP),
+            append_series: Halving::new(APPEND_SERIES_CAP),
             append_monotone: true,
             append_reopen_verified: true,
             append_max_generation: 0,
-            append_checks: Vec::new(),
+            append_checks: Halving::new(APPEND_SERIES_CAP),
+            append_gens_file: 0,
+            append_cycles: 0,
             append_body: None,
             append_source,
             last_physical: 0,
@@ -618,6 +646,7 @@ impl Run {
         };
         self.append_checks.push((returned, off));
         self.append_gens += 1;
+        self.append_gens_file += 1;
         self.append_max_generation = self.append_max_generation.max(returned);
         self.append_series.push(AppendPoint {
             generation: returned,
@@ -626,6 +655,38 @@ impl Run {
             returned,
         });
         Ok(())
+    }
+
+    /// Verify every recorded generation offset of the current append file against
+    /// the source, byte-exact. Sticky: a failure is never cleared.
+    fn append_verify(&mut self) -> Result<(), Box<dyn Error>> {
+        let checks: Vec<(u64, u64)> = self.append_checks.items().to_vec();
+        if checks.is_empty() {
+            return Ok(());
+        }
+        let reopened = reader::open(&self.append_path)?;
+        let mut ok = true;
+        for &(_, off) in &checks {
+            if fastpath::byte_at(&reopened, off)? != self.append_source[off as usize] {
+                ok = false;
+            }
+        }
+        if !ok {
+            self.append_reopen_verified = false;
+        }
+        Ok(())
+    }
+
+    /// Start a fresh append file (the append phase recycles once the generation
+    /// cap is reached, so the phase can fill its time budget). Non-withdrawal is a
+    /// per-file property: a new file never rewrites an old one.
+    fn append_reset(&mut self) {
+        let _ = std::fs::remove_file(&self.append_path);
+        self.append_body = None;
+        self.last_physical = 0;
+        self.append_checks.clear();
+        self.append_gens_file = 0;
+        self.append_cycles += 1;
     }
 
     fn execute(&mut self) -> Result<(), Box<dyn Error>> {
@@ -649,7 +710,7 @@ impl Run {
                     }
                     self.publish_one()?;
                     self.push_sample(None);
-                    if self.append_gens < APPEND_CAP {
+                    if self.append_gens_file < APPEND_CAP {
                         self.append_one()?;
                         self.push_sample(Some(self.last_physical));
                     } else {
@@ -665,9 +726,12 @@ impl Run {
                     self.push_sample(None);
                 }
                 Phase::Append => {
-                    if self.append_gens >= APPEND_CAP {
-                        self.ended_reason = "cycles".to_string();
-                        break;
+                    if self.append_gens_file >= APPEND_CAP {
+                        // Verify the completed file, then start a fresh one so the
+                        // phase can fill its time budget rather than ending at the
+                        // generation cap.
+                        self.append_verify()?;
+                        self.append_reset();
                     }
                     self.append_one()?;
                     self.push_sample(Some(self.last_physical));
@@ -682,18 +746,9 @@ impl Run {
         self.cycles_done = cycle;
         self.elapsed_s = self.start.elapsed().as_secs_f64();
 
-        // Reopen the append file once and verify one byte at every generation's
-        // recorded logical offset against the source.
-        if !self.append_checks.is_empty() {
-            let reopened = reader::open(&self.append_path)?;
-            let mut ok = true;
-            for &(_, off) in &self.append_checks {
-                if fastpath::byte_at(&reopened, off)? != self.append_source[off as usize] {
-                    ok = false;
-                }
-            }
-            self.append_reopen_verified = ok;
-        }
+        // Reopen the append file once and verify every recorded generation's
+        // logical offset against the source (the helper is sticky on failure).
+        self.append_verify()?;
 
         // ---- real gates: fail loudly, never publish a misleading artifact ----
         if self.sentinel_mismatches != 0 {
@@ -735,6 +790,44 @@ impl Run {
         let growth = last_half_max.saturating_sub(first_half_max);
         let plateau = first_half_max == 0 || (growth as f64) < 0.05 * first_half_max as f64;
 
+        // A plateau test on half-maxima can hide a slow monotone creep, so report
+        // the creep itself: a least-squares RSS slope (B/s) over the second half of
+        // the time-uniform sample, and how far that projects over 7 days. Separately
+        // report the exact sampled time after which the counting allocator's
+        // *live* bytes never change again -- live bytes flat with a creeping RSS is
+        // fragmentation (freed-but-retained arenas), not a leak.
+        let ser = self.series.items();
+        let half = ser.len() / 2;
+        let rss_creep_b_per_s = least_squares_slope(ser.get(half..).unwrap_or(&[]));
+        let rss_creep_7day_bytes = (rss_creep_b_per_s.max(0.0) * 604_800.0) as u64;
+        let alloc_flat_after_ms = {
+            let mut last_differing: Option<usize> = None;
+            for (i, s) in ser.iter().enumerate() {
+                if s.in_use_bytes != in_use_end {
+                    last_differing = Some(i);
+                }
+            }
+            match last_differing {
+                Some(i) if i + 1 < ser.len() => ser[i + 1].t_ms,
+                Some(_) => (self.elapsed_s * 1000.0) as u64,
+                None => ser.first().map(|s| s.t_ms).unwrap_or(0),
+            }
+        };
+        let alloc_end_equals_max = in_use_end == in_use_max;
+        // Second-half ranges. For an oscillating (sawtooth) live-byte series,
+        // "the time after which it never changes again" is the wrong test, so also
+        // report the range over the second half and a bounded-oscillation flag:
+        // alloc_live_flat = second-half live-byte range <= 1% of its second-half max.
+        let tail = ser.get(half..).unwrap_or(&[]);
+        let in_use_tail_min = tail.iter().map(|s| s.in_use_bytes).min().unwrap_or(0);
+        let in_use_tail_max = tail.iter().map(|s| s.in_use_bytes).max().unwrap_or(0);
+        let in_use_tail_range = in_use_tail_max.saturating_sub(in_use_tail_min);
+        let alloc_live_flat =
+            in_use_tail_max == 0 || (in_use_tail_range as f64) <= 0.01 * in_use_tail_max as f64;
+        let rss_tail_min = tail.iter().map(|s| s.rss_bytes).min().unwrap_or(0);
+        let rss_tail_max = tail.iter().map(|s| s.rss_bytes).max().unwrap_or(0);
+        let rss_tail_range = rss_tail_max.saturating_sub(rss_tail_min);
+
         // Decode latency: first vs last decile (by time) of the uniform sample.
         let lat = self.lat.items();
         let take = (lat.len() / 10).max(1).min(lat.len());
@@ -751,8 +844,8 @@ impl Run {
         let seven_day_ops = (decode_per_s * 86_400.0 * 7.0) as u64;
         let total_ops = self.ops_total();
 
-        let (pmin, pmed, pmax) = min_median_max(&self.publish_physical);
-        let (dmin, dmed, dmax) = min_median_max(&self.publish_on_disk);
+        let (pmin, pmed, pmax) = min_median_max(self.publish_physical.items());
+        let (dmin, dmed, dmax) = min_median_max(self.publish_on_disk.items());
         let alloc_count = ALLOCS.load(Ordering::Relaxed);
         let free_count = FREES.load(Ordering::Relaxed);
 
@@ -840,6 +933,23 @@ impl Run {
             "    \"plateau_rule\": \"{}\",",
             json_escape(PLATEAU_RULE)
         );
+        jline!(
+            js,
+            "    \"rss_creep_bytes_per_s_last_half\": {rss_creep_b_per_s:.3},"
+        );
+        jline!(js, "    \"rss_creep_7day_bytes\": {rss_creep_7day_bytes},");
+        jline!(
+            js,
+            "    \"rss_creep_rule\": \"{}\",",
+            json_escape(CREEP_RULE)
+        );
+        jline!(js, "    \"alloc_flat_after_ms\": {alloc_flat_after_ms},");
+        jline!(js, "    \"alloc_end_equals_max\": {alloc_end_equals_max},");
+        jline!(js, "    \"alloc_live_tail_min\": {in_use_tail_min},");
+        jline!(js, "    \"alloc_live_tail_max\": {in_use_tail_max},");
+        jline!(js, "    \"alloc_live_tail_range\": {in_use_tail_range},");
+        jline!(js, "    \"alloc_live_flat\": {alloc_live_flat},");
+        jline!(js, "    \"rss_second_half_range\": {rss_tail_range},");
         js.push_str("    \"series\": [\n");
         let series = downsample(self.series.items(), SERIES_MAX);
         for (i, s) in series.iter().enumerate() {
@@ -879,13 +989,14 @@ impl Run {
             self.append_reopen_verified
         );
         jline!(js, "    \"append_generations\": {},", self.append_gens);
+        jline!(js, "    \"append_files\": {},", self.append_cycles + 1);
         jline!(
             js,
             "    \"append_max_generation\": {},",
             self.append_max_generation
         );
         js.push_str("    \"append_series\": [\n");
-        let points = downsample(&self.append_series, SERIES_MAX);
+        let points = downsample(self.append_series.items(), SERIES_MAX);
         for (i, p) in points.iter().enumerate() {
             let comma = if i + 1 == points.len() { "" } else { "," };
             jline!(
@@ -948,6 +1059,36 @@ fn alloc_bytes(path: &Path) -> u64 {
     match std::fs::symlink_metadata(path) {
         Ok(m) => m.blocks().saturating_mul(512).max(m.len()),
         Err(_) => 0,
+    }
+}
+
+/// Least-squares slope of RSS (bytes) against time (seconds), in B/s. `xs` must be
+/// time-ordered (the halving sampler preserves time order); an empty or
+/// single-point slice, or a degenerate time span, yields `0.0`.
+fn least_squares_slope(xs: &[Sample]) -> f64 {
+    let n = xs.len() as f64;
+    if xs.len() < 2 {
+        return 0.0;
+    }
+    let t0 = xs[0].t_ms as f64;
+    let mean_x = xs
+        .iter()
+        .map(|s| (s.t_ms as f64 - t0) / 1000.0)
+        .sum::<f64>()
+        / n;
+    let mean_y = xs.iter().map(|s| s.rss_bytes as f64).sum::<f64>() / n;
+    let mut num = 0.0f64;
+    let mut den = 0.0f64;
+    for s in xs {
+        let x = (s.t_ms as f64 - t0) / 1000.0 - mean_x;
+        let y = s.rss_bytes as f64 - mean_y;
+        num += x * y;
+        den += x * x;
+    }
+    if den == 0.0 {
+        0.0
+    } else {
+        num / den
     }
 }
 
@@ -1020,7 +1161,9 @@ const LAT_RULE: &str = "per-decode-op latency, one time-ordered uniform sample c
 
 const PLATEAU_RULE: &str = "plateau = (max RSS over the second half of samples - max RSS over the first half) < 5% of the first-half max";
 
-const FRAG_METHOD: &str = "alloc_in_use is what the counting global allocator holds live; rss_bytes is the kernel resident set (VmRSS) read from /proc/self/status; rss_minus_in_use_max = rss_max - alloc_in_use_max is the non-allocator resident proxy (stacks, code, page tables, allocator metadata and retained arenas); leak_bytes = alloc_in_use_end - alloc_in_use_at_end_of_first_cycle; rss_drift_bytes = last RSS - RSS at end of the first cycle (after warmup)";
+const CREEP_RULE: &str = "rss_creep_bytes_per_s_last_half = least-squares slope of rss_bytes against time over the second half of the time-uniform sample (B/s); rss_creep_7day_bytes = max(0, slope) * 604800, an operation-count-style projection ONLY. The live-memory leak test is alloc_live_flat: the second-half live-byte range must be <= 1% of its second-half max (a bounded sawtooth counts as flat, which a 'never changes again' test would wrongly reject); alloc_end_equals_max and alloc_flat_after_ms are reported alongside";
+
+const FRAG_METHOD: &str = "alloc_in_use is what the counting global allocator holds live; rss_bytes is the kernel resident set (VmRSS) read from /proc/self/status; rss_minus_in_use_max = rss_max - alloc_in_use_max is the non-allocator resident proxy (stacks, code, page tables, allocator metadata and retained arenas); leak_bytes = alloc_in_use_end - alloc_in_use_at_end_of_first_cycle; rss_drift_bytes = last RSS - RSS at end of the first cycle (after warmup); alloc_flat_after_ms = the first sampled time after which in_use_bytes never changes again (the exact live-memory plateau); alloc_end_equals_max = in_use_end == alloc_in_use_max";
 
 fn main() {
     let args = match parse_args() {

@@ -17,6 +17,34 @@ is written to disk are marked **⚠ wire format** and their rules live in
 
 - Nothing yet.
 
+## [0.7.1] - 2026-10-14
+
+**Wire format: no change.** The `.ekb` line stays `0.3`; machine cores remain
+byte-identical and a 0.7.1 writer emits exactly what 0.7.0 emitted. No public API
+change and no MSRV change — this is a **PATCH** release: a new evidence harness, a
+new doc, and the wiring that goes with them (additive example/script/doc surfaces
+only).
+
+### Added
+
+- **Machine-9 endurance soak** (`examples/endurance.rs`, `scripts/run-endurance.sh`,
+  `docs/ENDURANCE.md`): a time-compressed 120 s mixed read/write/append run plus a
+  per-phase matrix (decode / publish / append, one process each) sampling process
+  RSS and a counting `#[global_allocator]` after every batch. Live bytes are
+  **exactly flat** for the decode (48.9 M ops) and publish (2.14 M ops) phases and
+  a fixed **162,568 B** sawtooth for append (39,123 generations over 306 recycled
+  files); RSS plateaus in every run with a small residual creep attributed to
+  allocator-arena retention, and `physical_bytes` stays monotone and
+  reopen-verified (`endurance.json`, `endurance-phases.json`) (T1).
+- **`docs/ENDURANCE.md`** and the `docs/INDEX.md` / README evidence wiring.
+
+### Fixed
+
+- **Endurance harness self-accounting.** The first revision's unbounded publish
+  `Vec`s and its reallocating halving sampler were corrected (bounded samplers
+  reserved up front; in-place compaction). The unbounded buffers had masqueraded as
+  a **33.5 MiB publish "leak"** — now **0**.
+
 ## [0.7.0] - 2026-10-14
 
 **Wire format: no change.** The `.ekb` line stays `0.3`; machine cores remain
@@ -193,7 +221,8 @@ exist).
 - Correctness court, property tests, fuzzing and Miri/ASan coverage; the measured
   speed-vs-space frontier and conventional-baseline comparison.
 
-[Unreleased]: https://github.com/infinityabundance/EKBLOOM/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/infinityabundance/EKBLOOM/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/infinityabundance/EKBLOOM/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/infinityabundance/EKBLOOM/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/infinityabundance/EKBLOOM/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/infinityabundance/EKBLOOM/compare/v0.4.0...v0.5.0

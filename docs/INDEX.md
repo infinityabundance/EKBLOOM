@@ -58,6 +58,7 @@ is in [`../CHANGELOG.md`](../CHANGELOG.md).
 | [`HARDENING.md`](HARDENING.md) | **The hardened untrusted-input boundary** (S4): the threat matrix (input class → typed error → measured peak RSS/CPU), the AUTH downgrade/rollback analysis, mapped-file truncation handling, the five new fuzz targets, and the residual risks (peak RSS **6.29 MiB**, every error typed and bounded). |
 | [`CONTROLLER.md`](CONTROLLER.md) | **The online workload-adaptation controller** (`src/controller.rs`, S5): the API, control-theory hygiene (memory/background-I/O/construction budgets, dual hysteresis, determinism, additivity), and equal-budget comparisons vs a static plan / TinyLFU / LRU (warm p50 **70 ns** vs static **14,878 ns**; matches the caches; loses cold). |
 | [`DB-INTEGRATION.md`](DB-INTEGRATION.md) | **EKBLOOM inside a real embedded KV engine** (`redb`, S8): the same 80/20 100-byte workload with the values as codec outputs in a real B-tree + page cache — footprint, point-get p50/p99.9, write amplification, scan, bytes fetched and the honest DB-level verdict (machine 9 loses on every DB axis). |
+| [`ENDURANCE.md`](ENDURANCE.md) | **The machine-9 endurance soak** (time-compressed): a 120 s mixed run plus a per-phase matrix (decode / publish / append in separate processes) with a counting-allocator live-byte test, the RSS creep, the 7-day projection and its caveat — live bytes bounded in every phase, publication churn exactly flat, and the measurement-hygiene result that the first revision's apparent publish "leak" was the harness's own unbounded buffers. |
 | [`MACHINES.md`](MACHINES.md) | **The machine catalogue (ids 1–9)**: name, `machine_id`, `core_version`, exact transition/encoding math, complete resumable state, decode algorithm, size table and wins/loses, plus a relationship map — one section per machine. |
 | [`REFINEMENT.md`](REFINEMENT.md) | **Machine-spec ↔ implementation refinement**: per machine (ids 1–9) the abstract state/transition/observable, the Rust mapping, the transition invariants (site + discharging test/gate), the complete resumable state, restart correctness and resource bounds — plus the reviewer-run proof-obligation checklist (`scripts/run-refinement.sh`), the wire integrity primitives actually used, and the honest refinement gaps. |
 | [`BUDGET-GUIDE.md`](BUDGET-GUIDE.md) | **The budget chooser guide**: how to pick machine / segment size / restart `K` / block `B` / path `D` / tiles, with a budget × workload decision table, the measured tradeoffs, and worked examples — backed by `choose_plan`. |
@@ -134,6 +135,8 @@ is in [`../CHANGELOG.md`](../CHANGELOG.md).
 | [`bench/hardening.json`](../evidence/bench/hardening.json) | **The hardened untrusted-input boundary** (S4): **5** classes / **86** iterations, peak RSS **6,590,464 B (6.29 MiB)**, `all_typed_errors`/`all_bounded` true, plus the AUTH rollback residual. |
 | [`bench/controller.json`](../evidence/bench/controller.json) | **The online workload-adaptation controller** (S5): static / TinyLFU / LRU / raw floors at `tight` and `generous` allowances — warm p50/p99, cold p50/p99, SLO misses, bytes spent and adaptation counts. |
 | [`bench/kv-integration.json`](../evidence/bench/kv-integration.json) | **Real embedded-`redb` KV integration** (S8): machine 9 vs raw / LZ4 / `zstd-dict` — footprint, `F/N`, warm p50/p99.9, write amplification, scan and bytes fetched, plus the record-granular ledger reference. |
+| [`bench/endurance.json`](../evidence/bench/endurance.json) | **The machine-9 endurance soak** (120 s, mixed): RSS, counting-allocator live bytes (flat after 4.3 s, `alloc_live_flat` true), decode p50 drift, append `physical_bytes` growth, and the 7-day projection with its verbatim caveat. |
+| [`bench/endurance-phases.json`](../evidence/bench/endurance-phases.json) | **The endurance phase matrix** (45 s each, one process per phase): decode / publish / append with live bytes **exactly flat** for decode and publish, a bounded sawtooth for append, and the RSS creep attributed per phase. |
 
 ## Reproduce (inside the pinned container only)
 
@@ -177,7 +180,8 @@ sh scripts/run-crossfs.sh           # crossfs.json (cross-filesystem determinism
 sh scripts/run-controller.sh       # controller.json (online workload-adaptation controller; S5)
 sh scripts/run-hardening.sh        # hardening.json (hardened untrusted-input boundary; S4)
 sh scripts/run-kv-integration.sh   # kv-integration.json (real embedded-redb KV integration; S8, 6 GiB cap)
-sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (58 files)
+sh scripts/run-endurance.sh        # endurance.json + endurance-phases.json (machine-9 soak; 6 GiB cap)
+sh scripts/validate-evidence.sh     # validate every evidence/**/*.json
 sh scripts/container-fuzz.sh        # all 24 libFuzzer targets (fuzz_machine/open/bloom/history_store/packed/tiles/blocks/batch/rans_i/region/pack/seg/resource/rans_w/rans_il/roundtrip/stream/open_auth/dictionary + declared_lengths/alloc_exhaustion/dict_substitution/auth_downgrade/mapped_truncate)
 sh scripts/run-gates.sh             # acceptance gates G1-G5 (docs/GATES.md)
 sh scripts/run-refinement.sh        # docs/REFINEMENT.md obligation table (PASS/FAIL)

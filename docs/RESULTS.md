@@ -1018,7 +1018,7 @@ sh scripts/run-counters.sh          # counters.json (hardware counters, CAP_PERF
 sh scripts/run-bound.sh             # bound.json (worst-case step bound, 1,000,000 samples)
 sh scripts/run-faults.sh            # faults.json (transactional-publication fault injection; R2)
 sh scripts/run-crossfs.sh           # crossfs.json (cross-filesystem determinism; R2)
-sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (58 files)
+sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (60 files)
 sh scripts/container-loom.sh        # Loom model checking (tests/loom.rs + tests/loom_rcu.rs)
 sh scripts/container-bench.sh       # Divan microbenchmarks (benches/ekbloom.rs)
 sh scripts/capture-environment.sh   # refresh evidence/environment.txt

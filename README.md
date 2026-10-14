@@ -15,7 +15,7 @@ preserves exact correctness, accounts for the bytes it actually manifests, and
 converts manifested space into access speed.
 
 This crate is a single Cargo package (`ekbloom`), shipping one library and one
-binary (`ekbloom`), and **`ekbloom` v0.7.0 is published on
+binary (`ekbloom`), and **`ekbloom` v0.7.1 is published on
 [crates.io](https://crates.io/crates/ekbloom)**. The frozen internal contract is
 `docs/DESIGN.md`; the original specification lives in `research/`. The release
 history is in [`CHANGELOG.md`](CHANGELOG.md); the wire-format compatibility and
@@ -64,8 +64,8 @@ typed error and never partially decodes):
    `UnsupportedCoreVersion { machine_id, core_version }`;
 3. `manifest_version == 1` — else `UnsupportedManifestVersion { version }`.
 
-In practice every release through 0.7.0 writes wire line **`0.3`**, so an `.ekb`
-written by any 0.3.0–0.7.0 release stays readable; the release-by-release
+In practice every release through 0.7.1 writes wire line **`0.3`**, so an `.ekb`
+written by any 0.3.0–0.7.1 release stays readable; the release-by-release
 read/write table and the full `format_major.minor × core_version ×
 manifest_version` matrix are in [`docs/MIGRATION.md`](docs/MIGRATION.md) §8.
 
@@ -1425,7 +1425,7 @@ sh scripts/run-crossfs.sh           # evidence/bench/crossfs.json (cross-filesys
 sh scripts/run-hardening.sh         # evidence/bench/hardening.json (hardened untrusted-input boundary; S4)
 sh scripts/run-controller.sh        # evidence/bench/controller.json (online controller; S5)
 sh scripts/run-kv-integration.sh    # evidence/bench/kv-integration.json (real embedded-redb KV integration; S8)
-sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (58 files)
+sh scripts/validate-evidence.sh     # validate every evidence/**/*.json (60 files)
 sh scripts/run-gates.sh             # acceptance gates G1-G5 (docs/GATES.md)
 sh scripts/run-scale.sh             # nightly 2^30 scale build (opt-in: EKB_RUN_SCALE=1)
 sh scripts/run-scalar.sh scalar     # x86_64 with EKB_NO_SIMD=1: equality + gates + bounded court
@@ -1591,6 +1591,13 @@ hardening targets `fuzz_declared_lengths`, `fuzz_alloc_exhaustion`,
 - **The dictionary machine is tested inside a real KV engine** (S8).
   Codec values are stored in `redb` 4.4 and decoded through a real B-tree; the honest
   DB-level verdict is recorded ([`docs/DB-INTEGRATION.md`](docs/DB-INTEGRATION.md), P59).
+- **The long-run soak question is now measured, time-compressed** (T1). A 120 s
+  mixed run plus a per-phase matrix (decode / publish / append, one process each)
+  shows machine 9's allocator **live** bytes are bounded in **every** phase —
+  **exactly constant** for decode (48.9 M ops) and publish (2.14 M ops), a fixed
+  **162,568 B** sawtooth for append (39,123 generations) — with RSS plateauing in
+  each and `physical_bytes` monotone and reopen-verified
+  ([`docs/ENDURANCE.md`](docs/ENDURANCE.md), `endurance.json` + `endurance-phases.json`).
 
 ### Remaining (honest)
 
@@ -1731,6 +1738,12 @@ hardening targets `fuzz_declared_lengths`, `fuzz_alloc_exhaustion`,
   per-value storage removes the block amplification that flattered machine 9. Its only
   edge is the small, self-contained per-value tail ([`docs/DB-INTEGRATION.md`](docs/DB-INTEGRATION.md),
   `kv-integration.json`).
+- **The endurance evidence is time-compressed, not a 7-day soak** (T1). The
+  phase-matrix runs are **45 s** and the append phase **recycles files**; live memory
+  is shown bounded in every phase, but a small residual RSS creep (**0.0–6.9 KB/s**,
+  allocator-arena retention, **not** live data) is not proven to asymptote, and
+  multi-day filesystem / writeback / thermal effects are not exercised
+  ([`docs/ENDURANCE.md`](docs/ENDURANCE.md) §5–§6).
 - **The central ledger covers the `FileBody` read path only, after open** (S1). It
   counts physical reads served by a `FileBody`; the separate surfaces (`HybridReader`,
   `Baseline`, FUSE, `mmap`, `HistoryStore`) and the input `reader::open` reads are
@@ -1795,6 +1808,7 @@ hardening targets `fuzz_declared_lengths`, `fuzz_alloc_exhaustion`,
 - `evidence/bench/hardening.json` — the hardened untrusted-input boundary (S4): **5** classes / **86** iterations, peak RSS **6.29 MiB**, every error typed and bounded, plus the AUTH rollback residual.
 - `evidence/bench/controller.json` — the online workload-adaptation controller (S5) vs a static plan / TinyLFU / LRU at equal allowances (warm p50 **70 ns** vs static **14,878 ns**; matches the caches; loses the cold epoch).
 - `evidence/bench/kv-integration.json` — the real embedded-`redb` KV integration (S8): machine 9 vs raw / LZ4 / `zstd-dict` footprint, point-get latency, write amplification and scan throughput.
+- `evidence/bench/endurance.json` + `endurance-phases.json` — the **machine-9 endurance soak**: a 120 s mixed read/write/append run plus a per-phase matrix (decode / publish / append), with an RSS trace, a counting-allocator live-byte leak test, the `physical_bytes` growth series and the 7-day projection with its caveat (live bytes bounded in every phase; publication churn exactly flat).
 - `tests/fixtures/` — 12 frozen v0.3.0/v0.4.0 `.ekb` reverse-compat fixtures + `expected.json` (whole-file BLAKE3) (Q1).
 
 Documentation map:
@@ -1850,6 +1864,7 @@ Documentation map:
 | [`docs/HARDENING.md`](docs/HARDENING.md) | The hardened untrusted-input boundary (S4): the threat matrix (input class → typed error → measured peak RSS/CPU), the AUTH downgrade/rollback analysis, mapped-file truncation, the five new fuzz targets, and the residual risks (peak RSS **6.29 MiB**). |
 | [`docs/CONTROLLER.md`](docs/CONTROLLER.md) | The online workload-adaptation controller (`src/controller.rs`, S5): the API, control-theory hygiene (budget/bg-I/O/hysteresis/determinism), and equal-budget comparisons vs a static plan / TinyLFU / LRU. |
 | [`docs/DB-INTEGRATION.md`](docs/DB-INTEGRATION.md) | EKBLOOM inside a real embedded KV engine (`redb`, S8): codec values stored and decoded through a real B-tree, with the honest DB-level verdict (machine 9 loses on every DB axis). |
+| [`docs/ENDURANCE.md`](docs/ENDURANCE.md) | The machine-9 endurance soak: a 120 s mixed run plus a per-phase matrix with a counting-allocator live-byte test and the RSS creep — live bytes bounded in every phase, publication churn exactly flat, and an honest measurement-hygiene finding. |
 | [`docs/MACHINES.md`](docs/MACHINES.md) | The machine catalogue (ids 1–9): exact transition/encoding math, complete resumable state, decode algorithm, size table and wins/loses per machine, plus a relationship map. |
 | [`docs/REFINEMENT.md`](docs/REFINEMENT.md) | Machine-spec ↔ implementation refinement for machines 1–9: abstract state/transition/observable, Rust mapping, transition invariants (site + discharging test/gate), complete resumable state, restart correctness, resource bounds, the reviewer-run obligation checklist (`scripts/run-refinement.sh`), the wire integrity primitives actually used, and the honest refinement gaps. |
 | [`docs/BUDGET-GUIDE.md`](docs/BUDGET-GUIDE.md) | The budget chooser guide (`choose_plan`): budget × workload decision table, how to pick machine / segment / restart `K` / block `B` / path `D` / tiles, and worked examples. |
