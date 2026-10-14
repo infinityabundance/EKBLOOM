@@ -34,6 +34,7 @@ pub mod bloom_key;
 pub mod bloom_path;
 pub mod bloom_region;
 pub mod checkpoint;
+pub mod controller;
 pub mod court;
 pub mod dictionary;
 pub mod engine;
@@ -86,7 +87,7 @@ pub use asyncpub::{append, detect_backend, publish, Backend};
 pub use baseline::{
     measure_baseline, measure_body, pinned_block_count, write_baselines_json, Baseline,
     BaselineKind, BaselinePoint, BaselineReport, Capabilities, HotBlockCache, PinnedHotCache,
-    DEFAULT_INDEX_BLOCK, DEFAULT_LRU_BLOCK,
+    TinyLfuCache, DEFAULT_INDEX_BLOCK, DEFAULT_LRU_BLOCK,
 };
 pub use batch::{
     accelerator_available, accelerator_device_present, AcceleratorBackend, Backend as BatchBackend,
@@ -102,6 +103,7 @@ pub use bloom_global::{Counterexample, GlobalBloom, GlobalCertification};
 pub use bloom_path::PathBloom;
 pub use bloom_region::{RegionCertification, RegionDescriptor};
 pub use checkpoint::CheckpointSet;
+pub use controller::{ControlAction, ControlConfig, Controller};
 pub use court::Workload as CourtWorkload;
 pub use court::{
     calibrate_clock_ghz, collect_config_manifest, collect_environment, default_working_sets,

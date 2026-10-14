@@ -416,6 +416,261 @@ pub fn pinned_block_count(hot_bytes: u64, block_bytes: u64, total_blocks: u64) -
     hot_bytes.div_ceil(block_bytes).clamp(1, total_blocks)
 }
 
+/// A tiny 4-bit Count-Min sketch with periodic aging, the frequency estimator that
+/// backs [`TinyLfuCache`]'s admission decision.
+#[derive(Debug)]
+struct CountMinSketch {
+    width: usize,
+    depth: usize,
+    counters: Vec<u8>,
+    samples: u64,
+    reset_at: u64,
+}
+
+impl CountMinSketch {
+    fn new(width: usize, depth: usize, reset_at: u64) -> CountMinSketch {
+        CountMinSketch {
+            width: width.max(1),
+            depth: depth.max(1),
+            counters: vec![0u8; width.max(1) * depth.max(1)],
+            samples: 0,
+            reset_at: reset_at.max(1),
+        }
+    }
+
+    /// Record one observation of `key`, halving every counter once the sample
+    /// budget is exhausted (the standard TinyLFU aging step).
+    fn increment(&mut self, key: u64) {
+        if self.samples >= self.reset_at {
+            self.age();
+        }
+        self.samples = self.samples.saturating_add(1);
+        for i in 0..self.depth {
+            let idx = i * self.width + self.hash(key, i);
+            if let Some(c) = self.counters.get_mut(idx) {
+                if *c < 15 {
+                    *c += 1;
+                }
+            }
+        }
+    }
+
+    /// The estimated frequency of `key` (the minimum over the sketch rows).
+    fn estimate(&self, key: u64) -> u64 {
+        let mut min = u64::MAX;
+        for i in 0..self.depth {
+            let idx = i * self.width + self.hash(key, i);
+            let v = self.counters.get(idx).copied().unwrap_or(0) as u64;
+            if v < min {
+                min = v;
+            }
+        }
+        if min == u64::MAX {
+            0
+        } else {
+            min
+        }
+    }
+
+    fn age(&mut self) {
+        for c in self.counters.iter_mut() {
+            *c >>= 1;
+        }
+        self.samples >>= 1;
+    }
+
+    fn hash(&self, key: u64, i: usize) -> usize {
+        let mut x = key.wrapping_add((i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        x ^= x >> 33;
+        (x as usize) % self.width
+    }
+}
+
+/// A compact **TinyLFU** admission cache over decoded fixed-size blocks.
+///
+/// This is the conventional *frequency-aware* admission policy the EKBLOOM online
+/// controller is compared against: an LRU list of resident decoded blocks plus a
+/// Count-Min-sketch frequency estimator. A resident block is a hit; on a miss the
+/// candidate block is decoded and admitted only when its estimated frequency is
+/// **higher than the LRU victim's** (or the cache has room), so a one-shot scan
+/// never displaces a genuinely hot block. The emitted workload is byte-exact and
+/// identical to [`HotBlockCache`]; only the replacement policy differs.
+#[derive(Debug)]
+pub struct TinyLfuCache {
+    block_bytes: u64,
+    capacity_bytes: u64,
+    max_blocks: usize,
+    resident: BTreeMap<u64, Vec<u8>>,
+    recency: Vec<u64>,
+    resident_bytes: u64,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+    admissions: u64,
+    rejections: u64,
+    sketch: CountMinSketch,
+    scratch: Option<Vec<u8>>,
+}
+
+impl TinyLfuCache {
+    /// A TinyLFU cache of `block_bytes`-sized decoded blocks bounded by
+    /// `capacity_bytes` of resident data.
+    pub fn new(block_bytes: u64, capacity_bytes: u64) -> TinyLfuCache {
+        let block_bytes = block_bytes.max(1);
+        let max_blocks = usize::try_from((capacity_bytes / block_bytes).max(1)).unwrap_or(1);
+        let reset_at = (max_blocks as u64).saturating_mul(10).max(1000);
+        TinyLfuCache {
+            block_bytes,
+            capacity_bytes,
+            max_blocks,
+            resident: BTreeMap::new(),
+            recency: Vec::new(),
+            resident_bytes: 0,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+            admissions: 0,
+            rejections: 0,
+            sketch: CountMinSketch::new(4096, 4, reset_at),
+            scratch: None,
+        }
+    }
+
+    /// The decoded block size this cache holds.
+    #[inline]
+    pub fn block_bytes(&self) -> u64 {
+        self.block_bytes
+    }
+
+    /// The resident-byte budget.
+    #[inline]
+    pub fn capacity_bytes(&self) -> u64 {
+        self.capacity_bytes
+    }
+
+    /// The bytes currently resident.
+    #[inline]
+    pub fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
+    }
+
+    /// Cache hits.
+    #[inline]
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    /// Cache misses (block decoded on demand).
+    #[inline]
+    pub fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    /// LRU evictions.
+    #[inline]
+    pub fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    /// Misses whose candidate was admitted.
+    #[inline]
+    pub fn admissions(&self) -> u64 {
+        self.admissions
+    }
+
+    /// Misses whose candidate was rejected by the frequency filter (served without
+    /// caching).
+    #[inline]
+    pub fn rejections(&self) -> u64 {
+        self.rejections
+    }
+
+    /// Hit fraction over the lookups seen (`0.0` when none).
+    #[inline]
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits.saturating_add(self.misses);
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
+
+    fn touch(&mut self, block: u64) {
+        if let Some(pos) = self.recency.iter().position(|&b| b == block) {
+            self.recency.remove(pos);
+        }
+        self.recency.push(block);
+    }
+
+    fn insert(&mut self, block: u64, data: Vec<u8>) {
+        match self.resident.remove(&block) {
+            Some(old) => self.resident_bytes = self.resident_bytes.saturating_sub(old.len() as u64),
+            None => {
+                if let Some(pos) = self.recency.iter().position(|&b| b == block) {
+                    self.recency.remove(pos);
+                }
+            }
+        }
+        self.resident_bytes = self.resident_bytes.saturating_add(data.len() as u64);
+        self.resident.insert(block, data);
+        self.touch(block);
+        while self.resident_bytes > self.capacity_bytes && self.resident.len() > 1 {
+            let Some(victim) = self.recency.first().copied() else {
+                break;
+            };
+            self.recency.remove(0);
+            if let Some(evicted) = self.resident.remove(&victim) {
+                self.resident_bytes = self.resident_bytes.saturating_sub(evicted.len() as u64);
+                self.evictions = self.evictions.saturating_add(1);
+            }
+        }
+    }
+
+    /// Whether the candidate `block` should be admitted: freely while the cache has
+    /// room, otherwise only when its estimated frequency beats the LRU victim's.
+    fn admit(&self, block: u64) -> bool {
+        if self.resident.len() < self.max_blocks {
+            return true;
+        }
+        match self.recency.first().copied() {
+            Some(victim) => self.sketch.estimate(block) > self.sketch.estimate(victim),
+            None => true,
+        }
+    }
+
+    /// Cache-on-read: record the access frequency, return the resident block on a
+    /// hit, else decode with `fill` and admit it when the frequency filter allows.
+    /// A rejected candidate is returned from a scratch slot without being retained.
+    pub fn get_or_load<F: FnOnce() -> Option<Vec<u8>>>(
+        &mut self,
+        block: u64,
+        fill: F,
+    ) -> Option<&[u8]> {
+        self.sketch.increment(block);
+        if self.resident.contains_key(&block) {
+            self.hits = self.hits.saturating_add(1);
+            self.touch(block);
+            return self.resident.get(&block).map(Vec::as_slice);
+        }
+        self.misses = self.misses.saturating_add(1);
+        let data = fill()?;
+        if self.admit(block) {
+            self.admissions = self.admissions.saturating_add(1);
+            self.insert(block, data);
+            self.resident.get(&block).map(Vec::as_slice)
+        } else {
+            self.rejections = self.rejections.saturating_add(1);
+            self.scratch = Some(data);
+            self.scratch.as_deref()
+        }
+    }
+}
+
 /// Mutable LRU-cache state (interior mutability so reads keep the `&self` API).
 #[derive(Debug, Default)]
 struct LruState {
