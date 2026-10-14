@@ -215,3 +215,27 @@ Changing the on-disk format therefore requires, in the same change:
 
 A pull request that changes the wire format without new frozen fixtures, or that
 edits an existing fixture, is a migration-policy violation.
+
+---
+
+## 7. Structure persistence (additive, no wire change)
+
+Every structure an `EkbloomBody` can manifest has a dedicated, versioned section
+kind (see [`CORE-LAYOUT.md`](CORE-LAYOUT.md) §6): the full history (2), checkpoint
+sets (3), each bloom kind (4–7), certificates (8), segmented history (11), tiles
+(12) and block indexes (13). The writer emits a section for **every** manifested
+structure on both the fresh-write ([`crate::writer::write_body`]) and incremental
+([`crate::writer::append_generation`]) paths, and the reader reconstructs each one
+back into the body on `open`. Adding a further manifested structure is therefore
+purely **additive**: it takes a fresh `SectionKind`, writes as a new generation,
+and leaves the header, the footer, the recovery model, and every existing section
+byte-identical. An unknown section kind is still rejected, so a reader that does
+not implement a new structure never silently ignores it.
+
+The round-trip contract — writer bytes `==` structure `to_bytes()` `==` the
+reader-parsed structure, with identical `physical_bytes()`, `byte_at` samples and
+`verify`/`verify_deep` verdict before-write versus after-reopen — is pinned by
+[`tests/persist_all.rs`](../tests/persist_all.rs) for every structure type on both
+machines 1 and 2, through the fresh and append paths, plus a MaxSpeed-style body and
+the frozen legacy fixtures. It changes **no stored byte** and adds **no new wire
+version**.

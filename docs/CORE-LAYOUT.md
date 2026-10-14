@@ -361,3 +361,43 @@ forward and selects the newest valid commit (matches on `generation`,
 - Core: unaligned length; padded to 8 before the first commit.
 - Each section: 40-byte header, payload, padded to 8.
 - Footer: 64 bytes, immediately after the last (8-aligned) section.
+
+---
+
+## 6. Manifested-structure persistence
+
+Every structure an in-memory `EkbloomBody` manifests is published as its own
+section (each with a 40-byte `SectionHeader` checksum and, in its payload, a
+`core_hash` binding it to the visible core). There is no structure that is
+manifested but not written, and no section the reader silently drops: a body
+written and then reopened is byte-for-byte equivalent, and `physical_bytes()`,
+`byte_at` and the `verify`/`verify_deep` verdict are identical before and after.
+
+The field-by-field mapping is:
+
+| `EkbloomBody` field | section kind (wire code) | payload |
+|---|---|---|
+| `core` | (the visible core, §2) | machine `encode(source)` |
+| `history: Option<History>` | `history-full` (2) | `History::to_bytes` |
+| `checkpoints: Vec<CheckpointSet>` | `checkpoints` (3) | `CheckpointSet::to_bytes` (each set one section) |
+| `blooms: Vec<BloomShell>` (`Universal`) | `bloom-global` (4) | `BloomShell::to_bytes` |
+| `blooms: Vec<BloomShell>` (`Contextual`) | `bloom-context` (5) | `BloomShell::to_bytes` |
+| `blooms: Vec<BloomShell>` (`Regional`) | `bloom-region` (6) | `BloomShell::to_bytes` (region table) |
+| `blooms: Vec<BloomShell>` (`Path`) | `bloom-path` (7) | `BloomShell::to_bytes` |
+| `certificates: Vec<Certificate>` | `certificate` (8) | `Certificate::to_bytes` |
+| `tiles: Vec<TileSet>` | `tiles` (12) | `TileSet::to_bytes` (each set one section) |
+| `blocks: Vec<BlockIndex>` | `blocks` (13) | `BlockIndex::to_bytes` (each index one section) |
+
+One structure is deliberately *not* a field of the in-memory `EkbloomBody`: the
+**streaming segmented history projection** (`history-segmented`, wire 11). It is
+written only by [`crate::writer::write_history_segmented`] and read back by
+[`crate::reader::FileBody`] (bounded `pread` of `segmented_state_at`); `open`
+validates and accounts for it (contributing one manifest component) but does not
+materialise it, because reconstructing a whole-object state projection from a
+bounded-memory store is the opposite of that structure's purpose.
+
+`verify`/`verify_deep` check every reopened structure: the history, every
+checkpoint restart, each bloom (including regional successor cursors), the
+tile sets (every materialised tile against a fresh authoritative decode), the
+block indexes (every restart against a fresh pass) and the certificate receipts.
+Round-trip equivalence is pinned by [`tests/persist_all.rs`](../tests/persist_all.rs).
