@@ -104,9 +104,10 @@ pub use bloom_region::{RegionCertification, RegionDescriptor};
 pub use checkpoint::CheckpointSet;
 pub use court::Workload as CourtWorkload;
 pub use court::{
-    calibrate_clock_ghz, collect_environment, default_working_sets, lcg_bytes, loop_overhead_ns,
-    spread_offsets, write_court_json, Candidate, Court, CourtConfig, CourtEnv, CourtReport, Dist,
-    ParetoPoint, Row,
+    calibrate_clock_ghz, collect_config_manifest, collect_environment, default_working_sets,
+    lcg_bytes, loop_overhead_ns, shuffle_order, spread_offsets, write_config_manifest_json,
+    write_court_json, Candidate, ConfigManifest, CorpusDescriptor, Court, CourtConfig, CourtEnv,
+    CourtReport, Dist, ParetoPoint, Row,
 };
 pub use dictionary::{
     lookup as lookup_dictionary, register as register_dictionary,

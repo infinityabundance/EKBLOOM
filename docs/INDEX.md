@@ -31,6 +31,7 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`HANDLES.md`](HANDLES.md) | **Persistent verified handles + RCU publication**, persisted (`TILES`) sections. |
 | [`IOURING.md`](IOURING.md) | The **`io_uring` hybrid batched read path** (`HybridReader`) plus the publication backend. |
 | [`COURT.md`](COURT.md) | The **rigorous performance court**: interleaved reps, bootstrap 95% CIs, 3-D Pareto frontier. |
+| [`BENCHMARKING.md`](BENCHMARKING.md) | The **benchmark methodology**: repeated interleaved trials, bootstrap 95% CIs, the configuration manifest, and the honest single-host limits. |
 | [`PLANNER.md`](PLANNER.md) | The **certified, search-free access planner** (`§14` three-role separation) plus the **workload-directed background planner** (`§4`). |
 | [`KERNELS.md`](KERNELS.md) | **SIMD reconstruction kernels** (directive §6): Kernel A/B, each kept or rejected with measured ratios. |
 | [`MMAP.md`](MMAP.md) | **Read-only mapped surface + huge pages** (`src/mapped.rs`): mmap KEEP, huge pages rejected. |
@@ -113,6 +114,8 @@ one-line description. Start with [`DESIGN.md`](DESIGN.md) for the frozen contrac
 | [`bench/rocksdb-skew.json`](../evidence/bench/rocksdb-skew.json) | **RocksDB-style skewed KV court**: 100-byte values, 80/20 key skew, `get` + 4 KiB `read_random` — footprint, bytes fetched per read (I/O amplification), hot/cold and p50/p99.9, vs raw / block LZ4 / seekable Zstd / Zstd-with-dictionary, and EKBLOOM's best plan + machine 9. |
 | [`bench/counters.json`](../evidence/bench/counters.json) | **Hardware counters** (`CAP_PERFMON`) for 1-byte and 4 KiB reads: instructions/byte, cycles/read, cache-miss rate, L1 misses/read. |
 | [`bench/concurrency.json`](../evidence/bench/concurrency.json) | **Concurrency p99**: 64 readers vs a publishing writer — p50/p99/p99.9 for byte_at and 4 KiB reads, quiet vs busy, and the shared-lock-per-read ratio. |
+| [`bench/multirun.json`](../evidence/bench/multirun.json) | **Repeated, interleaved multirun court**: full distributions (min/p25/p50/p75/p90/p99/p99.9/max, mean, stddev) with **bootstrap 95% CIs for p50/p99** for `byte_at`, bytes fetched, the cold gap, and the 1/2/4/8/16/32/64-reader concurrency tail-scaling. |
+| [`bench/config-manifest.json`](../evidence/bench/config-manifest.json) | The **full configuration manifest** behind `multirun.json`: CPU model + flags, kernel, container image id, cgroup/`--cpus`/`--memory` limits, governor, SMT, page size, RNG seeds, corpus hashes/sizes and the exact command lines. |
 | [`bench/bound.json`](../evidence/bench/bound.json) | **Worst-case bound verification**: 1,000,000 random positions (plus rANS and multi-path passes), `measured_steps ≤ worst_case_steps_for`, **zero** violations. |
 | [`counterexamples/bloom-key-0001.json`](../evidence/counterexamples/bloom-key-0001.json) | The rejected universal `T_4[x]` witness (key `175`, two equal-state/different-outcome positions). |
 | [`model-search/model-search-sweep.json`](../evidence/model-search/model-search-sweep.json) | The `D = 4` finite-model sufficiency sweep (`k = 0..4` conflicts `64/256/1024/4096/0`). |
@@ -140,6 +143,7 @@ sh scripts/run-packed.sh            # packed.json
 sh scripts/run-tiles.sh             # tiles.json
 sh scripts/run-handles.sh           # handles.json
 sh scripts/run-court.sh             # court.json + planner.json
+sh scripts/run-multirun.sh          # multirun.json + config-manifest.json (repeated interleaved trials, 95% CIs)
 sh scripts/run-kernels.sh           # kernels.json
 sh scripts/run-planner-bg.sh        # planner-bg.json
 sh scripts/run-mmap.sh              # mmap.json

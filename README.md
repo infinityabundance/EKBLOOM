@@ -1243,6 +1243,7 @@ sh scripts/run-packed.sh            # evidence/bench/packed.json (packed restart
 sh scripts/run-tiles.sh             # evidence/bench/tiles.json (selective hot tiles)
 sh scripts/run-handles.sh           # evidence/bench/handles.json (handles + RCU + persisted tiles)
 sh scripts/run-court.sh             # evidence/bench/{court,planner}.json (court + planner)
+sh scripts/run-multirun.sh          # evidence/bench/{multirun,config-manifest}.json (repeated interleaved trials + 95% CIs)
 sh scripts/run-kernels.sh           # evidence/bench/kernels.json (SIMD reconstruction kernels)
 sh scripts/run-planner-bg.sh        # evidence/bench/planner-bg.json (background planner)
 sh scripts/run-mmap.sh              # evidence/bench/mmap.json (mmap + huge pages)
@@ -1573,6 +1574,7 @@ Nightly-only harnesses (pinned separately): `scripts/container-fuzz.sh`
 - `evidence/bench/corpora.json` — the standard-corpora court (Silesia/enwik8/Calgary/text/ELF) at an equal budget (P6).
 - `evidence/bench/counters.json` — hardware counters: 39.14 instructions/byte, 8.1 cycles for a 1-byte read (P6).
 - `evidence/bench/concurrency.json` — 64 readers vs a publishing writer: 1.4e-3 locks/read, non-spiking tails (P6).
+- `evidence/bench/multirun.json` + `config-manifest.json` — **repeated, interleaved trials** with full distributions and **bootstrap 95% CIs** for p50/p99 (byte_at, bytes fetched, cold gap, 1/2/4/8/16/32/64-reader tail-scaling) and the **full configuration manifest** (CPU/kernel/image/cgroup/seeds/corpora/command lines). See [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md).
 - `evidence/bench/bound.json` — the worst-case step bound: 1,200,000 samples, **0** violations (P6).
 - `evidence/bench/rocksdb-skew.json` — the **RocksDB-style skewed KV court**: 100-byte values, 80/20 key skew, `get` + 4 KiB `read_random` — footprint, bytes fetched per read (I/O amplification), hot/cold and p50/p99.9, vs raw / block LZ4 / seekable Zstd / Zstd-with-dictionary, plus EKBLOOM's best plan and machine 9.
 - `evidence/counterexamples/` — rejected state-keyed blooms.
@@ -1609,6 +1611,7 @@ Documentation map:
 | [`docs/HANDLES.md`](docs/HANDLES.md) | Persistent verified handles + RCU publication, persisted tiles. |
 | [`docs/IOURING.md`](docs/IOURING.md) | The `io_uring` hybrid batched read path. |
 | [`docs/COURT.md`](docs/COURT.md) | The rigorous performance court (95% CIs, 3-D Pareto). |
+| [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) | Benchmark methodology: repeated interleaved trials, bootstrap 95% CIs, the configuration manifest, and the honest single-host limits. |
 | [`docs/PLANNER.md`](docs/PLANNER.md) | The certified, search-free access planner + workload-directed background planner. |
 | [`docs/KERNELS.md`](docs/KERNELS.md) | SIMD reconstruction kernels (§6): keep/reject per measured kernel. |
 | [`docs/MMAP.md`](docs/MMAP.md) | Read-only `mmap` surface + huge-page investigation (keep/reject). |

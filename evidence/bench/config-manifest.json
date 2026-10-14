@@ -1,0 +1,29 @@
+{
+  "generated_by": "examples/multirun.rs (sh scripts/run-multirun.sh)",
+  "cpu_model": "AMD Ryzen 7 9800X3D 8-Core Processor",
+  "cpu_flags": "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good amd_lbr_v2 nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpuid_fault cpb cat_l3 cdp_l3 hw_pstate ssbd mba perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local user_shstk avx_vnni avx512_bf16 clzero irperf xsaveerptr rdpru wbnoinvd cppc arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold avic v_vmsave_vmload vgif x2avic v_spec_ctrl vnmi avx512vbmi umip pku ospke avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid bus_lock_detect movdiri movdir64b overflow_recov succor smca fsrm avx512_vp2intersect flush_l1d amd_lbr_pmc_freeze",
+  "cpu_count": "8",
+  "kernel": "7.2.9-2-cachyos",
+  "page_size": "4096",
+  "governor": "performance",
+  "smt": "1",
+  "image_ref": "ekbloom-rust:1.99.0",
+  "image_id": "sha256:fad56f12288907e1fd8b61d0d0702388587d413f4519ecda4e79fa19e18be0b6",
+  "base_image": "rust:1.99.0-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa",
+  "dockerfile_sha256": "bee84e6a62bae3f348e91233f7f8957b1d1a9c9020fe27d058df91625a4727da",
+  "cgroup_cpu_max": "800000 100000",
+  "cgroup_memory_max": "6442450944",
+  "container_memory_limit": "6g",
+  "container_cpus_limit": "8",
+  "rng_seeds": [{"name": "multirun_seed", "value": "0xE8B1000000000001"}, {"name": "byte_offsets_seed", "value": "multirun_seed ^ 0x0FF5E700 / ^ 0xF11E0001 / ^ 0xF11E0002"}, {"name": "concurrency_seed", "value": "0xE8B10000C0C00000"}, {"name": "cargo_lock_blake3", "value": "899cdd017bf43e09b4a79fae2257c750766f7777c430c69be7489f0b373e05ef"}],
+  "corpora": [
+    {"name": "text", "kind": "text-like", "bytes": 1048576, "blake3": "fea09f22fa0512c97cbdb18600ba7e961038310e6332f9e0bd91c2c6cd733eeb", "seed": "measured-from-container"},
+    {"name": "elf", "kind": "elf-executable", "bytes": 1048576, "blake3": "2b4ce68bccbf000a9968f20a25d0b42af3effdb581063ee0634ce8301f288874", "seed": "measured-from-container"},
+    {"name": "synthetic-lcg", "kind": "file-backed-cold", "bytes": 4194304, "blake3": "bf243720579e5263998e5f04ce972d229663a651d4568ad2fef9ea4e91e6ae58", "seed": "0xE8B10000F11E4EAC"}
+  ],
+  "command_lines": [
+    "docker run --rm --memory=6g --memory-swap=6g --cpus=8 --pids-limit=4096 --ulimit core=0 --cap-drop=ALL --security-opt=no-new-privileges -v /mnt/1tb_kingston/EKBLOOM:/work -w /work -u 1000:1000 -e HOME=/tmp -e CARGO_HOME=/work/.cargo-home -e RUSTUP_HOME=/usr/local/rustup -e CARGO_TARGET_DIR=/work/target -e CARGO_TERM_COLOR=never -e RUSTUP_TOOLCHAIN=1.99.0 -e EKB_PAGE_SIZE=4096 ekbloom-rust:1.99.0 cargo run --release --example multirun",
+    "pinned: 0-7",
+    "in-container: taskset -c 0-7 cargo run --release --example multirun"
+  ]
+}
