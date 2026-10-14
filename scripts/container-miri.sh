@@ -13,10 +13,10 @@
 # to keep the runtime and memory footprint small while covering every machine and
 # codec:
 #
-#   * machines 1-8 and the decode paths -> the eight explicit machine-module
+#   * machines 1-9 and the decode paths -> the nine explicit machine-module
 #     prefixes (machine::, machine_pack::, machine_seg::, machine_store::,
-#     machine_rans::, machine_rans_i::, machine_rans_il::, machine_rans_w::) plus
-#     blocks:: (machine-1/2 decode);
+#     machine_rans::, machine_rans_i::, machine_rans_il::, machine_rans_w::,
+#     machine_dict::) plus blocks:: (machine-1/2 decode);
 #   * stream / checkpoint / bloom / resource unit tests.
 #
 # The prefixes are EXPLICIT module qualifiers, not the bare substring `machine`.
@@ -45,7 +45,7 @@ EKB_MEMSWAP_LIMIT="${EKB_MEMSWAP_LIMIT:-8g}"
 # libtest matches a test iff its name contains ANY of these substrings (OR).
 # Explicit module prefixes only (see above): no `async_io::`, `mapped::`, `simd::`,
 # and no filesystem/fuse clock-dependent test.
-MIRI_FILTER="${EKB_MIRI_FILTER:-machine:: machine_pack:: machine_seg:: machine_store:: machine_rans:: machine_rans_i:: machine_rans_il:: machine_rans_w:: blocks:: stream:: checkpoint:: bloom resource::}"
+MIRI_FILTER="${EKB_MIRI_FILTER:-machine:: machine_dict:: machine_pack:: machine_seg:: machine_store:: machine_rans:: machine_rans_i:: machine_rans_il:: machine_rans_w:: blocks:: stream:: checkpoint:: bloom resource::}"
 
 # Three unit tests have loop/allocation bounds that are Miri-infeasible (Miri is
 # an interpreter, ~100-1000x slower): they build/parse 100k-300k-byte streams or

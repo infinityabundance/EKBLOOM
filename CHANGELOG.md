@@ -15,7 +15,13 @@ is written to disk are marked **⚠ wire format** and their rules live in
 
 ### Added
 
-- Nothing yet.
+- **Miri coverage for machine 9 (`OrANS-DICT`), and a wider machine-9 unit-test
+  surface.** `scripts/container-miri.sh` now selects the `machine_dict::` unit
+  tests (frame layout, machine registration, the embedded and referenced/registry
+  paths, unregistered/truncated/tampered/out-of-range refusals, logical-length
+  mismatch, reveal/peek/skip and restart validation), so `cargo miri test` covers
+  **machines 1–9** — the documented Miri subset grows to **73** unit tests
+  (0 failed). No library, wire-format or public-API change (P4/T2).
 
 ## [0.7.1] - 2026-10-14
 

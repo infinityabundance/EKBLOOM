@@ -240,13 +240,14 @@ truncate/replace/unlink/over-read adversarially. Miri excludes `mapped::`
 `tests/mmap.rs::unsafe_is_confined_to_three_sanctioned_modules` (suite) both fail
 if any other module gains `unsafe`.
 
-*Miri* (`scripts/container-miri.sh`) covers the safe subset — machines 1–8
+*Miri* (`scripts/container-miri.sh`) covers the safe subset — machines 1–9
 (`machine::`, `machine_pack::`, `machine_seg::`, `machine_store::`,
-`machine_rans::`, `machine_rans_i::`, `machine_rans_il::`, `machine_rans_w::`),
-`blocks::` and the decode/stream/checkpoint/bloom/resource unit tests (61 tests,
-all pass) — and explicitly excludes these three modules via explicit module
-prefixes (a bare `machine` substring would also pull in clock-dependent
-`filesystem`/`fuse` tests that Miri's isolation rejects); see `docs/ALLOC.md` §5.
+`machine_rans::`, `machine_rans_i::`, `machine_rans_il::`, `machine_rans_w::`,
+`machine_dict::`), `blocks::` and the decode/stream/checkpoint/bloom/resource unit
+tests (73 tests, all pass) — and explicitly excludes these three modules via
+explicit module prefixes (a bare `machine` substring would also pull in
+clock-dependent `filesystem`/`fuse` tests that Miri's isolation rejects); see
+`docs/ALLOC.md` §5.
 
 ## 6. Reproduce
 

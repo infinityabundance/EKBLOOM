@@ -342,6 +342,33 @@ impl OrMachine for DictMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dictionary::{register, unregister};
+
+    /// A tiny deterministic corpus. Kept small on purpose: these tests are also run
+    /// under Miri, which is an interpreter (~100–1000× slower), so every input is a
+    /// few bytes and every loop is bounded.
+    const RECORDS: [&[u8]; 4] = [
+        b"abcabc",
+        b"user=alice|region=us-east-1",
+        b"zzzzzzzzzz",
+        b"ab",
+    ];
+
+    /// A dictionary trained from the shared corpus plus a test-unique salt, so every
+    /// test that touches the process-wide registry gets a *distinct* content id. The
+    /// registry is shared by the whole test process and tests run in parallel, so a
+    /// single shared id would let one test's `unregister` break another test's
+    /// `from_core` (or make its "unregistered" assertion race).
+    fn trained(salt: &[u8]) -> Dictionary {
+        let mut records: Vec<&[u8]> = RECORDS.to_vec();
+        records.push(salt);
+        dictionary::train_dictionary(&records).expect("train")
+    }
+
+    /// The little-endian `u32` embedded at `off` (the frame's `dict_len`).
+    fn u32_at(core: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes([core[off], core[off + 1], core[off + 2], core[off + 3]])
+    }
 
     #[test]
     fn frame_prefix_is_dict_id_plus_len() {
@@ -360,5 +387,174 @@ mod tests {
             &embedded[16..20],
             &(dict.to_bytes().len() as u32).to_le_bytes()
         );
+    }
+
+    #[test]
+    fn machine_is_registered_under_its_id() {
+        assert!(crate::machine::machine_by_id(MACHINE_DICT).is_some());
+    }
+
+    /// The self-contained path: `OrMachine::encode` trains a dictionary from the
+    /// source and embeds it, so decoding must not depend on the process-wide
+    /// registry at all.
+    #[test]
+    fn embedded_core_round_trips_without_the_registry() {
+        for src in RECORDS {
+            let core = DICT.encode(src).expect("encode");
+            let ctx = DictContext::from_core(&core).expect("context");
+            assert_eq!(ctx.logical_len(), src.len() as u64);
+            // Embedded: `dict_len > 0` and the embedded model validates by content id.
+            assert!(
+                u32_at(&core, 16) > 0,
+                "embedded frame carries the dictionary"
+            );
+            assert_eq!(DICT.decode(&core, src.len() as u64).expect("decode"), src);
+            assert!(DICT.check_core(&core, src.len() as u64).is_ok());
+        }
+    }
+
+    /// The referenced path: the core names a dictionary by id and the model is
+    /// resolved from the registry. An unregistered id is a typed error — a record is
+    /// never decoded against the wrong (or a missing) model.
+    #[test]
+    fn referenced_core_resolves_through_the_registry_or_is_refused() {
+        let dict = trained(b"referenced");
+        let src = RECORDS[1];
+        let core = frame_reference(&dict, &dict.encode(src).expect("encode"));
+        assert_eq!(u32_at(&core, 16), 0, "referenced frame embeds nothing");
+
+        unregister(&dict.id());
+        assert!(!dictionary::registered(&dict.id()));
+        assert!(matches!(
+            DictContext::from_core(&core),
+            Err(EkbloomError::BadSection { .. })
+        ));
+
+        register(&dict).expect("register");
+        let ctx = DictContext::from_core(&core).expect("context");
+        assert_eq!(ctx.dict_id(), dict.id());
+        assert_eq!(DICT.decode(&core, src.len() as u64).expect("decode"), src);
+        unregister(&dict.id());
+    }
+
+    /// A truncation must never panic; every prefix shorter than the fixed frame is
+    /// refused with a typed error.
+    #[test]
+    fn truncation_is_a_typed_error_and_never_panics() {
+        let dict = trained(b"truncation");
+        register(&dict).expect("register");
+        let core = frame_reference(&dict, &dict.encode(RECORDS[1]).expect("encode"));
+        for n in 0..core.len() {
+            // Must not panic for any prefix: it either parses (a longer prefix can
+            // still carry the header) or returns a typed error.
+            if let Ok(ctx) = DictContext::from_core(&core[..n]) {
+                // If it parsed, a decode is still bounded and never panics.
+                let _ = DICT.decode(&core[..n], ctx.logical_len());
+            }
+        }
+        for n in 0..DICT_FRAME_PREFIX_BYTES {
+            assert!(
+                DictContext::from_core(&core[..n]).is_err(),
+                "frame prefix {n} must be refused"
+            );
+        }
+        assert!(DictContext::from_core(&core).is_ok());
+        unregister(&dict.id());
+    }
+
+    /// A tampered embedded dictionary is refused: `from_bytes` recomputes the
+    /// content id, so a single flipped byte can no longer resolve.
+    #[test]
+    fn tampered_embedded_dictionary_is_refused() {
+        let core = DICT.encode(RECORDS[1]).expect("encode");
+        let dict_len = u32_at(&core, 16) as usize;
+        assert!(dict_len > 0);
+        let mut tampered = core.clone();
+        let at = DICT_FRAME_PREFIX_BYTES + dict_len / 2;
+        tampered[at] ^= 0x01;
+        assert!(
+            DictContext::from_core(&tampered).is_err(),
+            "a flipped dictionary byte must not resolve"
+        );
+    }
+
+    /// An out-of-range genesis state is a typed error, not a wrong byte.
+    #[test]
+    fn out_of_range_record_state_is_refused() {
+        let core = DICT.encode(RECORDS[1]).expect("encode");
+        let dict_len = u32_at(&core, 16) as usize;
+        let state_off = DICT_FRAME_PREFIX_BYTES + dict_len + 4;
+        let mut bad = core.clone();
+        bad[state_off..state_off + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(!valid_state(0));
+        assert!(matches!(
+            DictContext::from_core(&bad),
+            Err(EkbloomError::BadSection { .. })
+        ));
+    }
+
+    /// A declared logical length that disagrees with the core is refused.
+    #[test]
+    fn logical_len_mismatch_is_refused() {
+        let src = RECORDS[0];
+        let core = DICT.encode(src).expect("encode");
+        let ok = src.len() as u64;
+        assert_eq!(DICT.decode(&core, ok).expect("decode"), src);
+        assert!(matches!(
+            DICT.decode(&core, ok + 1),
+            Err(EkbloomError::BadSection { .. })
+        ));
+        assert!(DICT.check_core(&core, ok + 1).is_err());
+    }
+
+    /// Reveal / peek / skip all agree with the record, from genesis, for every
+    /// corpus entry and at a mid-record skip boundary.
+    #[test]
+    fn reveal_peek_and_skip_reproduce_the_record() {
+        let dict = trained(b"reveal-peek-skip");
+        register(&dict).expect("register");
+        for src in RECORDS {
+            let core = frame_reference(&dict, &dict.encode(src).expect("encode"));
+            let ctx = DictContext::from_core(&core).expect("context");
+
+            let mut omega = Snapshot::new(ctx.initial_state(), ctx.header_bytes());
+            let mut out = Vec::new();
+            ctx.decode_into(&core, &mut omega, ctx.logical_len(), &mut out)
+                .expect("decode_into");
+            assert_eq!(out, src);
+
+            if !src.is_empty() {
+                let mut omega = Snapshot::new(ctx.initial_state(), ctx.header_bytes());
+                let peeked = ctx.peek(&core, &omega).expect("peek");
+                let revealed = ctx.reveal(&core, &mut omega).expect("reveal");
+                assert_eq!(peeked, revealed);
+                assert_eq!(peeked, src[0]);
+            }
+
+            if src.len() >= 2 {
+                let n = src.len() / 2;
+                let mut omega = Snapshot::new(ctx.initial_state(), ctx.header_bytes());
+                ctx.skip(&core, &mut omega, n as u64).expect("skip");
+                let mut rest = Vec::new();
+                ctx.decode_into(&core, &mut omega, (src.len() - n) as u64, &mut rest)
+                    .expect("rest");
+                assert_eq!(rest, &src[n..]);
+            }
+        }
+        unregister(&dict.id());
+    }
+
+    /// Restart validation accepts the genesis snapshot and rejects an illegal state.
+    #[test]
+    fn restart_validation_is_bounded() {
+        let core = DICT.encode(RECORDS[1]).expect("encode");
+        let ctx = DictContext::from_core(&core).expect("context");
+        let genesis = Snapshot::new(ctx.initial_state(), ctx.header_bytes());
+        assert!(ctx.validate_restart(&genesis).is_ok());
+        let illegal = Snapshot::new(0, ctx.header_bytes());
+        assert!(matches!(
+            ctx.validate_restart(&illegal),
+            Err(EkbloomError::BadSection { .. })
+        ));
     }
 }

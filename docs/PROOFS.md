@@ -1925,7 +1925,7 @@ and a reader refuses any version it does not know, never guessing (P45); the
 and downstream-seekable (P46); **corruption detection is 100 %** and localized to
 ≤4096 B with a typed `Corrupt { section, offset }` (P47); the crate's `unsafe` is an
 audited, machine-enforced budget of **three** sanctioned modules with zero production
-`.unwrap()`/`panic!` and **61** Miri unit tests (P4, P47-adjacent); **machine 9**
+`.unwrap()`/`panic!` and **73** Miri unit tests (P4, P47-adjacent); **machine 9**
 decodes a small record only against its intended shared dictionary (**83.5 vs 590.0
 B/rec**) (P49); and **cross-architecture determinism** (x86_64 == arm64) and the
 machine-checked gates **G1–G5** hold, including the **1,200,000-sample worst-case
@@ -2117,12 +2117,12 @@ changed (P45–P50 unchanged).
     manifested body still catches it through the manifest `core_hash` linkage, and only
     the opt-in keyed-MAC `AUTH` closes it — the same *integrity ≠ authenticity* boundary
     as everywhere (P49; `docs/DICTIONARY.md`, `docs/reviews/security.md` Revision 9).
-24. **Miri covers the safe subset (machines 1–8), not the three `unsafe` modules or
-    machine 9.** The SIMD intrinsics, the `io_uring` syscalls and the `mmap`/`madvise`
-    surface are outside Miri's model, and the shared-dictionary machine is not in the
-    Miri filter; they are pinned instead by `tests/simd.rs`/`tests/unsafe_review.rs`/
-    `tests/mmap.rs`, the SAFE review and `tests/dictionary.rs` (P4; `docs/SAFETY.md`,
-    `docs/ALLOC.md`).
+24. **Miri covers the safe subset (machines 1–9); only the three `unsafe` modules
+    remain outside its model.** The SIMD intrinsics, the `io_uring` syscalls and the
+    `mmap`/`madvise` surface are outside Miri's model and are pinned instead by
+    `tests/simd.rs`/`tests/unsafe_review.rs`/`tests/mmap.rs` and the SAFE review; the
+    shared-dictionary machine 9 is now in the Miri filter (`machine_dict::`, **73**
+    unit tests) (P4/T2; `docs/SAFETY.md`, `docs/ALLOC.md`).
 25. **Loopback xfs/btrfs cross-filesystem determinism is untested.** P56 covers three
     filesystems (**overlayfs**, **tmpfs**, **ext2-ext3**); a loopback xfs/btrfs attempt
     is **blocked** in this environment (`mkfs.xfs`/`mkfs.btrfs` are not installed and

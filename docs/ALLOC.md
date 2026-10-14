@@ -135,14 +135,14 @@ subset, serialised (`--test-threads=1`), matching these explicit module prefixes
 `filesystem::…read_machine…` and `fuse::…machine_mode…` tests, which Miri's
 default isolation rejects at `SystemTime::now()`):
 
-* machines 1–8 and the decode paths — `machine::`, `machine_pack::`,
+* machines 1–9 and the decode paths — `machine::`, `machine_pack::`,
   `machine_seg::`, `machine_store::`, `machine_rans::`, `machine_rans_i::`,
-  `machine_rans_il::`, `machine_rans_w::`;
+  `machine_rans_il::`, `machine_rans_w::`, `machine_dict::`;
 * `blocks::` — the machine-1/2 block-decode unit tests;
 * `stream::`, `checkpoint::`, `bloom`, `resource::` — the stream/checkpoint/
   bloom/resource unit tests.
 
-This selects **61 unit tests**, all of which pass under Miri (0 failed).
+This selects **73 unit tests**, all of which pass under Miri (0 failed).
 
 The three sanctioned `unsafe` modules are **explicitly excluded**: `simd::`
 (Miri cannot execute the x86 intrinsics), `async_io::` (feature-gated ring

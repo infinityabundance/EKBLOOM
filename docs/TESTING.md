@@ -218,11 +218,12 @@ corpora and is the P6 evidence), so it is not re-run here.
 
 The `aarch64` job additionally runs the **bounded Miri subset** — the same test
 set `scripts/container-miri.sh` covers — natively on arm64 (`cargo test --release
---lib -- machine:: … resource::`). Sixty-five tests pass here; Miri additionally
-skips three Miri-infeasible tests, giving the documented 61. True Miri is a
-bytecode interpreter: executing it under QEMU emulation did not complete within a
-13-minute budget, so it is opt-in (`EKB_ARM64_MIRI=1`) and expected to be slow;
-true Miri remains an x86_64 guarantee (`sh scripts/container-miri.sh`).
+--lib -- machine:: machine_dict:: … resource::`). It runs that set with the same
+three Miri-infeasible tests skipped; the x86_64 Miri run reports **73** passed.
+True Miri is a bytecode interpreter: executing it under QEMU emulation did not
+complete within a 13-minute budget, so it is opt-in (`EKB_ARM64_MIRI=1`) and
+expected to be slow; true Miri remains an x86_64 guarantee
+(`sh scripts/container-miri.sh`).
 
 **Recorded matrix** (one run; exact values in `evidence/bench/ci-matrix.json`, and
 percentiles are run-to-run noisy):

@@ -246,7 +246,7 @@ manifest_version` matrix are in [`docs/MIGRATION.md`](docs/MIGRATION.md) §8.
 24. **`unsafe` is an audited budget (P4).** The crate is safe Rust except exactly
     **three** sanctioned modules (`src/simd.rs`, `src/async_io.rs`, `src/mapped.rs`);
     a gate (`scripts/check-safety.sh`) fails closed on a new module and the read path
-    has **0** production `.unwrap()`/`panic!`; Miri covers **61** unit tests
+    has **0** production `.unwrap()`/`panic!`; Miri covers **73** unit tests
     ([`docs/SAFETY.md`](docs/SAFETY.md), [`docs/ALLOC.md`](docs/ALLOC.md)).
 25. **Shared dictionaries for small records (P5).** Machine 9 (`OrANS-DICT`) factors a
     trained order-0 model out of the record: **83.5 B/record vs machine 2's 590.0**
@@ -1144,7 +1144,7 @@ sanctioned, independently-reviewed modules — `src/simd.rs` (AVX2/AVX-512 gathe
 kernels), `src/async_io.rs` (`io_uring` SQEs) and `src/mapped.rs` (read-only
 `mmap`/`madvise`/`munmap`) — each with a byte-identical safe fallback.
 `scripts/check-safety.sh` fails closed on a new module, the production read path has
-**0** `.unwrap()`/`panic!` (four audited infallible `.expect(`), and Miri covers **61**
+**0** `.unwrap()`/`panic!` (four audited infallible `.expect(`), and Miri covers **73**
 unit tests ([`docs/SAFETY.md`](docs/SAFETY.md), [`docs/ALLOC.md`](docs/ALLOC.md)).
 - **P5 — shared trained dictionaries (machine 9).** `OrANS-DICT` stores a 540-byte
 order-0 model once and references it per record (or embeds it), keeping machine 2's
@@ -1537,7 +1537,7 @@ hardening targets `fuzz_declared_lengths`, `fuzz_alloc_exhaustion`,
   `Corrupt { section, offset }` ([`docs/CORRUPTION.md`](docs/CORRUPTION.md)).
 - **`unsafe` and allocation are an audited, machine-enforced budget** (P4). Three
   sanctioned modules, a fail-closed gate, zero production `.unwrap()`/`panic!`, and
-  **61** Miri unit tests ([`docs/SAFETY.md`](docs/SAFETY.md), [`docs/ALLOC.md`](docs/ALLOC.md)).
+  **73** Miri unit tests ([`docs/SAFETY.md`](docs/SAFETY.md), [`docs/ALLOC.md`](docs/ALLOC.md)).
 - **Small records share one trained dictionary** (P5). Machine 9 gives **83.5
   B/record vs 590.0** and break-even at **2 records** ([`docs/DICTIONARY.md`](docs/DICTIONARY.md)).
 - **Cross-architecture determinism and machine-checked gates** (P8). x86_64 == arm64
@@ -1598,6 +1598,11 @@ hardening targets `fuzz_declared_lengths`, `fuzz_alloc_exhaustion`,
   **162,568 B** sawtooth for append (39,123 generations) — with RSS plateauing in
   each and `physical_bytes` monotone and reopen-verified
   ([`docs/ENDURANCE.md`](docs/ENDURANCE.md), `endurance.json` + `endurance-phases.json`).
+- **Miri now covers the shared-dictionary machine** (T2). `scripts/container-miri.sh`
+  selects `machine_dict::` alongside the other machines, so `cargo miri test` covers
+  **machines 1–9** (**73** unit tests, 0 failed); the only modules still outside
+  Miri's model are the three sanctioned `unsafe` ones
+  ([`docs/SAFETY.md`](docs/SAFETY.md), [`docs/ALLOC.md`](docs/ALLOC.md)).
 
 ### Remaining (honest)
 
@@ -1718,12 +1723,11 @@ hardening targets `fuzz_declared_lengths`, `fuzz_alloc_exhaustion`,
   `core_hash` linkage. Integrity ≠ authenticity — only `AUTH` closes it
   ([`docs/DICTIONARY.md`](docs/DICTIONARY.md), [`docs/reviews/security.md`](docs/reviews/security.md)
   Revision 9).
-- **Miri covers the safe subset (machines 1–8), not the three `unsafe` modules or
-  machine 9** (P4). The SIMD intrinsics, `io_uring` syscalls and `mmap` are outside
-  Miri's model and are covered instead by `tests/simd.rs`/`tests/unsafe_review.rs`/
-  `tests/mmap.rs` and the SAFE review; the shared-dictionary machine is pinned by
-  `tests/dictionary.rs`, not Miri ([`docs/SAFETY.md`](docs/SAFETY.md),
-  [`docs/ALLOC.md`](docs/ALLOC.md)).
+- **Miri covers the safe subset (machines 1–9); only the three `unsafe` modules
+  remain outside its model** (P4). The SIMD intrinsics, `io_uring` syscalls and
+  `mmap` are outside Miri's model and are covered instead by
+  `tests/simd.rs`/`tests/unsafe_review.rs`/`tests/mmap.rs` and the SAFE review
+  ([`docs/SAFETY.md`](docs/SAFETY.md), [`docs/ALLOC.md`](docs/ALLOC.md)).
 - **Loopback xfs/btrfs cross-filesystem determinism is untested** (R2). The cross-FS
   check covers **overlayfs / tmpfs / ext2-ext3**; a loopback xfs/btrfs attempt is
   **blocked** in this environment (`mkfs.xfs`/`mkfs.btrfs` are not installed and
