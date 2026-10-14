@@ -11,7 +11,42 @@ RUST_BASE_IMAGE="rust:1.99.0-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841
 # local image id is recorded at build time in evidence/environment.txt.
 IMAGE="ekbloom-rust:1.99.0"
 
-PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# Resolve the project root robustly. The scripts are normally run as files
+# (`sh scripts/x.sh`) or sourced *from* such a script, so `$0` names a file under
+# the repository and its directory is the anchor. When `lib.sh` is instead sourced
+# from an interactive shell, `$0` is the shell itself (`sh`, `bash`, ...), whose
+# dirname is `.` or `/`; anchoring on that resolves the wrong root and would try to
+# create `//.cargo-home`. In that case fall back to a current directory that
+# actually contains `scripts/lib.sh`, and fail loudly if there is no anchor at all.
+resolve_project_dir() {
+    if [ -n "${0:-}" ]; then
+        _ekb_anchor="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || _ekb_anchor=""
+        if [ -n "$_ekb_anchor" ] && [ -f "$_ekb_anchor/lib.sh" ]; then
+            (cd "$_ekb_anchor/.." && pwd)
+            return 0
+        fi
+    fi
+    if [ -f "./scripts/lib.sh" ]; then
+        pwd
+        return 0
+    fi
+    # Walk up from the current directory, so sourcing `lib.sh` from a
+    # subdirectory still anchors on the repository root.
+    _ekb_dir="$(pwd)"
+    while [ "$_ekb_dir" != "/" ] && [ -n "$_ekb_dir" ]; do
+        if [ -f "$_ekb_dir/scripts/lib.sh" ]; then
+            printf '%s\n' "$_ekb_dir"
+            return 0
+        fi
+        _ekb_dir="$(dirname "$_ekb_dir")"
+    done
+    return 1
+}
+
+PROJECT_DIR="$(resolve_project_dir)" || {
+    echo "ekbloom: cannot locate the project root; run the scripts from the repository root." >&2
+    exit 1
+}
 
 # OOM protection: cap memory (and swap) so a runaway allocation cannot exhaust
 # the host. 8 GiB is comfortably above peak for the full harness while bounded.
