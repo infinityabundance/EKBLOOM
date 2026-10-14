@@ -106,10 +106,25 @@ docker run --rm \
             done
         fi
 
+        # The adversarial-hardening targets have no committed corpus of their own;
+        # they reuse the closest structured corpus as seeds so the campaign starts
+        # on the parse/verify paths from the first execution.
+        seed_from() {
+            SRC=/work/evidence/fuzz/"$2"
+            [ -d "$SRC" ] || return 0
+            mkdir -p "corpus/$1"
+            cp "$SRC"/*.bin "corpus/$1/" 2>/dev/null || true
+        }
+        seed_from fuzz_declared_lengths fuzz_open
+        seed_from fuzz_alloc_exhaustion fuzz_open
+        seed_from fuzz_dict_substitution fuzz_dictionary
+        seed_from fuzz_auth_downgrade fuzz_open_auth
+        seed_from fuzz_mapped_truncate fuzz_open
+
         failed=0
         # Every target declared in fuzz/Cargo.toml. Keep this list in sync with
         # that manifest so the campaign covers the whole fuzz surface.
-        for TARGET in fuzz_machine fuzz_open fuzz_bloom fuzz_history_store fuzz_packed fuzz_tiles fuzz_blocks fuzz_batch fuzz_rans_i fuzz_region fuzz_pack fuzz_seg fuzz_resource fuzz_rans_w fuzz_rans_il fuzz_roundtrip fuzz_stream fuzz_open_auth fuzz_dictionary; do
+        for TARGET in fuzz_machine fuzz_open fuzz_bloom fuzz_history_store fuzz_packed fuzz_tiles fuzz_blocks fuzz_batch fuzz_rans_i fuzz_region fuzz_pack fuzz_seg fuzz_resource fuzz_rans_w fuzz_rans_il fuzz_roundtrip fuzz_stream fuzz_open_auth fuzz_dictionary fuzz_declared_lengths fuzz_alloc_exhaustion fuzz_dict_substitution fuzz_auth_downgrade fuzz_mapped_truncate; do
             start=$(date +%s)
             echo "ekbloom-fuzz: running $TARGET"
             if cargo fuzz run "$TARGET" -- -runs="$EKB_FUZZ_RUNS" -max_total_time="$EKB_FUZZ_SECS"; then

@@ -147,3 +147,38 @@ path = "fuzz_targets/fuzz_dictionary.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_declared_lengths"
+path = "fuzz_targets/fuzz_declared_lengths.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_alloc_exhaustion"
+path = "fuzz_targets/fuzz_alloc_exhaustion.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_dict_substitution"
+path = "fuzz_targets/fuzz_dict_substitution.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_auth_downgrade"
+path = "fuzz_targets/fuzz_auth_downgrade.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_mapped_truncate"
+path = "fuzz_targets/fuzz_mapped_truncate.rs"
+test = false
+doc = false
+bench = false

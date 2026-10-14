@@ -1,0 +1,88 @@
+{
+  "generated_by": "examples/hardening.rs (sh scripts/run-hardening.sh)",
+  "model": "for each adversarial input class, the worst-case peak RSS and wall-clock the opener/reader consumes before returning a typed error",
+  "policy_default_max_single_allocation": 1073741824,
+  "container_memory_limit": "4g",
+  "classes": [
+    {
+  "class": "declared_lengths",
+  "iterations": 11,
+  "input_bytes": 73083,
+  "peak_rss_bytes": 2174976,
+  "max_wall_ns": 1803,
+  "total_wall_ns": 8116,
+  "typed_errors_only": true,
+  "bounded": true,
+  "peak_within_policy": true,
+  "policy_bytes": 1073741824,
+  "observed": { "BadMagic": 10, "BadSection(block_index_magic_mismatch)": 5, "BadSection(dictionary_frequencies_sum_to_0__expecte)": 1, "BadSection(dictionary_record_has_trailing_bytes)": 4, "BadSection(history_count_0_inconsistent_with_logica)": 2, "BadSection(tile_set_magic_mismatch)": 6, "BadSection(unknown_or_unregistered_dictionary_id_00)": 1, "BadSection(unknown_or_unregistered_dictionary_id_45)": 3, "Overflow(block index count)": 1, "Overflow(checkpoint byte length)": 1, "Overflow(core extent)": 2, "Overflow(history byte length)": 4, "Overflow(section payload extent)": 1, "Truncated": 38, "unsupported_checkpoint_interval_0": 1, "unsupported_checkpoint_interval_11451953": 1, "unsupported_checkpoint_interval_12626358": 1, "unsupported_checkpoint_interval_12794130": 2, "unsupported_checkpoint_interval_22269292": 1, "unsupported_checkpoint_interval_36616125": 1, "unsupported_checkpoint_interval_37452194": 1 },
+  "detail": {  }
+},
+    {
+  "class": "alloc_exhaustion",
+  "iterations": 64,
+  "input_bytes": 704,
+  "peak_rss_bytes": 2064384,
+  "max_wall_ns": 1904,
+  "total_wall_ns": 27593,
+  "typed_errors_only": true,
+  "bounded": true,
+  "peak_within_policy": true,
+  "policy_bytes": 1073741824,
+  "observed": { "AllocationTooLarge": 320, "Truncated": 64 },
+  "detail": { "ceiling_bytes": "1073741824", "ceiling_inclusive": "true", "declared_u64_max_refused": "true", "one_past_refused": "true" }
+},
+    {
+  "class": "dictionary_substitution",
+  "iterations": 4,
+  "input_bytes": 1194,
+  "peak_rss_bytes": 2134016,
+  "max_wall_ns": 3777,
+  "total_wall_ns": 13625,
+  "typed_errors_only": true,
+  "bounded": true,
+  "peak_within_policy": true,
+  "policy_bytes": 1073741824,
+  "observed": { "BadMagic": 1, "BadSection(embedded_dictionary_id_does_not_match_th)": 2, "BadSection(unknown_or_unregistered_dictionary_id_22)": 2, "BadSection(unknown_or_unregistered_dictionary_id_45)": 2, "CorruptGeneration(core_hash_mismatch)": 1, "Truncated": 4 },
+  "detail": { "forged_id": "typed_reject", "oversized_dict": "typed_reject", "record_mismatch": "typed_reject", "relabelled": "typed_reject" }
+},
+    {
+  "class": "auth_downgrade",
+  "iterations": 5,
+  "input_bytes": 7424,
+  "peak_rss_bytes": 6590464,
+  "max_wall_ns": 93916,
+  "total_wall_ns": 96620,
+  "typed_errors_only": true,
+  "bounded": true,
+  "peak_within_policy": true,
+  "policy_bytes": 1073741824,
+  "observed": { "BadSection(commit_footer_marker_missing)": 1, "ChecksumMismatch(auth)": 1, "CorruptGeneration(authenticated_open_requires_an_AUTH_sect)": 2 },
+  "detail": { "flip_auth": "rejected", "newest_generation": "2", "rollback_accepted": "true", "rollback_older_generation": "accepted_residual_risk", "strip_auth": "rejected", "unkeyed_file_rejected_in_strict_mode": "rejected", "unkeyed_open_ignores_auth": "true", "wrong_key": "rejected" }
+},
+    {
+  "class": "mapped_truncation",
+  "iterations": 2,
+  "input_bytes": 6144,
+  "peak_rss_bytes": 2125824,
+  "max_wall_ns": 1683,
+  "total_wall_ns": 3826,
+  "typed_errors_only": true,
+  "bounded": true,
+  "peak_within_policy": true,
+  "policy_bytes": 1073741824,
+  "observed": { "InvalidArgument": 1, "Io": 1, "OutOfBounds": 1 },
+  "detail": { "active_reader_typed": "true", "mapped_retained_read_exact": "true", "untouched_bytes": "2196", "zero_length_rejected": "true" }
+}
+  ],
+  "summary": {
+    "all_typed_errors": true,
+    "all_bounded": true,
+    "max_peak_rss_bytes": 6590464,
+    "max_wall_ns": 93916,
+    "total_iterations": 86,
+    "peak_within_policy": true
+  },
+  "failed_classes": [],
+  "residual_risks": ["AUTH rollback/replay is not detected (no freshness): an older, genuinely authenticated generation authenticates under the same key", "MappedSurface requires an immutable backing file; reading past a live mapping whose file shrank is the caller's responsibility and is never used on the untrusted parser path"]
+}
