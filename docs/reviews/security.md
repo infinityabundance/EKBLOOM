@@ -1138,4 +1138,120 @@ override is fuzzed through the public trait. (fuzz-only edit; campaign re-run gr
   * The harness injects **truncation-style** crash images; an `fsync` that fails *after a full write* (correct length, possibly partial durability) is unmodellable and is covered instead by the corruption court and `crash_recovery.rs`. A completed-but-unflushed append can leave a wholly valid new generation while the writer returned an error — never torn.
   * `file_blake3` is a manifest value, not embedded in the `.ekb`: a regeneration that also edits `expected.json` still passes, which is a deliberate manifest edit carrying the same trust as the fixtures.
   * The `cpu_features()` observation above (now **fixed** in the follow-up commit).
- 
+
+## Revision 11 — S1–S8: central I/O accounting, persistence, multirun honesty, hardening, controller, refinement, KV integration (verdict **NO LIBRARY DEFECT FOUND; all claims held**)
+
+Independent re-run in the pinned, memory-capped container (every `docker run`
+`--memory=4g --memory-swap=4g`, except the scripts that cap at 6/8 GiB themselves):
+`container-verify.sh` **847 passed / 0 failed** (safety gate OK, fmt + clippy
+`-D warnings` clean); `container-reproduce.sh` clean `--locked --release` build +
+**833 passed / 0 failed** + **58** evidence JSON validated; `container-fuzz.sh`
+**24/24** targets PASS; `run-hardening.sh` **5 classes / 86 iterations,
+`max_peak_rss=6.38 MiB`, `all_typed=true`, `all_bounded=true`**;
+`run-refinement.sh` **O1–O16 all PASS**. No library defect found; no fix required.
+
+### S1 I/O accounting — **held; no uncounted read path in `FileBody`**
+
+Every physical read on the `FileBody` read path now funnels through the one
+`ReadLedger` via `LoggedFile`: tiles (`FileTiles::read_range` → `Payload`), bounded
+encoded windows and whole-core fallbacks (`counted_core_window` → `Encoded`),
+restart/section/directory records (`counted_pread` → `Metadata`), path-bloom hot
+slices, history state arrays and the machine-2/4 model header load
+(`build_prepared` → `Dictionary`). I traced all five `read_into` branches
+(tiles/path/blocks/checkpoint/history/machine) and the segmented-history
+`state_at`; each charges the ledger. The residual (documented, not a defect):
+**open-time parse/hash reads are not counted** (`scan_file`, `parse_tiles/blocks/
+segmented/bloom/checkpoint/history`, footer/`read_committed_generation`), and the
+separate surfaces (`HybridReader`, `Baseline`, FUSE `BackingSurface::read`, mmap,
+`HistoryStore`) are outside the `FileBody` ledger — consistent with
+`fetched_bytes`'s doc and the `ioacct.rs` module doc. `tests/ioacct.rs` (6 tests)
+pins each class and cross-checks `/proc/self/io` (`syscr`/`rchar` ≥ ledger within
+slack); a deliberately uncharged raw `pread` is shown to leave the ledger at zero
+while `syscr` rises. **(held)**
+
+### S2/S8 persistence — **held**
+
+`tests/persist_all.rs::roundtrip` writes, reopens, and asserts the reconstructed
+body is `==` the pre-write body (history, every checkpoint, all four bloom kinds,
+certificate, tiles, blocks), `physical_bytes()` identical, `byte_at` byte-exact at
+sampled positions through both the in-memory and file-backed readers, and
+`verify`/`verify_deep` pass — for machine 1 and the cursor-divergent machine 2,
+plus each structure individually and the append path. `assert_*_section_payloads`
+require the writer's section payloads to equal each structure's own `to_bytes()`
+and forbid a dropped/extra section. **(held)**
+
+### S3 multirun honesty — **held**
+
+`Cfg::from_env` clamps `reps ∈ [3,31]` (default 15), so a single run cannot
+masquerade as a distribution: the evidence records `samples = reps × byte_samples`
+(3840 for the first row), per-rep interleaving via the seeded
+`shuffle_order(seed ^ …)`, and a deterministic seeded bootstrap CI
+(`Dist::from_samples` → `bootstrap_ci`, same `seed`). `Court`'s
+`bootstrap_ci_is_deterministic_and_sane` / `shuffle_order_is_a_seeded_permutation`
+confirm both. `config-manifest.json` records image id/digest, Dockerfile sha,
+cgroup caps, command lines, corpora hashes and all RNG seeds. **(held)**
+
+### S4 hardening — **held; bounded memory and typed errors confirmed**
+
+Five new fuzz targets (declared lengths, alloc exhaustion, dict substitution, auth
+downgrade, mapped truncation) all PASS, incl. an in-target assertion that strict
+mode rejects any image with no `AUTH` and that `checked_default(cap+1)` is
+`AllocationTooLarge`. `run-hardening.sh` drives the five classes against the real
+1 GiB policy: peak RSS **6.38 MiB**, every error typed, no OOM/panic; forged
+machine-5/6 `u64::MAX` cores, oversized `dict_len`, relabelled embedded
+dictionaries and record mismatches are all typed rejects. I could not exceed the
+allocation policy or trigger a panic. **(held)**
+
+### S5 controller — **held; no declared-constraint violation found**
+
+`tests/controller.rs` (8 tests) pins additive/non-withdrawal (earlier tile bytes
+byte-identical, core hash unchanged, `verify_deep` green), the memory budget
+(`physical_bytes() ≤ memory_budget` every epoch), the background-I/O cap (a full
+8 KiB bucket admits exactly one tile), both hysteresis guards (dwell at epoch 5
+for `hysteresis=4`; the `1+hyst` band blocks a marginal shift), determinism
+(identical config+observations ⇒ identical actions) and exact SLO accounting. The
+`step` decision never consults the wall clock, and the pre-filter is conservative
+(`tile_size + TILE_IO_RESERVE`, actual ≤ reserve) with the runtime budget check
+authoritative in `manifest_hot_tiles`. **(held)**
+
+### S6 refinement — **held; obligations discharge the cited checks**
+
+Spot-checked §2 rANS (`valid_state` keeps `x ∈ [RANS_L, RANS_L<<8)`; `step_cap =
+len·4096 + 2^20`), §4 machine-4 complete state (`snapshot_needs_lanes() == true`,
+`WIDE_LEN = 45`, wide successor stored; `machine4_zeroing_lanes_would_produce_wrong_bytes`
+demonstrates the compact form is lossy), §10 `estimate ≥ actual`
+(`tests/budget.rs::estimate_never_underestimates_actual_physical_bytes`) and §13
+the honest gaps (un-wired `2(s+p)+64` for machines 7/8/9, sampled `worst_case_steps`).
+`run-refinement.sh` maps every row O1–O16 to its named test/gate and all PASS. **(held)**
+
+### S7 versioning/docs — **held (one low doc inconsistency, reported)**
+
+`MIGRATION.md` §2/§5/§8 agree that this build reads `format 0.0–0.3` ×
+`core_version {0,1}` × `manifest 1` = machines 1–9, and §8.2's per-release table is
+self-consistent. **Observation (low, not fixed — outside library scope):** §5's
+wire-line row reads `0.3 | machines 1–8` while §8.2 splits 0.3.0 (machines 1–4)
+from 0.4.0 (1–8); the §5 row conflates the two releases on the same wire line. Not
+an S7 regression (pre-existing) and never a wire claim.
+
+### S8 KV integration — **held; verdict supported by the JSON**
+
+`tests/kv_integration.rs` (4 tests) stores codec outputs as redb values, reopens
+from disk and asserts byte-exact point gets + full scan for every codec, that the
+shared dictionary is stored once, present in the metadata table and counted in the
+footprint, and that write amplification / footprint are measured (`> 0`) rather
+than assumed. `evidence/bench/kv-integration.json` carries the measured rows
+(`ekbloom-m9` 3,891,200 B / 0.973× raw / wamp 1.94× / warm p50 1072 ns / p99.9
+2574 ns / scan 97 MiB/s vs `zstd-dict` 0.525× / 231 ns / 595 MiB/s) and a `verdict`
+string explicitly stating machine 9 does **not** beat `zstd-dict` or LZ4 in a real
+B-tree store; the doc table matches the JSON field-for-field. No fabricated DB
+metrics. **(held)**
+
+### Residual risk (Revision 11)
+
+* The `FileBody` ledger bounds read-path I/O **after** open; open-time parse/hash
+  and the other read surfaces (`HybridReader`, `Baseline`, FUSE region, mmap,
+  `HistoryStore`) are not charged. A future whole-system I/O claim must not
+  attribute those to `fetched_bytes`.
+* Machine-9's redb numbers are host-dependent in absolute terms (the doc says so);
+  only the ordering/footprint ratios are portable.
+* `MIGRATION.md` §5 vs §8.2 machine-range wording (above) should be reconciled.

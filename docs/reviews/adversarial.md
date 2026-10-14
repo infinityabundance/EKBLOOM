@@ -822,4 +822,45 @@ now called for machines 1–9. (fuzz-only edit.)
   artifact does; it never changes a byte). **(Addressed in the follow-up commit:**
   `cpu_features()` now reports the **effective** (scalar-aware) capability — clearing
   the SIMD fields and setting `forced_scalar` under forced scalar — with
-  `hardware_features()` kept for the raw facts (`cpu_features_reports_no_simd_under_forced_scalar`).)**
+  `hardware_features()` kept for the raw facts (`cpu_features_reports_no_simd_under_forced_scalar`).**
+
+## Revision 11 — S1–S8 (verdict **NO LIBRARY DEFECT FOUND; all attacks held**)
+
+Independent adversarial re-run in the pinned container (4 GiB caps): verify
+**847/0**, release **833/0** + **58** evidence JSON, fuzz **24/24**, hardening
+**5 classes / 86 iters max 6.38 MiB, all typed+bounded**, refinement **O1–O16
+PASS**. No library defect; nothing to fix.
+
+### Attacks tried
+
+* **S1 under-count hunt** — traced every `FileBody` read branch and the segmented
+  `state_at`; all charge the one `ReadLedger` (tiles `Payload`, windows `Encoded`,
+  restarts/directories/history states `Metadata`, model header `Dictionary`). The
+  `/proc/self/io` agreement test and its bypass probe show the ledger cannot be
+  silently outpaced by a `FileBody` read. Cannot make it under-count. **(held)**
+* **S2 reopen equivalence** — every structure byte-exact through write→reopen→
+  verify on machines 1/2, individually and via the append path; section payloads
+  == `to_bytes()`; no silent drop. **(held)**
+* **S3 distribution masquerade** — `reps ≥ 3` clamped, pooled samples reported,
+  interleaving seed-recorded, bootstrap CI deterministic; a single run cannot
+  pass as a distribution. **(held)**
+* **S4 adversarial classes** — malformed lengths, alloc exhaustion, dict
+  substitution, auth downgrade, mapped truncation: typed errors, bounded RSS
+  (6.38 MiB), no panic, strict mode rejects no-AUTH. **(held)**
+* **S5 controller constraint violation** — additive-only, budget/bg-I/O honoured,
+  dual hysteresis, deterministic; the pre-filter is conservative and the runtime
+  budget is authoritative. Cannot violate a declared constraint. **(held)**
+* **S6 obligation spot-check** — rANS state range, machine-4 wide state,
+  `estimate ≥ actual`, honest §13 gaps all match code/tests; runner all PASS. **(held)**
+* **S8 KV honesty** — values byte-exact in redb; dictionary in the metadata table
+  and in the footprint; the "machine 9 loses" `verdict` string matches the
+  measured JSON. **(held)**
+
+### Residual risk (Revision 11)
+
+* The central ledger covers `FileBody` read-path I/O only; open-time parse/hash
+  and the other read surfaces (HybridReader/Baseline/FUSE/mmap/HistoryStore) are
+  outside it — a real boundary, now explicit in the module doc.
+* `MIGRATION.md` §5's wire-line row (`0.3 → machines 1–8`) reads ambiguously
+  against §8.2's per-release split (0.3.0 = 1–4, 0.4.0 = 1–8); wording only, no
+  wire claim changes.
