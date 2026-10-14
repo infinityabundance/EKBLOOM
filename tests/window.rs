@@ -124,14 +124,14 @@ fn windowed_block_reads_are_exact_and_bounded_for_machine2() {
         let reference = open(&path).unwrap();
         let body = FileBody::open(&path).unwrap();
         for &(off, len) in &probes(n, b) {
-            let before = body.fetched_bytes();
+            let before = body.fetched_encoded_bytes();
             let got = body
                 .read(ReadRequest {
                     offset: off,
                     length: len,
                 })
                 .unwrap();
-            let fetched = body.fetched_bytes() - before;
+            let fetched = body.fetched_encoded_bytes() - before;
             assert_eq!(
                 got,
                 &src[off as usize..(off + len) as usize],
@@ -179,14 +179,14 @@ fn windowed_block_reads_are_exact_and_bounded_for_machine4() {
         let reference = open(&path).unwrap();
         let body = FileBody::open(&path).unwrap();
         for &(off, len) in &probes(n, b) {
-            let before = body.fetched_bytes();
+            let before = body.fetched_encoded_bytes();
             let got = body
                 .read(ReadRequest {
                     offset: off,
                     length: len,
                 })
                 .unwrap();
-            let fetched = body.fetched_bytes() - before;
+            let fetched = body.fetched_encoded_bytes() - before;
             assert_eq!(
                 got,
                 &src[off as usize..(off + len) as usize],
@@ -270,14 +270,14 @@ fn windowed_checkpoint_reads_are_exact_and_bounded() {
         let file_body = FileBody::open(&path).unwrap();
 
         for &(off, len) in &probes(n, 256) {
-            let before = file_body.fetched_bytes();
+            let before = file_body.fetched_encoded_bytes();
             let got = file_body
                 .read(ReadRequest {
                     offset: off,
                     length: len,
                 })
                 .unwrap();
-            let fetched = file_body.fetched_bytes() - before;
+            let fetched = file_body.fetched_encoded_bytes() - before;
             assert_eq!(
                 got,
                 &src[off as usize..(off + len) as usize],

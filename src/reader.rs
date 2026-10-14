@@ -22,6 +22,7 @@ use crate::checkpoint::{parse_checkpoint_layout, CheckpointSet, CKPT_HEADER_MAX}
 use crate::error::{EkbloomError, Result};
 use crate::format::{self, SectionKind};
 use crate::history::History;
+use crate::ioacct::{LoggedFile, ReadClass, ReadLedger};
 use crate::machine::{
     machine_by_id, prepare, OrMachine, Prepared, MACHINE_NL2, MACHINE_RANS0, MACHINE_RANS0I,
     MACHINE_STORE,
@@ -36,7 +37,6 @@ use crate::ReadRequest;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Read the logical bytes `req.offset .. req.offset + req.length`.
 ///
@@ -608,6 +608,7 @@ fn build_prepared(
     core_offset: u64,
     core_len: u64,
     total: u64,
+    ledger: &ReadLedger,
 ) -> Result<Option<Prepared<'static>>> {
     let header_bound = match machine.machine_id() {
         MACHINE_RANS0 => crate::machine_rans::HEADER_BYTES as u64,
@@ -615,7 +616,10 @@ fn build_prepared(
         _ => return Ok(None),
     };
     let n = core_len.min(header_bound);
-    let header = read_vec_at(file, core_offset, n, total)?;
+    // The model header is the decoder's dictionary: it is a physical read charged
+    // to the central ledger like every other read path.
+    let header =
+        LoggedFile::new(file, total, ledger).read_vec_at(core_offset, n, ReadClass::Dictionary)?;
     Ok(Some(prepare(machine, &header)?))
 }
 
@@ -707,8 +711,6 @@ struct FileTiles {
     data_offset: u64,
     /// Length of the tile blob.
     data_len: u64,
-    /// File length, used to bound every `pread`.
-    physical_len: u64,
 }
 
 impl FileTiles {
@@ -792,7 +794,16 @@ impl FileTiles {
     }
 
     /// Read `[offset, end)` from materialised tiles by bounded `pread`.
-    fn read_range(&self, file: &File, offset: u64, end: u64, out: &mut Vec<u8>) -> Result<()> {
+    ///
+    /// Every tile fragment is charged to the central ledger, so a read served
+    /// from a persisted tile set is counted like any other physical read.
+    fn read_range(
+        &self,
+        file: &LoggedFile<'_>,
+        offset: u64,
+        end: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         if !self.covers(offset, end) {
             return Err(bad("tile range is not fully materialised"));
         }
@@ -824,7 +835,7 @@ impl FileTiles {
                 what: "tile read buffer",
             })?;
             out.resize(new_len, 0);
-            read_exact_at_len(file, &mut out[prev..], file_off, self.physical_len)?;
+            file.read_exact_at(&mut out[prev..], file_off, ReadClass::Payload)?;
             pos = seg_end;
         }
         Ok(())
@@ -901,7 +912,6 @@ fn parse_tiles(
         slots,
         data_offset,
         data_len,
-        physical_len: total,
     };
 
     // Structural validation of the directory: exact shape, valid group bases,
@@ -1395,12 +1405,13 @@ struct FileSegmentedHistory {
     header: SegmentedHeader,
     payload_offset: u64,
     payload_len: u64,
-    physical_len: u64,
 }
 
 impl FileSegmentedHistory {
     /// Read `x_i` via one bounded index read plus one 4-byte state read.
-    fn state_at(&self, file: &File, i: u64) -> Result<u32> {
+    ///
+    /// Both reads are charged to the central ledger (read-path metadata).
+    fn state_at(&self, file: &LoggedFile<'_>, i: u64) -> Result<u32> {
         let h = &self.header;
         if i > h.logical_len {
             return Err(oob(i, 1, h.logical_len));
@@ -1423,7 +1434,7 @@ impl FileSegmentedHistory {
                     what: "history-segmented index",
                 })?;
         let mut entry = [0u8; 8];
-        read_exact_at_len(file, &mut entry, index_off, self.physical_len)?;
+        file.read_exact_at(&mut entry, index_off, ReadClass::Metadata)?;
         let seg_rel = le_u64(&entry, 0);
         let byte_rel = seg_rel
             .checked_add(within.checked_mul(4).ok_or(EkbloomError::Overflow {
@@ -1445,7 +1456,7 @@ impl FileSegmentedHistory {
                 what: "history-segmented state offset",
             })?;
         let mut buf = [0u8; 4];
-        read_exact_at_len(file, &mut buf, byte_off, self.physical_len)?;
+        file.read_exact_at(&mut buf, byte_off, ReadClass::Metadata)?;
         Ok(u32::from_le_bytes(buf))
     }
 }
@@ -1483,7 +1494,6 @@ fn parse_segmented(
         header,
         payload_offset,
         payload_len,
-        physical_len: total,
     })
 }
 
@@ -1530,10 +1540,12 @@ pub struct FileBody {
     prepared: Option<Prepared<'static>>,
     /// Whether bounded encoded-window reads are enabled (default `true`).
     windowed: bool,
-    /// Encoded (renormalisation) core bytes fetched on the read path so far.
-    fetched_bytes: AtomicU64,
-    /// Read-path `pread` count so far.
-    fetched_reads: AtomicU64,
+    /// The one ledger every physical read path charges: tile reads, bounded
+    /// encoded windows, the decoder model (dictionary) header, section/metadata
+    /// reads and plain core reads. Exposed as
+    /// [`FileBody::fetched_bytes`] / [`FileBody::fetched_reads`] (all classes) and
+    /// [`FileBody::fetched_encoded_bytes`] (the bounded-window quantity).
+    ledger: ReadLedger,
 }
 
 impl FileBody {
@@ -1586,7 +1598,7 @@ impl FileBody {
     /// has no such section, and with [`EkbloomError::OutOfBounds`] for `i > N`.
     pub fn segmented_state_at(&self, i: u64) -> Result<u32> {
         match &self.segmented {
-            Some(seg) => seg.state_at(&self.file, i),
+            Some(seg) => seg.state_at(&self.logged(), i),
             None => Err(EkbloomError::InvalidArgument {
                 what: "file has no history-segmented section".to_string(),
             }),
@@ -1721,6 +1733,9 @@ impl FileBody {
     /// Validate a file by streaming, keeping only offsets and headers.
     fn parse(file: File) -> Result<FileBody> {
         let physical_len = file.metadata()?.len();
+        // One ledger for the whole body: the model header load and every later
+        // read path charge it.
+        let ledger = ReadLedger::new();
         let (header, commits, torn_error) = scan_file(&file, physical_len)?;
         let selected = match commits.last().cloned() {
             Some(commit) => commit,
@@ -1905,7 +1920,8 @@ impl FileBody {
             ));
         }
 
-        let prepared = build_prepared(machine, &file, core_offset, core_len, physical_len)?;
+        let prepared =
+            build_prepared(machine, &file, core_offset, core_len, physical_len, &ledger)?;
 
         Ok(FileBody {
             file,
@@ -1925,8 +1941,7 @@ impl FileBody {
             profiles: manifest.profiles,
             prepared,
             windowed: true,
-            fetched_bytes: AtomicU64::new(0),
-            fetched_reads: AtomicU64::new(0),
+            ledger,
         })
     }
 
@@ -1980,7 +1995,7 @@ impl FileBody {
     fn read_via_tiles(&self, offset: u64, end: u64, out: &mut Vec<u8>) -> Result<bool> {
         for tile_set in &self.tiles {
             if tile_set.covers(offset, end) {
-                tile_set.read_range(&self.file, offset, end, out)?;
+                tile_set.read_range(&self.logged(), offset, end, out)?;
                 return Ok(true);
             }
         }
@@ -2022,24 +2037,34 @@ impl FileBody {
             .ok_or(EkbloomError::Overflow {
                 what: "core window offset",
             })?;
-        read_vec_at(&self.file, off, to - from, self.physical_len)
+        self.counted_core_window(off, to - from)
     }
 
-    /// Encoded (renormalisation) core bytes fetched by reads on this body so far.
+    /// Total physical bytes fetched by reads on this body so far — tile reads,
+    /// bounded encoded windows, the decoder model (dictionary) header load,
+    /// section/metadata reads and plain core reads.
     ///
-    /// This is the counter the bounded-window contract is stated over: a read
-    /// needing `s` positioning steps and `n` output symbols fetches at most
-    /// `2 * (s + n) + margin` encoded bytes (see [`encoded_window_bound`]) and
-    /// never the whole core. Open-time hashing is not counted.
+    /// Every read path charges the one central [`ReadLedger`], so this counter
+    /// cannot be bypassed by a path (the tile path included). Open-time section
+    /// *hashing* is not counted; the model-header load is.
     #[inline]
     pub fn fetched_bytes(&self) -> u64 {
-        self.fetched_bytes.load(Ordering::Relaxed)
+        self.ledger.bytes()
     }
 
-    /// The number of read-path `pread` calls performed so far.
+    /// The number of read-path `pread` calls performed so far (all classes).
     #[inline]
     pub fn fetched_reads(&self) -> u64 {
-        self.fetched_reads.load(Ordering::Relaxed)
+        self.ledger.read_calls()
+    }
+
+    /// Encoded (renormalisation) core-window bytes fetched so far: the quantity
+    /// the bounded-window theorem is stated over. A read needing `s` positioning
+    /// steps and `n` output symbols fetches at most `2 * (s + n) + margin`
+    /// encoded bytes, and never the whole core.
+    #[inline]
+    pub fn fetched_encoded_bytes(&self) -> u64 {
+        self.ledger.encoded_bytes()
     }
 
     /// Enable or disable bounded encoded-window reads (default enabled).
@@ -2052,20 +2077,22 @@ impl FileBody {
         self.windowed = enabled;
     }
 
-    /// A bounds-checked `pread` that also accounts a read-path syscall.
+    /// A bounds-checked `pread` bound to the central ledger, charged as
+    /// read-path metadata (restart records, section prefixes, directories).
     fn counted_pread(&self, buf: &mut [u8], off: u64) -> Result<()> {
-        read_exact_at_len(&self.file, buf, off, self.physical_len)?;
-        self.fetched_reads.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        self.logged().read_exact_at(buf, off, ReadClass::Metadata)
     }
 
-    /// Fetch a core byte window and account it as both a syscall and encoded
-    /// bytes fetched.
+    /// Fetch a core byte window and charge it as both a syscall and encoded
+    /// bytes (the bounded-window quantity).
     fn counted_core_window(&self, off: u64, len: u64) -> Result<Vec<u8>> {
-        let buf = read_vec_at(&self.file, off, len, self.physical_len)?;
-        self.fetched_reads.fetch_add(1, Ordering::Relaxed);
-        self.fetched_bytes.fetch_add(len, Ordering::Relaxed);
-        Ok(buf)
+        self.logged().read_vec_at(off, len, ReadClass::Encoded)
+    }
+
+    /// The central ledger bound to this body's backing file.
+    #[inline]
+    fn logged(&self) -> LoggedFile<'_> {
+        LoggedFile::new(&self.file, self.physical_len, &self.ledger)
     }
 
     /// Decode `length` output symbols after `steps` positioning steps from the
@@ -2170,7 +2197,8 @@ impl FileBody {
             let file_off = hot_off.checked_add(offset).ok_or(EkbloomError::Overflow {
                 what: "path hot offset",
             })?;
-            read_exact_at_len(&self.file, &mut out[prev..], file_off, self.physical_len)?;
+            self.logged()
+                .read_exact_at(&mut out[prev..], file_off, ReadClass::Payload)?;
             return Ok(true);
         }
         Ok(false)
@@ -2196,7 +2224,8 @@ impl FileBody {
                 what: "path payload offset",
             })?;
         let mut p = [0u8; PATH_PAYLOAD_PREFIX_LEN];
-        read_exact_at_len(&self.file, &mut p, prefix_off, self.physical_len)?;
+        self.logged()
+            .read_exact_at(&mut p, prefix_off, ReadClass::Metadata)?;
         let depth = u16::from_le_bytes([p[0], p[1]]);
         if depth != bloom.depth {
             return Ok(None);
@@ -2377,7 +2406,9 @@ impl FileBody {
             .ok_or(EkbloomError::Overflow {
                 what: "history states",
             })?;
-        let states = read_vec_at(&self.file, state_off, state_bytes, self.physical_len)?;
+        let states = self
+            .logged()
+            .read_vec_at(state_off, state_bytes, ReadClass::Metadata)?;
 
         if let Ok(n) = usize::try_from(span) {
             out.reserve(n);
@@ -3104,14 +3135,14 @@ mod tests {
             probes.push((n, 0));
 
             for &(off, len) in &probes {
-                let before = body.fetched_bytes();
+                let before = body.fetched_encoded_bytes();
                 let got = body
                     .read(ReadRequest {
                         offset: off,
                         length: len,
                     })
                     .unwrap();
-                let fetched = body.fetched_bytes() - before;
+                let fetched = body.fetched_encoded_bytes() - before;
                 assert_eq!(
                     got,
                     &src[off as usize..(off + len) as usize],

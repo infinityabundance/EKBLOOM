@@ -352,14 +352,14 @@ fn window_bound_holds_at_boundaries_with_a_frequency_one_model() {
             probes.push((n - 1, 1));
             probes.push((n / 2, 7));
             for &(off, len) in &probes {
-                let before = body.fetched_bytes();
+                let before = body.fetched_encoded_bytes();
                 let got = body
                     .read(ReadRequest {
                         offset: off,
                         length: len,
                     })
                     .unwrap();
-                let fetched = body.fetched_bytes() - before;
+                let fetched = body.fetched_encoded_bytes() - before;
                 assert_eq!(
                     got,
                     &src[off as usize..(off + len) as usize],

@@ -46,6 +46,7 @@ pub mod fuse;
 pub mod handle;
 pub mod history;
 pub mod history_store;
+pub mod ioacct;
 pub mod kernels;
 pub mod machine;
 pub mod machine_dict;
@@ -131,6 +132,7 @@ pub use fuse::{
 pub use handle::{ObjectCache, OpenObject, ReadDirectory};
 pub use history::History;
 pub use history_store::{current_rss_bytes, peak_rss_bytes, HistoryStore, StoreConfig};
+pub use ioacct::{LoggedFile, ReadClass, ReadLedger};
 pub use kernels::{
     block_start_states, independent_window_jobs, kernel_a_scalar, kernel_a_scalar_windows,
     kernel_a_simd_windows, kernel_a_table, kernel_a_unrolled, kernel_b_simd, kernel_b_threads,

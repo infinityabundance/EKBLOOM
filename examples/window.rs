@@ -5,7 +5,10 @@
 //! objects, this measures, **before** (`EKBLOOM` whole-core fetch) and **after**
 //! (bounded encoded window):
 //!
-//!   * encoded bytes fetched per read (the counter the theorem bounds),
+//!   * encoded bytes fetched per read (the counter the theorem bounds; the
+//!     `FileBody::fetched_encoded_bytes` ledger class),
+//!   * total read-path bytes fetched per read (the central `ReadLedger`,
+//!     `FileBody::fetched_bytes`, which also charges the restart/metadata read),
 //!   * read-path `pread` syscalls,
 //!   * read-path buffer allocation bytes,
 //!   * reconstruction steps (`offset % block_bytes + length`), and
@@ -74,6 +77,8 @@ fn sample_offsets(seed: u64, n: u64, len: u64, count: usize) -> Vec<u64> {
 struct Stats {
     encoded_bytes_max: u64,
     encoded_bytes_mean: f64,
+    total_bytes_max: u64,
+    total_bytes_mean: f64,
     syscalls_max: u64,
     alloc_bytes_max: u64,
     steps_max: u64,
@@ -88,12 +93,15 @@ fn run_reads(fb: &FileBody, src: &[u8], offsets: &[u64], len: u64) -> Stats {
     let mut lat = Vec::with_capacity(offsets.len());
     let mut encoded_bytes_max = 0u64;
     let mut encoded_bytes_sum = 0u64;
+    let mut total_bytes_max = 0u64;
+    let mut total_bytes_sum = 0u64;
     let mut syscalls_max = 0u64;
     let mut alloc_max = 0u64;
     let mut steps_max = 0u64;
     let mut exact = true;
     for &off in offsets {
-        let bytes_before = fb.fetched_bytes();
+        let enc_before = fb.fetched_encoded_bytes();
+        let total_before = fb.fetched_bytes();
         let reads_before = fb.fetched_reads();
         let t0 = now_ns();
         let mut out = Vec::new();
@@ -106,7 +114,11 @@ fn run_reads(fb: &FileBody, src: &[u8], offsets: &[u64], len: u64) -> Stats {
         )
         .expect("read");
         lat.push(now_ns().saturating_sub(t0));
-        let fetched = fb.fetched_bytes() - bytes_before;
+        // `fetched_encoded_bytes` is the theorem's counter (the bounded encoded
+        // window); `fetched_bytes` is the central ledger's total, which also
+        // charges the restart/metadata reads the same read performs.
+        let fetched = fb.fetched_encoded_bytes() - enc_before;
+        let total = fb.fetched_bytes() - total_before;
         let syscalls = fb.fetched_reads() - reads_before;
         if out != src[off as usize..(off + len) as usize] {
             exact = false;
@@ -114,6 +126,8 @@ fn run_reads(fb: &FileBody, src: &[u8], offsets: &[u64], len: u64) -> Stats {
         black_box(&out);
         encoded_bytes_max = encoded_bytes_max.max(fetched);
         encoded_bytes_sum += fetched;
+        total_bytes_max = total_bytes_max.max(total);
+        total_bytes_sum += total;
         syscalls_max = syscalls_max.max(syscalls);
         alloc_max = alloc_max.max(fetched.saturating_add(out.capacity() as u64));
         steps_max = steps_max.max((off % u64::from(BLOCK_BYTES)) + len);
@@ -123,6 +137,8 @@ fn run_reads(fb: &FileBody, src: &[u8], offsets: &[u64], len: u64) -> Stats {
     Stats {
         encoded_bytes_max,
         encoded_bytes_mean: encoded_bytes_sum as f64 / offsets.len().max(1) as f64,
+        total_bytes_max,
+        total_bytes_mean: total_bytes_sum as f64 / offsets.len().max(1) as f64,
         syscalls_max,
         alloc_bytes_max: alloc_max,
         steps_max,
@@ -135,10 +151,13 @@ fn run_reads(fb: &FileBody, src: &[u8], offsets: &[u64], len: u64) -> Stats {
 fn mode_json(name: &str, s: &Stats) -> String {
     format!(
         "{{\"mode\":\"{name}\",\"encoded_bytes_max\":{},\"encoded_bytes_mean\":{:.1},\
+         \"total_bytes_max\":{},\"total_bytes_mean\":{:.1},\
          \"syscalls_max\":{},\"alloc_bytes_max\":{},\"steps_max\":{},\
          \"p50_ns\":{:.0},\"p99_ns\":{:.0},\"exact\":{}}}",
         s.encoded_bytes_max,
         s.encoded_bytes_mean,
+        s.total_bytes_max,
+        s.total_bytes_mean,
         s.syscalls_max,
         s.alloc_bytes_max,
         s.steps_max,
@@ -242,9 +261,10 @@ fn main() -> ekbloom::Result<()> {
                         acceptance_json,
                         "    {{\"machine_id\":{machine_id},\"logical_len\":{n},\"core_len\":{core_len},\
                          \"before_encoded_bytes\":{},\"after_encoded_bytes\":{},\
-                         \"whole_core_avoided\":{}}},",
+                         \"after_total_bytes\":{},\"whole_core_avoided\":{}}},",
                         before.encoded_bytes_max,
                         after.encoded_bytes_max,
+                        after.total_bytes_max,
                         after.encoded_bytes_max < core_len,
                     );
                 }
@@ -278,6 +298,10 @@ fn main() -> ekbloom::Result<()> {
     );
     let _ = writeln!(js, "  \"renorm_max_per_step\": 2,");
     let _ = writeln!(js, "  \"window_margin\": {WINDOW_MARGIN},");
+    let _ = writeln!(
+        js,
+        "  \"accounting\": \"every read charges one central ReadLedger (src/ioacct.rs); encoded_bytes is the bounded encoded-window counter (fetched_encoded_bytes), total_bytes is the full read-path counter (fetched_bytes, including the restart/metadata reads)\",",
+    );
     let _ = writeln!(
         js,
         "  \"acceptance\": [\n{}\n  ],",

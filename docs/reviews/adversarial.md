@@ -608,7 +608,7 @@ length and object id. Same body+generation is byte-exact and equals `reader::rea
 
 With a frequency-1 model that drives many minimal-frequency boundary states, the
 per-read encoded bytes stay `≤ 2·(steps+len)+64` across block boundaries (counted
-through `FileBody::fetched_bytes`), byte-exact vs `reader::read`; truncation and a
+through `FileBody::fetched_encoded_bytes`), byte-exact vs `reader::read`; truncation and a
 cursor at the core end are typed `Err`; machines 1/3 are unaffected (rebased /
 whole-core paths, `tests/window.rs`). A forged state outside `[RANS_L, RANS_L<<8)`
 and a machine-4 state/lane disagreement are rejected by `validate_restart`.

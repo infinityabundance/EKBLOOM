@@ -97,6 +97,17 @@ the exact pre-change whole-core fetch (used only to measure `before` in the same
 binary). Machines 1 and 3 (`cursor == position`, no retained model) keep their
 existing paths unchanged.
 
+**Accounting.** Every file-backed read charges one central ledger
+([`src/ioacct.rs`](../src/ioacct.rs)). The bounded window is the ledger's
+*encoded* class — `FileBody::fetched_encoded_bytes`, the quantity the theorem
+bounds — while the restart record and every other physical read path (tiles, the
+decoder model/dictionary header, section/metadata) are charged to the same
+ledger's totals `FileBody::fetched_bytes` / `fetched_reads`. Each read in this
+experiment is a block restart (a metadata read) plus a bounded encoded window, so
+`window.json` records both: `encoded_bytes_*` (the theorem counter, unchanged) and
+`total_bytes_*` (the full read-path counter, the window plus the 12-byte
+machine-2 / 45-byte machine-4 restart record).
+
 ---
 
 ## 3. Measured (`evidence/bench/window.json`)

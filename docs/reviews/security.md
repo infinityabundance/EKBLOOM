@@ -864,7 +864,7 @@ different object, whose core hash differs) and a newer *generation* of the same
 object are both rejected with `EngineBodyMismatch` before any decode;
 `ReadyObject` binds body+engine structurally. Same body+generation is byte-exact.
 * **N2 bounded window** — the encoded-window bound holds at block boundaries
-(`fetched ≤ 2·(steps+len)+64` via the `fetched_bytes` counter); truncation and a
+(`fetched ≤ 2·(steps+len)+64` via the `fetched_encoded_bytes` counter); truncation and a
 cursor at the core end are typed `Err`; machines 1/3 are on the unaffected
 whole-core/rebased paths (`tests/window.rs`).
 * **N3 machine 5** — extraction is exact at every position for every width 1–8

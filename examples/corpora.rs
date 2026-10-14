@@ -15,7 +15,7 @@
 //! Per corpus and contender the evidence records the retained footprint
 //! (`physical_bytes`/`N`), the `byte_at` p50/p99, and the 4 KiB read p50/p99.
 //! For EKBLOOM it additionally records — from the real file-backed **encoded
-//! window counters** ([`ekbloom::FileBody::fetched_bytes`] /
+//! window counters** ([`ekbloom::FileBody::fetched_encoded_bytes`] /
 //! `fetched_reads`) — the encoded bytes fetched and the `pread` syscalls per
 //! 4 KiB read; the compressed codecs' per-read compressed bytes and syscalls are
 //! recorded the same way.
@@ -258,7 +258,7 @@ fn measure_corpus(
     let mut sys_max = 0u64;
     let mut sys_sum = 0u64;
     for (i, &o) in file_offs.iter().enumerate() {
-        let before_b = fb.fetched_bytes();
+        let before_b = fb.fetched_encoded_bytes();
         let before_s = fb.fetched_reads();
         let got = fb.read(ReadRequest {
             offset: o,
@@ -278,7 +278,7 @@ fn measure_corpus(
                 got
             );
         }
-        let df = fb.fetched_bytes() - before_b;
+        let df = fb.fetched_encoded_bytes() - before_b;
         let ds = fb.fetched_reads() - before_s;
         fetched_max = fetched_max.max(df);
         fetched_sum += df;

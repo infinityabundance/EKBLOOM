@@ -844,30 +844,21 @@ impl DictStore {
 // ---------------------------------------------------------------------------
 
 /// Wraps a [`ekbloom::FileBody`] and reports the bytes actually fetched per read
-/// from its window counters.
+/// from the reader's central I/O ledger.
 ///
-/// `FileBody::fetched_bytes` counts only the encoded core windows and restart
-/// reads; a read served from a **persisted tile set** is a plain `pread` the
-/// counter does not yet charge (a library gap reported in `docs/ROCKSDB.md`), so
-/// this meter adds those tile bytes back explicitly from the tile geometry.
+/// `FileBody::fetched_bytes` / `fetched_reads` now charge **every** physical read
+/// path, including a read served from a persisted tile set (the tile preads route
+/// through the same ledger), so no geometric re-addition is needed.
 pub struct FileMeter {
     fb: ekbloom::FileBody,
-    tile_shift: Option<u8>,
-    logical_len: u64,
 }
 
 impl FileMeter {
-    /// Open `path` and prepare the tile-aware byte meter.
+    /// Open `path` and prepare the byte meter.
     pub fn open(path: &Path) -> ekbloom::Result<FileMeter> {
         let mut fb = ekbloom::FileBody::open(path)?;
         fb.set_bounded_windows(true);
-        let tile_shift = fb.tile_summaries().iter().map(|t| t.tile_shift).min();
-        let logical_len = fb.logical_len();
-        Ok(FileMeter {
-            fb,
-            tile_shift,
-            logical_len,
-        })
+        Ok(FileMeter { fb })
     }
 
     /// Read `[offset, offset+len)` and return `(bytes_fetched, syscalls)`.
@@ -878,18 +869,8 @@ impl FileMeter {
             offset,
             length: len,
         })?;
-        let mut bytes = self.fb.fetched_bytes() - before_b;
-        let mut syscalls = self.fb.fetched_reads() - before_s;
-        if bytes == 0 && syscalls == 0 && self.fb.tiles_cover(offset, len) {
-            if let Some(shift) = self.tile_shift {
-                // `read_via_tiles` preads exactly the requested range, split at
-                // tile boundaries: total bytes = `len`, one `pread` per tile.
-                let first = offset >> shift;
-                let last = (offset + len - 1) >> shift;
-                bytes = len;
-                syscalls = last - first + 1;
-            }
-        }
+        let bytes = self.fb.fetched_bytes() - before_b;
+        let syscalls = self.fb.fetched_reads() - before_s;
         Ok((out, bytes, syscalls))
     }
 }

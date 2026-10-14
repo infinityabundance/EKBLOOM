@@ -67,7 +67,7 @@ under the same rules:
 **Metrics.** Retained footprint (`physical_bytes` = the real `du`-style
 allocation of every file) as `E_V = physical / N`; `byte_at` p50/p99 (single-byte
 positional reads); 4 KiB read p50/p99; and, from EKBLOOM's **real encoded-window
-counters** (`FileBody::fetched_bytes` / `fetched_reads`), the encoded bytes
+counters** (`FileBody::fetched_encoded_bytes` / `fetched_reads`), the encoded bytes
 fetched and the `pread` syscalls per 4 KiB read. The codec stores report their
 per-4-KiB compressed bytes and `pread`s the same way. Every read is asserted
 byte-exact before any timing. `byte_at`/4 KiB percentiles are nearest-rank over

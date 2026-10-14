@@ -1211,7 +1211,7 @@ is fetched and retried **once** before a typed `CoreTooShort`. ∎
 syscalls**; p99 **972 → 26.4 µs**; a 1-byte read fetches 8,216 B (1,250×)
 (`evidence/bench/window.json`). A frequency-1 model (many minimal-frequency
 boundary states) keeps every per-read fetch `≤ 2·(steps+len)+64` across block
-boundaries via `FileBody::fetched_bytes`.
+boundaries via `FileBody::fetched_encoded_bytes`.
 
 **Tested:** `tests/window.rs` (5 tests), `src/reader.rs`, `tests/adversarial_r7.rs`.
 

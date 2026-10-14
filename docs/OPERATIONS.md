@@ -25,7 +25,7 @@ or the read path; none requires re-deriving the machine.
 | `ResourcePolicy` breach counter | `ekbloom::resource_breaches()` (`reset_resource_breaches()` to clear) | **0** in steady state; a nonzero rate means untrusted/core-declared lengths are hitting the 1 GiB ceiling — investigate, do not ignore | this crate (`src/resource.rs`); see `SECURITY.md` §11 |
 | read p50 / p99 | measure per read with `metrics::percentiles`, or `ekbloom bench`; nearest-rank over a ns sample | **seekable block read p50 ≈ 11 µs / p99 ≈ 20.8 µs**; hot, cache-resident single-byte reads are far lower | `stream.json` (`read_at_p50_ns = 11011`, `read_at_p99_ns = 20818`) |
 | hot `byte_at` p50 | the certified hot path (tiles / direct-address) | **≈ 30–130 ns**: tiles 80–110 ns, packed 1-byte ≈ 30 ns, raw-vec 20–110 ns; the whole-object `byte_at` path is ~1.1–3.3 µs | `tiles.json` (80–110 ns hot p50); `frontier.json` `packed` (≈ 30 ns, 4 KiB ≈ 3.5 µs); `corpora.json` (`raw-vec` `byte_at_p50_ns` 20–110) |
-| `bytes_fetched` / `fetched_reads` | `FileBody::fetched_bytes()` / `fetched_reads()` (read-path `pread` deltas; open-time hashing is not counted) | **bytes fetched per 4 KiB read ≈ 16–20 KiB** on real corpora; a bounded window read fetches far less than the whole core | `corpora.json` (`fetched_bytes_per_4k` 16,912–20,460); `window.json` (4 KiB of a 64 MiB object: **10,270,243 B → 16,440 B**, 625×) |
+| `bytes_fetched` / `fetched_reads` | `FileBody::fetched_bytes()` / `fetched_reads()` — the central `ReadLedger` totals ([`src/ioacct.rs`](../src/ioacct.rs)); every physical read path charges it (tile reads, encoded windows, the model/dictionary header, section/metadata). `FileBody::fetched_encoded_bytes()` is the encoded core-window class alone. Open-time section *hashing* is not counted; the model-header load is | **bytes fetched per 4 KiB read ≈ 16–20 KiB** on real corpora; a bounded window read fetches far less than the whole core; a tile-served hot get fetches exactly the requested bytes | `corpora.json` (`fetched_bytes_per_4k` 16,912–20,460, the encoded-window class); `window.json` (64 MiB object: encoded **10,270,243 → 16,440 B**, 625×; total **→ 16,452 B** incl. the restart record); `rocksdb-skew.json` (`ekbloom-opt` `get` 311.6 B/read) |
 
 **Two derived signals worth alerting on:**
 
@@ -234,3 +234,38 @@ and mounting a loop device needs `CAP_SYS_ADMIN` (the default container drops al
 capabilities; `EKB_CROSSFS_PRIVILEGED=1` adds `--privileged`). The exact blocker is
 recorded in the artifact. The x86_64-vs-aarch64 comparison is separate and already
 covered by `scripts/container-aarch64.sh` (Q2 — identical).
+
+---
+
+## 8. I/O accounting (one ledger, no bypass)
+
+**Module:** [`src/ioacct.rs`](../src/ioacct.rs) · **Tests:**
+[`tests/ioacct.rs`](../tests/ioacct.rs) · **Evidence:**
+[`evidence/bench/window.json`](../evidence/bench/window.json),
+[`evidence/bench/rocksdb-skew.json`](../evidence/bench/rocksdb-skew.json)
+
+Every physical read the file-backed reader performs flows through **one**
+interface: a `ReadLedger` charged by a bounds-checked `LoggedFile` wrapper. No
+read path can be added that silently skips it, and the counter cannot be
+reconstructed from geometry (the earlier tile workaround is removed).
+
+| counter | what it is | use it for |
+|---|---|---|
+| `FileBody::fetched_bytes()` | total read-path physical bytes — tile reads, bounded encoded windows, the decoder model (dictionary) header load, section/metadata reads, plain core reads | I/O-amplification and per-read bytes (§1) |
+| `FileBody::fetched_reads()` | total read-path `pread` calls | syscalls per read |
+| `FileBody::fetched_encoded_bytes()` | the **encoded core-window** class alone | the bounded-window theorem (a read needing `s` steps and `n` symbols fetches ≤ `2*(s+n)+64` encoded bytes) |
+
+**Reading it honestly.** `fetched_bytes()` is a *total*, so a cold window read
+also charges its restart record (12 B for machine 2, 45 B for machine 4) and a
+tile-served hot get charges exactly the requested range. The theorem's counter is
+`fetched_encoded_bytes()`, which excludes that metadata. The model/dictionary
+header is loaded **once** at open and charged then, so `fetched_bytes()` is
+non-zero immediately after `FileBody::open` on a cursor-divergent machine; the
+read-path deltas an operator exports are unaffected. Open-time section *hashing*
+(streamed CRC/BLAKE3 validation) remains uncounted.
+
+**Independent validation.** `tests/ioacct.rs` checks the ledger against a
+process-level `/proc/self/io` trace: around a read sequence the kernel's `syscr`
+and `rchar` deltas match the ledger's syscall and byte counts within a documented
+slack (observed: ledger 241,419 B / 64 syscalls vs kernel `rchar` 241,518 B /
+`syscr` 68), and a regression proves an uncharged read would be caught.
