@@ -34,7 +34,18 @@
 //! `decode(core)` uses the shared model and the length carried in the core.
 
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+// The registry lock is the crate's third shared-mutable structure after the
+// `OrFs` index and the `ObjectCache` maps. Under `--cfg loom` the very same
+// `register`/`lookup`/`registered`/`unregister` code is compiled against loom's
+// instrumented `RwLock` so `tests/loom_dictionary.rs` exhaustively explores its
+// publication/lookup interleavings; production builds use `std::sync`. No
+// behaviour differs.
+#[cfg(loom)]
+use loom::sync::RwLock;
+#[cfg(not(loom))]
+use std::sync::OnceLock;
+#[cfg(not(loom))]
+use std::sync::RwLock;
 
 use crate::error::{EkbloomError, Result};
 use crate::machine_rans::{valid_state, RansContext, M, MODEL_BYTES, RANS_L, SCALE_BITS, SYMBOLS};
@@ -332,10 +343,58 @@ impl Dictionary {
 
 /// Process-wide registry of trained dictionaries, so a machine-9 core may
 /// **reference** a dictionary by content id instead of embedding it.
+///
+/// The one-time cell initialisation is **not** part of the modelled protocol:
+/// loom 0.7.2's `sync` module has no `OnceLock`, and a `std::sync::OnceLock`
+/// cannot be reset between the schedules `loom::model` re-runs its closure for.
+/// A normal build keeps the plain `OnceLock` cell below; the loom build uses a
+/// resettable slot (see `reset_registry_for_model`) and models the `RwLock`
+/// protocol around the map, which is the shared state that actually matters.
+#[cfg(not(loom))]
 static REGISTRY: OnceLock<RwLock<HashMap<[u8; 16], Dictionary>>> = OnceLock::new();
 
+#[cfg(not(loom))]
 fn registry() -> &'static RwLock<HashMap<[u8; 16], Dictionary>> {
     REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Loom-only slot holding the registry installed by
+/// [`reset_registry_for_model`]. It is a plain `std::sync::Mutex` guarding only
+/// a pointer; it is deliberately **not** a loom primitive and is uncontended
+/// during the modelled region (it is installed before any thread is spawned), so
+/// it is not part of the protocol under test.
+#[cfg(loom)]
+static REGISTRY_SLOT: std::sync::Mutex<Option<&'static RwLock<HashMap<[u8; 16], Dictionary>>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(loom)]
+fn registry() -> &'static RwLock<HashMap<[u8; 16], Dictionary>> {
+    let mut slot = REGISTRY_SLOT.lock().unwrap_or_else(|e| e.into_inner());
+    match *slot {
+        Some(lock) => lock,
+        None => {
+            let lock: &'static RwLock<HashMap<[u8; 16], Dictionary>> =
+                Box::leak(Box::new(RwLock::new(HashMap::new())));
+            *slot = Some(lock);
+            lock
+        }
+    }
+}
+
+/// Install a fresh, empty registry for the schedule about to run (loom only).
+///
+/// `loom::model` re-runs its closure once per explored schedule, and a
+/// `loom::sync::RwLock` belongs to the execution that created it, so a registry
+/// carried across schedules would be stale. Call this at the **top of every
+/// model closure** so each schedule starts from a clean registry. This item does
+/// not exist in an ordinary build; the previous registry is abandoned to process
+/// teardown (the loom build is test-only and short-lived).
+#[cfg(loom)]
+pub fn reset_registry_for_model() {
+    let lock: &'static RwLock<HashMap<[u8; 16], Dictionary>> =
+        Box::leak(Box::new(RwLock::new(HashMap::new())));
+    let mut slot = REGISTRY_SLOT.lock().unwrap_or_else(|e| e.into_inner());
+    *slot = Some(lock);
 }
 
 /// Register `dict` so a machine-9 core may reference it by [`Dictionary::id`].

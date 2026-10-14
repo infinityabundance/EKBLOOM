@@ -15,7 +15,15 @@ is written to disk are marked **⚠ wire format** and their rules live in
 
 ### Added
 
-- Nothing yet.
+- **Loom model of the process-wide dictionary registry**
+  (`tests/loom_dictionary.rs`; **3 scenarios / 384 interleavings** at
+  preemptions = 2, 2,715 at preemptions = 3). The registry's `RwLock` publication
+  protocol (`src/dictionary.rs`) is now exhaustively model-checked for
+  no wrong-model resolution, publication visibility, cross-id isolation and
+  idempotent concurrent register; `scripts/container-loom.sh` runs the new target
+  alongside `loom` and `loom_rcu`. The registry's one-time cell initialisation is
+  not modelled (loom 0.7.2 has no `sync::OnceLock`); no library, wire-format or
+  public-API change (P54-style extension, [`docs/reviews/concurrency.md`](docs/reviews/concurrency.md) §3c).
 
 ## [0.7.2] - 2026-10-15
 

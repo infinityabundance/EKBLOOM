@@ -72,7 +72,7 @@ is in [`../CHANGELOG.md`](../CHANGELOG.md).
 | Review | One line |
 |---|---|
 | [`reviews/adversarial.md`](reviews/adversarial.md) | Try-to-break-correctness pass: 15 tests, a rev-2 segmented/budget/adaptive pass, a rev-3 `prefix`/`packed`/`tiles`/`handle`/`planner`/`court` pass (11 tests + `fuzz_packed`/`fuzz_tiles`), a rev-4 `blocks`/`engine`/region-cursor/`checkpoint` pass, a rev-5 pass over the L1–L4 surface (13 tests + `fuzz_batch`/`fuzz_rans_i`), a rev-6 pass over the M1–M5 surface (13 tests in `adversarial_m.rs` + `fuzz_region`), a **rev-7** pass over the N1–N7 surface (11 tests in `adversarial_r7.rs` + `fuzz_pack`/`fuzz_seg`; verdict **two defects, both fixed**), a **rev-8** pass over the O1–O2 surface (9 tests in `adversarial_o.rs` + `fuzz_rans_w`/`fuzz_rans_il`; verdict **two defects, both fixed**), and a **rev-9** pass over the P1–P8 surface (7 tests in `adversarial_p.rs`; verdict **no library defect found** — one fuzz-coverage gap fixed, two doc defects reported), and a **rev-10** pass over the Q/R surface (compat fixtures, scalar/aarch64 CI, Loom RCU, dictionary, faults, cross-FS; verdict **no library defect found** — one test-hardening fix, one honesty observation), and a **rev-11** pass over the S1–S8 surface (central I/O accounting, persistence, multirun honesty, hardening, controller, refinement, KV integration; verdict **no library defect found — all attacks held**). |
-| [`reviews/concurrency.md`](reviews/concurrency.md) | Concurrency audit + **Loom** model checking of the `OrFs` index critical section and, since the Q-round (Q4), the RCU handle/`OrFs` publication path (`tests/loom_rcu.rs`: **3 scenarios / 407 interleavings**, no torn read). |
+| [`reviews/concurrency.md`](reviews/concurrency.md) | Concurrency audit + **Loom** model checking of the `OrFs` index critical section and, since the Q-round (Q4), the RCU handle/`OrFs` publication path (`tests/loom_rcu.rs`: **3 scenarios / 407 interleavings**, no torn read), and of the process-wide dictionary registry (`tests/loom_dictionary.rs`: **3 scenarios / 384 interleavings**, no wrong-model resolution). |
 | [`reviews/mathematics.md`](reviews/mathematics.md) | Independent re-derivation of P1–P6; only defect is a wording clause (benign). |
 | [`reviews/performance.md`](reviews/performance.md) | Locality & SIMD investigation of the certified path-bloom hot path. |
 | [`reviews/reproducibility.md`](reviews/reproducibility.md) | Independent reproducibility review: pinning, lockfile, clean-checkout, benchmark drift. |
@@ -189,6 +189,6 @@ sh scripts/run-scale.sh             # nightly 2^30 scale build (opt-in: EKB_RUN_
 sh scripts/run-scalar.sh scalar     # x86_64 with EKB_NO_SIMD=1: equality + gates + bounded court
 sh scripts/run-matrix.sh            # cross-platform CI matrix {x86_64-simd, x86_64-scalar, aarch64} (ci-matrix.json)
 sh scripts/container-aarch64.sh     # cross-arch determinism (x86_64 == arm64 via QEMU) + the arm64 CI job
-sh scripts/container-loom.sh        # Loom model checking (tests/loom.rs + tests/loom_rcu.rs; Q4)
+sh scripts/container-loom.sh        # Loom model checking (tests/loom.rs + tests/loom_rcu.rs + tests/loom_dictionary.rs)
 sh scripts/capture-environment.sh   # environment.txt
 ```

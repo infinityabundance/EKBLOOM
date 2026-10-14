@@ -10,12 +10,16 @@
 # while bounding the run; raise it with EKB_LOOM_MAX_PREEMPTIONS for a deeper
 # sweep. See https://docs.rs/loom for the model and its caveats.
 #
-# Two model files compile the SAME production code against loom's instrumented
-# `Mutex` (src/filesystem.rs, src/handle.rs) and are run here:
-#   * tests/loom.rs      — the OrFs index check-then-publish critical section.
-#   * tests/loom_rcu.rs  — the RCU handle cache: generation publication, the
-#                          single-flight builder lock, and index-publish vs the
-#                          lock-free read of an already-open object.
+# Three model files compile the SAME production code against loom's
+# instrumented `Mutex`/`RwLock` (src/filesystem.rs, src/handle.rs,
+# src/dictionary.rs) and are run here:
+#   * tests/loom.rs             — the OrFs index check-then-publish critical section.
+#   * tests/loom_rcu.rs         — the RCU handle cache: generation publication, the
+#                                 single-flight builder lock, and index-publish vs the
+#                                 lock-free read of an already-open object.
+#   * tests/loom_dictionary.rs  — the process-wide dictionary registry: publication
+#                                 visibility, no wrong-model resolution, cross-id
+#                                 isolation, and idempotent concurrent register.
 set -eu
 
 # Loom is lightweight (single OS thread, bounded schedules); keep the OOM cap
@@ -29,9 +33,9 @@ export EKB_MEM_LIMIT EKB_MEMSWAP_LIMIT
 
 LOOM_MAX_PREEMPTIONS="${EKB_LOOM_MAX_PREEMPTIONS:-2}"
 
-echo "ekbloom-loom: RUSTFLAGS='--cfg loom' cargo test --test <loom|loom_rcu> --release"
+echo "ekbloom-loom: RUSTFLAGS='--cfg loom' cargo test --test <loom|loom_rcu|loom_dictionary> --release"
 echo "ekbloom-loom: LOOM_MAX_PREEMPTIONS=$LOOM_MAX_PREEMPTIONS (memory-capped at $EKB_MEM_LIMIT)"
-echo "ekbloom-loom: models = tests/loom.rs (OrFs index) + tests/loom_rcu.rs (handle/generation RCU)"
+echo "ekbloom-loom: models = tests/loom.rs (OrFs index) + tests/loom_rcu.rs (handle/generation RCU) + tests/loom_dictionary.rs (dictionary registry)"
 
 # `env` overlays the two vars for cargo only; everything else (memory cap,
 # pid cap, dropped capabilities, non-privileged user) comes from lib.sh.
@@ -48,3 +52,4 @@ run_loom() {
 
 run_loom loom "$@"
 run_loom loom_rcu "$@"
+run_loom loom_dictionary "$@"

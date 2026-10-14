@@ -1218,7 +1218,11 @@ DEFECT FOUND — one test-hardening fix, one honesty observation**).
   a reader always observes **one whole committed generation**, never a torn read, and
   every thread joins (no deadlock). Publication *ordering* stays a filesystem
   property covered by crash-recovery tests ([`docs/HANDLES.md`](docs/HANDLES.md),
-  [`docs/reviews/concurrency.md`](docs/reviews/concurrency.md), P54).
+  [`docs/reviews/concurrency.md`](docs/reviews/concurrency.md), P54). Since the
+  Q-round, the same harness also models the **process-wide dictionary registry**
+  (`tests/loom_dictionary.rs`: **3 scenarios / 384 interleavings**, no
+  wrong-model resolution; [`docs/DICTIONARY.md`](docs/DICTIONARY.md),
+  [`docs/reviews/concurrency.md`](docs/reviews/concurrency.md) §3c).
 
 ### R-round: one-line dictionary API, fault atomicity, cross-FS determinism (R1–R2)
 
@@ -1351,12 +1355,16 @@ scalar loop in independent runs and remains unwired; the certified hot path is a
 straight-line `memcpy`-lowered copy plus a scalar random-1b loop.
 
 **Loom** (`sh scripts/container-loom.sh`) exhaustively model-checks the crate's
-genuine shared-mutable structures — the `OrFs` index mutex (`tests/loom.rs`) and,
-since the Q-round, the RCU handle/`OrFs` publication path (`tests/loom_rcu.rs`):
+genuine shared-mutable structures — the `OrFs` index mutex (`tests/loom.rs`),
+since the Q-round the RCU handle/`OrFs` publication path (`tests/loom_rcu.rs`),
+and the process-wide dictionary registry (`tests/loom_dictionary.rs`):
 330 schedules at preemptions = 2 and 1,416 at preemptions = 3 for the index model,
 plus **3 RCU scenarios / 407 interleavings** (274 publication + 33 single-flight +
-100 index-vs-lock-free-read), all pass with **no torn read**. Publication ordering
-is a filesystem property covered by crash-recovery tests, not Loom
+100 index-vs-lock-free-read), plus **3 registry scenarios / 384 interleavings**
+(23 publication-visibility + 243 cross-id isolation + 118 idempotent register),
+all pass with **no torn read** and **no wrong-model resolution**. Publication
+ordering and the registry's one-time cell initialisation are not Loom
+properties; publication ordering is covered by crash-recovery tests
 ([`docs/reviews/concurrency.md`](docs/reviews/concurrency.md)).
 
 ---
@@ -1431,7 +1439,7 @@ sh scripts/run-scale.sh             # nightly 2^30 scale build (opt-in: EKB_RUN_
 sh scripts/run-scalar.sh scalar     # x86_64 with EKB_NO_SIMD=1: equality + gates + bounded court
 sh scripts/run-matrix.sh            # cross-platform CI matrix {x86_64-simd, x86_64-scalar, aarch64} (ci-matrix.json)
 sh scripts/container-aarch64.sh     # cross-arch determinism (x86_64 == arm64, QEMU) + the arm64 CI job
-sh scripts/container-loom.sh        # Loom model checking (tests/loom.rs + tests/loom_rcu.rs)
+sh scripts/container-loom.sh        # Loom model checking (tests/loom.rs + tests/loom_rcu.rs + tests/loom_dictionary.rs)
 sh scripts/container-reproduce.sh   # clean build + tests from scratch
 sh scripts/capture-environment.sh   # write evidence/environment.txt
 ```
@@ -1451,12 +1459,16 @@ hardening targets `fuzz_declared_lengths`, `fuzz_alloc_exhaustion`,
 ### Verified tooling
 
 - **Loom** (`sh scripts/container-loom.sh`) exhaustively model-checks the `OrFs`
-  index mutex and, since the Q-round, the **RCU publication path**
-  (`tests/loom.rs` + `tests/loom_rcu.rs`): 330 schedules at preemptions = 2, 1,416
-  at preemptions = 3 for the index model, and **3 RCU scenarios / 407 interleavings**
-  (274 publication + 33 single-flight + 100 index-vs-lock-free-read), all pass with
-  no torn read; publication ordering is a filesystem property covered by
-  crash-recovery tests
+  index mutex, since the Q-round the **RCU publication path**, and the
+  process-wide **dictionary registry**
+  (`tests/loom.rs` + `tests/loom_rcu.rs` + `tests/loom_dictionary.rs`): 330
+  schedules at preemptions = 2, 1,416
+  at preemptions = 3 for the index model, **3 RCU scenarios / 407 interleavings**
+  (274 publication + 33 single-flight + 100 index-vs-lock-free-read), and
+  **3 registry scenarios / 384 interleavings**
+  (23 publication-visibility + 243 cross-id isolation + 118 idempotent register),
+  all pass with no torn read and no wrong-model resolution; publication ordering
+  is a filesystem property covered by crash-recovery tests
   ([`docs/reviews/concurrency.md`](docs/reviews/concurrency.md)).
 - **Budgets** never under-estimate and are transactional; 1,419 builds asserted
   `estimate ≥ actual`
@@ -1552,7 +1564,10 @@ hardening targets `fuzz_declared_lengths`, `fuzz_alloc_exhaustion`,
   store (**81.8 vs 578.0 B/get**, **4.1× tighter p99.9**) at a **~5.2× larger**
   footprint (Q3, [`docs/ROCKSDB.md`](docs/ROCKSDB.md)); and Loom model-checks the RCU
   publication path over **3 scenarios / 407 schedules** with **no torn read** (Q4,
-  P54).
+  P54) and the process-wide dictionary registry over **3 scenarios / 384
+  schedules** with **no wrong-model resolution**
+  ([`docs/DICTIONARY.md`](docs/DICTIONARY.md),
+  [`docs/reviews/concurrency.md`](docs/reviews/concurrency.md) §3c).
 - **A one-line dictionary API, fault-atomic publication, and cross-FS determinism**
   (R1–R2). `Dictionary::train`/`create_with_dict` build and use a shared model in
   one line, with `SECURITY` v2 / `OPERATIONS` / `MACHINE_CONTRACT` documented (R1,

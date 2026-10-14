@@ -172,6 +172,13 @@ machine 9 both **embedded** and **referenced** (and a referenced body failing to
 read once its dictionary is unregistered); and the machines 1–8 non-regression
 plus the machine-9 registration. `src/machine_dict.rs` adds a framing unit test.
 
+The registry's **publication protocol** (the `RwLock` guarding
+`HashMap<[u8; 16], Dictionary>`) is additionally model-checked over all
+interleavings by Loom ([`tests/loom_dictionary.rs`](../tests/loom_dictionary.rs):
+**3 scenarios / 384 interleavings**, no wrong-model resolution; see
+[`docs/reviews/concurrency.md`](reviews/concurrency.md) §3c). That covers the
+in-memory protocol only, not persistent storage.
+
 ---
 
 ## 6. Reproduce
@@ -179,6 +186,7 @@ plus the machine-9 registration. `src/machine_dict.rs` adds a framing unit test.
 ```sh
 sh scripts/container-verify.sh          # fmt + clippy(-D warnings) + full suite
 sh scripts/container-test.sh --release --test dictionary -- --nocapture
+sh scripts/container-loom.sh            # Loom model of the registry (tests/loom_dictionary.rs)
 sh scripts/run-dictionary.sh            # writes evidence/bench/dictionary.json
 ```
 

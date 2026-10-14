@@ -2,10 +2,12 @@
 
 Scope: every shared-mutable critical section and synchronization point in the
 crate — `filesystem` (the `OrFs` index), `handle` (the RCU `ObjectCache`
-handle/generation cache), `worker` (background construction), `asyncpub`
+handle/generation cache), `dictionary` (the process-wide dictionary registry),
+`worker` (background construction), `asyncpub`
 (publication), `reader`/`recovery`/`writer` (generation visibility).
-Method: a written audit of the code, then exhaustive Loom models of the two
-genuine shared-mutable structures (`OrFs`'s index and `ObjectCache`'s maps), plus
+Method: a written audit of the code, then exhaustive Loom models of the three
+genuine shared-mutable structures (`OrFs`'s index, `ObjectCache`'s maps, and the
+dictionary registry), plus
 real-thread stress tests. All tooling ran inside the pinned container via
 `scripts/container-loom.sh` and `scripts/container-verify.sh` (memory-capped;
 Loom is capped at 4 GiB). Loom was run on **stable** (1.99.0); it needs no
@@ -17,6 +19,7 @@ nightly.
 |---|---|---|---|
 | `filesystem::OrFs` | `Mutex<BTreeMap<String, IndexEntry>>` guarding check‑then‑insert **and** publication of an object's backing files | **genuine shared-mutable** | **yes** (`tests/loom.rs`) |
 | `handle::ObjectCache` | `Mutex<BTreeMap<PathBuf, Arc<OpenObject>>>` (the published handles) + `Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>` (the per‑path single‑flight builder locks), plus `AtomicU64` hit/miss counters | **genuine shared-mutable** — RCU publication + single‑flight | **yes** (`tests/loom_rcu.rs`) |
+| `dictionary` registry | `RwLock<HashMap<[u8; 16], Dictionary>>` behind a one‑time cell; machine‑9 records reference a model by content id | **genuine shared-mutable** — publication/lookup of referenced models | **yes** (`tests/loom_dictionary.rs`) |
 | `worker::regional_parallel` | scoped threads sharing `&[u8]` `core`/`states`; each returns an owned `Vec<RegionBuild>` through its join handle | lock-free by construction (immutable borrows, move-only results) | no — trivially safe |
 | `worker::manifest_background` | `EkbloomBody` **moved** into one thread, result returned via join handle | move-only ownership | no — trivially safe |
 | `EkbloomBody` shared as `Arc` (`create` → `read`, `category_concurrent_readers`) | immutable after construction | lock-free (shared immutable) | no — trivially safe |
@@ -24,16 +27,17 @@ nightly.
 | `recovery` scanning while a writer appends | whole-file `std::fs::read` + footer validation | filesystem consistency, not memory | no — see §4 |
 | `writer::{write_body,append_generation}` | single caller thread, no shared Rust state | — | no |
 
-There are exactly **two** shared-mutable structures in the crate — the `OrFs`
-index and the `ObjectCache` maps — and both are plain `Mutex`s. The rest is
+There are exactly **three** shared-mutable structures in the crate — the `OrFs`
+index, the `ObjectCache` maps, and the dictionary registry — and all three are
+plain locks (two `Mutex`s and one `RwLock`). The rest is
 immutable sharing or move-only transfer, which needs no synchronization and
 therefore gained nothing that would make a model faithful. We deliberately did
 **not** add atomics or channels anywhere to create something to test.
 
 ## 2. Production change (minimal, behaviour-identical)
 
-`src/filesystem.rs` is the only source edit. The `std::sync::{Mutex,MutexGuard}`
-import became a cfg-selected alias:
+For the `OrFs` index model, `src/filesystem.rs` is the only source edit. The
+`std::sync::{Mutex,MutexGuard}` import became a cfg-selected alias:
 
 ```rust
 #[cfg(loom)]      use loom::sync::{Mutex, MutexGuard};
@@ -43,7 +47,11 @@ import became a cfg-selected alias:
 and `fn lock(...)` now spells the guard as the alias. Production compiles
 `std::sync`; under `--cfg loom` the **same** `create`/`read`/`stat`/`load` code is
 compiled against loom's instrumented `Mutex`. No logic, signature or behaviour
-changes; the ordinary test suite and clippy gate are unaffected.
+changes; the ordinary test suite and clippy gate are unaffected. The RCU model
+(§3b) needed no new production change (the `src/handle.rs` alias already
+predated it), and the dictionary registry model (§3c) adds one more
+cfg-selected alias of the same kind in `src/dictionary.rs` — a normal (non-loom)
+build is byte-for-byte unaffected.
 
 `Cargo.toml` adds the dependency under
 `[target.'cfg(loom)'.dependencies] loom = "0.7"` (plus a `[lints.rust]`
@@ -142,6 +150,49 @@ while a writer appends 24 generations, asserting byte-exactness and handle
 consistency under churn, and that rebuilds stay single-flighted far below the
 open count.
 
+## 3c. Dictionary registry model — `tests/loom_dictionary.rs`
+
+`src/dictionary.rs` keeps the **process-wide registry** a machine-9
+(`OrANS-DICT`) record references: `register` inserts a trained `Dictionary`
+under its content id, and `lookup`/`registered`/`unregister` resolve, test and
+remove it. A wrong or missing resolution would decode a record against another
+dictionary's model. The registry is a
+`RwLock<HashMap<[u8; 16], Dictionary>>` behind a one-time cell. Under `--cfg loom`
+that `RwLock` is loom's instrumented type (a cfg-selected alias in
+`src/dictionary.rs`; a production change of the same minimal kind as §2), so
+`loom_dictionary` drives the real `register`/`lookup`/`registered`/`unregister`
+API:
+
+1. `publication_visibility_and_no_wrong_model` — two threads register two
+distinct dictionaries; each thread's later `lookup` observes its own model
+(publication visibility), and no lookup ever resolves an id to another
+dictionary's model (the critical invariant).
+2. `cross_id_isolation_under_concurrent_register_unregister` — two threads
+repeatedly `register`/`lookup`/`unregister` *distinct* ids on the shared lock;
+neither id ever resolves to the other's model, and each thread's `unregister`
+is visible to its own later `lookup`.
+3. `idempotent_concurrent_register_of_one_dictionary` — three threads register
+the *same* dictionary concurrently; it stays resolvable to its own model.
+
+Interleavings explored (each model logs its count under `--nocapture`;
+`LOOM_MAX_PREEMPTIONS` from `scripts/container-loom.sh`, models run with
+`--test-threads=1`):
+
+| model | preemptions = 2 | preemptions = 3 |
+|---|---:|---:|
+| `publication_visibility_and_no_wrong_model` | 23 | 57 |
+| `cross_id_isolation_under_concurrent_register_unregister` | 243 | 1938 |
+| `idempotent_concurrent_register_of_one_dictionary` | 118 | 720 |
+
+All pass. That is **384** exhaustive schedules at a bound of 2 and **2,715** at
+a bound of 3. No wrong-model resolution was found. The registry's one-time cell
+*initialisation* is not modelled: loom 0.7.2 has no `sync::OnceLock`, and a
+`std::sync::OnceLock` cannot be reset between the schedules `loom::model`
+re-runs its closure for, so the loom build uses a resettable slot
+(`dictionary::reset_registry_for_model`, called at the top of every closure) and
+models the `RwLock` protocol around the map. The model covers the **in-memory
+registry protocol**, not persistent storage.
+
 ## 4. Honest limits — where Loom does not apply
 
 - **Publication ordering is a filesystem property.** `write_body` publishes by
@@ -159,28 +210,36 @@ open count.
   should be invented.
 - **Loom explores only loom-instrumented types.** `std::fs` calls inside the
   model run for real and are invisible to the scheduler; the models therefore
-  verify the *in-memory* mutex protocols (`OrFs`'s index and `ObjectCache`'s
-  maps), which are the only shared Rust state.
+  verify the *in-memory* mutex protocols (`OrFs`'s index, `ObjectCache`'s maps,
+  and the dictionary registry), which are the only shared Rust state.
+- **The dictionary registry's one-time cell is not modelled.** loom 0.7.2 has no
+  `OnceLock`, and the `HashMap` behind the `RwLock` is ordinary data; the model
+  covers the `RwLock` publication/lookup protocol only, not the cell
+  initialisation or any persistent storage.
 
 **Conclusion.** Loom's applicable surface in EKBLOOM is small — the `OrFs` index
-mutex and the `ObjectCache` maps — but where it applies it is exact: it proves
+mutex, the `ObjectCache` maps, and the dictionary registry — but where it applies
+it is exact: it proves
 the `OrFs` check‑then‑publish critical section cannot be split by a refactor
 without a concurrent reader observing a partially published object; that
 same-path creation is mutually exclusive; that RCU publication is atomic (a
 reader sees the old or the new *whole* generation, never a torn one) and cannot
-deadlock; and that the single-flight builder lock admits exactly one build per
-(path, generation). Beyond that, the crate's safety is structural (immutability
+deadlock; that the single-flight builder lock admits exactly one build per
+(path, generation); and that the dictionary registry never resolves an id to
+another dictionary's model, observes its own publications, and isolates distinct
+ids. Beyond that, the crate's safety is structural (immutability
 and move-only ownership), which was verified by reading the code and by the
 multi-threaded stress tests, not by Loom.
 
 ## 5. Reproduce
 
 ```sh
-sh scripts/container-loom.sh                             # 6 models (loom + loom_rcu), preemptions = 2
+sh scripts/container-loom.sh                             # 9 models (loom + loom_rcu + loom_dictionary), preemptions = 2
 EKB_LOOM_MAX_PREEMPTIONS=3 sh scripts/container-loom.sh  # deeper sweep
 sh scripts/container-verify.sh                           # fmt + clippy -D warnings + tests
 ```
 
-`scripts/container-loom.sh` runs both `--test loom` and `--test loom_rcu` (each
+`scripts/container-loom.sh` runs `--test loom`, `--test loom_rcu` and
+`--test loom_dictionary` (each
 memory-capped at 4 GiB) with `--nocapture --test-threads=1`, so every model's
 interleaving count is reported.

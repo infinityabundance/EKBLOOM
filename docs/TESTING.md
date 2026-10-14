@@ -302,6 +302,7 @@ sh scripts/container-aarch64.sh   # x86_64 == arm64 (QEMU); writes aarch64-deter
 sh scripts/run-scalar.sh scalar   # x86_64 with EKB_NO_SIMD=1; writes ci-x86_64-scalar.json
 sh scripts/run-matrix.sh          # the {x86_64-simd, x86_64-scalar, aarch64} CI matrix; writes ci-matrix.json
 sh scripts/run-scale.sh           # nightly 2^30 build (opt-in: EKB_RUN_SCALE=1)
+sh scripts/container-loom.sh      # exhaustive Loom models (loom + loom_rcu + loom_dictionary)
 sh scripts/container-reproduce.sh # clean release build + suite + evidence validation
 ```
 
@@ -363,3 +364,31 @@ not installed and the container is offline for `apt` (and `mount` needs
 `CAP_SYS_ADMIN`, i.e. `EKB_CROSSFS_PRIVILEGED=1`). The blocker is recorded verbatim
 in the artifact. x86_64-vs-aarch64 determinism is covered separately by
 [`scripts/container-aarch64.sh`](../scripts/container-aarch64.sh) (Q2: identical).
+
+---
+
+## 10. Loom model checking
+
+**Runner:** [`scripts/container-loom.sh`](../scripts/container-loom.sh) · **Review:**
+[`docs/reviews/concurrency.md`](../docs/reviews/concurrency.md)
+
+Loom model-checks the crate's three genuine shared-mutable structures. It runs on
+**stable** (`--cfg loom`, no nightly) inside the pinned container, memory-capped
+at 4 GiB, with `LOOM_MAX_PREEMPTIONS=2` by default
+(`EKB_LOOM_MAX_PREEMPTIONS=3` for a deeper sweep) and `--nocapture
+--test-threads=1` so each model's interleaving count is reported. Three test
+targets compile the **same** production code against loom's instrumented
+types:
+
+| target | structure | modelled protocol | schedules (preemptions = 2) |
+|---|---|---|---:|
+| [`tests/loom.rs`](../tests/loom.rs) | `OrFs` index `Mutex` | check‑then‑publish critical section | 238 |
+| [`tests/loom_rcu.rs`](../tests/loom_rcu.rs) | `ObjectCache` maps | RCU generation publication + single-flight | 407 |
+| [`tests/loom_dictionary.rs`](../tests/loom_dictionary.rs) | dictionary registry `RwLock` | publication/lookup, no wrong-model resolution | 384 |
+
+All pass, with **no torn read** and **no wrong-model resolution**. Publication
+*ordering* (temp file + `rename`, append + `Footer`) and the registry's one-time
+cell initialisation are not Loom properties and are covered elsewhere (crash
+recovery, `src/dictionary.rs`'s plain `OnceLock` cell). See
+[`docs/reviews/concurrency.md`](../docs/reviews/concurrency.md) for the per-model
+breakdown and the preemptions = 3 counts.
